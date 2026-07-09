@@ -451,14 +451,16 @@ impl Batcher<'_> {
     /// routed to the emoji glyph or per-character drawing. The routing mirrors
     /// `shape::text_advance`, so the quads land where layout measured.
     fn text(&mut self, face_key: FaceKey, x: i32, baseline: i32, text: &str, color: u32) {
-        let face = self.fonts.face_for(face_key);
         let mut pen = x as f32;
         if text.is_ascii() {
             for ch in text.chars() {
-                pen = self.scalar(face, face_key, ch, pen, baseline, color);
+                pen = self.scalar(face_key, ch, pen, baseline, color);
             }
             return;
         }
+        // Only the emoji cluster path needs the keyed face directly; the
+        // per-scalar path resolves its own face (primary or fallback) per glyph.
+        let face = self.fonts.face_for(face_key);
         for (_, cluster) in grapheme::graphemes(text) {
             match self.packed_cluster(face, face_key, cluster) {
                 Some(packed) => {
@@ -467,7 +469,7 @@ impl Batcher<'_> {
                 }
                 None => {
                     for ch in cluster.chars() {
-                        pen = self.scalar(face, face_key, ch, pen, baseline, color);
+                        pen = self.scalar(face_key, ch, pen, baseline, color);
                     }
                 }
             }
@@ -500,7 +502,7 @@ impl Batcher<'_> {
                     // glyph advances and any combining marks land back over it.
                     let mut p = pen;
                     for ch in cluster.chars() {
-                        p = self.scalar(face, face_key, ch, p, baseline, color);
+                        p = self.scalar(face_key, ch, p, baseline, color);
                     }
                 }
             }
@@ -511,16 +513,8 @@ impl Batcher<'_> {
     /// returning the advanced pen. Its placement is cached beside the atlas
     /// slot, so a steady-state frame emits the quad without re-rasterising the
     /// glyph.
-    fn scalar(
-        &mut self,
-        face: &Face,
-        face_key: FaceKey,
-        ch: char,
-        pen: f32,
-        baseline: i32,
-        color: u32,
-    ) -> f32 {
-        let packed = self.packed_scalar(face, face_key, ch);
+    fn scalar(&mut self, face_key: FaceKey, ch: char, pen: f32, baseline: i32, color: u32) -> f32 {
+        let packed = self.packed_scalar(face_key, ch);
         self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, color);
         pen + packed.advance
     }
@@ -528,15 +522,21 @@ impl Batcher<'_> {
     /// The cached placement for a scalar glyph. On the first sight of this
     /// (face, character) the glyph is rasterized once and its coverage written
     /// straight into the atlas; later frames read the cached placement. The
+    /// glyph is rasterized from [`Fonts::glyph_face`], so a scalar the keyed face
+    /// lacks (a Nerd Font icon, a stray symbol) inks from a fallback face instead
+    /// of the `.notdef` box; the `(key, ch)` cache key stays unique because that
+    /// resolution is deterministic. A cache hit records against the keyed face
+    /// and never re-resolves, so steady-state frames pay no fallback cost. The
     /// atlas cache is the only glyph raster cache, so its hit and miss are
     /// reported to the face for the frame stats.
-    fn packed_scalar(&mut self, face: &Face, face_key: FaceKey, ch: char) -> PackedGlyph {
+    fn packed_scalar(&mut self, face_key: FaceKey, ch: char) -> PackedGlyph {
+        let primary = self.fonts.face_for(face_key);
         if let Some(&packed) = self.cache.scalar_slots.get(&(face_key, ch)) {
-            face.record_glyph_hit();
+            primary.record_glyph_hit();
             return packed;
         }
-        face.record_glyph_miss();
-        let g = face.rasterize(ch);
+        primary.record_glyph_miss();
+        let g = self.fonts.glyph_face(face_key, ch).rasterize(ch);
         let atlas = &mut self.cache.glyphs;
         let packed = PackedGlyph {
             slot: atlas.pack(g.width as u32, g.rows as u32, &g.coverage),

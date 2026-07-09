@@ -23,83 +23,72 @@ use std::rc::Rc;
 use crate::platform::emoji::{wants_emoji, ColorGlyph, EmojiFont};
 use crate::platform::error::{Error, Result};
 
-/// A monospace family and the four style files the editor draws emphasis with.
-/// The first family whose `regular` file exists wins; a missing bold, italic, or
-/// bold-italic variant falls back to the regular face at render time, so a family
-/// that ships only some weights still renders (just without the slant or weight).
-/// Paths are hardcoded by design; a short list keeps the editor runnable
-/// across machines without a font-discovery crate.
-struct FontFamily {
-    regular: &'static str,
-    bold: &'static str,
-    italic: &'static str,
-    bold_italic: &'static str,
+/// A font family and the four style files the editor draws emphasis with. A
+/// missing bold, italic, or bold-italic variant falls back to the regular face
+/// at render time, so a family that ships only some weights still renders (just
+/// without the slant or weight). Paths are owned so a config, the built-in
+/// default now and a loaded file later, can supply them.
+#[derive(Clone, Debug)]
+pub struct FontFamily {
+    pub regular: String,
+    pub bold: String,
+    pub italic: String,
+    pub bold_italic: String,
 }
 
-const FONT_FAMILIES: &[FontFamily] = &[
-    FontFamily {
-        regular: "/usr/share/fonts/TTF/Hack-Regular.ttf",
-        bold: "/usr/share/fonts/TTF/Hack-Bold.ttf",
-        italic: "/usr/share/fonts/TTF/Hack-Italic.ttf",
-        bold_italic: "/usr/share/fonts/TTF/Hack-BoldItalic.ttf",
-    },
-    FontFamily {
-        regular: "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
-        bold: "/usr/share/fonts/noto/NotoSansMono-Bold.ttf",
-        // Noto Sans Mono ships no italic; these paths simply will not exist, and
-        // the lookup falls back to the regular face.
-        italic: "/usr/share/fonts/noto/NotoSansMono-Italic.ttf",
-        bold_italic: "/usr/share/fonts/noto/NotoSansMono-BoldItalic.ttf",
-    },
-    FontFamily {
-        regular: "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
-        bold: "/usr/share/fonts/Adwaita/AdwaitaMono-Bold.ttf",
-        italic: "/usr/share/fonts/Adwaita/AdwaitaMono-Italic.ttf",
-        bold_italic: "/usr/share/fonts/Adwaita/AdwaitaMono-BoldItalic.ttf",
-    },
-    FontFamily {
-        regular: "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-        bold: "/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf",
-        // DejaVu calls its slanted styles Oblique rather than Italic.
-        italic: "/usr/share/fonts/TTF/DejaVuSansMono-Oblique.ttf",
-        bold_italic: "/usr/share/fonts/TTF/DejaVuSansMono-BoldOblique.ttf",
-    },
-    FontFamily {
-        regular: "/usr/share/fonts/TTF/Roboto-Regular.ttf",
-        bold: "/usr/share/fonts/TTF/Roboto-Bold.ttf",
-        italic: "/usr/share/fonts/TTF/Roboto-Italic.ttf",
-        bold_italic: "/usr/share/fonts/TTF/Roboto-BoldItalic.ttf",
-    },
-];
-
-/// The first family whose regular face is installed on this machine.
-fn default_family() -> Result<&'static FontFamily> {
-    FONT_FAMILIES
-        .iter()
-        .find(|f| std::path::Path::new(f.regular).exists())
-        .ok_or_else(|| Error::msg("no usable font family found in the candidate list"))
+impl FontFamily {
+    /// A family from its four style paths.
+    pub fn new(regular: &str, bold: &str, italic: &str, bold_italic: &str) -> Self {
+        Self {
+            regular: regular.into(),
+            bold: bold.into(),
+            italic: italic.into(),
+            bold_italic: bold_italic.into(),
+        }
+    }
 }
 
-/// Candidate regular faces for code: a monospace deliberately distinct from the
-/// prose family, so code blocks and inline code read in their own typeface. Only
-/// the regular face is ever needed (code never renders bold or italic), so this
-/// is a flat list of paths rather than full families.
-const CODE_FONT_FAMILIES: &[&str] = &[
-    "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
-    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
-    "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
-    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-    "/usr/share/fonts/gnu-free/FreeMono.otf",
-];
+/// Which fonts the editor opens: an ordered list of prose family candidates, an
+/// ordered list of code face candidates, and an ordered fallback chain for
+/// scalars the chosen family cannot draw. The first prose family whose regular
+/// file exists is used; the first installed code face distinct from that regular
+/// renders code, else code shares the prose face; the fallback chain is consulted
+/// glyph by glyph (see [`Fonts::glyph_face`]) for a character the prose or code
+/// face lacks. The concrete selection is the app's to supply: its `Default` impl
+/// lives with the app config, keeping this portable layer free of per-project
+/// font paths. A loader can later replace it.
+#[derive(Clone, Debug)]
+pub struct FontConfig {
+    pub families: Vec<FontFamily>,
+    pub code: Vec<String>,
+    /// Regular-weight faces consulted, in order, for a scalar the prose or code
+    /// face has no glyph for: a symbols/icon font (a terminal's Nerd Font and
+    /// Powerline glyphs live in the private-use area, which text families do not
+    /// carry) or a wider-coverage Unicode fallback. Only installed files open;
+    /// an empty list means no fallback (a missing glyph renders as the `.notdef`
+    /// tofu box, the pre-fallback behavior). An app with no need for it (a
+    /// text-only editor) leaves this empty.
+    pub fallback: Vec<String>,
+}
 
-/// The first installed code face whose path differs from the prose family's
-/// regular face, or `None` if none is available. A `None` leaves code sharing the
-/// prose face: still readable, just without the visual distinction.
-fn code_regular_path(prose: &FontFamily) -> Option<&'static str> {
-    CODE_FONT_FAMILIES
-        .iter()
-        .copied()
-        .find(|&p| p != prose.regular && std::path::Path::new(p).exists())
+impl FontConfig {
+    /// The first prose family whose regular face is installed on this machine.
+    fn default_family(&self) -> Result<&FontFamily> {
+        self.families
+            .iter()
+            .find(|f| std::path::Path::new(&f.regular).exists())
+            .ok_or_else(|| Error::msg("no usable font family found in the candidate list"))
+    }
+
+    /// The first installed code face whose path differs from the prose family's
+    /// regular face, or `None` if none is available. A `None` leaves code sharing
+    /// the prose face: still readable, just without the visual distinction.
+    fn code_regular_path(&self, prose: &FontFamily) -> Option<&str> {
+        self.code
+            .iter()
+            .map(String::as_str)
+            .find(|&p| p != prose.regular.as_str() && std::path::Path::new(p).exists())
+    }
 }
 
 /// Which variant of the font family a run renders in. Body text and syntax
@@ -311,8 +300,10 @@ impl Glyph {
 }
 
 /// Render-ready line metrics for a face at its current pixel size, rounded to
-/// whole pixels. Ascent and descent are both positive (pixels above and below
-/// the baseline); `line_height` is the baseline-to-baseline distance.
+/// whole pixels. Ascent and descent are both positive glyph metrics (pixels
+/// above and below the baseline); `line_height` is the baseline-to-baseline
+/// distance and may exceed ascent + descent, the surplus being leading that
+/// falls below the line (so text is top-aligned in a taller line box).
 #[derive(Clone, Copy, Debug)]
 pub struct Metrics {
     pub ascent: i32,
@@ -392,7 +383,8 @@ impl Face {
     /// family's variants per size itself.
     #[cfg(test)]
     pub fn open_default(pixel_size: u32) -> Result<Self> {
-        let face = Self::from_path(default_family()?.regular)?;
+        let config = FontConfig::default();
+        let face = Self::from_path(&config.default_family()?.regular)?;
         face.set_pixel_size(pixel_size)?;
         Ok(face)
     }
@@ -674,20 +666,18 @@ impl Face {
     }
 
     /// Render-ready [`Metrics`] at the current pixel size: ascent and descent
-    /// rounded up to whole pixels, and the baseline-to-baseline line height
-    /// (falling back to ascent + descent if the font reports none).
+    /// rounded up to whole pixels, and the baseline-to-baseline line height,
+    /// held to at least the ink height so stacked lines never overlap.
+    ///
+    /// FreeType rounds the ascender up and the descender down independently of
+    /// the height it reports, so a font can hand back a baseline-to-baseline
+    /// height a pixel below the rounded ascent + descent (Noto Sans does at some
+    /// sizes). Taking the max keeps the line box honest for any font.
     pub fn metrics(&self) -> Metrics {
         let (ascent, descent) = self.line_metrics();
         let ascent = ascent.ceil() as i32;
         let descent = (-descent).ceil() as i32;
-        let line_height = {
-            let h = self.line_height().ceil() as i32;
-            if h > 0 {
-                h
-            } else {
-                ascent + descent
-            }
-        };
+        let line_height = (self.line_height().ceil() as i32).max(ascent + descent);
         Metrics {
             ascent,
             descent,
@@ -722,18 +712,25 @@ struct SizedFaces {
     /// The code family's regular face at this size, or `None` when no distinct
     /// code family is installed (code then falls back to `regular`).
     code: Option<Face>,
+    /// The fallback chain at this size ([`FontConfig::fallback`]), in priority
+    /// order, holding only the faces whose files exist. Consulted by
+    /// [`Fonts::glyph_face`] for a scalar the keyed face cannot draw; empty when
+    /// the config lists none.
+    fallback: Vec<Face>,
     metrics: Metrics,
 }
 
 impl SizedFaces {
     /// Every face this size actually opened: the regular face plus whichever
-    /// variants and code face exist. Used to roll up cache stats across faces.
+    /// variants, code face, and fallback faces exist. Used to roll up cache stats
+    /// across faces.
     fn faces(&self) -> impl Iterator<Item = &Face> {
         std::iter::once(&self.regular)
             .chain(self.bold.as_ref())
             .chain(self.italic.as_ref())
             .chain(self.bold_italic.as_ref())
             .chain(self.code.as_ref())
+            .chain(self.fallback.iter())
     }
 }
 
@@ -751,27 +748,52 @@ pub struct Fonts {
 }
 
 impl Fonts {
-    /// Open the default family at each of `sizes` (zeros and duplicates skipped),
-    /// loading every available style per size. At least one nonzero size is
-    /// required; the first opened becomes the fallback.
+    /// Open the default font selection at each of `sizes`, with the font's own
+    /// line height (a scale of 1.0, no extra leading). A convenience over
+    /// [`Self::with_config`] using [`FontConfig::default`]; tests and the perf
+    /// harness use it, while the editor threads its own config through
+    /// [`Self::with_config`].
     pub fn new(sizes: &[u32]) -> Result<Self> {
-        let family = default_family()?;
-        let code_path = code_regular_path(family);
+        Self::with_config(&FontConfig::default(), sizes, 1.0)
+    }
+
+    /// Open `config`'s prose family and code face at each of `sizes` (zeros and
+    /// duplicates skipped), loading every available style per size. Each size's
+    /// line box is grown to at least `line_height_scale` times the size (the CSS
+    /// line-height model), never below the font's own line height, so lines can
+    /// be spaced out without overlapping. At least one nonzero size is required;
+    /// the first opened becomes the fallback.
+    pub fn with_config(config: &FontConfig, sizes: &[u32], line_height_scale: f32) -> Result<Self> {
+        let family = config.default_family()?;
+        let code_path = config.code_regular_path(family);
         let emoji = EmojiFont::open().map(Rc::new);
         let mut sized: Vec<SizedFaces> = Vec::new();
         for &size in sizes {
             if size == 0 || sized.iter().any(|s| s.size == size) {
                 continue;
             }
-            let regular = open_face(family.regular, size, emoji.as_ref())?;
-            let metrics = regular.metrics();
+            let regular = open_face(&family.regular, size, emoji.as_ref())?;
+            let mut metrics = regular.metrics();
+            // Grow the line box to the requested multiple of the size, keeping
+            // the font's own line height as the floor so lines never overlap.
+            // Ascent and descent stay the glyph metrics; the extra sits below.
+            let target = (line_height_scale * size as f32).round() as i32;
+            metrics.line_height = metrics.line_height.max(target);
+            // Fallback faces draw only scalars the primary lacks and never route
+            // emoji clusters themselves, so they carry no emoji font.
+            let fallback = config
+                .fallback
+                .iter()
+                .filter_map(|p| open_variant(p, size, None))
+                .collect();
             sized.push(SizedFaces {
                 size,
                 regular,
-                bold: open_variant(family.bold, size, emoji.as_ref()),
-                italic: open_variant(family.italic, size, emoji.as_ref()),
-                bold_italic: open_variant(family.bold_italic, size, emoji.as_ref()),
+                bold: open_variant(&family.bold, size, emoji.as_ref()),
+                italic: open_variant(&family.italic, size, emoji.as_ref()),
+                bold_italic: open_variant(&family.bold_italic, size, emoji.as_ref()),
                 code: code_path.and_then(|p| open_variant(p, size, emoji.as_ref())),
+                fallback,
                 metrics,
             });
         }
@@ -822,6 +844,33 @@ impl Fonts {
             FaceKey::Prose { size, style } => self.face(size, style),
             FaceKey::Code { size } => self.code_face(size),
         }
+    }
+
+    /// The physical face to rasterize `ch` in for `key`: the keyed face when its
+    /// character map covers `ch`, otherwise the first fallback face at that size
+    /// that does, otherwise the keyed face again (so a scalar absent everywhere
+    /// still draws its `.notdef` box, the pre-fallback behavior). This is how a
+    /// Nerd Font / Powerline icon a prompt emits reaches its glyph in a symbols
+    /// font even though the prose or code family has no cell for it.
+    ///
+    /// Emoji never arrive here: a color cluster is resolved through the emoji
+    /// cluster path before any scalar is drawn. The keyed face's own cmap is
+    /// consulted first and answers every ASCII and Latin glyph without touching a
+    /// fallback face, so the common case pays a single [`FT_Get_Char_Index`], and
+    /// only a genuine miss walks the (short) chain. The GPU batcher caches the
+    /// resolved raster by `(key, ch)`, so this runs once per new glyph, never per
+    /// frame. With an empty [`FontConfig::fallback`] the chain is empty and this
+    /// always returns the keyed face.
+    pub fn glyph_face(&self, key: FaceKey, ch: char) -> &Face {
+        let primary = self.face_for(key);
+        if primary.has_scalar(ch) {
+            return primary;
+        }
+        self.entry(key.size())
+            .fallback
+            .iter()
+            .find(|f| f.has_scalar(ch))
+            .unwrap_or(primary)
     }
 
     /// The metrics for `size`, or the fallback's metrics if `size` was not opened.
@@ -988,13 +1037,13 @@ mod tests {
     }
 
     #[test]
-    fn line_height_covers_ascent_plus_descent() {
-        let face = open();
-        let (ascent, descent) = face.line_metrics();
-        let height = face.line_height();
-        // Baseline-to-baseline spacing is at least the ink height (ascent above
-        // the baseline plus the descent below it).
-        assert!(height >= ascent - descent, "height {height} too small");
+    fn render_metrics_never_overlap_lines() {
+        // FreeType can report a baseline-to-baseline height a pixel under the
+        // rounded ink height (it rounds ascender up and descender down apart from
+        // the height). The render metrics clamp so a line box always covers its
+        // own ink, whatever the raw font reports.
+        let m = open().metrics();
+        assert!(m.line_height >= m.ascent + m.descent);
     }
 
     #[test]
@@ -1010,6 +1059,34 @@ mod tests {
         let small = fonts.metrics(16);
         let large = fonts.metrics(32);
         assert!(large.line_height > small.line_height, "32px is taller");
+    }
+
+    #[test]
+    fn line_height_scale_grows_the_box_and_keeps_glyph_metrics() {
+        let base = Fonts::new(&[14]).expect("a default font").metrics(14);
+        // A scale well above any 14px font's own line height forces the box to
+        // the scaled target; 3.0 gives 42px, past ascent + descent.
+        let big = Fonts::with_config(&FontConfig::default(), &[14], 3.0)
+            .expect("a default font")
+            .metrics(14);
+        assert_eq!(big.ascent, base.ascent, "ascent stays the glyph metric");
+        assert_eq!(big.descent, base.descent, "descent stays the glyph metric");
+        assert_eq!(big.line_height, 42, "line box is round(3.0 * 14)");
+        assert!(
+            big.line_height > big.ascent + big.descent,
+            "the surplus is leading below the line"
+        );
+    }
+
+    #[test]
+    fn line_height_scale_floors_at_the_font_line_height() {
+        // A scale too small to matter leaves the font's own line height, so
+        // lines never overlap.
+        let base = Fonts::new(&[14]).expect("a default font").metrics(14);
+        let tiny = Fonts::with_config(&FontConfig::default(), &[14], 0.1)
+            .expect("a default font")
+            .metrics(14);
+        assert_eq!(tiny.line_height, base.line_height);
     }
 
     #[test]
@@ -1078,5 +1155,40 @@ mod tests {
             face.advance('a'),
             "a simple cluster measures exactly like its character"
         );
+    }
+
+    #[test]
+    fn glyph_face_falls_back_for_a_nerd_font_icon() {
+        // U+F418 is the Nerd Font octicon "git-branch" (nf-oct-git_branch), the
+        // icon a git prompt prints. It lives in the private-use area, so a plain
+        // text or monospace family never carries it: the config's fallback chain
+        // (a symbols font) must supply it or the cell renders as a blank / tofu
+        // box. This holds for either app: with an empty fallback list (a text
+        // editor) the resolver simply returns the primary and the ink assertion
+        // is skipped; with a symbols font configured (a terminal) it inks.
+        const BRANCH: char = '\u{F418}';
+        let fonts = Fonts::new(&[16]).expect("a default font");
+        let key = FaceKey::Prose {
+            size: 16,
+            style: FontStyle::Regular,
+        };
+
+        // A glyph the primary owns resolves to the primary itself, untouched, so
+        // the common path never walks the fallback chain.
+        let primary = fonts.face_for(key);
+        assert!(primary.has_scalar('A'));
+        assert!(std::ptr::eq(fonts.glyph_face(key, 'A'), primary));
+
+        // Resolving the icon never panics whether or not a fallback is present.
+        // When the primary lacks it but a fallback covers it, the resolved face
+        // must ink it: that inked raster is exactly the fix for the blank cell.
+        let resolved = fonts.glyph_face(key, BRANCH);
+        if !primary.has_scalar(BRANCH) && resolved.has_scalar(BRANCH) {
+            let g = resolved.rasterize(BRANCH);
+            assert!(
+                g.coverage.iter().any(|&c| c > 0),
+                "the branch icon should ink from a fallback face"
+            );
+        }
     }
 }

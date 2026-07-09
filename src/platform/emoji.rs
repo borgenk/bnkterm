@@ -62,7 +62,8 @@ pub struct ColorGlyph {
 }
 
 /// Where distros install the Noto color emoji font. Same hardcoded-path policy
-/// as [`FONT_FAMILIES`]; a machine with none of these simply has no emoji.
+/// as the prose and code fonts in freetype.rs; a machine with none of these
+/// simply has no emoji.
 const EMOJI_FONTS: &[&str] = &[
     "/usr/share/fonts/noto/NotoColorEmoji.ttf",
     "/usr/share/fonts/google-noto/NotoColorEmoji.ttf",
