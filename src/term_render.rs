@@ -1,0 +1,1130 @@
+//! The terminal's painter: it walks the visible grid and produces a
+//! backend-agnostic [`DisplayList`], the value the damage differ and the GPU
+//! batcher both consume. This is the seam between the terminal core and the
+//! renderer: the core never touches Vulkan, it emits drawing
+//! primitives, and everything downstream (`display::damage`, `gpu::build_frame`)
+//! is a pure function of that list.
+//!
+//! ```text
+//!   grid::Screen ──build_display_list──▶ DisplayList ──┬─ gpu::build_frame ─▶ pixels
+//!   (+ Theme, CellMetrics, cursor,                     └─ damage(old,new) ─▶ [Rect]
+//!    selection)
+//! ```
+//!
+//! # Fixed pitch is the whole game
+//!
+//! A terminal is a grid: the cell at `(row, col)` occupies exactly the pixel box
+//! `[col*w, (col+1)*w) x [row*h, (row+1)*h)`, and the cursor, the selection, and
+//! the glyphs must all agree on where that box is or the display corrupts (the
+//! cursor "drifts from the glyphs"). We get that for
+//! free by *placing everything at `col * w`* and never accumulating a font's
+//! (fractional) advance: text goes out as [`DrawCmd::Cells`], whose contract is
+//! exactly "cluster `i` draws at `x + i*cell_w`". The one measurement that keys
+//! the whole grid, `cell_w`, is the advance of a reference glyph from the regular
+//! face rounded to a whole pixel; the grid decides *which* column a rune lands in
+//! (via `width::width`), so measurement and placement can never disagree.
+//!
+//! # What a frame is made of
+//!
+//! Per painted row, in stacking order (the list order the damage diff and the GPU
+//! rely on): the base background fill (once, whole surface), then per-cell
+//! background runs where a cell's background differs from the theme's, then the
+//! foreground as fixed-pitch [`DrawCmd::Cells`] runs (with wide glyphs and
+//! astral-plane runes broken out into their own [`DrawCmd::Text`] so the pitch
+//! stays uniform), then underline/strike rules, and finally the cursor on top.
+//! Everything past the base fill is emitted only where it is not the default, so
+//! an idle screen of mostly-blank cells produces a short list and an unchanged
+//! frame diffs to nothing.
+
+use crate::color::{Ground, Rgb, Theme};
+use crate::grid::{Attrs, Cell, Screen};
+use crate::platform::freetype::{FaceKey, FontStyle, Fonts};
+use crate::platform::geom::Rect;
+use crate::render::display::{DisplayList, DrawCmd};
+
+/// The glyph whose advance defines the monospace cell width. `M` is the classic
+/// full-width reference; on a genuine monospace face every glyph shares it.
+const REFERENCE_GLYPH: char = 'M';
+
+/// The selection highlight background: a muted steel blue that stays legible
+/// under the default fg.
+const SELECTION_BG: Rgb = Rgb::new(0x41, 0x57, 0x76);
+
+/// The width of a bar (`DECSCUSR 5/6`) cursor, in pixels.
+const BAR_CURSOR_WIDTH: i32 = 2;
+
+/// The scroll-position indicator drawn on the right edge while viewing history:
+/// its width in pixels and its colour (a soft steel grey, dim so it never fights
+/// the text).
+const SCROLL_INDICATOR_WIDTH: i32 = 4;
+const SCROLL_INDICATOR_COLOR: u32 = 0x0055_6070;
+
+/// Fixed monospace cell metrics in whole pixels: the pitch the entire grid is
+/// laid out on. `size` is the pixel size the faces were opened at, carried so the
+/// painter can name the [`FaceKey`] a run draws in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CellMetrics {
+    pub size: u32,
+    /// Cell width: one column's advance.
+    pub w: i32,
+    /// Cell height: the baseline-to-baseline line height.
+    pub h: i32,
+    /// Pixels from the top of a cell down to the baseline.
+    pub ascent: i32,
+    /// Pixels from the baseline to the bottom of a cell.
+    pub descent: i32,
+}
+
+impl CellMetrics {
+    /// Measure the cell box from the opened fonts at `size`: the line height for
+    /// the row pitch and the regular face's reference-glyph advance for the column
+    /// pitch, each rounded to a whole pixel (a fractional pitch is what drifts a
+    /// grid). Width and height are clamped to at least one pixel so a degenerate
+    /// face can never produce a zero-area cell.
+    pub fn from_fonts(fonts: &Fonts, size: u32) -> Self {
+        let m = fonts.metrics(size);
+        let advance = fonts
+            .face(size, FontStyle::Regular)
+            .advance(REFERENCE_GLYPH);
+        CellMetrics {
+            size,
+            w: (advance.round() as i32).max(1),
+            h: m.line_height.max(1),
+            ascent: m.ascent,
+            descent: m.descent,
+        }
+    }
+
+    /// The largest `(cols, rows)` grid that fits a `width` x `height` pixel
+    /// surface, at least 1x1. The app uses this to size the grid on a resize.
+    pub fn columns_rows(self, width: i32, height: i32) -> (usize, usize) {
+        let cols = (width / self.w).max(1) as usize;
+        let rows = (height / self.h).max(1) as usize;
+        (cols, rows)
+    }
+
+    /// The baseline y for `row`, measured from the top of the surface.
+    fn baseline(self, row: usize) -> i32 {
+        row as i32 * self.h + self.ascent
+    }
+}
+
+/// A cursor's drawn shape. The style escape (`DECSCUSR`) is not parsed yet
+/// (phase 3+), so the app chooses this; the grid only says whether the cursor is
+/// visible at all (`DECTCEM`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CursorShape {
+    /// A filled cell that inverts the glyph under it (the default).
+    Block,
+    /// A thin vertical bar at the cell's left edge.
+    Bar,
+    /// A thin rule along the cell's baseline.
+    Underline,
+}
+
+/// How to paint the cursor this frame. `visible` folds the grid's `DECTCEM` state
+/// together with the app's blink phase, so the painter draws the cursor exactly
+/// when it should be lit. An unfocused window draws a hollow block, the xterm
+/// convention for "this window does not have the keyboard".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CursorRender {
+    pub shape: CursorShape,
+    pub visible: bool,
+    pub focused: bool,
+}
+
+impl Default for CursorRender {
+    fn default() -> Self {
+        CursorRender {
+            shape: CursorShape::Block,
+            visible: true,
+            focused: true,
+        }
+    }
+}
+
+/// A linear text selection over the visible grid, in `(row, col)` cell
+/// coordinates. `anchor` is where the drag began and `head` where it is now,
+/// either order; a cell is selected when it falls between them in reading order
+/// (whole rows in the middle, partial rows at the ends). This is the render half
+/// of selection; the pointer handling and clipboard hand-off land in phase 4.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Selection {
+    pub anchor: (usize, usize),
+    pub head: (usize, usize),
+}
+
+impl Selection {
+    /// `(start, end)` in reading order, so `start <= end` row-major.
+    fn ordered(self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// Whether cell `(row, col)` lies within the selection, inclusive of both
+    /// ends. Rows strictly between the endpoints are wholly selected.
+    fn contains(self, row: usize, col: usize) -> bool {
+        let (start, end) = self.ordered();
+        (row, col) >= start && (row, col) <= end
+    }
+}
+
+/// Build the frame for `screen`: the whole visible grid as a display list, ready
+/// for [`crate::render::display::damage`] and [`crate::render::gpu::build_frame`].
+/// Pure in its inputs (no fonts, no GPU), so a test asserts the exact primitives
+/// a grid state produces and the damage diff proves an unchanged frame is free.
+pub fn build_display_list(
+    screen: &Screen,
+    theme: &Theme,
+    metrics: CellMetrics,
+    surface: (i32, i32),
+    cursor: CursorRender,
+    selection: Option<Selection>,
+) -> DisplayList {
+    let mut painter = Painter {
+        screen,
+        theme,
+        metrics,
+        selection,
+        list: Vec::new(),
+    };
+    painter.background(surface);
+    let (cols, rows) = screen.dimensions();
+    for row in 0..rows {
+        painter.background_row(row, cols);
+        painter.foreground_row(row, cols);
+    }
+    painter.cursor(cursor, cols, rows);
+    painter.scroll_indicator(surface, rows);
+    painter.list
+}
+
+/// The per-frame builder: the shared inputs plus the list being appended to. One
+/// method per concern keeps [`build_display_list`] readable.
+struct Painter<'a> {
+    screen: &'a Screen,
+    theme: &'a Theme,
+    metrics: CellMetrics,
+    selection: Option<Selection>,
+    list: DisplayList,
+}
+
+impl Painter<'_> {
+    /// The base background: one fill of the theme background covering the whole
+    /// surface (including any partial cell at the right/bottom edge). Every
+    /// default-background cell is then just this fill showing through, so the
+    /// per-cell background pass emits nothing for them.
+    fn background(&mut self, surface: (i32, i32)) {
+        self.list.push(DrawCmd::Fill {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: surface.0.max(0),
+                h: surface.1.max(0),
+            },
+            color: self.theme.bg.to_u32(),
+        });
+    }
+
+    /// Per-cell backgrounds for one row, coalesced into runs of equal colour so a
+    /// solid band is one fill. A run equal to the theme background is skipped (the
+    /// base fill already covers it). A wide glyph's spacer carries the leader's
+    /// colours, so it coalesces with the leader with no special case here.
+    fn background_row(&mut self, row: usize, cols: usize) {
+        let m = self.metrics;
+        let mut col = 0;
+        while col < cols {
+            let bg = self.cell_bg(row, col);
+            let start = col;
+            col += 1;
+            while col < cols && self.cell_bg(row, col) == bg {
+                col += 1;
+            }
+            if bg != self.theme.bg {
+                self.list.push(DrawCmd::Fill {
+                    rect: Rect {
+                        x: start as i32 * m.w,
+                        y: row as i32 * m.h,
+                        w: (col - start) as i32 * m.w,
+                        h: m.h,
+                    },
+                    color: bg.to_u32(),
+                });
+            }
+        }
+    }
+
+    /// The foreground glyphs and text decorations for one row. Consecutive
+    /// single-width cells that share a foreground colour, face style, and
+    /// underline/strike state batch into one fixed-pitch [`DrawCmd::Cells`] run;
+    /// a wide glyph (its leader) and an astral-plane rune break out into their own
+    /// [`DrawCmd::Text`] so the run's one-cluster-per-cell contract holds. See the
+    /// module header for why the pitch, not the advance, drives placement.
+    fn foreground_row(&mut self, row: usize, cols: usize) {
+        let m = self.metrics;
+        let baseline = m.baseline(row);
+        let mut col = 0;
+        while col < cols {
+            let cell = self.cell(row, col);
+            if cell.is_wide_spacer() {
+                // An orphaned spacer (its leader scrolled off the left) draws
+                // nothing; the leader owns the glyph.
+                col += 1;
+                continue;
+            }
+            if cell.is_wide_leader() || !cells_safe(cell.rune) {
+                // Wide glyphs and astral runes stand alone at their exact column,
+                // so their non-uniform advance can never shift a following cell.
+                self.push_glyph(row, col, cell, baseline);
+                col += if cell.is_wide_leader() { 2 } else { 1 };
+                continue;
+            }
+            self.push_run(row, col, cols, cell, baseline);
+            col = self.run_end(row, col, cols, cell);
+        }
+    }
+
+    /// Emit a fixed-pitch run starting at `col`: the maximal span of single-width,
+    /// same-style cells. The [`DrawCmd::Cells`] text is trimmed to the last inked
+    /// cell (trailing blanks in the run draw nothing, so carrying them would only
+    /// cost allocation and coarsen the damage diff), while underline/strike rules
+    /// span the full styled run, because a styled trailing space still shows its
+    /// rule (xterm draws it).
+    fn push_run(&mut self, row: usize, col: usize, cols: usize, first: Cell, baseline: i32) {
+        let m = self.metrics;
+        let fg = self.cell_fg(first);
+        let style = style_of(first);
+        let end = self.run_end(row, col, cols, first);
+        let mut text = String::new();
+        // Bytes and cell count up to and including the last cell with ink, so a
+        // trailing blank never lands in the emitted text.
+        let mut inked_bytes = 0;
+        let mut inked_cells = 0;
+        for c in col..end {
+            let cell = self.cell(row, c);
+            let hidden = cell.attrs.contains(Attrs::HIDDEN);
+            text.push(if hidden { ' ' } else { cell.rune });
+            let marks = (!hidden).then(|| self.marks(row, c)).flatten();
+            if let Some(marks) = marks {
+                text.extend(marks);
+            }
+            if !hidden && (cell.rune != ' ' || marks.is_some_and(|m| !m.is_empty())) {
+                inked_bytes = text.len();
+                inked_cells = c - col + 1;
+            }
+        }
+        let x = col as i32 * m.w;
+        if inked_cells > 0 {
+            text.truncate(inked_bytes);
+            self.list.push(DrawCmd::Cells {
+                bounds: text_bounds(x, baseline, inked_cells as i32 * m.w, m),
+                x,
+                baseline,
+                cell_w: m.w,
+                face: FaceKey::Prose {
+                    size: m.size,
+                    style,
+                },
+                color: fg.to_u32(),
+                text,
+            });
+        }
+        self.push_decorations(first, x, (end - col) as i32 * m.w, baseline, fg);
+    }
+
+    /// The underline and strike rules for a run, drawn as solid fills spanning the
+    /// run's width in the run's foreground colour.
+    fn push_decorations(&mut self, cell: Cell, x: i32, run_w: i32, baseline: i32, fg: Rgb) {
+        let m = self.metrics;
+        let thickness = (m.size as i32 / 12).max(1);
+        if cell.attrs.contains(Attrs::UNDERLINE) {
+            self.list.push(DrawCmd::Fill {
+                rect: Rect {
+                    x,
+                    y: baseline + (m.descent / 2).max(1),
+                    w: run_w,
+                    h: thickness,
+                },
+                color: fg.to_u32(),
+            });
+        }
+        if cell.attrs.contains(Attrs::STRIKE) {
+            self.list.push(DrawCmd::Fill {
+                rect: Rect {
+                    x,
+                    y: baseline - m.ascent / 3,
+                    w: run_w,
+                    h: thickness,
+                },
+                color: fg.to_u32(),
+            });
+        }
+    }
+
+    /// One cell's glyph as a standalone [`DrawCmd::Text`] at its exact column,
+    /// used for wide glyphs and astral runes (base rune plus any combining marks).
+    /// A hidden or blank cell draws nothing.
+    fn push_glyph(&mut self, row: usize, col: usize, cell: Cell, baseline: i32) {
+        if cell.attrs.contains(Attrs::HIDDEN) || (cell.rune == ' ' && self.marks_empty(row, col)) {
+            return;
+        }
+        let m = self.metrics;
+        let x = col as i32 * m.w;
+        let width_cells = if cell.is_wide_leader() { 2 } else { 1 };
+        let mut text = String::new();
+        text.push(cell.rune);
+        if let Some(marks) = self.marks(row, col) {
+            text.extend(marks);
+        }
+        self.list.push(DrawCmd::Text {
+            bounds: text_bounds(x, baseline, width_cells * m.w, m),
+            x,
+            baseline,
+            face: FaceKey::Prose {
+                size: m.size,
+                style: style_of(cell),
+            },
+            color: self.cell_fg(cell).to_u32(),
+            text,
+        });
+    }
+
+    /// The cursor, drawn last so it stacks over the cell it sits on. Nothing is
+    /// drawn when the cursor is hidden or its position is off the grid. A block
+    /// cursor on a wide glyph covers both halves and, when focused, re-stamps the
+    /// glyph in the cell background so it reads as inverted.
+    fn cursor(&mut self, cursor: CursorRender, cols: usize, rows: usize) {
+        if !cursor.visible {
+            return;
+        }
+        let (cr, mut cc) = self.screen.cursor();
+        // The live cursor row maps to `cr + view_offset` on screen; when scrolled
+        // far enough into history it falls below the window and is not drawn.
+        let Some(dr) = cr.checked_add(self.screen.view_offset()) else {
+            return;
+        };
+        if dr >= rows || cc >= cols {
+            return;
+        }
+        // A cursor parked on a wide spacer belongs to the leader on its left.
+        if self.cell(dr, cc).is_wide_spacer() && cc > 0 {
+            cc -= 1;
+        }
+        let cell = self.cell(dr, cc);
+        let width_cells = if cell.is_wide_leader() { 2 } else { 1 };
+        let m = self.metrics;
+        let x = cc as i32 * m.w;
+        let y = dr as i32 * m.h;
+        let color = self.theme.cursor.to_u32();
+        match cursor.shape {
+            CursorShape::Block if cursor.focused => {
+                self.list.push(DrawCmd::Fill {
+                    rect: Rect {
+                        x,
+                        y,
+                        w: width_cells * m.w,
+                        h: m.h,
+                    },
+                    color,
+                });
+                self.stamp_inverted_glyph(dr, cc, cell, width_cells);
+            }
+            CursorShape::Block => self.hollow_block(x, y, width_cells * m.w),
+            CursorShape::Bar => self.list.push(DrawCmd::Fill {
+                rect: Rect {
+                    x,
+                    y,
+                    w: BAR_CURSOR_WIDTH,
+                    h: m.h,
+                },
+                color,
+            }),
+            CursorShape::Underline => {
+                let thickness = (m.size as i32 / 8).max(2);
+                self.list.push(DrawCmd::Fill {
+                    rect: Rect {
+                        x,
+                        y: y + m.h - thickness,
+                        w: width_cells * m.w,
+                        h: thickness,
+                    },
+                    color,
+                });
+            }
+        }
+    }
+
+    /// A right-edge indicator of where the view sits in the scrollback, drawn only
+    /// while scrolled up. Its height and position are proportional to the window's
+    /// slice of the whole history-plus-screen, like a scrollbar thumb, so a glance
+    /// says how far back you are.
+    fn scroll_indicator(&mut self, surface: (i32, i32), rows: usize) {
+        if !self.screen.is_scrolled() {
+            return;
+        }
+        let (sw, sh) = surface;
+        let total = self.screen.scrollback_len() + rows; // all lines, history + screen
+        if total == 0 || sh <= 0 || sw <= 0 {
+            return;
+        }
+        // The first visible line's index into that whole, and the window height.
+        let top = self.screen.scrollback_len() - self.screen.view_offset();
+        let y = (top as i64 * sh as i64 / total as i64) as i32;
+        // A minimum thumb height so it stays grabbable/visible on a deep history.
+        let min_thumb = (sh / 20).max(8);
+        let h = ((rows as i64 * sh as i64 / total as i64) as i32).max(min_thumb);
+        self.list.push(DrawCmd::Fill {
+            rect: Rect {
+                x: sw - SCROLL_INDICATOR_WIDTH,
+                y: y.min(sh - h).max(0),
+                w: SCROLL_INDICATOR_WIDTH,
+                h,
+            },
+            color: SCROLL_INDICATOR_COLOR,
+        });
+    }
+
+    /// Re-draw the glyph beneath a focused block cursor in the cell's background
+    /// colour, so the character shows as a cutout in the cursor block.
+    fn stamp_inverted_glyph(&mut self, row: usize, col: usize, cell: Cell, width_cells: i32) {
+        if cell.rune == ' ' && self.marks_empty(row, col) {
+            return;
+        }
+        let m = self.metrics;
+        let x = col as i32 * m.w;
+        let baseline = m.baseline(row);
+        let mut text = String::new();
+        text.push(cell.rune);
+        if let Some(marks) = self.marks(row, col) {
+            text.extend(marks);
+        }
+        // The inverted glyph takes the cell's own background (reverse honoured),
+        // ignoring any selection so the cursor stays legible over a selection.
+        let (_, bg) = self.resolve(cell, false);
+        self.list.push(DrawCmd::Text {
+            bounds: text_bounds(x, baseline, width_cells * m.w, m),
+            x,
+            baseline,
+            face: FaceKey::Prose {
+                size: m.size,
+                style: style_of(cell),
+            },
+            color: bg.to_u32(),
+            text,
+        });
+    }
+
+    /// A hollow block outline (unfocused window) as four thin edge fills.
+    fn hollow_block(&mut self, x: i32, y: i32, w: i32) {
+        let m = self.metrics;
+        let color = self.theme.cursor.to_u32();
+        let t = 1;
+        let edges = [
+            Rect { x, y, w, h: t }, // top
+            Rect {
+                x,
+                y: y + m.h - t,
+                w,
+                h: t,
+            }, // bottom
+            Rect { x, y, w: t, h: m.h }, // left
+            Rect {
+                x: x + w - t,
+                y,
+                w: t,
+                h: m.h,
+            }, // right
+        ];
+        for rect in edges {
+            self.list.push(DrawCmd::Fill { rect, color });
+        }
+    }
+
+    /// The exclusive end column of the run beginning at `col`: it stops at the
+    /// first cell whose style differs, or that is wide or astral (those are drawn
+    /// standalone), or the end of the row.
+    fn run_end(&self, row: usize, col: usize, cols: usize, first: Cell) -> usize {
+        let fg = self.cell_fg(first);
+        let style = style_of(first);
+        let ul = first.attrs.contains(Attrs::UNDERLINE);
+        let st = first.attrs.contains(Attrs::STRIKE);
+        let mut end = col + 1;
+        while end < cols {
+            let c = self.cell(row, end);
+            if c.is_wide_leader() || c.is_wide_spacer() || !cells_safe(c.rune) {
+                break;
+            }
+            if self.cell_fg(c) != fg
+                || style_of(c) != style
+                || c.attrs.contains(Attrs::UNDERLINE) != ul
+                || c.attrs.contains(Attrs::STRIKE) != st
+            {
+                break;
+            }
+            end += 1;
+        }
+        end
+    }
+
+    /// The cell shown at display `(row, col)`, honouring the scroll offset (the
+    /// live cell when pinned to the bottom). Every content path goes through this
+    /// so scrollback and the live screen paint identically.
+    fn cell(&self, row: usize, col: usize) -> Cell {
+        self.screen.view_cell(row, col)
+    }
+
+    /// Combining marks at display `(row, col)`, honouring the scroll offset.
+    fn marks(&self, row: usize, col: usize) -> Option<&[char]> {
+        self.screen.view_marks(row, col)
+    }
+
+    /// The resolved foreground colour of a cell (reverse and dim applied).
+    fn cell_fg(&self, cell: Cell) -> Rgb {
+        self.resolve(cell, false).0
+    }
+
+    /// The resolved background colour of cell `(row, col)`, selection applied.
+    fn cell_bg(&self, row: usize, col: usize) -> Rgb {
+        let selected = self.selection.is_some_and(|s| s.contains(row, col));
+        self.resolve(self.cell(row, col), selected).1
+    }
+
+    /// Resolve a cell's `(fg, bg)` to concrete colours: reverse swaps the two, dim
+    /// darkens the foreground, and a selected cell takes the selection background.
+    fn resolve(&self, cell: Cell, selected: bool) -> (Rgb, Rgb) {
+        let mut fg = cell.fg.resolve(self.theme, Ground::Foreground);
+        let mut bg = cell.bg.resolve(self.theme, Ground::Background);
+        if cell.attrs.contains(Attrs::REVERSE) {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        if cell.attrs.contains(Attrs::DIM) {
+            fg = dim(fg);
+        }
+        if selected {
+            bg = SELECTION_BG;
+        }
+        (fg, bg)
+    }
+
+    /// Whether cell `(row, col)` has no combining marks (a blank base rune with no
+    /// marks draws nothing).
+    fn marks_empty(&self, row: usize, col: usize) -> bool {
+        self.marks(row, col).is_none_or(|m| m.is_empty())
+    }
+}
+
+/// The bearing padding around a run: a glyph's ink can spill
+/// past its advance box (an italic tail, a box-drawing overhang), so the damage
+/// and clip rectangle is padded to never shear a glyph's edge.
+fn text_bounds(x: i32, baseline: i32, run_w: i32, m: CellMetrics) -> Rect {
+    let pad_x = (m.size as i32 / 2).max(2);
+    let pad_y = (m.size as i32 / 4).max(1);
+    Rect {
+        x: x - pad_x,
+        y: baseline - m.ascent - pad_y,
+        w: run_w.max(0) + 2 * pad_x,
+        h: m.ascent + m.descent + 2 * pad_y,
+    }
+}
+
+/// Whether a rune is safe to batch into a fixed-pitch [`DrawCmd::Cells`] run:
+/// every Basic-Multilingual-Plane scalar is, because none of them are regional
+/// indicators or emoji that a grapheme segmenter would merge across cell
+/// boundaries (those all live in the astral planes). An astral rune is drawn
+/// standalone so one cell always maps to one cluster in a run. Indic conjuncts
+/// and other segmentation exotica are the 5% we deliberately punt.
+fn cells_safe(rune: char) -> bool {
+    (rune as u32) <= 0xFFFF
+}
+
+/// The font style a cell's bold/italic attributes select.
+fn style_of(cell: Cell) -> FontStyle {
+    match (
+        cell.attrs.contains(Attrs::BOLD),
+        cell.attrs.contains(Attrs::ITALIC),
+    ) {
+        (true, true) => FontStyle::BoldItalic,
+        (true, false) => FontStyle::Bold,
+        (false, true) => FontStyle::Italic,
+        (false, false) => FontStyle::Regular,
+    }
+}
+
+/// Darken a colour to two-thirds intensity for the SGR dim (faint) attribute.
+/// Done in `u16` so the doubling can never overflow a channel.
+fn dim(c: Rgb) -> Rgb {
+    let scale = |v: u8| ((u16::from(v) * 2) / 3) as u8;
+    Rgb::new(scale(c.r), scale(c.g), scale(c.b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::color::Color;
+
+    /// Synthetic metrics: a 10x20 cell so column/row math reads off by eye.
+    const M: CellMetrics = CellMetrics {
+        size: 16,
+        w: 10,
+        h: 20,
+        ascent: 15,
+        descent: 5,
+    };
+
+    fn feed(s: &mut Screen, bytes: &[u8]) {
+        let mut p = crate::vt::Parser::new();
+        p.advance_bytes(s, bytes);
+    }
+
+    /// Build a list for a screen with the default theme, no selection, cursor
+    /// hidden (so the tests that are about content are not perturbed by it).
+    fn list_of(s: &Screen) -> DisplayList {
+        build_display_list(
+            s,
+            &Theme::default(),
+            M,
+            (s.dimensions().0 as i32 * M.w, s.dimensions().1 as i32 * M.h),
+            CursorRender {
+                visible: false,
+                ..CursorRender::default()
+            },
+            None,
+        )
+    }
+
+    fn cells_runs(list: &[DrawCmd]) -> Vec<(i32, i32, String)> {
+        list.iter()
+            .filter_map(|c| match c {
+                DrawCmd::Cells {
+                    x, baseline, text, ..
+                } => Some((*x, *baseline, text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fills(list: &[DrawCmd]) -> Vec<(Rect, u32)> {
+        list.iter()
+            .filter_map(|c| match c {
+                DrawCmd::Fill { rect, color } => Some((*rect, *color)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn blank_screen_is_just_the_background() {
+        let s = Screen::new(4, 2);
+        let list = list_of(&s);
+        // One base fill covering the whole surface, nothing else.
+        assert_eq!(
+            fills(&list),
+            vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 40,
+                    h: 40
+                },
+                Theme::default().bg.to_u32()
+            )]
+        );
+        assert!(cells_runs(&list).is_empty(), "no glyphs on a blank screen");
+    }
+
+    #[test]
+    fn plain_text_is_one_fixed_pitch_run_per_line() {
+        let mut s = Screen::new(10, 1);
+        feed(&mut s, b"hello");
+        let runs = cells_runs(&list_of(&s));
+        assert_eq!(
+            runs,
+            vec![(0, M.ascent, "hello".to_string())],
+            "the whole line batches into one run at column 0, baseline = ascent"
+        );
+    }
+
+    #[test]
+    fn a_colour_change_splits_the_run() {
+        let mut s = Screen::new(10, 1);
+        feed(&mut s, b"ab\x1b[31mcd");
+        let runs = cells_runs(&list_of(&s));
+        assert_eq!(
+            runs,
+            vec![
+                (0, M.ascent, "ab".to_string()),
+                (2 * M.w, M.ascent, "cd".to_string()),
+            ],
+            "the run breaks where the colour changes; the second starts at its column"
+        );
+    }
+
+    #[test]
+    fn trailing_blanks_emit_no_run() {
+        let mut s = Screen::new(10, 1);
+        feed(&mut s, b"hi");
+        let runs = cells_runs(&list_of(&s));
+        // "hi" then eight blanks: the blanks are default cells, so only "hi" is a
+        // run and there are no stray blank runs.
+        assert_eq!(runs, vec![(0, M.ascent, "hi".to_string())]);
+    }
+
+    #[test]
+    fn a_coloured_background_is_a_fill_band() {
+        let mut s = Screen::new(6, 1);
+        feed(&mut s, b"\x1b[41mXX"); // red background, two cells
+        let f = fills(&list_of(&s));
+        let red = Color::Ansi(1).resolve(&Theme::default(), Ground::Background);
+        // Base fill first, then the two-cell red band.
+        assert_eq!(f[0].1, Theme::default().bg.to_u32());
+        assert_eq!(
+            f[1],
+            (
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 2 * M.w,
+                    h: M.h
+                },
+                red.to_u32()
+            ),
+            "adjacent same-bg cells coalesce into one band"
+        );
+    }
+
+    #[test]
+    fn reverse_video_swaps_foreground_and_background() {
+        let mut s = Screen::new(4, 1);
+        feed(&mut s, b"\x1b[7mA");
+        let list = list_of(&s);
+        let t = Theme::default();
+        // The cell background becomes the default fg (a fill), and the glyph is
+        // drawn in the default bg.
+        let band = fills(&list)
+            .into_iter()
+            .find(|(r, _)| r.x == 0 && r.w == M.w)
+            .expect("a reverse cell paints its background");
+        assert_eq!(band.1, t.fg.to_u32());
+        let run = cells_runs(&list).into_iter().next().expect("glyph run");
+        // Foreground colour lives on the Cells command, not returned by helper;
+        // re-read it here.
+        if let DrawCmd::Cells { color, .. } = list
+            .iter()
+            .find(|c| matches!(c, DrawCmd::Cells { .. }))
+            .unwrap()
+        {
+            assert_eq!(*color, t.bg.to_u32(), "reversed glyph uses the default bg");
+        }
+        assert_eq!(run.2, "A");
+    }
+
+    #[test]
+    fn wide_char_is_broken_out_and_the_spacer_is_skipped() {
+        let mut s = Screen::new(6, 1);
+        feed(&mut s, "a漢b".as_bytes());
+        let list = list_of(&s);
+        // 'a' at col 0 (run), 漢 standalone Text at col 1 (two cells wide), 'b' at
+        // col 3 (the spacer at col 2 drew nothing).
+        let texts: Vec<(i32, String)> = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text { x, text, .. } => Some((*x, text.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec![(M.w, "漢".to_string())]);
+        assert_eq!(
+            cells_runs(&list),
+            vec![
+                (0, M.ascent, "a".to_string()),
+                (3 * M.w, M.ascent, "b".to_string()),
+            ],
+            "'b' lands at column 3, past the wide glyph's spacer"
+        );
+    }
+
+    #[test]
+    fn combining_mark_rides_with_its_base_in_the_run() {
+        let mut s = Screen::new(6, 1);
+        feed(&mut s, "e\u{0301}x".as_bytes()); // é (e + combining acute), then x
+        let runs = cells_runs(&list_of(&s));
+        assert_eq!(
+            runs,
+            vec![(0, M.ascent, "e\u{0301}x".to_string())],
+            "the mark stays glued to its base; both cells share one run"
+        );
+    }
+
+    #[test]
+    fn underline_adds_a_rule_under_the_run() {
+        let mut s = Screen::new(6, 1);
+        feed(&mut s, b"\x1b[4mok");
+        let list = list_of(&s);
+        let t = Theme::default();
+        let rule = fills(&list)
+            .into_iter()
+            .find(|(r, _)| r.y > M.ascent) // below the baseline
+            .expect("an underline rule");
+        assert_eq!(rule.0.x, 0);
+        assert_eq!(rule.0.w, 2 * M.w, "the rule spans the whole run");
+        assert_eq!(rule.1, t.fg.to_u32());
+    }
+
+    #[test]
+    fn block_cursor_fills_its_cell_and_inverts_the_glyph() {
+        let mut s = Screen::new(4, 1);
+        feed(&mut s, b"X"); // cursor now rests at column 1 (after X)
+        s.move_to(0, 0); // park it on the glyph
+        let t = Theme::default();
+        let list = build_display_list(&s, &t, M, (40, 20), CursorRender::default(), None);
+        // The last commands are the cursor block then the inverted glyph.
+        let cursor_fill = fills(&list)
+            .into_iter()
+            .find(|(r, c)| r.x == 0 && r.w == M.w && *c == t.cursor.to_u32())
+            .expect("a filled cursor block");
+        assert_eq!(
+            cursor_fill.0,
+            Rect {
+                x: 0,
+                y: 0,
+                w: M.w,
+                h: M.h
+            }
+        );
+        // The inverted 'X' is a Text in the background colour, drawn last.
+        match list.last().unwrap() {
+            DrawCmd::Text { text, color, .. } => {
+                assert_eq!(text, "X");
+                assert_eq!(*color, t.bg.to_u32(), "the cursor glyph is inverted");
+            }
+            other => panic!("expected the inverted glyph last, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bar_and_underline_cursors_do_not_invert() {
+        let mut s = Screen::new(4, 1);
+        feed(&mut s, b"X");
+        s.move_to(0, 0);
+        for shape in [CursorShape::Bar, CursorShape::Underline] {
+            let list = build_display_list(
+                &s,
+                &Theme::default(),
+                M,
+                (40, 20),
+                CursorRender {
+                    shape,
+                    ..CursorRender::default()
+                },
+                None,
+            );
+            // No inverted glyph: the only Text/Cells for 'X' is the normal one.
+            let glyphs = list
+                .iter()
+                .filter(|c| matches!(c, DrawCmd::Cells { .. } | DrawCmd::Text { .. }))
+                .count();
+            assert_eq!(glyphs, 1, "{shape:?} leaves the glyph alone");
+        }
+    }
+
+    #[test]
+    fn hidden_cursor_draws_nothing_extra() {
+        let mut s = Screen::new(4, 1);
+        feed(&mut s, b"X");
+        s.move_to(0, 0);
+        let hidden = build_display_list(
+            &s,
+            &Theme::default(),
+            M,
+            (40, 20),
+            CursorRender {
+                visible: false,
+                ..CursorRender::default()
+            },
+            None,
+        );
+        // Same as a plain render: base fill + the one glyph run.
+        assert_eq!(hidden.len(), 2);
+    }
+
+    #[test]
+    fn selection_paints_the_selected_cells() {
+        let mut s = Screen::new(6, 1);
+        feed(&mut s, b"abcdef");
+        let list = build_display_list(
+            &s,
+            &Theme::default(),
+            M,
+            (60, 20),
+            CursorRender {
+                visible: false,
+                ..CursorRender::default()
+            },
+            Some(Selection {
+                anchor: (0, 1),
+                head: (0, 3),
+            }),
+        );
+        // Columns 1..=3 get the selection background as one band.
+        let band = fills(&list)
+            .into_iter()
+            .find(|(_, c)| *c == SELECTION_BG.to_u32())
+            .expect("a selection band");
+        assert_eq!(
+            band.0,
+            Rect {
+                x: M.w,
+                y: 0,
+                w: 3 * M.w,
+                h: M.h
+            }
+        );
+    }
+
+    #[test]
+    fn an_unchanged_frame_diffs_to_no_damage() {
+        // The heart of the damage claim: rebuild the same grid twice and the diff
+        // is empty, so an idle terminal presents no draw work.
+        let mut s = Screen::new(20, 5);
+        feed(&mut s, b"\x1b[32mhello\x1b[0m world");
+        let a = list_of(&s);
+        let b = list_of(&s);
+        let (w, h) = (20 * M.w, 5 * M.h);
+        assert!(
+            crate::render::display::damage(&a, &b, w, h).is_empty(),
+            "an unchanged frame emits no damage"
+        );
+    }
+
+    #[test]
+    fn typing_one_cell_damages_only_its_line() {
+        let mut s = Screen::new(20, 3);
+        feed(&mut s, b"line one\r\nline two\r\nline three");
+        let before = list_of(&s);
+        // Change one cell on the middle line.
+        s.move_to(1, 0);
+        feed(&mut s, b"X");
+        let after = list_of(&s);
+        let (w, h) = (20 * M.w, 3 * M.h);
+        let d = crate::render::display::damage(&before, &after, w, h);
+        assert!(!d.is_empty(), "the edit is visible");
+        // Every damaged rectangle is confined to the middle row's band.
+        for r in d {
+            assert!(
+                r.y >= M.h - M.ascent && r.y + r.h <= 2 * M.h + M.descent,
+                "damage {r:?} stays on the edited line"
+            );
+        }
+    }
+
+    #[test]
+    fn cell_metrics_from_a_real_face_are_a_sane_box() {
+        // The one font-touching entry point: the measured cell must be a positive
+        // box with the baseline inside it, or the whole grid is malformed. Uses
+        // the installed monospace family (available wherever the render tests run).
+        let fonts = crate::platform::freetype::Fonts::new(&[16]).expect("a monospace face");
+        let m = CellMetrics::from_fonts(&fonts, 16);
+        assert_eq!(m.size, 16);
+        assert!(m.w >= 1 && m.h >= 1, "a non-degenerate cell: {m:?}");
+        assert!(
+            m.ascent > 0 && m.descent >= 0,
+            "baseline inside the cell: {m:?}"
+        );
+        assert!(
+            m.ascent + m.descent <= m.h,
+            "ink height fits the line height: {m:?}"
+        );
+        // The grid-fit inverse divides the surface back into whole cells.
+        assert_eq!(m.columns_rows(m.w * 80, m.h * 24), (80, 24));
+    }
+
+    #[test]
+    fn astral_rune_is_drawn_standalone() {
+        let mut s = Screen::new(6, 1);
+        // U+1D400 MATHEMATICAL BOLD CAPITAL A: astral, width 1, must not batch.
+        feed(&mut s, "a\u{1D400}b".as_bytes());
+        let list = list_of(&s);
+        let has_astral_text = list
+            .iter()
+            .any(|c| matches!(c, DrawCmd::Text { text, .. } if text == "\u{1D400}"));
+        assert!(
+            has_astral_text,
+            "the astral rune breaks out into its own Text"
+        );
+    }
+
+    #[test]
+    fn a_scrolled_view_paints_scrollback_not_the_live_screen() {
+        // Two rows visible, older lines in history; scrolled up, the painter must
+        // draw the history rows, not the live bottom.
+        let mut s = Screen::new(6, 2);
+        feed(&mut s, b"one\r\ntwo\r\nthree\r\nfour");
+        s.scroll_view_up(2); // to the top: "one" over "two"
+        let runs = cells_runs(&build_display_list(
+            &s,
+            &Theme::default(),
+            M,
+            (6 * M.w, 2 * M.h),
+            CursorRender {
+                visible: false,
+                ..CursorRender::default()
+            },
+            None,
+        ));
+        let texts: Vec<&str> = runs.iter().map(|(_, _, t)| t.as_str()).collect();
+        assert!(texts.contains(&"one"), "history row is painted: {texts:?}");
+        assert!(
+            !texts.contains(&"four"),
+            "the live bottom is not: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn the_cursor_is_hidden_when_scrolled_out_of_view() {
+        let mut s = Screen::new(6, 2);
+        feed(&mut s, b"one\r\ntwo\r\nthree\r\nfour"); // cursor on the live bottom row
+        s.scroll_view_up(2); // live rows scrolled below the window
+        let list = build_display_list(
+            &s,
+            &Theme::default(),
+            M,
+            (6 * M.w, 2 * M.h),
+            CursorRender::default(), // visible + focused
+            None,
+        );
+        // No inverted glyph and no cursor block colour: the cursor sits off-view.
+        let cursor_color = Theme::default().cursor.to_u32();
+        assert!(
+            !fills(&list).iter().any(|(_, c)| *c == cursor_color),
+            "the cursor is not drawn while viewing history"
+        );
+    }
+
+    #[test]
+    fn a_scroll_indicator_shows_only_while_scrolled() {
+        let mut s = Screen::new(6, 2);
+        feed(&mut s, b"one\r\ntwo\r\nthree\r\nfour");
+        let surface = (6 * M.w, 2 * M.h);
+        let indicator = |s: &Screen| {
+            build_display_list(
+                s,
+                &Theme::default(),
+                M,
+                surface,
+                CursorRender {
+                    visible: false,
+                    ..CursorRender::default()
+                },
+                None,
+            )
+            .iter()
+            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == SCROLL_INDICATOR_COLOR))
+        };
+        assert!(!indicator(&s), "no indicator when pinned to the bottom");
+        s.scroll_view_up(1);
+        assert!(indicator(&s), "an indicator appears while viewing history");
+    }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "bnkterm"
+version = "0.1.0"
+edition = "2021"
+
+# Zero dependencies, on purpose. bnkterm is a native Wayland client (the wire
+# protocol is spoken directly over a UnixStream) and FFIs into the system
+# libraries it needs (FreeType, HarfBuzz, xkbcommon, libvulkan, libc for the
+# PTY).
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true             # Link-time optimization (better perf + smaller binary)
+codegen-units = 1      # Single codegen unit for better optimization
+panic = "abort"        # No unwinding, smaller binary
+debug = 1              # Line tables for readable crash backtraces
+strip = "debuginfo"    # Strip DWARF info, keep symbol names for backtraces
