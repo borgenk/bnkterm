@@ -27,7 +27,7 @@ use crate::platform::dmabuf;
 use crate::platform::ffi;
 use crate::platform::protocol::{
     self, wl_buffer, wl_display, wl_surface, wp_linux_drm_syncobj_manager_v1,
-    wp_linux_drm_syncobj_surface_v1, xdg_surface, zwp_linux_buffer_params_v1,
+    wp_linux_drm_syncobj_surface_v1, wp_viewport, xdg_surface, zwp_linux_buffer_params_v1,
     zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
 use crate::platform::wire::{Arg, Reader};
@@ -183,7 +183,7 @@ impl State {
         if compositor_mods.is_empty() {
             return Err(Error::msg("compositor does not accept XRGB8888 dmabufs"));
         }
-        let gpu = vulkan::Gpu::new(main_device)?;
+        let gpu = vulkan::Gpu::new(main_device, crate::app::config_text_gamma())?;
         let mods = gpu.image_modifiers(&compositor_mods);
         if mods.is_empty() {
             return Err(Error::msg(
@@ -373,17 +373,39 @@ impl State {
     /// compositor one atomic, consistent size for the frame, so the anchored edge
     /// does not drift. Caller commits after this.
     pub(super) fn ack_configure(&mut self, serial: u32) {
-        let (w, h) = (self.width as i32, self.height as i32);
-        self.conn.request(
-            self.xdg_surface,
-            xdg_surface::SET_WINDOW_GEOMETRY,
-            &[Arg::Int(0), Arg::Int(0), Arg::Int(w), Arg::Int(h)],
-        );
+        self.declare_surface_scale();
         self.conn.request(
             self.xdg_surface,
             xdg_surface::ACK_CONFIGURE,
             &[Arg::Uint(serial)],
         );
+    }
+
+    /// (Re)declare the surface's logical geometry and how the device-pixel buffer
+    /// maps onto it: a viewport destination on the fractional path, or an integer
+    /// buffer scale on the fallback. The geometry is the whole logical surface (no
+    /// client-side decorations); sending it with the ack and the matching buffer
+    /// gives the compositor one atomic size for the frame, so an anchored resize
+    /// edge does not drift. Idempotent surface state; marks the scale synced.
+    pub(super) fn declare_surface_scale(&mut self) {
+        let (lw, lh) = (self.scale.logical.0 as i32, self.scale.logical.1 as i32);
+        self.conn.request(
+            self.xdg_surface,
+            xdg_surface::SET_WINDOW_GEOMETRY,
+            &[Arg::Int(0), Arg::Int(0), Arg::Int(lw), Arg::Int(lh)],
+        );
+        if self.scale.is_fractional() {
+            self.conn.request(
+                self.scale.viewport,
+                wp_viewport::SET_DESTINATION,
+                &[Arg::Int(lw), Arg::Int(lh)],
+            );
+        } else {
+            let n = (self.scale.factor_120 / 120).max(1) as i32;
+            self.conn
+                .request(self.surface, wl_surface::SET_BUFFER_SCALE, &[Arg::Int(n)]);
+        }
+        self.scale.synced = true;
     }
 
     /// Build the current frame and present it on the GPU. Returns false if both
@@ -430,6 +452,11 @@ impl State {
         }
         if let Some(serial) = ack {
             self.ack_configure(serial);
+        }
+        // A scale change can arrive without a configure (e.g. a monitor move), so
+        // make sure the geometry + viewport/buffer-scale ride this commit too.
+        if !self.scale.synced {
+            self.declare_surface_scale();
         }
 
         let background = color_f32(self.theme.bg.to_u32());
@@ -632,7 +659,7 @@ impl State {
             return Ok(());
         }
         let main_device = fb.main_device;
-        let gpu = match vulkan::Gpu::new(main_device) {
+        let gpu = match vulkan::Gpu::new(main_device, crate::app::config_text_gamma()) {
             Ok(gpu) => gpu,
             Err(e) => {
                 println!("gpu-probe: vulkan unavailable: {e}");

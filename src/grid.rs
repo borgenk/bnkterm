@@ -668,7 +668,10 @@ pub struct Screen {
     /// local selection/scroll.
     mouse: MouseMode,
     /// The cursor shape and whether it blinks, from `DECSCUSR`. Defaults to a
-    /// blinking block (xterm's default).
+    /// steady block: xterm's default is a *blinking* block, but every modern
+    /// terminal opens steady (commonly via a `cursor-style-blink = false` setting),
+    /// so that is bnkterm's power-on default. A program can still request blink with
+    /// `DECSCUSR`.
     cursor_style: CursorStyle,
     cursor_blink: bool,
     /// Bytes to write back to the child in answer to a query (DA, DSR). The grid
@@ -699,7 +702,7 @@ impl Screen {
             view_offset: 0,
             mouse: MouseMode::default(),
             cursor_style: CursorStyle::Block,
-            cursor_blink: true,
+            cursor_blink: false,
             responses: Vec::new(),
         }
     }
@@ -739,7 +742,8 @@ impl Screen {
         self.cursor_style
     }
 
-    /// Whether the child asked the cursor to blink (default true).
+    /// Whether the child asked the cursor to blink (default false; see
+    /// `cursor_blink`).
     pub fn cursor_blinks(&self) -> bool {
         self.cursor_blink
     }
@@ -2697,16 +2701,16 @@ mod tests {
     #[test]
     fn decscusr_sets_the_cursor_shape_and_blink() {
         let mut s = Screen::new(10, 2);
-        // Default is a blinking block.
+        // Power-on default is a steady block (see `cursor_blink`).
         assert_eq!(s.cursor_style(), CursorStyle::Block);
-        assert!(s.cursor_blinks());
+        assert!(!s.cursor_blinks());
         feed(&mut s, b"\x1b[4 q"); // steady underline
         assert_eq!(s.cursor_style(), CursorStyle::Underline);
         assert!(!s.cursor_blinks());
         feed(&mut s, b"\x1b[5 q"); // blinking bar
         assert_eq!(s.cursor_style(), CursorStyle::Bar);
         assert!(s.cursor_blinks());
-        feed(&mut s, b"\x1b[0 q"); // back to the default (blinking block)
+        feed(&mut s, b"\x1b[0 q"); // DECSCUSR 0: a blinking block (its own default)
         assert_eq!(s.cursor_style(), CursorStyle::Block);
         assert!(s.cursor_blinks());
     }

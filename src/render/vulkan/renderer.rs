@@ -39,6 +39,9 @@ pub(super) struct Renderer {
     /// CPU mirror generation they were created for.
     pub(super) glyph_tex: Option<(Texture, u32)>,
     pub(super) emoji_tex: Option<(Texture, u32)>,
+    /// The power the fragment shader raises glyph coverage to, thinning the
+    /// linear-light-composited text back to a gamma-space weight (see quad.frag).
+    pub(super) glyph_coverage_gamma: f32,
 }
 
 /// The full-image color subresource range every barrier and view here uses.
@@ -233,9 +236,13 @@ pub(super) fn allocate_set(
 /// Build the frame renderer: the render pass, descriptor layouts, pipeline
 /// (from the committed SPIR-V), sampler, and descriptor pool with the two
 /// standing sets. On error, everything built so far is destroyed.
-pub(super) fn create_renderer(fns: &DeviceFns, device: VkDevice) -> Result<Renderer> {
+pub(super) fn create_renderer(
+    fns: &DeviceFns,
+    device: VkDevice,
+    glyph_coverage_gamma: f32,
+) -> Result<Renderer> {
     let mut r = Renderer::default();
-    match fill_renderer(&mut r, fns, device) {
+    match fill_renderer(&mut r, fns, device, glyph_coverage_gamma) {
         Ok(()) => Ok(r),
         Err(e) => {
             r.destroy(fns, device);
@@ -244,7 +251,13 @@ pub(super) fn create_renderer(fns: &DeviceFns, device: VkDevice) -> Result<Rende
     }
 }
 
-fn fill_renderer(r: &mut Renderer, fns: &DeviceFns, device: VkDevice) -> Result<()> {
+fn fill_renderer(
+    r: &mut Renderer,
+    fns: &DeviceFns,
+    device: VkDevice,
+    glyph_coverage_gamma: f32,
+) -> Result<()> {
+    r.glyph_coverage_gamma = glyph_coverage_gamma;
     // The render pass: one B8G8R8A8 color attachment, cleared on load, kept
     // in COLOR_ATTACHMENT_OPTIMAL (the ownership barriers live outside). The
     // sRGB format matches the image's sRGB view, so blending is gamma-correct
@@ -304,12 +317,14 @@ fn fill_renderer(r: &mut Renderer, fns: &DeviceFns, device: VkDevice) -> Result<
         &mut r.set_layout_atlas,
     )?;
 
-    // Pipeline layout: the atlas set plus the viewport push constant.
+    // Pipeline layout: the atlas set plus the push constant. The vertex stage
+    // reads the viewport (offset 0, 8 bytes); the fragment stage reads the glyph
+    // mask gamma (offset 8, 4 bytes). One range spans both, 12 bytes total.
     let set_layouts = [r.set_layout_atlas];
     let push_range = VkPushConstantRange {
-        stage_flags: VK_SHADER_STAGE_VERTEX_BIT,
+        stage_flags: VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         offset: 0,
-        size: 8,
+        size: 12,
     };
     let layout_info = VkPipelineLayoutCreateInfo {
         s_type: VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,

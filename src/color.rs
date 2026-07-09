@@ -135,30 +135,32 @@ fn cube_level(level: u8) -> u8 {
 }
 
 impl Default for Theme {
-    /// The default palette: the classic xterm 16 colors, over a dark background.
-    /// Config makes this overridable later (phase 4); it is not baked into anything.
+    /// The default palette: Tomorrow Night (a common built-in default), a white
+    /// foreground on `#282c34`, and a `#ff0078` cursor. These mirror a familiar
+    /// mainstream-terminal look so bnkterm renders as expected out of the box;
+    /// config makes them overridable later (phase 4), not baked in.
     fn default() -> Self {
         Theme {
-            fg: Rgb::new(0xda, 0xda, 0xda),
-            bg: Rgb::new(0x1c, 0x21, 0x27),
-            cursor: Rgb::new(0xda, 0xda, 0xda),
+            fg: Rgb::new(0xff, 0xff, 0xff),
+            bg: Rgb::new(0x28, 0x2c, 0x34),
+            cursor: Rgb::new(0xff, 0x00, 0x78),
             ansi: [
-                Rgb::new(0x00, 0x00, 0x00), // 0  black
-                Rgb::new(0xcd, 0x00, 0x00), // 1  red
-                Rgb::new(0x00, 0xcd, 0x00), // 2  green
-                Rgb::new(0xcd, 0xcd, 0x00), // 3  yellow
-                Rgb::new(0x00, 0x00, 0xee), // 4  blue
-                Rgb::new(0xcd, 0x00, 0xcd), // 5  magenta
-                Rgb::new(0x00, 0xcd, 0xcd), // 6  cyan
-                Rgb::new(0xe5, 0xe5, 0xe5), // 7  white
-                Rgb::new(0x7f, 0x7f, 0x7f), // 8  bright black
-                Rgb::new(0xff, 0x00, 0x00), // 9  bright red
-                Rgb::new(0x00, 0xff, 0x00), // 10 bright green
-                Rgb::new(0xff, 0xff, 0x00), // 11 bright yellow
-                Rgb::new(0x5c, 0x5c, 0xff), // 12 bright blue
-                Rgb::new(0xff, 0x00, 0xff), // 13 bright magenta
-                Rgb::new(0x00, 0xff, 0xff), // 14 bright cyan
-                Rgb::new(0xff, 0xff, 0xff), // 15 bright white
+                Rgb::new(0x1d, 0x1f, 0x21), // 0  black
+                Rgb::new(0xcc, 0x66, 0x66), // 1  red
+                Rgb::new(0xb5, 0xbd, 0x68), // 2  green
+                Rgb::new(0xf0, 0xc6, 0x74), // 3  yellow
+                Rgb::new(0x81, 0xa2, 0xbe), // 4  blue
+                Rgb::new(0xb2, 0x94, 0xbb), // 5  magenta
+                Rgb::new(0x8a, 0xbe, 0xb7), // 6  cyan
+                Rgb::new(0xc5, 0xc8, 0xc6), // 7  white
+                Rgb::new(0x66, 0x66, 0x66), // 8  bright black
+                Rgb::new(0xd5, 0x4e, 0x53), // 9  bright red
+                Rgb::new(0xb9, 0xca, 0x4a), // 10 bright green
+                Rgb::new(0xe7, 0xc5, 0x47), // 11 bright yellow
+                Rgb::new(0x7a, 0xa6, 0xda), // 12 bright blue
+                Rgb::new(0xc3, 0x97, 0xd8), // 13 bright magenta
+                Rgb::new(0x70, 0xc0, 0xb1), // 14 bright cyan
+                Rgb::new(0xea, 0xea, 0xea), // 15 bright white
             ],
         }
     }

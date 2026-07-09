@@ -14,10 +14,12 @@
 //! # Fixed pitch is the whole game
 //!
 //! A terminal is a grid: the cell at `(row, col)` occupies exactly the pixel box
-//! `[col*w, (col+1)*w) x [row*h, (row+1)*h)`, and the cursor, the selection, and
-//! the glyphs must all agree on where that box is or the display corrupts (the
-//! cursor "drifts from the glyphs"). We get that for
-//! free by *placing everything at `col * w`* and never accumulating a font's
+//! `[ox + col*w, ox + (col+1)*w) x [oy + row*h, oy + (row+1)*h)`, where `(ox, oy)`
+//! is the window's content origin (the padding inset the caller passes; the whole
+//! grid slides by it as one rigid block). The cursor, the selection, and the
+//! glyphs must all agree on where that box is or the display corrupts (the cursor
+//! "drifts from the glyphs"). We get that for free by
+//! *routing every coordinate through `cell_x`/`cell_y`* and never accumulating a font's
 //! (fractional) advance: text goes out as [`DrawCmd::Cells`], whose contract is
 //! exactly "cluster `i` draws at `x + i*cell_w`". The one measurement that keys
 //! the whole grid, `cell_w`, is the advance of a reference glyph from the regular
@@ -102,11 +104,6 @@ impl CellMetrics {
         let rows = (height / self.h).max(1) as usize;
         (cols, rows)
     }
-
-    /// The baseline y for `row`, measured from the top of the surface.
-    fn baseline(self, row: usize) -> i32 {
-        row as i32 * self.h + self.ascent
-    }
 }
 
 /// A cursor's drawn shape. The style escape (`DECSCUSR`) is not parsed yet
@@ -174,13 +171,17 @@ impl Selection {
 
 /// Build the frame for `screen`: the whole visible grid as a display list, ready
 /// for [`crate::render::display::damage`] and [`crate::render::gpu::build_frame`].
-/// Pure in its inputs (no fonts, no GPU), so a test asserts the exact primitives
-/// a grid state produces and the damage diff proves an unchanged frame is free.
+/// `origin` is the top-left pixel the grid is drawn from (the window padding);
+/// the background still fills the whole `surface`, so the inset shows as a margin
+/// of background around the text. Pure in its inputs (no fonts, no GPU), so a test
+/// asserts the exact primitives a grid state produces and the damage diff proves
+/// an unchanged frame is free.
 pub fn build_display_list(
     screen: &Screen,
     theme: &Theme,
     metrics: CellMetrics,
     surface: (i32, i32),
+    origin: (i32, i32),
     cursor: CursorRender,
     selection: Option<Selection>,
 ) -> DisplayList {
@@ -188,6 +189,7 @@ pub fn build_display_list(
         screen,
         theme,
         metrics,
+        origin,
         selection,
         list: Vec::new(),
     };
@@ -208,11 +210,30 @@ struct Painter<'a> {
     screen: &'a Screen,
     theme: &'a Theme,
     metrics: CellMetrics,
+    /// The grid's top-left pixel in the surface: the window padding inset. Every
+    /// cell coordinate is measured from here (via [`Self::cell_x`]/[`Self::cell_y`]),
+    /// so the whole grid rides the same rigid offset and can never drift from it.
+    origin: (i32, i32),
     selection: Option<Selection>,
     list: DisplayList,
 }
 
 impl Painter<'_> {
+    /// The left pixel of column `col`, from the content origin.
+    fn cell_x(&self, col: usize) -> i32 {
+        self.origin.0 + col as i32 * self.metrics.w
+    }
+
+    /// The top pixel of row `row`, from the content origin.
+    fn cell_y(&self, row: usize) -> i32 {
+        self.origin.1 + row as i32 * self.metrics.h
+    }
+
+    /// The baseline y for `row`: the row's top plus the face ascent.
+    fn baseline(&self, row: usize) -> i32 {
+        self.cell_y(row) + self.metrics.ascent
+    }
+
     /// The base background: one fill of the theme background covering the whole
     /// surface (including any partial cell at the right/bottom edge). Every
     /// default-background cell is then just this fill showing through, so the
@@ -244,10 +265,12 @@ impl Painter<'_> {
                 col += 1;
             }
             if bg != self.theme.bg {
+                let x = self.cell_x(start);
+                let y = self.cell_y(row);
                 self.list.push(DrawCmd::Fill {
                     rect: Rect {
-                        x: start as i32 * m.w,
-                        y: row as i32 * m.h,
+                        x,
+                        y,
                         w: (col - start) as i32 * m.w,
                         h: m.h,
                     },
@@ -264,8 +287,7 @@ impl Painter<'_> {
     /// [`DrawCmd::Text`] so the run's one-cluster-per-cell contract holds. See the
     /// module header for why the pitch, not the advance, drives placement.
     fn foreground_row(&mut self, row: usize, cols: usize) {
-        let m = self.metrics;
-        let baseline = m.baseline(row);
+        let baseline = self.baseline(row);
         let mut col = 0;
         while col < cols {
             let cell = self.cell(row, col);
@@ -316,7 +338,7 @@ impl Painter<'_> {
                 inked_cells = c - col + 1;
             }
         }
-        let x = col as i32 * m.w;
+        let x = self.cell_x(col);
         if inked_cells > 0 {
             text.truncate(inked_bytes);
             self.list.push(DrawCmd::Cells {
@@ -372,7 +394,7 @@ impl Painter<'_> {
             return;
         }
         let m = self.metrics;
-        let x = col as i32 * m.w;
+        let x = self.cell_x(col);
         let width_cells = if cell.is_wide_leader() { 2 } else { 1 };
         let mut text = String::new();
         text.push(cell.rune);
@@ -416,8 +438,8 @@ impl Painter<'_> {
         let cell = self.cell(dr, cc);
         let width_cells = if cell.is_wide_leader() { 2 } else { 1 };
         let m = self.metrics;
-        let x = cc as i32 * m.w;
-        let y = dr as i32 * m.h;
+        let x = self.cell_x(cc);
+        let y = self.cell_y(dr);
         let color = self.theme.cursor.to_u32();
         match cursor.shape {
             CursorShape::Block if cursor.focused => {
@@ -494,8 +516,8 @@ impl Painter<'_> {
             return;
         }
         let m = self.metrics;
-        let x = col as i32 * m.w;
-        let baseline = m.baseline(row);
+        let x = self.cell_x(col);
+        let baseline = self.baseline(row);
         let mut text = String::new();
         text.push(cell.rune);
         if let Some(marks) = self.marks(row, col) {
@@ -687,6 +709,7 @@ mod tests {
             &Theme::default(),
             M,
             (s.dimensions().0 as i32 * M.w, s.dimensions().1 as i32 * M.h),
+            (0, 0),
             CursorRender {
                 visible: false,
                 ..CursorRender::default()
@@ -879,7 +902,7 @@ mod tests {
         feed(&mut s, b"X"); // cursor now rests at column 1 (after X)
         s.move_to(0, 0); // park it on the glyph
         let t = Theme::default();
-        let list = build_display_list(&s, &t, M, (40, 20), CursorRender::default(), None);
+        let list = build_display_list(&s, &t, M, (40, 20), (0, 0), CursorRender::default(), None);
         // The last commands are the cursor block then the inverted glyph.
         let cursor_fill = fills(&list)
             .into_iter()
@@ -905,6 +928,50 @@ mod tests {
     }
 
     #[test]
+    fn a_nonzero_origin_insets_the_grid_but_not_the_background() {
+        let mut s = Screen::new(4, 1);
+        feed(&mut s, b"X");
+        s.move_to(0, 0); // park the cursor on the glyph
+        let t = Theme::default();
+        let (ox, oy) = (5, 5);
+        let list = build_display_list(&s, &t, M, (40, 20), (ox, oy), CursorRender::default(), None);
+        // The base fill still covers the whole surface: the inset is a margin of
+        // background around the grid, not a smaller canvas.
+        assert_eq!(
+            fills(&list)[0],
+            (
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 40,
+                    h: 20
+                },
+                t.bg.to_u32()
+            )
+        );
+        // Glyph run and cursor block both ride the origin, so they stay aligned:
+        // the run at (ox, oy + ascent), the cursor block at (ox, oy).
+        assert_eq!(
+            cells_runs(&list),
+            vec![(ox, oy + M.ascent, "X".to_string())],
+            "the run is shifted by the content origin"
+        );
+        let cursor_fill = fills(&list)
+            .into_iter()
+            .find(|(_, c)| *c == t.cursor.to_u32())
+            .expect("a filled cursor block");
+        assert_eq!(
+            cursor_fill.0,
+            Rect {
+                x: ox,
+                y: oy,
+                w: M.w,
+                h: M.h
+            }
+        );
+    }
+
+    #[test]
     fn bar_and_underline_cursors_do_not_invert() {
         let mut s = Screen::new(4, 1);
         feed(&mut s, b"X");
@@ -915,6 +982,7 @@ mod tests {
                 &Theme::default(),
                 M,
                 (40, 20),
+                (0, 0),
                 CursorRender {
                     shape,
                     ..CursorRender::default()
@@ -940,6 +1008,7 @@ mod tests {
             &Theme::default(),
             M,
             (40, 20),
+            (0, 0),
             CursorRender {
                 visible: false,
                 ..CursorRender::default()
@@ -959,6 +1028,7 @@ mod tests {
             &Theme::default(),
             M,
             (60, 20),
+            (0, 0),
             CursorRender {
                 visible: false,
                 ..CursorRender::default()
@@ -1068,6 +1138,7 @@ mod tests {
             &Theme::default(),
             M,
             (6 * M.w, 2 * M.h),
+            (0, 0),
             CursorRender {
                 visible: false,
                 ..CursorRender::default()
@@ -1092,6 +1163,7 @@ mod tests {
             &Theme::default(),
             M,
             (6 * M.w, 2 * M.h),
+            (0, 0),
             CursorRender::default(), // visible + focused
             None,
         );
@@ -1114,6 +1186,7 @@ mod tests {
                 &Theme::default(),
                 M,
                 surface,
+                (0, 0),
                 CursorRender {
                     visible: false,
                     ..CursorRender::default()

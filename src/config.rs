@@ -10,6 +10,21 @@
 //! loader replaces these built-ins at startup.
 
 use crate::platform::freetype::{FontConfig, FontFamily};
+use std::path::PathBuf;
+
+/// A font file in the XDG user font directory (`$XDG_DATA_HOME/fonts`, else
+/// `$HOME/.local/share/fonts`). Used for fonts a user installs themselves, e.g.
+/// Consolas, a Microsoft font no distro packages under `/usr/share/fonts`.
+/// Derived from the environment rather than a literal `/home/<user>/…` so it
+/// stays portable; when neither variable is set it yields a path that will not
+/// exist, and the family simply falls through to the next candidate.
+fn user_font(name: &str) -> String {
+    let dir = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .unwrap_or_default();
+    dir.join("fonts").join(name).to_string_lossy().into_owned()
+}
 
 impl Default for FontConfig {
     fn default() -> Self {
@@ -19,6 +34,15 @@ impl Default for FontConfig {
             // the terminal runnable across machines without a font-discovery
             // crate.
             families: vec![
+                // Consolas leads: a common primary monospace face. User-installed,
+                // so it sits in the XDG user font dir; absent, the list falls
+                // through to Hack.
+                FontFamily::new(
+                    &user_font("consola.ttf"),
+                    &user_font("consolab.ttf"),
+                    &user_font("consolai.ttf"),
+                    &user_font("consolaz.ttf"),
+                ),
                 FontFamily::new(
                     "/usr/share/fonts/TTF/Hack-Regular.ttf",
                     "/usr/share/fonts/TTF/Hack-Bold.ttf",
@@ -66,8 +90,11 @@ impl Default for FontConfig {
             // Fallback chain for private-use icons and stray symbols the prose
             // family lacks. Symbols Nerd Font is the icons-only companion built
             // to fill the Nerd Font / Powerline ranges; its Mono cut sizes every
-            // icon to one cell, so it leads when installed. The Noto symbol faces
-            // mop up other Unicode symbols and dingbats.
+            // icon to one cell, so it leads when installed. When only the non-Mono
+            // cut is present it renders icons larger than one cell, on purpose, see
+            // the natural-size policy in `platform/freetype.rs` (fallback faces are
+            // not scaled to the cell). The Noto symbol faces mop up other Unicode
+            // symbols and dingbats.
             fallback: vec![
                 "/usr/share/fonts/TTF/SymbolsNerdFontMono-Regular.ttf".into(),
                 "/usr/share/fonts/TTF/SymbolsNerdFont-Regular.ttf".into(),

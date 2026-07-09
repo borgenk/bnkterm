@@ -32,6 +32,49 @@ pub mod wl_surface {
     /// ready for the next frame, pacing redraws to the refresh rate.
     pub const FRAME: u16 = 3;
     pub const COMMIT: u16 = 6;
+    /// Declare the integer scale the buffer is drawn at (the buffer is
+    /// `logical * scale` pixels). The compositor divides by it to place the
+    /// surface. Used on the integer-scale fallback path; the fractional path uses
+    /// a viewport instead.
+    pub const SET_BUFFER_SCALE: u16 = 8;
+    /// The surface is now shown on this `wl_output`; its argument is the output's
+    /// object id. Tracked (with `leave`) to pick the surface's integer scale as
+    /// the max over the outputs it spans.
+    pub const EV_ENTER: u16 = 0;
+    pub const EV_LEAVE: u16 = 1;
+}
+
+pub mod wl_output {
+    /// The output's integer scale factor (`wl_output` version 2+). The fractional
+    /// path ignores this; the integer fallback uses it.
+    pub const EV_SCALE: u16 = 3;
+}
+
+// Fractional scaling (`fractional-scale-v1`, version 1). The manager mints a
+// per-surface object that reports the compositor's preferred scale as a fixed
+// 120ths value; combined with a viewport it lets a surface render at exact device
+// resolution for scales like 1.25 or 1.5.
+pub mod wp_fractional_scale_manager_v1 {
+    /// Create a `wp_fractional_scale_v1` for a surface: `new_id`, then the surface.
+    pub const GET_FRACTIONAL_SCALE: u16 = 1;
+}
+
+pub mod wp_fractional_scale_v1 {
+    /// The preferred scale as `round(scale * 120)`: 120 is 1.0, 180 is 1.5.
+    pub const EV_PREFERRED_SCALE: u16 = 0;
+}
+
+// Viewport (`viewporter`, version 1). A viewport maps a surface's (device-pixel)
+// buffer onto a logical destination size, which is how the fractional path draws
+// a `logical * scale` buffer yet presents at the logical window size.
+pub mod wp_viewporter {
+    /// Create a `wp_viewport` for a surface: `new_id`, then the surface.
+    pub const GET_VIEWPORT: u16 = 1;
+}
+
+pub mod wp_viewport {
+    /// The surface's logical size: `width`, `height` as integers (-1,-1 unsets).
+    pub const SET_DESTINATION: u16 = 2;
 }
 
 pub mod wl_buffer {
@@ -203,6 +246,9 @@ pub const IFACE_DATA_DEVICE_MANAGER: &str = "wl_data_device_manager";
 pub const IFACE_CURSOR_SHAPE_MANAGER: &str = "wp_cursor_shape_manager_v1";
 pub const IFACE_DMABUF: &str = "zwp_linux_dmabuf_v1";
 pub const IFACE_DRM_SYNCOBJ: &str = "wp_linux_drm_syncobj_manager_v1";
+pub const IFACE_OUTPUT: &str = "wl_output";
+pub const IFACE_FRACTIONAL_SCALE_MANAGER: &str = "wp_fractional_scale_manager_v1";
+pub const IFACE_VIEWPORTER: &str = "wp_viewporter";
 
 pub const VERSION_COMPOSITOR: u32 = 4;
 pub const VERSION_WM_BASE: u32 = 1;
@@ -215,3 +261,9 @@ pub const VERSION_CURSOR_SHAPE_MANAGER: u32 = 1;
 pub const VERSION_DMABUF: u32 = 4;
 /// Explicit sync is a single version; we drive only what version 1 defines.
 pub const VERSION_DRM_SYNCOBJ: u32 = 1;
+/// Version 2 introduced the `scale` event, the only `wl_output` event the
+/// integer-scale fallback needs; a v1-only output reports no scale (treated as 1).
+pub const VERSION_OUTPUT: u32 = 2;
+/// Both scale protocols are single-version.
+pub const VERSION_FRACTIONAL_SCALE_MANAGER: u32 = 1;
+pub const VERSION_VIEWPORTER: u32 = 1;

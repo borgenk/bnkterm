@@ -781,6 +781,23 @@ impl Fonts {
             metrics.line_height = metrics.line_height.max(target);
             // Fallback faces draw only scalars the primary lacks and never route
             // emoji clusters themselves, so they carry no emoji font.
+            //
+            // They open at the primary `size` and their glyphs rasterize at the
+            // font's own natural proportions: we deliberately do NOT scale a
+            // fallback face down to the prose cell. Nerd Font's non-"Mono" cut draws
+            // icons larger than one cell, so an icon glyph (a git-branch mark, a
+            // Powerline separator) comes out big and crisp, as terminals that map
+            // the same cut do. The cost of natural size is that a wide icon can
+            // spill into the next cell; a trailing space beside it absorbs the
+            // overflow. (The "Mono" cut, when installed, is pre-fit to one cell and
+            // leads the chain in config.rs, so this only bites when it is absent.)
+            //
+            // ASSUMPTION, not verified: this is thought to be why some other
+            // terminals render the same glyph smaller and softer — they are believed
+            // to normalize a fallback face's metrics to the primary's, shrinking (and
+            // thus re-rasterizing smaller) a natively larger icon. That is an
+            // inference from observed output, not confirmed against their source;
+            // treat it as a lead if this policy is ever revisited.
             let fallback = config
                 .fallback
                 .iter()

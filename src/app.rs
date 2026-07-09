@@ -43,8 +43,9 @@ use crate::platform::ffi;
 use crate::platform::freetype::Fonts;
 use crate::platform::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_device_manager, wl_data_offer, wl_display,
-    wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_surface, xdg_surface, xdg_toplevel,
-    xdg_wm_base,
+    wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_surface,
+    wp_fractional_scale_manager_v1, wp_fractional_scale_v1, wp_viewporter, xdg_surface,
+    xdg_toplevel, xdg_wm_base,
 };
 use crate::platform::wire::{Arg, Message, Reader};
 use crate::platform::xkb::Xkb;
@@ -53,12 +54,25 @@ use crate::render::display::DisplayList;
 use crate::term_render::{self, CellMetrics, CursorRender, CursorShape, Selection};
 use crate::vt::Parser;
 
-/// The default pixel size the terminal font is opened at, overridable with the
-/// `BNKTERM_FONT_SIZE` env var (clamped to [`FONT_SIZE_RANGE`]).
-const FONT_SIZE: u32 = 16;
+/// The default font size in points. Converted to device pixels at the display's
+/// scale factor (see [`points_to_px`]), so the physical size tracks DPI the way
+/// mainstream terminal configs do. Overridable with `BNKTERM_FONT_POINTS`, or
+/// pinned to explicit pixels with `BNKTERM_FONT_SIZE`.
+const FONT_POINTS: f32 = 10.0;
 
-/// The sane range a configured font size is clamped to.
+/// The sane range a resolved device-pixel font size is clamped to.
 const FONT_SIZE_RANGE: std::ops::RangeInclusive<u32> = 6..=72;
+
+/// A compositor scale of 1.0, in the fractional-scale protocol's 120ths unit. The
+/// scale is unknown until the compositor reports it, so the window opens at unity.
+const SCALE_120_UNITY: u32 = 120;
+
+/// The default glyph mask gamma: the power the fragment shader raises coverage to.
+/// Linear-light compositing renders light-on-dark text heavier than the gamma-space
+/// stacks most GPU terminals use, so a value > 1 thins the anti-aliased edges back
+/// to a matching weight. 2.0 is the default; `BNKTERM_TEXT_GAMMA`
+/// tunes it (1.0 disables the correction, the old heavier look).
+const TEXT_GAMMA: f32 = 2.0;
 
 /// The cursor blink half-period: how long each of the on/off phases lasts.
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
@@ -67,6 +81,12 @@ const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 /// 80x24; the surface then resizes to whatever the compositor grants.
 const DEFAULT_COLS: usize = 80;
 const DEFAULT_ROWS: usize = 24;
+
+/// Blank margin, in pixels, between the window edge and the grid on every side
+/// (a common terminal default of `padding = 5`). The grid is
+/// inset by this and drawn from `(WINDOW_PADDING, WINDOW_PADDING)`; the surface
+/// background fills behind it, so the inset reads as a border of background.
+const WINDOW_PADDING: i32 = 5;
 
 /// The PTY read chunk: large so a burst of output drains in few syscalls.
 const PTY_READ_CHUNK: usize = 64 * 1024;
@@ -112,6 +132,68 @@ pub fn gpu_probe() -> crate::error::Result<()> {
     Ok(())
 }
 
+/// Compositor scale tracking and the objects that deliver it.
+///
+/// Two mechanisms, in priority order. The *fractional* path is primary: a
+/// `wp_fractional_scale_v1` reports `preferred_scale` in 120ths and a `wp_viewport`
+/// maps the device-pixel buffer down to the logical window size, so a 1.25 or 1.5
+/// display renders pixel-exact. The *integer* path is the fallback for compositors
+/// with no fractional-scale global: each `wl_output`'s `scale` event, the surface's
+/// scale being the max over the outputs it spans (`wl_surface.enter`/`leave`), and
+/// `wl_surface.set_buffer_scale`. `viewport != 0` means the fractional path is live.
+struct Scaling {
+    /// Effective scale as 120ths (120 = 1.0); drives font pixels and buffer size.
+    factor_120: u32,
+    /// Logical window size (surface-local px) from the last xdg configure. The
+    /// device buffer is this scaled up; the viewport (or buffer scale) maps back.
+    logical: (u32, u32),
+    /// Whether the surface's geometry + viewport/buffer-scale state has been resent
+    /// since `factor_120` or `logical` last changed. Cleared on change, set on sync.
+    synced: bool,
+    fractional_manager: Option<u32>,
+    viewporter: Option<u32>,
+    /// Per-surface objects the managers mint (0 when unavailable).
+    fractional_scale: u32,
+    viewport: u32,
+    /// Integer fallback: each bound `wl_output`'s scale, and the ids the surface
+    /// currently spans. Unused once the fractional path is live.
+    outputs: Vec<(u32, i32)>,
+    entered: Vec<u32>,
+}
+
+impl Scaling {
+    fn new(logical: (u32, u32)) -> Self {
+        Scaling {
+            factor_120: SCALE_120_UNITY,
+            logical,
+            synced: false,
+            fractional_manager: None,
+            viewporter: None,
+            fractional_scale: 0,
+            viewport: 0,
+            outputs: Vec::new(),
+            entered: Vec::new(),
+        }
+    }
+
+    /// Whether the fractional path is live (a viewport was created for the surface).
+    fn is_fractional(&self) -> bool {
+        self.viewport != 0
+    }
+
+    /// The integer scale the surface spans: the max scale over the outputs it is
+    /// on, at least 1. Used only on the fallback path.
+    fn integer_scale(&self) -> i32 {
+        self.entered
+            .iter()
+            .filter_map(|id| self.outputs.iter().find(|(oid, _)| oid == id))
+            .map(|(_, scale)| *scale)
+            .max()
+            .unwrap_or(1)
+            .max(1)
+    }
+}
+
 struct State {
     conn: Connection,
     fonts: Fonts,
@@ -150,9 +232,12 @@ struct State {
     /// The toplevel title last sent, so it is only re-set when it changes.
     title: String,
 
-    /// Current surface size in pixels.
+    /// Current surface size in *device* pixels (the buffer resolution the grid is
+    /// laid out in). The logical size lives in `scale.logical`.
     width: u32,
     height: u32,
+    /// Compositor scale factor and the objects that report it.
+    scale: Scaling,
 
     // Object ids. Globals are Option (discovered via the registry); ids we
     // create default to 0 (never valid) until assigned.
@@ -213,12 +298,14 @@ struct State {
 impl State {
     fn new(demo: bool) -> Result<Self> {
         let conn = Connection::connect()?;
-        let font_size = config_font_size();
+        // Open at unity scale; the compositor's real scale arrives after bring-up
+        // and reopens the fonts (see `apply_scale`).
+        let font_size = config_font_px(SCALE_120_UNITY);
         let fonts = Fonts::new(&[font_size])?;
         let metrics = CellMetrics::from_fonts(&fonts, font_size);
         let (cols, rows) = (DEFAULT_COLS, DEFAULT_ROWS);
-        let width = (cols as i32 * metrics.w).max(1) as u32;
-        let height = (rows as i32 * metrics.h).max(1) as u32;
+        let width = (cols as i32 * metrics.w + 2 * WINDOW_PADDING).max(1) as u32;
+        let height = (rows as i32 * metrics.h + 2 * WINDOW_PADDING).max(1) as u32;
         // Demo mode shows a static grid; live mode starts blank and the shell
         // fills it once the PTY is spawned.
         let screen = if demo {
@@ -250,6 +337,7 @@ impl State {
             title: String::new(),
             width,
             height,
+            scale: Scaling::new((width, height)),
             registry: 0,
             compositor: None,
             wm_base: None,
@@ -341,6 +429,27 @@ impl State {
             &[Arg::Str("bnkterm")],
         );
         self.refresh_title();
+
+        // Fractional scaling: a per-surface fractional-scale object delivers the
+        // preferred scale, and a viewport maps the device-pixel buffer onto the
+        // logical window size. They come as a pair; without both, the integer
+        // fallback (wl_output scale + set_buffer_scale) is used instead.
+        if let (Some(fmgr), Some(vp)) = (self.scale.fractional_manager, self.scale.viewporter) {
+            let fractional = self.alloc_id();
+            self.conn.request(
+                fmgr,
+                wp_fractional_scale_manager_v1::GET_FRACTIONAL_SCALE,
+                &[Arg::NewId(fractional), Arg::Object(self.surface)],
+            );
+            self.scale.fractional_scale = fractional;
+            let viewport = self.alloc_id();
+            self.conn.request(
+                vp,
+                wp_viewporter::GET_VIEWPORT,
+                &[Arg::NewId(viewport), Arg::Object(self.surface)],
+            );
+            self.scale.viewport = viewport;
+        }
 
         // The data device drives the clipboard; skip it when the compositor has no
         // manager (copy/paste is then simply unavailable).
@@ -524,27 +633,56 @@ impl State {
             visible: self.screen.cursor_visible() && !blinked_off,
             focused: self.focused,
         };
+        let pad = self.device_pad();
         let list = term_render::build_display_list(
             &self.screen,
             &self.theme,
             self.metrics,
             (self.width as i32, self.height as i32),
+            (pad, pad),
             cursor,
             self.selection,
         );
         Rc::new(list)
     }
 
-    /// Record a new surface size, resize the grid to the cells that now fit, and
-    /// tell the child (via `TIOCSWINSZ`, so it gets SIGWINCH and repaints). The
-    /// GPU buffers are reallocated lazily in `render_frame`. A no-op if unchanged.
+    /// A logical (surface-local) length in device pixels at the current scale,
+    /// rounded to nearest. Device pixels are what the buffer and grid are sized in.
+    fn to_device(&self, logical: u32) -> u32 {
+        logical_to_device(logical, self.scale.factor_120)
+    }
+
+    /// The logical window size scaled to the device buffer size, clamped so a bogus
+    /// configure cannot blow up the buffer arithmetic.
+    fn device_size(&self, logical_w: u32, logical_h: u32) -> (u32, u32) {
+        (
+            self.to_device(logical_w).clamp(1, MAX_DIMENSION),
+            self.to_device(logical_h).clamp(1, MAX_DIMENSION),
+        )
+    }
+
+    /// The window padding in device pixels: the logical [`WINDOW_PADDING`] scaled,
+    /// so the margin looks the same physical size at any DPI.
+    fn device_pad(&self) -> i32 {
+        self.to_device(WINDOW_PADDING as u32) as i32
+    }
+
+    /// Record a new *device* surface size, resize the grid to the cells that now fit
+    /// (inside the scaled padding), and tell the child (via `TIOCSWINSZ`, so it gets
+    /// SIGWINCH and repaints). GPU buffers are reallocated lazily in `render_frame`.
+    /// A no-op only when neither the device size nor the resulting grid changed (the
+    /// grid can change from a scale-driven metrics change at an unchanged size).
     fn resize_to(&mut self, w: u32, h: u32) {
-        if (w, h) == (self.width, self.height) {
+        // Reserve the padding on all sides, so the grid fits inside the margins.
+        let pad = self.device_pad();
+        let usable_w = (w as i32 - 2 * pad).max(0);
+        let usable_h = (h as i32 - 2 * pad).max(0);
+        let (cols, rows) = self.metrics.columns_rows(usable_w, usable_h);
+        if (w, h) == (self.width, self.height) && (cols, rows) == self.screen.dimensions() {
             return;
         }
         self.width = w;
         self.height = h;
-        let (cols, rows) = self.metrics.columns_rows(w as i32, h as i32);
         if self.demo {
             self.screen = demo_screen(cols, rows);
         } else {
@@ -556,6 +694,50 @@ impl State {
             }
         }
         self.dirty = true;
+    }
+
+    /// Adopt a new compositor scale (in 120ths): reopen the fonts at the size it
+    /// calls for, re-derive the device buffer size from the logical window, and
+    /// resize the grid. A no-op if the scale is unchanged.
+    fn set_scale_120(&mut self, factor_120: u32) {
+        let factor_120 = factor_120.max(1);
+        if factor_120 == self.scale.factor_120 {
+            return;
+        }
+        self.scale.factor_120 = factor_120;
+        self.scale.synced = false; // geometry + viewport/buffer-scale must be resent
+        let px = config_font_px(factor_120);
+        self.apply_font_size(px);
+        let (lw, lh) = self.scale.logical;
+        let (dw, dh) = self.device_size(lw, lh);
+        self.resize_to(dw, dh);
+        // Force the next frame even if the grid dimensions happened to land the
+        // same, so the resent scale state (and rescaled glyphs) reach the screen.
+        self.dirty = true;
+    }
+
+    /// Reopen the fonts at device-pixel `size` and recompute the cell metrics. On a
+    /// font-open failure the working fonts are kept (no panic, no blank window).
+    fn apply_font_size(&mut self, size: u32) {
+        if size == self.metrics.size {
+            return;
+        }
+        // On a font-open failure, keep the working fonts (no panic, no blank
+        // window); the next scale event may recover.
+        if let Ok(fonts) = Fonts::new(&[size]) {
+            self.metrics = CellMetrics::from_fonts(&fonts, size);
+            self.fonts = fonts;
+        }
+    }
+
+    /// On the integer-scale fallback, recompute the surface scale as the max over
+    /// the outputs it currently spans and adopt it. A no-op on the fractional path.
+    fn refresh_integer_scale(&mut self) {
+        if self.scale.is_fractional() {
+            return;
+        }
+        let factor_120 = self.scale.integer_scale() as u32 * 120;
+        self.set_scale_120(factor_120);
     }
 
     fn handle(&mut self, msg: Message) -> Result<()> {
@@ -602,11 +784,58 @@ impl State {
 
         if msg.object == self.xdg_surface && msg.opcode == xdg_surface::EV_CONFIGURE {
             self.pending_configure = Some(r.u32()?);
-            if let Some((w, h)) = self.pending_size.take() {
-                self.resize_to(w, h);
+            if let Some((lw, lh)) = self.pending_size.take() {
+                // The configure size is logical (surface-local); the buffer and
+                // grid are device pixels. Record the logical size (for the viewport
+                // destination) and resize the grid to the scaled device size.
+                self.scale.logical = (lw, lh);
+                self.scale.synced = false;
+                let (dw, dh) = self.device_size(lw, lh);
+                self.resize_to(dw, dh);
             }
             self.configured = true;
             self.dirty = true;
+            return Ok(());
+        }
+
+        // wp_fractional_scale_v1.preferred_scale: the compositor's scale as 120ths.
+        // This is the primary scale source; adopting it reopens the fonts and
+        // resizes the buffer to exact device resolution.
+        if self.scale.fractional_scale != 0
+            && msg.object == self.scale.fractional_scale
+            && msg.opcode == wp_fractional_scale_v1::EV_PREFERRED_SCALE
+        {
+            let scale_120 = r.u32()?;
+            self.set_scale_120(scale_120);
+            return Ok(());
+        }
+
+        // wl_surface.enter/leave and wl_output.scale drive the integer fallback
+        // (used only when the fractional path is absent).
+        if msg.object == self.surface
+            && (msg.opcode == wl_surface::EV_ENTER || msg.opcode == wl_surface::EV_LEAVE)
+        {
+            let output = r.u32()?;
+            if msg.opcode == wl_surface::EV_ENTER {
+                if !self.scale.entered.contains(&output) {
+                    self.scale.entered.push(output);
+                }
+            } else {
+                self.scale.entered.retain(|&o| o != output);
+            }
+            self.refresh_integer_scale();
+            return Ok(());
+        }
+        if msg.opcode == wl_output::EV_SCALE
+            && self.scale.outputs.iter().any(|(id, _)| *id == msg.object)
+        {
+            let factor = r.u32()? as i32;
+            for out in &mut self.scale.outputs {
+                if out.0 == msg.object {
+                    out.1 = factor.max(1);
+                }
+            }
+            self.refresh_integer_scale();
             return Ok(());
         }
 
@@ -881,8 +1110,15 @@ impl State {
     /// The cell under the pointer, clamped into the grid. Used for mouse reports.
     fn pointer_cell(&self) -> (usize, usize) {
         let (cols, rows) = self.screen.dimensions();
-        let col = (self.pointer_x / self.metrics.w as f32) as usize;
-        let row = (self.pointer_y / self.metrics.h as f32) as usize;
+        // Pointer coordinates are logical (surface-local); the grid is device
+        // pixels, so scale up first. The grid is then inset by the (device) padding;
+        // a pointer in the margin maps to the nearest edge cell (floored at zero).
+        let scale = self.scale.factor_120 as f32 / 120.0;
+        let pad = self.device_pad() as f32;
+        let px = (self.pointer_x * scale - pad).max(0.0);
+        let py = (self.pointer_y * scale - pad).max(0.0);
+        let col = (px / self.metrics.w as f32) as usize;
+        let row = (py / self.metrics.h as f32) as usize;
         (
             col.min(cols.saturating_sub(1)),
             row.min(rows.saturating_sub(1)),
@@ -1115,6 +1351,25 @@ impl State {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_DRM_SYNCOBJ);
                 self.presentation.syncobj_manager = Some(id);
             }
+            protocol::IFACE_OUTPUT => {
+                // One global per monitor; bind each and default its scale to 1
+                // until a `scale` event refines it (integer fallback only).
+                let id = self.bind_capped(name, interface, version, protocol::VERSION_OUTPUT);
+                self.scale.outputs.push((id, 1));
+            }
+            protocol::IFACE_FRACTIONAL_SCALE_MANAGER => {
+                let id = self.bind_capped(
+                    name,
+                    interface,
+                    version,
+                    protocol::VERSION_FRACTIONAL_SCALE_MANAGER,
+                );
+                self.scale.fractional_manager = Some(id);
+            }
+            protocol::IFACE_VIEWPORTER => {
+                let id = self.bind_capped(name, interface, version, protocol::VERSION_VIEWPORTER);
+                self.scale.viewporter = Some(id);
+            }
             _ => {}
         }
         Ok(())
@@ -1158,15 +1413,57 @@ impl State {
     }
 }
 
-/// The font size to open at: `BNKTERM_FONT_SIZE` if it parses, clamped to a sane
-/// range, else the default. The one config knob for now; theme and font family
-/// follow when config grows into a file.
-fn config_font_size() -> u32 {
-    std::env::var("BNKTERM_FONT_SIZE")
+/// Round a logical (surface-local) length to device pixels at scale `factor_120`
+/// (120ths; 120 = 1.0). The `+ 60` is round-to-nearest (half of 120). `u64` math
+/// so a large window times a large scale cannot overflow before the divide.
+fn logical_to_device(logical: u32, factor_120: u32) -> u32 {
+    (((logical as u64) * (factor_120 as u64) + 60) / 120) as u32
+}
+
+/// Convert a point size to device pixels at compositor scale `scale_120` (120ths;
+/// 120 = 1.0), clamped to [`FONT_SIZE_RANGE`]. The `96/72` factor is the reference
+/// 96 DPI over 72 points per inch, the same basis the sibling terminals use, so a
+/// given point size renders at the same physical height here as there.
+fn points_to_px(points: f32, scale_120: u32) -> u32 {
+    let px = points * (96.0 / 72.0) * (scale_120 as f32 / 120.0);
+    // `max(0)` guards a nonsense (negative/NaN) env value; NaN compares false, so
+    // it lands on the range start rather than a panic.
+    let px = if px.is_finite() {
+        px.round().max(0.0) as u32
+    } else {
+        0
+    };
+    px.clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end())
+}
+
+/// The device-pixel font size at compositor scale `scale_120`. `BNKTERM_FONT_SIZE`
+/// pins an explicit pixel height and opts out of scaling (the escape hatch);
+/// otherwise `BNKTERM_FONT_POINTS` (or [`FONT_POINTS`]) is scaled by the display.
+fn config_font_px(scale_120: u32) -> u32 {
+    if let Some(px) = std::env::var("BNKTERM_FONT_SIZE")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
-        .map(|s| s.clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end()))
-        .unwrap_or(FONT_SIZE)
+    {
+        return px.clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end());
+    }
+    let points = std::env::var("BNKTERM_FONT_POINTS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .unwrap_or(FONT_POINTS);
+    points_to_px(points, scale_120)
+}
+
+/// The glyph coverage gamma (see [`TEXT_GAMMA`]), overridable with
+/// `BNKTERM_TEXT_GAMMA` and clamped to a sane range so a bad value cannot make
+/// text vanish.
+fn config_text_gamma() -> f32 {
+    std::env::var("BNKTERM_TEXT_GAMMA")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|g| g.is_finite() && *g > 0.0)
+        .unwrap_or(TEXT_GAMMA)
+        .clamp(0.5, 4.0)
 }
 
 /// Map the grid's cursor style (from DECSCUSR) to how the renderer paints it.
@@ -1293,7 +1590,7 @@ mod tests {
         // fill plus glyph runs), so the window would show content.
         let s = demo_screen(80, 24);
         let metrics = CellMetrics {
-            size: FONT_SIZE,
+            size: 16,
             w: 8,
             h: 16,
             ascent: 12,
@@ -1304,9 +1601,69 @@ mod tests {
             &Theme::default(),
             metrics,
             (80 * 8, 24 * 16),
+            (0, 0),
             CursorRender::default(),
             None,
         );
         assert!(list.len() > 1, "more than just the background fill");
+    }
+
+    #[test]
+    fn points_to_px_scales_with_the_display() {
+        // 10pt at 96/72 is 13.33px; scale multiplies it and rounds to nearest.
+        assert_eq!(points_to_px(10.0, 120), 13); // 1.0x  -> 13.33 -> 13
+        assert_eq!(points_to_px(10.0, 180), 20); // 1.5x  -> 20.0  -> 20
+        assert_eq!(points_to_px(10.0, 240), 27); // 2.0x  -> 26.67 -> 27
+        assert_eq!(points_to_px(9.0, 120), 12); // 9pt at 1.0x -> 12
+                                                // Same physical size two ways: 10pt at 2x equals 20pt at 1x.
+        assert_eq!(points_to_px(10.0, 240), points_to_px(20.0, 120));
+    }
+
+    #[test]
+    fn points_to_px_clamps_and_survives_bad_input() {
+        let (lo, hi) = (*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end());
+        assert_eq!(points_to_px(1000.0, 120), hi); // absurdly large clamps down
+        assert_eq!(points_to_px(1.0, 120), lo); // tiny clamps up
+        assert_eq!(points_to_px(f32::NAN, 120), lo); // NaN -> range start, no panic
+        assert_eq!(points_to_px(-5.0, 120), lo); // negative -> range start
+        assert_eq!(points_to_px(0.0, 120), lo);
+    }
+
+    #[test]
+    fn logical_to_device_rounds_to_nearest() {
+        assert_eq!(logical_to_device(100, 120), 100); // 1.0x is identity
+        assert_eq!(logical_to_device(100, 240), 200); // 2.0x
+        assert_eq!(logical_to_device(100, 180), 150); // 1.5x
+        assert_eq!(logical_to_device(100, 150), 125); // 1.25x
+        assert_eq!(logical_to_device(101, 150), 126); // 126.25 -> 126 (nearest)
+                                                      // No overflow at the extremes (u64 math, then narrowed).
+        assert_eq!(logical_to_device(16384, 240), 32768);
+    }
+
+    #[test]
+    fn integer_scale_is_the_max_over_entered_outputs() {
+        let mut s = Scaling::new((800, 600));
+        s.outputs = vec![(10, 1), (11, 2), (12, 3)];
+        assert_eq!(s.integer_scale(), 1, "no outputs entered -> 1");
+        s.entered = vec![10];
+        assert_eq!(s.integer_scale(), 1);
+        s.entered = vec![10, 11];
+        assert_eq!(
+            s.integer_scale(),
+            2,
+            "spanning two outputs takes the larger"
+        );
+        s.entered = vec![11, 12];
+        assert_eq!(s.integer_scale(), 3);
+        // An entered id we never bound is ignored, and the floor is 1.
+        s.entered = vec![99];
+        assert_eq!(s.integer_scale(), 1);
+    }
+
+    #[test]
+    fn a_fresh_scaling_is_unity_and_not_fractional() {
+        let s = Scaling::new((800, 600));
+        assert_eq!(s.factor_120, SCALE_120_UNITY);
+        assert!(!s.is_fractional(), "no viewport yet");
     }
 }
