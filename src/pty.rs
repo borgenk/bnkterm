@@ -79,6 +79,9 @@ impl Pty {
         let slave_path = ptsname(master.as_raw_fd())?;
         set_winsize(master.as_raw_fd(), cols, rows)?;
         set_nonblocking(master.as_raw_fd())?;
+        // Best-effort throughput win (the child inherits it before the fork); the
+        // pty still works cooked-and-slow if it fails, so it is not fatal.
+        let _ = disable_opost(master.as_raw_fd());
 
         // Exported before the fork so the child inherits them. The process is
         // still single-purpose here; set_var is safe on this edition.
@@ -274,6 +277,14 @@ const F_SETFL: c_int = 4;
 // tty ioctls (Linux).
 const TIOCSCTTY: c_ulong = 0x540E;
 const TIOCSWINSZ: c_ulong = 0x5414;
+
+/// `OPOST` (`termios.h` `c_oflag`): output post-processing, whose `ONLCR` subflag
+/// maps `\n` to `\r\n`. We clear it so the tty stops dribbling the master read side
+/// in ~200-byte chunks (see [`disable_opost`]). `TCSANOW` applies a `tcsetattr`
+/// immediately. `NCCS` is the control-char array length in `struct termios`.
+const OPOST: u32 = 0o1;
+const TCSANOW: c_int = 0;
+const NCCS: usize = 32;
 // waitpid options.
 const WNOHANG: c_int = 1;
 // poll events.
@@ -304,6 +315,22 @@ struct Pollfd {
     revents: c_short,
 }
 
+/// `struct termios` (`termios.h`), Linux generic ABI: four flag words, the line
+/// discipline byte, the control-char array, and the two speeds. Mirrored field for
+/// field only to read the current settings, clear `OPOST` in `c_oflag`, and write
+/// them back; the size is pinned in the tests against the C ABI.
+#[repr(C)]
+struct Termios {
+    c_iflag: u32,
+    c_oflag: u32,
+    c_cflag: u32,
+    c_lflag: u32,
+    c_line: u8,
+    c_cc: [u8; NCCS],
+    c_ispeed: u32,
+    c_ospeed: u32,
+}
+
 extern "C" {
     fn posix_openpt(flags: c_int) -> c_int;
     fn grantpt(fd: c_int) -> c_int;
@@ -321,6 +348,8 @@ extern "C" {
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
     fn poll(fds: *mut Pollfd, nfds: c_ulong, timeout: c_int) -> c_int;
+    fn tcgetattr(fd: c_int, termios: *mut Termios) -> c_int;
+    fn tcsetattr(fd: c_int, actions: c_int, termios: *const Termios) -> c_int;
     fn _exit(code: c_int) -> !;
     fn __errno_location() -> *mut c_int;
 }
@@ -356,6 +385,28 @@ fn set_nonblocking(master: RawFd) -> Result<()> {
     // SAFETY: F_SETFL takes the new flag word; the fd is valid.
     if unsafe { fcntl(master, F_SETFL, flags | O_NONBLOCK) } < 0 {
         return Err(errno_error("fcntl(F_SETFL)"));
+    }
+    Ok(())
+}
+
+/// Clear `OPOST` on the tty so it stops post-processing the child's output. With
+/// `OPOST` on (the kernel default) the line discipline maps `\n` to `\r\n` and
+/// flushes the master read side in ~200-byte chunks, which caps a `cat` far below
+/// the parser's real rate; with it off the tty hands us multi-KB reads (~2.5x cat
+/// throughput). The terminal applies the equivalent `\n` -> newline mapping itself
+/// (see `grid::Screen::execute`), so the on-screen result is unchanged. Setting it
+/// on the master before the fork means the child inherits it. Best-effort: on
+/// failure the pty just runs in the slower cooked mode.
+fn disable_opost(master: RawFd) -> Result<()> {
+    // SAFETY: `t` is a live, correctly-typed local; tcgetattr fills it for `master`.
+    let mut t: Termios = unsafe { core::mem::zeroed() };
+    if unsafe { tcgetattr(master, &mut t) } != 0 {
+        return Err(errno_error("tcgetattr"));
+    }
+    t.c_oflag &= !OPOST;
+    // SAFETY: tcsetattr reads the live `t` and applies it to `master`.
+    if unsafe { tcsetattr(master, TCSANOW, &t) } != 0 {
+        return Err(errno_error("tcsetattr"));
     }
     Ok(())
 }
@@ -422,6 +473,15 @@ mod tests {
         // These mirror C structs the kernel writes/reads; pin their sizes.
         assert_eq!(std::mem::size_of::<Winsize>(), 8);
         assert_eq!(std::mem::size_of::<Pollfd>(), 8);
+    }
+
+    #[test]
+    fn termios_matches_the_c_abi() {
+        // tcgetattr/tcsetattr read and write the whole struct, so its size must
+        // match `struct termios` exactly: 4 flag words (16) + c_line (1) +
+        // c_cc[32] (32), padded to align the two 4-byte speeds = 60 on Linux.
+        assert_eq!(std::mem::size_of::<Termios>(), 60);
+        assert_eq!(std::mem::align_of::<Termios>(), 4);
     }
 
     #[test]
