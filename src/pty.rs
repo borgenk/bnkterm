@@ -79,9 +79,10 @@ impl Pty {
         let slave_path = ptsname(master.as_raw_fd())?;
         set_winsize(master.as_raw_fd(), cols, rows)?;
         set_nonblocking(master.as_raw_fd())?;
-        // Best-effort throughput win (the child inherits it before the fork); the
-        // pty still works cooked-and-slow if it fails, so it is not fatal.
-        let _ = disable_opost(master.as_raw_fd());
+        // Mark tty input as UTF-8 (the child inherits it before the fork). The
+        // output flags are left at the cooked default, so the pty still works if
+        // this fails; it is not fatal.
+        let _ = enable_iutf8(master.as_raw_fd());
 
         // Exported before the fork so the child inherits them. The process is
         // still single-purpose here; set_var is safe on this edition.
@@ -278,11 +279,11 @@ const F_SETFL: c_int = 4;
 const TIOCSCTTY: c_ulong = 0x540E;
 const TIOCSWINSZ: c_ulong = 0x5414;
 
-/// `OPOST` (`termios.h` `c_oflag`): output post-processing, whose `ONLCR` subflag
-/// maps `\n` to `\r\n`. We clear it so the tty stops dribbling the master read side
-/// in ~200-byte chunks (see [`disable_opost`]). `TCSANOW` applies a `tcsetattr`
-/// immediately. `NCCS` is the control-char array length in `struct termios`.
-const OPOST: u32 = 0o1;
+/// `IUTF8` (`termios.h` `c_iflag`): marks tty input as UTF-8 so a cooked-mode ERASE
+/// deletes a whole multibyte character rather than one byte (see [`enable_iutf8`]).
+/// `TCSANOW` applies a `tcsetattr` immediately. `NCCS` is the control-char array
+/// length in `struct termios`.
+const IUTF8: u32 = 0o40000;
 const TCSANOW: c_int = 0;
 const NCCS: usize = 32;
 // waitpid options.
@@ -317,7 +318,7 @@ struct Pollfd {
 
 /// `struct termios` (`termios.h`), Linux generic ABI: four flag words, the line
 /// discipline byte, the control-char array, and the two speeds. Mirrored field for
-/// field only to read the current settings, clear `OPOST` in `c_oflag`, and write
+/// field only to read the current settings, set `IUTF8` in `c_iflag`, and write
 /// them back; the size is pinned in the tests against the C ABI.
 #[repr(C)]
 struct Termios {
@@ -389,21 +390,20 @@ fn set_nonblocking(master: RawFd) -> Result<()> {
     Ok(())
 }
 
-/// Clear `OPOST` on the tty so it stops post-processing the child's output. With
-/// `OPOST` on (the kernel default) the line discipline maps `\n` to `\r\n` and
-/// flushes the master read side in ~200-byte chunks, which caps a `cat` far below
-/// the parser's real rate; with it off the tty hands us multi-KB reads (~2.5x cat
-/// throughput). The terminal applies the equivalent `\n` -> newline mapping itself
-/// (see `grid::Screen::execute`), so the on-screen result is unchanged. Setting it
-/// on the master before the fork means the child inherits it. Best-effort: on
-/// failure the pty just runs in the slower cooked mode.
-fn disable_opost(master: RawFd) -> Result<()> {
+/// Set `IUTF8` on the tty so cooked-mode line editing treats input as UTF-8: an
+/// ERASE (backspace) deletes a whole multibyte character rather than a single byte.
+/// This is the one termios tweak mainstream terminals make;
+/// the output flags (`OPOST`/`ONLCR`) are left at the kernel default, so programs
+/// that rely on the tty mapping `\n` to `\r\n` still render correctly. Setting it on
+/// the master before the fork means the child inherits it. Best-effort: on failure
+/// the pty just runs without it.
+fn enable_iutf8(master: RawFd) -> Result<()> {
     // SAFETY: `t` is a live, correctly-typed local; tcgetattr fills it for `master`.
     let mut t: Termios = unsafe { core::mem::zeroed() };
     if unsafe { tcgetattr(master, &mut t) } != 0 {
         return Err(errno_error("tcgetattr"));
     }
-    t.c_oflag &= !OPOST;
+    t.c_iflag |= IUTF8;
     // SAFETY: tcsetattr reads the live `t` and applies it to `master`.
     if unsafe { tcsetattr(master, TCSANOW, &t) } != 0 {
         return Err(errno_error("tcsetattr"));

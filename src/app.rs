@@ -560,7 +560,7 @@ impl State {
         self.grid_dims = (cols, rows);
         // Ship the fresh grid size and geometry to the core: it resizes the grid and
         // the PTY winsize (best-effort, so this cannot fail from here — see `apply`),
-        // and keeps the geometry copies `build_frame_list` lays out with.
+        // and keeps the geometry copies `fill_frame_list` lays out with.
         let _ = self.core.apply(ToTerminal::Resize {
             cols,
             rows,

@@ -65,7 +65,10 @@ pub struct AtlasUpload {
     pub bytes: Vec<u8>,
 }
 
-/// Everything the Vulkan renderer needs to draw one frame.
+/// Everything the Vulkan renderer needs to draw one frame. Reused across frames by
+/// [`build_frame_into`]: its `vertices`/`batches` are cleared and refilled, so a
+/// steady frame keeps their capacity instead of reallocating.
+#[derive(Default)]
 pub struct FrameData {
     pub vertices: Vec<Vertex>,
     pub batches: Vec<Batch>,
@@ -77,7 +80,7 @@ pub struct FrameData {
     pub emoji_upload: Option<AtlasUpload>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct AtlasInfo {
     pub width: u32,
     pub height: u32,
@@ -299,23 +302,32 @@ impl GlyphCache {
     }
 }
 
-/// Build one frame's GPU data from the display list. Restarts internally if an
-/// atlas grows mid-build, so the returned vertices always reference current atlas
-/// coordinates.
-pub fn build_frame(fonts: &Fonts, list: &[DrawCmd], cache: &mut GlyphCache) -> FrameData {
+/// Build one frame's GPU data from the display list into `out` (whose vertex and
+/// batch buffers are cleared and reused, so a steady frame allocates nothing).
+/// Restarts internally if an atlas grows mid-build, so the vertices always
+/// reference current atlas coordinates.
+pub fn build_frame_into(
+    fonts: &Fonts,
+    list: &[DrawCmd],
+    cache: &mut GlyphCache,
+    out: &mut FrameData,
+) {
     loop {
         let glyphs_gen = cache.glyphs.generation;
         let emoji_gen = cache.emoji.generation;
-        let mut b = Batcher {
-            fonts,
-            cache,
-            vertices: Vec::new(),
-            batches: Vec::new(),
-        };
-        for cmd in list {
-            b.command(cmd);
+        out.vertices.clear();
+        out.batches.clear();
+        {
+            let mut b = Batcher {
+                fonts,
+                cache: &mut *cache,
+                vertices: &mut out.vertices,
+                batches: &mut out.batches,
+            };
+            for cmd in list {
+                b.command(cmd);
+            }
         }
-        let (vertices, batches) = (b.vertices, b.batches);
         // An atlas grew (and wiped) during the build: earlier quads reference
         // dead coordinates. Clear the stale slot records and rebuild; the
         // second pass fits by construction (or skips at the cap).
@@ -323,22 +335,27 @@ pub fn build_frame(fonts: &Fonts, list: &[DrawCmd], cache: &mut GlyphCache) -> F
             cache.reset_for(glyphs_gen, emoji_gen);
             continue;
         }
-        return FrameData {
-            vertices,
-            batches,
-            glyph_atlas: cache.glyphs.info(),
-            emoji_atlas: cache.emoji.info(),
-            glyph_upload: cache.glyphs.take_upload(),
-            emoji_upload: cache.emoji.take_upload(),
-        };
+        out.glyph_atlas = cache.glyphs.info();
+        out.emoji_atlas = cache.emoji.info();
+        out.glyph_upload = cache.glyphs.take_upload();
+        out.emoji_upload = cache.emoji.take_upload();
+        return;
     }
+}
+
+/// Build a fresh frame, allocating its vertex and batch vectors. The one-shot path
+/// for tests; the render loop calls [`build_frame_into`] with a reused [`FrameData`].
+pub fn build_frame(fonts: &Fonts, list: &[DrawCmd], cache: &mut GlyphCache) -> FrameData {
+    let mut out = FrameData::default();
+    build_frame_into(fonts, list, cache, &mut out);
+    out
 }
 
 struct Batcher<'a> {
     fonts: &'a Fonts,
     cache: &'a mut GlyphCache,
-    vertices: Vec<Vertex>,
-    batches: Vec<Batch>,
+    vertices: &'a mut Vec<Vertex>,
+    batches: &'a mut Vec<Batch>,
 }
 
 impl Batcher<'_> {

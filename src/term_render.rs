@@ -169,13 +169,57 @@ impl Selection {
     }
 }
 
-/// Build the frame for `screen`: the whole visible grid as a display list, ready
-/// for [`crate::render::display::damage`] and [`crate::render::gpu::build_frame`].
-/// `origin` is the top-left pixel the grid is drawn from (the window padding);
-/// the background still fills the whole `surface`, so the inset shows as a margin
-/// of background around the text. Pure in its inputs (no fonts, no GPU), so a test
-/// asserts the exact primitives a grid state produces and the damage diff proves
-/// an unchanged frame is free.
+/// The inputs a frame build reads: the grid and its theme, the fixed cell metrics,
+/// the `surface`/`origin` geometry (`origin` is the grid's top-left pixel, the window
+/// padding; the background still fills the whole `surface`, so the inset shows as a
+/// margin), and the transient cursor and selection. Grouped so the pooled and
+/// one-shot builders share one parameter and the window/bench assemble it in one
+/// place. Pure data (no fonts, no GPU), so a test asserts the exact primitives a
+/// grid state produces.
+pub struct FrameInputs<'a> {
+    pub screen: &'a Screen,
+    pub theme: &'a Theme,
+    pub metrics: CellMetrics,
+    pub surface: (i32, i32),
+    pub origin: (i32, i32),
+    pub cursor: CursorRender,
+    pub selection: Option<Selection>,
+}
+
+/// Build the frame's display list into `out` (cleared first), drawing every run's
+/// text from `strings` — a pool of buffers retired by a previous frame — so a steady
+/// stream of frames rebuilds the list without allocating. Both are owned by a
+/// [`DisplayListPool`] across frames; `out` keeps its capacity and the strings are
+/// recycled, so only a first frame (or a grown grid) touches the allocator.
+pub fn build_display_list_into(
+    out: &mut DisplayList,
+    strings: &mut Vec<String>,
+    inputs: &FrameInputs,
+) {
+    out.clear();
+    let mut painter = Painter {
+        screen: inputs.screen,
+        theme: inputs.theme,
+        metrics: inputs.metrics,
+        origin: inputs.origin,
+        selection: inputs.selection,
+        list: out,
+        strings,
+    };
+    painter.background(inputs.surface);
+    let (cols, rows) = inputs.screen.dimensions();
+    for row in 0..rows {
+        painter.background_row(row, cols);
+        painter.foreground_row(row, cols);
+    }
+    painter.cursor(inputs.cursor, cols, rows);
+    painter.scroll_indicator(inputs.surface, rows);
+}
+
+/// Build a fresh display list, allocating its vector and run strings. The one-shot
+/// path for tests and callers that do not keep frame-to-frame state; the windowed
+/// render loop uses [`build_display_list_into`] with a [`DisplayListPool`] to stay
+/// allocation-free in steady state.
 pub fn build_display_list(
     screen: &Screen,
     theme: &Theme,
@@ -185,23 +229,87 @@ pub fn build_display_list(
     cursor: CursorRender,
     selection: Option<Selection>,
 ) -> DisplayList {
-    let mut painter = Painter {
-        screen,
-        theme,
-        metrics,
-        origin,
-        selection,
-        list: Vec::new(),
-    };
-    painter.background(surface);
-    let (cols, rows) = screen.dimensions();
-    for row in 0..rows {
-        painter.background_row(row, cols);
-        painter.foreground_row(row, cols);
+    let mut out = DisplayList::new();
+    let mut strings = Vec::new();
+    build_display_list_into(
+        &mut out,
+        &mut strings,
+        &FrameInputs {
+            screen,
+            theme,
+            metrics,
+            surface,
+            origin,
+            cursor,
+            selection,
+        },
+    );
+    out
+}
+
+/// Reusable storage for the per-frame display list, so a steady stream of frames
+/// rebuilds it without touching the allocator. Two buffers let the damage differ
+/// compare the on-screen frame against the freshly built one; a pool of string
+/// buffers salvaged from retired [`DrawCmd`]s feeds the next build.
+///
+/// ```text
+///   begin()  ─ salvage back's run strings ─▶ pool, clear back
+///   fill back (build_display_list_into, drawing text from the pool)
+///   damage(front, back) ─▶ regions to repaint
+///   commit() ─ swap front/back once the frame is presented
+/// ```
+#[derive(Default)]
+pub struct DisplayListPool {
+    /// The two lists; `front` indexes the on-screen one, `front ^ 1` the scratch.
+    buffers: [DisplayList; 2],
+    front: usize,
+    /// String buffers reclaimed from retired commands, cleared and ready to refill.
+    strings: Vec<String>,
+}
+
+impl DisplayListPool {
+    /// Recycle the back buffer's run strings into the pool and empty it (keeping its
+    /// capacity), then hand back that empty buffer and the pool to fill.
+    pub fn begin(&mut self) -> (&mut DisplayList, &mut Vec<String>) {
+        let back = self.front ^ 1;
+        let buf = &mut self.buffers[back];
+        let strings = &mut self.strings;
+        for cmd in buf.drain(..) {
+            if let Some(s) = cmd.into_text_buf() {
+                strings.push(s);
+            }
+        }
+        (buf, strings)
     }
-    painter.cursor(cursor, cols, rows);
-    painter.scroll_indicator(surface, rows);
-    painter.list
+
+    /// The on-screen list (the previous frame): the differ's `old` side.
+    pub fn front(&self) -> &DisplayList {
+        &self.buffers[self.front]
+    }
+
+    /// The freshly built list (this frame): the differ's `new` side.
+    pub fn back(&self) -> &DisplayList {
+        &self.buffers[self.front ^ 1]
+    }
+
+    /// Promote the built back buffer to the on-screen list, once it is presented.
+    pub fn commit(&mut self) {
+        self.front ^= 1;
+    }
+
+    /// Forget both frames (a resize wiped the buffers): recycle their strings and
+    /// clear them, so the next diff sees an empty prev and repaints in full.
+    pub fn reset(&mut self) {
+        let strings = &mut self.strings;
+        for buf in &mut self.buffers {
+            for cmd in buf.drain(..) {
+                if let Some(s) = cmd.into_text_buf() {
+                    strings.push(s);
+                }
+            }
+        }
+        self.front = 0;
+    }
 }
 
 /// The per-frame builder: the shared inputs plus the list being appended to. One
@@ -215,10 +323,22 @@ struct Painter<'a> {
     /// so the whole grid rides the same rigid offset and can never drift from it.
     origin: (i32, i32),
     selection: Option<Selection>,
-    list: DisplayList,
+    /// The list being appended to, owned by the caller's [`DisplayListPool`] and
+    /// reused across frames.
+    list: &'a mut DisplayList,
+    /// Recycled string buffers to draw run/glyph text from, so a steady frame's
+    /// text costs no allocation.
+    strings: &'a mut Vec<String>,
 }
 
 impl Painter<'_> {
+    /// A cleared string buffer from the recycle pool, or a fresh empty one when the
+    /// pool is dry. Every run and glyph text is drawn from here so the frame reuses
+    /// the buffers the previous frame retired.
+    fn take_string(&mut self) -> String {
+        self.strings.pop().unwrap_or_default()
+    }
+
     /// The left pixel of column `col`, from the content origin.
     fn cell_x(&self, col: usize) -> i32 {
         self.origin.0 + col as i32 * self.metrics.w
@@ -320,7 +440,11 @@ impl Painter<'_> {
         let fg = self.cell_fg(first);
         let style = style_of(first);
         let end = self.run_end(row, col, cols, first);
-        let mut text = String::new();
+        // A recycled buffer (from the pool) usually already has the capacity a run
+        // needs; reserving covers a fresh one and any run longer than last frame's,
+        // so an all-ASCII run (the common case) fills without reallocating.
+        let mut text = self.take_string();
+        text.reserve(end - col);
         // Bytes and cell count up to and including the last cell with ink, so a
         // trailing blank never lands in the emitted text.
         let mut inked_bytes = 0;
@@ -396,7 +520,7 @@ impl Painter<'_> {
         let m = self.metrics;
         let x = self.cell_x(col);
         let width_cells = if cell.is_wide_leader() { 2 } else { 1 };
-        let mut text = String::new();
+        let mut text = self.take_string();
         text.push(cell.rune);
         if let Some(marks) = self.marks(row, col) {
             text.extend(marks);
@@ -518,7 +642,7 @@ impl Painter<'_> {
         let m = self.metrics;
         let x = self.cell_x(col);
         let baseline = self.baseline(row);
-        let mut text = String::new();
+        let mut text = self.take_string();
         text.push(cell.rune);
         if let Some(marks) = self.marks(row, col) {
             text.extend(marks);

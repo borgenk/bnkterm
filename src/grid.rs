@@ -1924,20 +1924,13 @@ impl Perform for Screen {
 
     fn execute(&mut self, byte: u8) {
         match byte {
-            0x08 => self.backspace(), // BS
-            0x09 => self.tab(),       // HT
-            // LF also carriage-returns. The PTY runs with OPOST off (so the tty
-            // hands us multi-KB reads instead of ~200-byte dribbles, a ~2.5x cat
-            // throughput win), which means the kernel no longer maps `\n` to `\r\n`
-            // for us — so the terminal applies that ONLCR itself here. This matches
-            // xterm's *net* behaviour (ONLCR-on + LF-down-only), and `IND` (ESC D)
-            // plus `VT`/`FF` stay down-only, which ONLCR never touched.
-            0x0a => self.next_line(), // LF (with the ONLCR we now own)
-            0x0b | 0x0c => self.line_feed(), // VT, FF
-            0x0d => self.carriage_return(), // CR
-            0x0e => self.gl_is_g1 = true, // SO (shift out to G1)
-            0x0f => self.gl_is_g1 = false, // SI (shift in to G0)
-            _ => {}                   // BEL, NUL, ...: nothing to draw
+            0x08 => self.backspace(),        // BS
+            0x09 => self.tab(),              // HT
+            0x0a..=0x0c => self.line_feed(), // LF, VT, FF
+            0x0d => self.carriage_return(),  // CR
+            0x0e => self.gl_is_g1 = true,    // SO (shift out to G1)
+            0x0f => self.gl_is_g1 = false,   // SI (shift in to G0)
+            _ => {}                          // BEL, NUL, ...: nothing to draw
         }
     }
 
@@ -2231,19 +2224,6 @@ mod tests {
         assert_eq!(s.cursor(), (0, 0));
         s.line_feed();
         assert_eq!(s.cursor(), (1, 0));
-    }
-
-    #[test]
-    fn c0_line_feed_returns_to_column_zero() {
-        // The pty runs with OPOST off (see `pty::disable_opost`), so the terminal
-        // owns the `\n` -> `\r\n` mapping the kernel used to do: a bare C0 LF through
-        // the parser must carriage-return too, or every `cat` line would staircase.
-        let mut s = Screen::new(20, 4);
-        let mut p = crate::vt::Parser::new();
-        p.advance_bytes(&mut s, b"abc\ndef");
-        assert_eq!(s.row_string(0).trim_end(), "abc");
-        assert_eq!(s.row_string(1).trim_end(), "def"); // col 0, not staircased to col 3
-        assert_eq!(s.cursor(), (1, 3));
     }
 
     #[test]

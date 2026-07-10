@@ -72,7 +72,7 @@ pub enum ToTerminal {
 /// terminal parses output or a copy is made. The window drains these after each
 /// PTY pump and turns each into a Wayland request. The vocabulary grows with the
 /// seam: the frame itself is still pulled directly in Stage 1 (the window calls
-/// [`build_frame_list`](super::terminal::TerminalCore::build_frame_list)), so it
+/// [`fill_frame_list`](super::terminal::TerminalCore::fill_frame_list)), so it
 /// is not a message yet; Stage 2 adds `Frame` when the terminal becomes a separate
 /// producer.
 pub enum ToWindow {

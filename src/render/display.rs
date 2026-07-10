@@ -104,6 +104,20 @@ impl DrawCmd {
             DrawCmd::Text { bounds, .. } | DrawCmd::Cells { bounds, .. } => *bounds,
         }
     }
+
+    /// Reclaim this command's text buffer, cleared, when it carries one. The
+    /// per-frame display-list pool recycles these so a steady frame's run text is
+    /// drawn from the buffers the previous frame retired rather than freshly
+    /// allocated ones; a command with no text (a fill) yields `None`.
+    pub fn into_text_buf(self) -> Option<String> {
+        match self {
+            DrawCmd::Cells { mut text, .. } | DrawCmd::Text { mut text, .. } => {
+                text.clear();
+                Some(text)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The screen regions that differ between the previous frame `old` and the new
@@ -132,7 +146,9 @@ pub fn damage(old: &[DrawCmd], new: &[DrawCmd], width: i32, height: i32) -> Vec<
         .count();
     let (old, new) = (&old[..old.len() - suffix], &new[..new.len() - suffix]);
 
-    let mut counts: HashMap<&DrawCmd, i32> = HashMap::new();
+    // Sized for the differing commands up front (all distinct in the worst case),
+    // so a full-screen turnover fills the map without a single rehash.
+    let mut counts: HashMap<&DrawCmd, i32> = HashMap::with_capacity(old.len() + new.len());
     for c in old {
         *counts.entry(c).or_insert(0) += 1;
     }
@@ -145,11 +161,15 @@ pub fn damage(old: &[DrawCmd], new: &[DrawCmd], width: i32, height: i32) -> Vec<
         w: width.max(0),
         h: height.max(0),
     };
-    let mut rects: Vec<Rect> = counts
-        .into_iter()
-        .filter(|&(_, n)| n != 0)
-        .filter_map(|(c, _)| intersection(c.bounds(), surface))
-        .collect();
+    // Sized for the worst case (every differing command survives the clip) so the
+    // collect grows the vector at most once, not once per doubling.
+    let mut rects: Vec<Rect> = Vec::with_capacity(counts.len());
+    rects.extend(
+        counts
+            .into_iter()
+            .filter(|&(_, n)| n != 0)
+            .filter_map(|(c, _)| intersection(c.bounds(), surface)),
+    );
     coalesce(&mut rects);
     let area: i64 = rects.iter().map(|r| r.w as i64 * r.h as i64).sum();
     let surface_area = surface.w as i64 * surface.h as i64;

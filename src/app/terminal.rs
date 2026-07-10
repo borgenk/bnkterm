@@ -8,7 +8,7 @@
 //!   ToTerminal ─▶ TerminalCore::apply ─┬─▶ PTY write   (input → child)
 //!                                      └─▶ grid mutate  (parser, selection, scroll)
 //!   PTY read   ─▶ pump_pty ─▶ parser ─▶ grid ─▶ outbox (Title / Closed)
-//!   grid state ─▶ build_frame_list ─▶ DisplayList (pulled by the window each frame)
+//!   grid state ─▶ fill_frame_list ─▶ DisplayList (pulled by the window each frame)
 //! ```
 //!
 //! The window drives it: it resolves compositor events into [`ToTerminal`]
@@ -20,7 +20,6 @@
 //! with this seam unchanged.
 
 use std::os::fd::RawFd;
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use super::message::{PointerEvent, ToTerminal, ToWindow};
@@ -481,7 +480,7 @@ impl TerminalCore {
     /// Compose the window's display list: the visible grid painted at the current
     /// size, cursor on top (solid when focused, hollow when not). Reads the
     /// window-shipped geometry, so it stays a pure function of the grid state.
-    pub(super) fn build_frame_list(&mut self) -> Rc<DisplayList> {
+    pub(super) fn fill_frame_list(&self, out: &mut DisplayList, strings: &mut Vec<String>) {
         // The child chose the shape (DECSCUSR); blink hides it on the off phase
         // while focused, and DECTCEM hides it entirely.
         let blinked_off = self.cursor_blinking() && !self.blink_on;
@@ -490,16 +489,19 @@ impl TerminalCore {
             visible: self.screen.cursor_visible() && !blinked_off,
             focused: self.focused,
         };
-        let list = term_render::build_display_list(
-            &self.screen,
-            &self.theme,
-            self.metrics,
-            (self.width as i32, self.height as i32),
-            (self.pad, self.pad),
-            cursor,
-            self.selection,
+        term_render::build_display_list_into(
+            out,
+            strings,
+            &term_render::FrameInputs {
+                screen: &self.screen,
+                theme: &self.theme,
+                metrics: self.metrics,
+                surface: (self.width as i32, self.height as i32),
+                origin: (self.pad, self.pad),
+                cursor,
+                selection: self.selection,
+            },
         );
-        Rc::new(list)
     }
 
     /// Flip the blink phase if its deadline has passed (called each loop turn).

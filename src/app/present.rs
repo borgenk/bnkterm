@@ -15,7 +15,6 @@
 //! bridge in the Vulkan backend carries ordering.
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::rc::Rc;
 use std::time::Instant;
 
 use super::State;
@@ -31,9 +30,10 @@ use crate::platform::protocol::{
     zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
 use crate::platform::wire::{Arg, Reader};
-use crate::render::display::{self, DisplayList};
+use crate::render::display;
 use crate::render::gpu;
 use crate::render::vulkan;
+use crate::term_render;
 
 /// Client-owned explicit-sync state (`linux-drm-syncobj-v1`), negotiated over a
 /// live GPU backend when the compositor advertises the manager. Two DRM syncobj
@@ -132,7 +132,12 @@ pub(super) struct GpuPresentation {
     pub(super) buffers: [u32; 2],
     pub(super) busy: [bool; 2],
     pub(super) buffer_size: (u32, u32),
-    pub(super) present_list: Rc<DisplayList>,
+    /// The recycled display-list double buffer: the on-screen frame the next one is
+    /// diffed against, plus a pool of run strings, so a steady frame builds the list
+    /// without allocating.
+    pub(super) lists: term_render::DisplayListPool,
+    /// The reused GPU frame data (vertices/batches), refilled in place each frame.
+    pub(super) frame_scratch: gpu::FrameData,
     pub(super) frame_count: u64,
     pub(super) last_present: Option<Instant>,
     pub(super) explicit_fence_frames: u64,
@@ -155,7 +160,8 @@ impl GpuPresentation {
             buffers: [0, 0],
             busy: [false, false],
             buffer_size: (0, 0),
-            present_list: Rc::default(),
+            lists: term_render::DisplayListPool::default(),
+            frame_scratch: gpu::FrameData::default(),
             frame_count: 0,
             last_present: None,
             explicit_fence_frames: 0,
@@ -341,7 +347,7 @@ impl State {
         }
         // Fresh images hold no known frame, so forget what was on screen: the
         // screen diff gates whether the next frame presents at all.
-        self.presentation.present_list = Rc::default();
+        self.presentation.lists.reset();
         Ok(())
     }
 
@@ -431,10 +437,21 @@ impl State {
         };
         let started = self.stats.then(Instant::now);
         let (sw, sh) = (self.width as i32, self.height as i32);
-        let new_list = self.core.build_frame_list();
+        // Rebuild the display list into the recycled back buffer (salvaging the
+        // previous occupant's run strings into the pool first), so a steady frame
+        // builds it without allocating. `front` still holds the on-screen frame.
+        {
+            let (out, strings) = self.presentation.lists.begin();
+            self.core.fill_frame_list(out, strings);
+        }
 
         // Nothing changed since the on-screen frame: nothing to present (idle).
-        let screen_dmg = display::damage(&self.presentation.present_list, &new_list, sw, sh);
+        let screen_dmg = display::damage(
+            self.presentation.lists.front(),
+            self.presentation.lists.back(),
+            sw,
+            sh,
+        );
         // Ack the latest configure paired with this commit, so the buffer the
         // compositor sees is always the one sized to the configure it just acked;
         // that is what keeps an anchored resize edge from jumping. Taken here so
@@ -460,6 +477,14 @@ impl State {
         }
 
         let background = color_f32(self.core.clear_color());
+        // Batch the freshly built list into the reused frame data (vertices/batches
+        // refilled in place, no allocation in steady state).
+        gpu::build_frame_into(
+            &self.fonts,
+            self.presentation.lists.back(),
+            &mut self.presentation.glyphs,
+            &mut self.presentation.frame_scratch,
+        );
         // Render, returning the render-done fence under explicit sync (`None` on
         // the bridge path, or when the driver could not export one).
         let render_done = {
@@ -469,19 +494,21 @@ impl State {
             let Some(img) = self.presentation.images.get_mut(idx) else {
                 return Err(Error::msg("gpu frame without gpu buffers"));
             };
-            let frame = gpu::build_frame(&self.fonts, &new_list, &mut self.presentation.glyphs);
+            let frame = &self.presentation.frame_scratch;
             match self.presentation.explicit_sync.as_ref() {
                 Some(es) => {
                     let release_wait = es.release_fence(idx)?;
-                    gpu.render_list_explicit(img, &frame, background, release_wait)?
+                    gpu.render_list_explicit(img, frame, background, release_wait)?
                 }
                 None => {
-                    gpu.render_list(img, &frame, background)?;
+                    gpu.render_list(img, frame, background)?;
                     None
                 }
             }
         };
-        self.presentation.present_list = new_list;
+        // The freshly built back buffer is now on screen; it becomes next frame's
+        // `front` (the diff's old side).
+        self.presentation.lists.commit();
 
         let buffer = self.presentation.buffers[idx];
         self.conn.request(
