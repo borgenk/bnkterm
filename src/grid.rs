@@ -420,6 +420,51 @@ impl Buffer {
         }
     }
 
+    /// Fill `[start_col, start_col + run.len())` on `row` with `run`'s bytes as
+    /// single-width cells sharing `pen` — the bulk equivalent of one
+    /// [`write_cell`](Self::write_cell) per byte, but with the row (a `VecDeque`
+    /// index) resolved once instead of three times per cell. This is the ASCII
+    /// print hot path, so the redundant per-cell work is what it strips.
+    ///
+    /// The wide-pair break only has to look at the two edges: a wide character
+    /// wholly inside the run has both halves overwritten (no orphan), so only a
+    /// pair the run *straddles* can leave a partner outside it — a spacer at the
+    /// left edge orphans its leader to the left, a leader at the right edge orphans
+    /// its spacer to the right. Combining marks under the run drop in a single
+    /// retain. The `bulk_ascii_matches_per_char_under_fuzz` test pins this against
+    /// the byte-at-a-time path.
+    fn fill_ascii_run(&mut self, row: usize, start_col: usize, run: &[u8], pen: Pen) {
+        let cols = self.cols;
+        let end_col = start_col + run.len();
+        let Some(r) = self.lines.get_mut(row) else {
+            return;
+        };
+        // Left edge: overwriting a wide spacer orphans its leader one cell left.
+        if start_col > 0 && r.cells.get(start_col).is_some_and(|c| c.is_wide_spacer()) {
+            if let Some(slot) = r.cells.get_mut(start_col - 1) {
+                *slot = Cell::BLANK;
+            }
+            r.clear_marks(start_col - 1);
+        }
+        // Right edge: overwriting a wide leader orphans its spacer one cell right.
+        if end_col < cols && r.cells.get(end_col - 1).is_some_and(|c| c.is_wide_leader()) {
+            if let Some(slot) = r.cells.get_mut(end_col) {
+                *slot = Cell::BLANK;
+            }
+        }
+        for (k, &byte) in run.iter().enumerate() {
+            if let Some(slot) = r.cells.get_mut(start_col + k) {
+                *slot = Cell {
+                    rune: char::from(byte),
+                    fg: pen.fg,
+                    bg: pen.bg,
+                    attrs: pen.attrs,
+                };
+            }
+        }
+        r.combining.retain(|(c, _)| *c < start_col || *c >= end_col);
+    }
+
     /// Scroll `[top, bottom]` up by `n`, feeding `blank` rows in at the bottom.
     /// When `to_scrollback` and the region reaches the top of the screen, the
     /// rows leaving the top are retained in scrollback; otherwise they are
@@ -1074,6 +1119,55 @@ impl Screen {
         } else {
             b.cursor.col += cw;
             b.cursor.pending_wrap = false;
+        }
+    }
+
+    /// Bulk-write a run of printable ASCII (each width 1) at the cursor. Equivalent
+    /// to calling [`print`](Self::print) once per byte, but hoisting the per-char
+    /// width lookup, wrap check, and cursor math out of the inner loop: a screenful
+    /// of plain text becomes a few row-fills instead of thousands of single prints.
+    ///
+    /// Caller guarantees (upheld by `<Screen as Perform>::print_ascii`): every byte
+    /// is `0x20..=0x7e`, the active charset is identity ASCII, and insert mode is
+    /// off, so no per-char glyph mapping, wide-cell, or shift handling is needed.
+    /// `write_cell` still runs per cell, so wide-pair and combining-mark cleanup at
+    /// the run's edges is preserved.
+    fn print_ascii_run(&mut self, bytes: &[u8]) {
+        let cols = self.active().cols;
+        if cols == 0 {
+            return;
+        }
+        let pen = self.pen;
+        let autowrap = self.autowrap;
+
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            // Take any deferred wrap the previous cell left before placing more.
+            if self.active().cursor.pending_wrap {
+                self.wrap_line();
+            }
+            let (row, start_col) = {
+                let c = self.active().cursor;
+                (c.row, c.col)
+            };
+            // Fill to the end of the row, or until the run ends. `room >= 1`: the
+            // cursor column is always `< cols`, and a wrap just reset it to 0.
+            let room = cols - start_col;
+            let take = room.min(rest.len());
+            let (run, tail) = rest.split_at(take);
+            self.active_mut().fill_ascii_run(row, start_col, run, pen);
+            rest = tail;
+            // Advance the cursor exactly as the per-char path would after `take`
+            // cells: park at the last column with a deferred wrap when the row filled.
+            let end_col = start_col + take;
+            let b = self.active_mut();
+            if end_col >= cols {
+                b.cursor.col = cols - 1;
+                b.cursor.pending_wrap = autowrap;
+            } else {
+                b.cursor.col = end_col;
+                b.cursor.pending_wrap = false;
+            }
         }
     }
 
@@ -1811,6 +1905,23 @@ impl Perform for Screen {
         self.print(mapped);
     }
 
+    fn print_ascii(&mut self, bytes: &[u8]) {
+        // The bulk write assumes each byte is its own glyph placed one column
+        // apart. That holds only under the identity (ASCII) charset and outside
+        // insert mode; DEC Special Graphics remaps each byte to a line-drawing
+        // glyph, and insert mode shifts the row per char. Fall back to the per-char
+        // path (glyph mapping + inherent print) for both, keeping this identical to
+        // calling `Perform::print` on each byte.
+        if self.insert_mode || self.active_charset() != Charset::Ascii {
+            for &b in bytes {
+                let mapped = self.map_glyph(char::from(b));
+                self.print(mapped);
+            }
+            return;
+        }
+        self.print_ascii_run(bytes);
+    }
+
     fn execute(&mut self, byte: u8) {
         match byte {
             0x08 => self.backspace(),        // BS
@@ -2511,6 +2622,79 @@ mod tests {
             assert_eq!(s.primary.lines.len(), rows);
             assert_eq!(s.alt.lines.len(), rows);
             assert!(s.primary.scrollback.len() <= DEFAULT_SCROLLBACK);
+        }
+    }
+
+    /// Feed `bytes` two ways — `advance_bytes` (which bulk-writes printable-ASCII
+    /// runs) and one byte at a time through `advance` (the per-char path) — and
+    /// assert the resulting screens are identical. Any divergence is a bug in the
+    /// bulk `print_ascii` path.
+    fn assert_bulk_equiv(cols: usize, rows: usize, bytes: &[u8]) {
+        let mut bulk = Screen::new(cols, rows);
+        let mut per = Screen::new(cols, rows);
+        let mut pb = crate::vt::Parser::new();
+        let mut pc = crate::vt::Parser::new();
+        pb.advance_bytes(&mut bulk, bytes);
+        for &b in bytes {
+            pc.advance(&mut per, b);
+        }
+        assert_eq!(bulk.snapshot(), per.snapshot(), "snapshot mismatch");
+        assert_eq!(bulk.cursor(), per.cursor(), "cursor mismatch");
+    }
+
+    #[test]
+    fn bulk_ascii_equivalence_targeted() {
+        // A plain run that soft-wraps across several short rows, then a hard newline.
+        assert_bulk_equiv(10, 3, b"hello world this wraps over rows\r\nnext line");
+        // SGR pen changes split the run into differently-styled cells mid-stream.
+        assert_bulk_equiv(20, 3, b"norm\x1b[31mred\x1b[1;32mboldgreen\x1b[0mback");
+        // DEC Special Graphics via ESC ( 0 remaps ASCII to line-drawing: the bulk
+        // path must fall back and map each glyph. ESC ( B restores identity ASCII.
+        assert_bulk_equiv(20, 3, b"\x1b(0lqqqk abc\x1b(Bplain");
+        // SO/SI shift GL to G1 (designated special-graphics) and back.
+        assert_bulk_equiv(20, 3, b"\x1b)0ab\x0eqqwwee\x0fnormal");
+        // Insert mode (CSI 4h) shifts existing cells right as each char lands.
+        assert_bulk_equiv(20, 3, b"12345\x1b[H\x1b[4hABC");
+        // No autowrap (CSI ?7l): the cursor sticks at the last column and overwrites.
+        assert_bulk_equiv(8, 3, b"\x1b[?7labcdefghijk");
+        // Tab, carriage return, and backspace interleaved with runs.
+        assert_bulk_equiv(20, 3, b"ab\tcd\re\x08fgh");
+        // Cursor addressing lands the cursor mid-row before a run.
+        assert_bulk_equiv(20, 4, b"\x1b[2;5Hplaced here and wrapping onward");
+    }
+
+    #[test]
+    fn bulk_ascii_matches_per_char_under_fuzz() {
+        // A small grid so runs cross rows often, driven by a deterministic stream
+        // dense with ASCII runs but salted with the full byte range (ESC sequences,
+        // controls, high/UTF-8 bytes). Every 4 KiB block must leave both screens
+        // identical — the strongest guard that the bulk path changed nothing.
+        let mut bulk = Screen::new(8, 4);
+        let mut per = Screen::new(8, 4);
+        let mut pb = crate::vt::Parser::new();
+        let mut pc = crate::vt::Parser::new();
+        let mut seed: u64 = 0x0BAD_C0DE_1234_5678;
+        let mut buf = [0u8; 4096];
+        for block in 0..300 {
+            for b in buf.iter_mut() {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let r = (seed >> 33) as u32;
+                // ~1 in 6 bytes is full-range (keeps escapes/controls/UTF-8 in the
+                // mix); the rest are printable ASCII, so runs are long enough to wrap.
+                *b = if r.is_multiple_of(6) {
+                    (r >> 8) as u8
+                } else {
+                    0x20 + ((r >> 8) % 0x5f) as u8
+                };
+            }
+            pb.advance_bytes(&mut bulk, &buf);
+            for &byte in buf.iter() {
+                pc.advance(&mut per, byte);
+            }
+            assert_eq!(bulk.snapshot(), per.snapshot(), "block {block} snapshot");
+            assert_eq!(bulk.cursor(), per.cursor(), "block {block} cursor");
         }
     }
 

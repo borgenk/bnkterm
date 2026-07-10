@@ -35,6 +35,50 @@ const MAX_INTERMEDIATES: usize = 2;
 /// Cap on the OSC string buffer (e.g. a window title); bytes past it are dropped.
 const OSC_MAX: usize = 4096;
 
+/// Length of the leading run of printable ASCII (`0x20..=0x7e`) in `bytes`.
+///
+/// A byte `b` is printable iff `b.wrapping_sub(0x20) <= 0x5e`: one unsigned compare
+/// that rejects `b < 0x20` (wraps high), `b == 0x7f` (DEL, `0x5f`), and `b >= 0x80`
+/// (`>= 0x60`) at once. We sweep eight bytes at a time with SWAR and fall to that
+/// scalar test at the first word that isn't all-printable (and for the < 8-byte
+/// tail). Within a word, a byte is non-printable iff it is `>= 0x80` (`& HI`), or
+/// `< 0x20` (subtracting `0x20` borrows a high bit — a valid existence test once the
+/// high bits are known clear), or `== 0x7f` (adding one carries into the high bit,
+/// and cannot cross a byte boundary while every byte is `< 0x80`). The three terms
+/// are OR-ed: the word is all-printable iff the result is zero. Endianness does not
+/// matter, each byte is tested independently, so a native-order load is fine.
+fn printable_run_len(bytes: &[u8]) -> usize {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const LO_0X20: u64 = 0x2020_2020_2020_2020; // LO * 0x20
+
+    let mut i = 0;
+    while i + 8 <= bytes.len() {
+        // `get`/`try_from` cannot fail here (the window is exactly eight bytes); the
+        // `else` arms just keep the hot path panic-free.
+        let Some(chunk) = bytes.get(i..i + 8) else {
+            break;
+        };
+        let Ok(word) = <[u8; 8]>::try_from(chunk) else {
+            break;
+        };
+        let x = u64::from_ne_bytes(word);
+        let nonprintable = (x & HI) | (x.wrapping_sub(LO_0X20) & HI) | (x.wrapping_add(LO) & HI);
+        if nonprintable != 0 {
+            break;
+        }
+        i += 8;
+    }
+    // The word the SWAR loop stopped on, plus any tail shorter than eight bytes.
+    while let Some(&b) = bytes.get(i) {
+        if b.wrapping_sub(0x20) > 0x5e {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
 /// The actions the parser emits. A consumer implements this to interpret the
 /// stream; `grid::Screen` does so to drive the terminal, and tests do so to
 /// record the action sequence. Kept low-level (raw params, not pre-interpreted
@@ -43,6 +87,16 @@ const OSC_MAX: usize = 4096;
 pub trait Perform {
     /// A printable character (already UTF-8 decoded).
     fn print(&mut self, c: char);
+    /// A run of printable ASCII bytes (each `0x20..=0x7e`, width 1), in order. The
+    /// default prints them one at a time, so an implementor need not handle it; one
+    /// that can write cells in bulk (`grid::Screen`) overrides this to skip the
+    /// per-char width lookup and wrap math. `advance_bytes` emits it for plain-text
+    /// runs, which is the common case in a terminal stream.
+    fn print_ascii(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.print(char::from(b));
+        }
+    }
     /// A C0/C1 control byte to act on (BS, HT, LF, CR, ...).
     fn execute(&mut self, byte: u8);
     /// A complete CSI sequence: its numeric parameters, intermediate bytes, the
@@ -115,9 +169,31 @@ impl Parser {
 
     /// Feed a chunk of bytes. Reading the PTY in large chunks and handing the
     /// parser a slice (not a byte at a time) is the ingestion fast path.
+    ///
+    /// The bulk of a terminal stream is plain text, and in `Ground` a printable
+    /// ASCII byte prints one char and changes no state. So when we are in `Ground`
+    /// with no partial UTF-8 pending, we scan the whole run of printable ASCII with
+    /// a SWAR sweep ([`printable_run_len`]) and print it directly, skipping the
+    /// per-byte state-machine dispatch. Every other byte still goes through the full
+    /// [`advance`](Self::advance) path, so behavior is byte-for-byte identical, this
+    /// is purely a faster road for the common case (guarded by the golden suite and
+    /// the 2M-byte fuzz test, which must stay green).
     pub fn advance_bytes<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) {
-        for &byte in bytes {
-            self.advance(performer, byte);
+        let mut rest = bytes;
+        while let Some(&first) = rest.first() {
+            if self.state == State::Ground
+                && self.utf8_remaining == 0
+                && first.wrapping_sub(0x20) <= 0x5e
+            {
+                // `first` is printable, so the run is at least one byte; `rest`
+                // strictly shrinks and the loop terminates.
+                let n = printable_run_len(rest);
+                performer.print_ascii(&rest[..n]);
+                rest = &rest[n..];
+            } else {
+                self.advance(performer, first);
+                rest = &rest[1..];
+            }
         }
     }
 
@@ -472,6 +548,18 @@ mod tests {
         r.actions
     }
 
+    /// The reference path: feed one byte at a time through `advance`, bypassing the
+    /// chunked fast path in `advance_bytes`. Any divergence between this and `run`
+    /// is a fast-path bug.
+    fn run_per_byte(bytes: &[u8]) -> Vec<Action> {
+        let mut p = Parser::new();
+        let mut r = Recorder::default();
+        for &b in bytes {
+            p.advance(&mut r, b);
+        }
+        r.actions
+    }
+
     #[test]
     fn plain_ascii_prints() {
         assert_eq!(run(b"hi"), vec![Action::Print('h'), Action::Print('i')]);
@@ -711,6 +799,65 @@ mod tests {
             p.advance(&mut r, byte);
             // Keep the recorder from growing without bound over the whole run.
             r.actions.clear();
+        }
+    }
+
+    #[test]
+    fn printable_run_len_finds_ascii_runs() {
+        assert_eq!(printable_run_len(b""), 0);
+        assert_eq!(printable_run_len(b"hello"), 5);
+        assert_eq!(printable_run_len(b"\nabc"), 0); // first byte non-printable
+        assert_eq!(printable_run_len(b"hi\nthere"), 2); // LF stops the run
+        assert_eq!(printable_run_len(b"ab\x7fcd"), 2); // DEL stops it
+        assert_eq!(printable_run_len(b"ab\x1fcd"), 2); // a C0 control stops it
+        assert_eq!(printable_run_len(b"ab\x80"), 2); // a UTF-8 high byte stops it
+                                                     // The inclusive boundaries space (0x20) and tilde (0x7e) are printable.
+        assert_eq!(printable_run_len(&[0x20, 0x7e]), 2);
+        // Exactly one SWAR word, all printable.
+        assert_eq!(printable_run_len(b"abcdefgh"), 8);
+        // A non-printable exactly at the word boundary: the SWAR loop must stop at 8.
+        assert_eq!(printable_run_len(b"abcdefgh\nij"), 8);
+        // A control in the second word: 10 printable, then LF.
+        assert_eq!(printable_run_len(b"abcdefghij\nkl"), 10);
+        // A run spanning several words.
+        assert_eq!(printable_run_len(&[b'x'; 100]), 100);
+    }
+
+    #[test]
+    fn fast_path_matches_byte_at_a_time() {
+        // The ASCII fast path in advance_bytes must be byte-for-byte identical to
+        // feeding advance() one byte at a time. Build a deterministic stream biased
+        // toward printable ASCII (long runs) but salted with the interesting bytes:
+        // ESC, C0 controls, DEL, and UTF-8 lead/continuation/invalid bytes, so run
+        // boundaries, SWAR word edges, and every state transition get exercised.
+        let mut seed: u64 = 0xdead_beef_0bad_f00d;
+        let mut bytes = Vec::with_capacity(50_000);
+        for _ in 0..50_000 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let r = (seed >> 33) as u32;
+            let b = match r % 16 {
+                0 => 0x1b,                           // ESC (starts a sequence)
+                1 => ((r >> 8) as u8) | 0x80,        // UTF-8 lead / continuation / invalid
+                2 => ((r >> 8) as u8) & 0x1f,        // a C0 control
+                3 => 0x7f,                           // DEL
+                _ => 0x20 + ((r >> 8) % 0x5f) as u8, // printable ASCII 0x20..=0x7e
+            };
+            bytes.push(b);
+        }
+        // Whole slice at once.
+        assert_eq!(run(&bytes), run_per_byte(&bytes));
+        // And across arbitrary chunk splits: the PTY delivers arbitrary chunks, and
+        // a run / escape sequence / multibyte char can straddle any boundary.
+        let reference = run_per_byte(&bytes);
+        for split in [1usize, 7, 8, 9, 63, 64, 100, 4096] {
+            let mut p = Parser::new();
+            let mut rec = Recorder::default();
+            for chunk in bytes.chunks(split) {
+                p.advance_bytes(&mut rec, chunk);
+            }
+            assert_eq!(rec.actions, reference, "chunk split {split}");
         }
     }
 }
