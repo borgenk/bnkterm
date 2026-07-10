@@ -12,6 +12,7 @@
 
 use std::os::fd::AsRawFd;
 
+use super::message::ToTerminal;
 use super::State;
 use crate::error::{Error, Result};
 use crate::platform::ffi;
@@ -118,20 +119,10 @@ impl State {
         Ok(())
     }
 
-    /// Copy the current selection's text to the clipboard (no-op without one).
-    pub(super) fn copy_selection(&mut self) {
-        let Some(sel) = self.selection else {
-            return;
-        };
-        let text = self.screen.selection_text(sel.anchor, sel.head);
-        if !text.is_empty() {
-            self.set_clipboard(text.into_bytes());
-        }
-    }
-
     /// Become the clipboard owner serving `data` as text, replacing any source we
-    /// held. Needs the data device (skips silently without it).
-    fn set_clipboard(&mut self, data: Vec<u8>) {
+    /// held. Needs the data device (skips silently without it). Called from the
+    /// outbox drain when the core reports a fresh selection to own.
+    pub(super) fn set_clipboard(&mut self, data: Vec<u8>) {
         let (Some(manager), true) = (self.data_device_manager, self.data_device != 0) else {
             return;
         };
@@ -163,29 +154,10 @@ impl State {
     /// bracketed-paste markers when the program enabled them (`?2004`). Snaps the
     /// view to the bottom, like any input.
     pub(super) fn paste(&mut self) -> Result<()> {
-        let Some(text) = self.clipboard_text()? else {
-            return Ok(());
-        };
-        if text.is_empty() {
-            return Ok(());
-        }
-        // A pasted newline is delivered as CR; collapse CRLF so it is not doubled.
-        let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-        let bracketed = self.screen.bracketed_paste();
-        let mut buf = Vec::with_capacity(normalized.len() + 12);
-        if bracketed {
-            buf.extend_from_slice(b"\x1b[200~");
-        }
-        buf.extend_from_slice(normalized.as_bytes());
-        if bracketed {
-            buf.extend_from_slice(b"\x1b[201~");
-        }
-        if self.screen.is_scrolled() {
-            self.screen.scroll_view_to_bottom();
-            self.dirty = true;
-        }
-        if let Some(pty) = &self.pty {
-            pty.write_all(&buf)?;
+        // The window fetches the clipboard text (the data-device dance below); the
+        // terminal normalizes, brackets, and writes it (see `TerminalCore::apply`).
+        if let Some(text) = self.clipboard_text()? {
+            self.core.apply(ToTerminal::Paste(text.into_bytes()))?;
         }
         Ok(())
     }

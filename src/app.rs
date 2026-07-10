@@ -21,23 +21,24 @@
 //! render question from the live pipeline.
 
 mod clipboard;
+mod message;
 mod present;
+mod terminal;
 
 use std::os::fd::AsRawFd;
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use self::clipboard::ClipboardState;
+use self::message::{PointerEvent, ToTerminal, ToWindow};
 use self::present::GpuPresentation;
-use crate::color::Theme;
+use self::terminal::TerminalCore;
 // The app orchestrates the platform/render layers (which carry their own error
 // type) and the terminal core (which uses the crate-level one). It speaks the
 // crate-level `Error`/`Result` throughout; a `?` on a platform call converts
 // through the `From` bridge in `crate::error`, so there is one error type here.
 use crate::error::{Error, Result};
-use crate::grid::{CursorStyle, Screen};
 use crate::input;
-use crate::mouse::{self, MouseButton, MouseKind};
+use crate::mouse::MouseButton;
 use crate::platform::conn::{Connection, Fill};
 use crate::platform::ffi;
 use crate::platform::freetype::Fonts;
@@ -49,10 +50,8 @@ use crate::platform::protocol::{
 };
 use crate::platform::wire::{Arg, Message, Reader};
 use crate::platform::xkb::Xkb;
-use crate::pty::{self, Pty, ReadOutcome};
-use crate::render::display::DisplayList;
-use crate::term_render::{self, CellMetrics, CursorRender, CursorShape, Selection};
-use crate::vt::Parser;
+use crate::pty;
+use crate::term_render::CellMetrics;
 
 /// The default font size in points. Converted to device pixels at the display's
 /// scale factor (see [`points_to_px`]), so the physical size tracks DPI the way
@@ -74,9 +73,6 @@ const SCALE_120_UNITY: u32 = 120;
 /// tunes it (1.0 disables the correction, the old heavier look).
 const TEXT_GAMMA: f32 = 2.0;
 
-/// The cursor blink half-period: how long each of the on/off phases lasts.
-const BLINK_INTERVAL: Duration = Duration::from_millis(530);
-
 /// The grid the window opens at, before the compositor sends a size. Classic
 /// 80x24; the surface then resizes to whatever the compositor grants.
 const DEFAULT_COLS: usize = 80;
@@ -87,13 +83,6 @@ const DEFAULT_ROWS: usize = 24;
 /// inset by this and drawn from `(WINDOW_PADDING, WINDOW_PADDING)`; the surface
 /// background fills behind it, so the inset reads as a border of background.
 const WINDOW_PADDING: i32 = 5;
-
-/// The PTY read chunk: large so a burst of output drains in few syscalls.
-const PTY_READ_CHUNK: usize = 64 * 1024;
-
-/// Lines the scrollback view moves per wheel notch, and arrows sent per notch
-/// when the wheel falls back to arrow keys on the alt screen.
-const WHEEL_LINES: usize = 3;
 
 /// Right mouse button (`BTN_RIGHT`) and middle (`BTN_MIDDLE`) from
 /// `linux/input-event-codes.h`; `BTN_LEFT` is in `protocol`.
@@ -198,29 +187,13 @@ struct State {
     conn: Connection,
     fonts: Fonts,
     xkb: Xkb,
-    theme: Theme,
-    /// The fixed cell box the whole grid is laid out on.
+    /// The terminal half of the app behind the seam: the PTY, parser, grid,
+    /// selection, cursor blink, theme, and the frame geometry it lays out with. The
+    /// window feeds it messages, pulls a display list, and drains its outbox.
+    core: TerminalCore,
+    /// The fixed cell box the whole grid is laid out on. Window-authoritative (it
+    /// owns the fonts and scale); the core holds a copy, shipped over on a resize.
     metrics: CellMetrics,
-    /// The grid being shown, always sized to the current window's `(cols, rows)`.
-    screen: Screen,
-    /// The VT state machine driving `screen` from the child's output bytes.
-    parser: Parser,
-    /// The child on the far side of the PTY; `None` in demo mode (and before the
-    /// first configure, since the PTY is sized to the granted window).
-    pty: Option<Pty>,
-    /// Demo mode: a static grid, no shell.
-    demo: bool,
-    /// Reused PTY read buffer (allocated once, not per drain).
-    pty_read_buf: Vec<u8>,
-    /// Reused key-encoding buffer (allocated once, not per key press).
-    key_buf: Vec<u8>,
-    /// Whether the surface holds keyboard focus, so the cursor draws solid when
-    /// focused and hollow when not.
-    focused: bool,
-    /// Cursor blink: the current on/off phase, and when it next toggles (`None`
-    /// when not blinking, e.g. unfocused). Activity resets it to on.
-    blink_on: bool,
-    blink_at: Option<Instant>,
     /// Key auto-repeat: Wayland delivers no repeat events, so the client synthesises
     /// them from the compositor's `repeat_info`. `repeat_key`/`repeat_at` track the
     /// held key and when it next fires; `repeat_interval` is `None` when repeat is
@@ -229,13 +202,15 @@ struct State {
     repeat_interval: Option<Duration>,
     repeat_key: Option<u32>,
     repeat_at: Option<Instant>,
-    /// The toplevel title last sent, so it is only re-set when it changes.
-    title: String,
 
     /// Current surface size in *device* pixels (the buffer resolution the grid is
     /// laid out in). The logical size lives in `scale.logical`.
     width: u32,
     height: u32,
+    /// The grid size in cells the window last shipped to the core, mirrored here so
+    /// the window can clamp a pointer to the grid and skip a no-op resize without
+    /// reaching into the core's screen.
+    grid_dims: (usize, usize),
     /// Compositor scale factor and the objects that report it.
     scale: Scaling,
 
@@ -247,17 +222,12 @@ struct State {
     seat: Option<u32>,
     keyboard: u32,
     pointer: u32,
-    /// Latest pointer position in surface pixels, and the button held for drag
-    /// reporting (`None` when no button is down). `axis_accum` gathers fractional
-    /// wheel deltas into whole notches.
+    /// Latest pointer position in surface pixels. `axis_accum` gathers fractional
+    /// wheel deltas into whole notches (the button held for drag reporting lives
+    /// on the core, with the mouse mode it reports under).
     pointer_x: f32,
     pointer_y: f32,
-    mouse_held: Option<MouseButton>,
     axis_accum: f32,
-    /// The active text selection (a left-drag), or `None`. In display coords.
-    selection: Option<Selection>,
-    /// Whether a selection drag is in progress (the button is down).
-    selecting: bool,
     surface: u32,
     xdg_surface: u32,
     toplevel: u32,
@@ -284,8 +254,6 @@ struct State {
     pending_configure: Option<u32>,
     configured: bool,
     closed: bool,
-    /// The content changed and a frame should be drawn.
-    dirty: bool,
     /// The in-flight frame callback's id, or 0 when none is pending. While it is
     /// nonzero the loop holds off redrawing, so bursts coalesce into at most one
     /// frame per refresh (frame pacing).
@@ -306,37 +274,25 @@ impl State {
         let (cols, rows) = (DEFAULT_COLS, DEFAULT_ROWS);
         let width = (cols as i32 * metrics.w + 2 * WINDOW_PADDING).max(1) as u32;
         let height = (rows as i32 * metrics.h + 2 * WINDOW_PADDING).max(1) as u32;
-        // Demo mode shows a static grid; live mode starts blank and the shell
-        // fills it once the PTY is spawned.
-        let screen = if demo {
-            demo_screen(cols, rows)
-        } else {
-            Screen::new(cols, rows)
-        };
+        // The terminal core owns the grid/parser/PTY and its own geometry copies.
+        // At unity scale the device padding is just `WINDOW_PADDING`; the first
+        // configure ships the real geometry over on a `Resize`.
+        let core = TerminalCore::new(demo, cols, rows, metrics, width, height, WINDOW_PADDING);
 
         Ok(Self {
             conn,
             fonts,
             xkb: Xkb::new()?,
-            theme: Theme::default(),
+            core,
             metrics,
-            screen,
-            parser: Parser::new(),
-            pty: None,
-            demo,
-            pty_read_buf: vec![0u8; PTY_READ_CHUNK],
-            key_buf: Vec::new(),
-            focused: false,
-            blink_on: true,
-            blink_at: None,
             // Sensible defaults until the compositor sends repeat_info.
             repeat_delay: Duration::from_millis(400),
             repeat_interval: Some(Duration::from_millis(33)),
             repeat_key: None,
             repeat_at: None,
-            title: String::new(),
             width,
             height,
+            grid_dims: (cols, rows),
             scale: Scaling::new((width, height)),
             registry: 0,
             compositor: None,
@@ -346,10 +302,7 @@ impl State {
             pointer: 0,
             pointer_x: 0.0,
             pointer_y: 0.0,
-            mouse_held: None,
             axis_accum: 0.0,
-            selection: None,
-            selecting: false,
             surface: 0,
             xdg_surface: 0,
             toplevel: 0,
@@ -365,7 +318,6 @@ impl State {
             pending_configure: None,
             configured: false,
             closed: false,
-            dirty: true,
             frame_callback: 0,
             stats: std::env::var_os("BNKTERM_STATS").is_some(),
         })
@@ -428,7 +380,9 @@ impl State {
             xdg_toplevel::SET_APP_ID,
             &[Arg::Str("bnkterm")],
         );
-        self.refresh_title();
+        // The initial title is the app name; the core emits a `Title` later if the
+        // child sets one via OSC 0/2.
+        self.set_toplevel_title("bnkterm");
 
         // Fractional scaling: a per-surface fractional-scale object delivers the
         // preferred scale, and a viewport maps the device-pixel buffer onto the
@@ -473,9 +427,8 @@ impl State {
 
         // Now that the window has its granted size, spawn the shell on a PTY
         // sized to the grid. Demo mode skips this and shows its static screen.
-        if !self.demo {
-            let (cols, rows) = self.screen.dimensions();
-            self.pty = Some(Pty::spawn(cols, rows)?);
+        if !self.core.is_demo() {
+            let (cols, rows) = self.core.spawn_shell()?;
             eprintln!("bnkterm: shell on a {cols}x{rows} grid. Close the window to exit.");
         } else {
             eprintln!("bnkterm: phase-2 static demo. Close the window to exit.");
@@ -509,24 +462,26 @@ impl State {
                 self.handle(msg)?;
             }
             // Read a chunk of the child's output into the grid (a no-op with no
-            // PTY, or when nothing is ready).
-            self.pump_pty()?;
+            // PTY, or when nothing is ready), then act on what it produced (a title
+            // change, a copied selection to own, the child exiting).
+            self.core.pump_pty()?;
+            self.drain_outbox()?;
             // Fire any blink toggle or key repeat that has come due.
             self.service_timers()?;
             // Pace to the compositor: only draw when no frame callback is
             // outstanding, so a burst collapses into a single repaint.
-            if self.configured && self.dirty && self.frame_callback == 0 && self.render_frame()? {
-                self.dirty = false;
+            if self.configured
+                && self.core.dirty
+                && self.frame_callback == 0
+                && self.render_frame()?
+            {
+                self.core.dirty = false;
             }
             if done(self) {
                 return Ok(());
             }
             self.conn.flush()?;
-            let ready = pty::wait_readable(
-                self.conn.fd(),
-                self.pty.as_ref().map(Pty::fd),
-                self.next_wake(),
-            )?;
+            let ready = pty::wait_readable(self.conn.fd(), self.core.pty_fd(), self.next_wake())?;
             if ready.wayland {
                 // poll said the socket has data (or hung up); this recv returns
                 // immediately, its short timeout only a safety net.
@@ -538,13 +493,12 @@ impl State {
         }
     }
 
-    /// Fire the cursor blink and key repeat if their deadlines have passed.
+    /// Fire the cursor blink and key repeat if their deadlines have passed. The
+    /// blink is the core's (it builds the frame); key repeat is the window's (it
+    /// holds the compositor's `repeat_info` and the held key).
     fn service_timers(&mut self) -> Result<()> {
-        let now = Instant::now();
-        if self.cursor_blinking() && self.blink_at.is_some_and(|at| at <= now) {
-            self.tick_blink();
-        }
-        if self.repeat_at.is_some_and(|at| at <= now) {
+        self.core.tick_blink_if_due();
+        if self.repeat_at.is_some_and(|at| at <= Instant::now()) {
             self.fire_repeat()?;
         }
         Ok(())
@@ -552,98 +506,18 @@ impl State {
 
     /// How long to block for input: the soonest of the pending cursor-blink and
     /// key-repeat deadlines, or `None` (block indefinitely) when neither is armed.
+    /// The blink deadline is the core's; the key-repeat deadline is the window's.
     fn next_wake(&self) -> Option<Duration> {
         let now = Instant::now();
         let due = |at: Instant| {
             at.saturating_duration_since(now)
                 .max(Duration::from_millis(1))
         };
-        let blink = self.cursor_blinking().then_some(self.blink_at).flatten();
-        [blink, self.repeat_at].into_iter().flatten().map(due).min()
-    }
-
-    /// Whether the cursor should be blinking right now: focused, visible, and the
-    /// child asked for a blinking style.
-    fn cursor_blinking(&self) -> bool {
-        self.focused && self.screen.cursor_visible() && self.screen.cursor_blinks()
-    }
-
-    /// Flip the blink phase and schedule the next toggle.
-    fn tick_blink(&mut self) {
-        self.blink_on = !self.blink_on;
-        self.blink_at = Some(Instant::now() + BLINK_INTERVAL);
-        self.dirty = true;
-    }
-
-    /// Reset the cursor to its lit phase and restart the blink timer, so it shows
-    /// solid immediately after activity (a keystroke, output) and blinks only when
-    /// idle. A no-op's timer stays `None` while unfocused.
-    fn bump_cursor(&mut self) {
-        self.blink_on = true;
-        self.blink_at = self.focused.then(|| Instant::now() + BLINK_INTERVAL);
-    }
-
-    /// Read one chunk of the child's output through the parser into the grid. A
-    /// closed PTY (the shell exited) ends the session.
-    fn pump_pty(&mut self) -> Result<()> {
-        // Borrow the PTY and its buffer as distinct fields, so the read does not
-        // conflict with the parser/screen borrows below.
-        let outcome = match &self.pty {
-            Some(pty) => pty.read(&mut self.pty_read_buf)?,
-            None => return Ok(()),
-        };
-        match outcome {
-            ReadOutcome::Data(n) => {
-                self.parser
-                    .advance_bytes(&mut self.screen, &self.pty_read_buf[..n]);
-                // Answer any query the child made (DA/DSR): the grid queued the
-                // reply bytes; write them back through the PTY.
-                let responses = self.screen.take_responses();
-                if !responses.is_empty() {
-                    if let Some(pty) = &self.pty {
-                        pty.write_all(&responses)?;
-                    }
-                }
-                // New output snaps the view to the live bottom (xterm behavior),
-                // so a stream of output always shows its latest line.
-                self.screen.scroll_view_to_bottom();
-                // The cells under any selection just changed meaning; drop it
-                // rather than leave a highlight over stale content.
-                self.selection = None;
-                self.selecting = false;
-                self.bump_cursor(); // output shows the cursor solid, then blinks
-                self.dirty = true;
-                // The child may have set its title via OSC 0/2.
-                self.refresh_title();
-            }
-            ReadOutcome::WouldBlock => {}
-            ReadOutcome::Eof => self.closed = true,
-        }
-        Ok(())
-    }
-
-    /// Compose the window's display list: the visible grid painted at the current
-    /// size, cursor on top (solid when focused, hollow when not).
-    fn build_frame_list(&mut self) -> Rc<DisplayList> {
-        // The child chose the shape (DECSCUSR); blink hides it on the off phase
-        // while focused, and DECTCEM hides it entirely.
-        let blinked_off = self.cursor_blinking() && !self.blink_on;
-        let cursor = CursorRender {
-            shape: cursor_shape(self.screen.cursor_style()),
-            visible: self.screen.cursor_visible() && !blinked_off,
-            focused: self.focused,
-        };
-        let pad = self.device_pad();
-        let list = term_render::build_display_list(
-            &self.screen,
-            &self.theme,
-            self.metrics,
-            (self.width as i32, self.height as i32),
-            (pad, pad),
-            cursor,
-            self.selection,
-        );
-        Rc::new(list)
+        [self.core.blink_deadline(), self.repeat_at]
+            .into_iter()
+            .flatten()
+            .map(due)
+            .min()
     }
 
     /// A logical (surface-local) length in device pixels at the current scale,
@@ -678,22 +552,23 @@ impl State {
         let usable_w = (w as i32 - 2 * pad).max(0);
         let usable_h = (h as i32 - 2 * pad).max(0);
         let (cols, rows) = self.metrics.columns_rows(usable_w, usable_h);
-        if (w, h) == (self.width, self.height) && (cols, rows) == self.screen.dimensions() {
+        if (w, h) == (self.width, self.height) && (cols, rows) == self.grid_dims {
             return;
         }
         self.width = w;
         self.height = h;
-        if self.demo {
-            self.screen = demo_screen(cols, rows);
-        } else {
-            self.screen.resize(cols, rows);
-            if let Some(pty) = &self.pty {
-                // Best-effort: a resize on a dead child errors, which the next
-                // read surfaces as EOF and shuts the session down cleanly.
-                let _ = pty.resize(cols, rows);
-            }
-        }
-        self.dirty = true;
+        self.grid_dims = (cols, rows);
+        // Ship the fresh grid size and geometry to the core: it resizes the grid and
+        // the PTY winsize (best-effort, so this cannot fail from here — see `apply`),
+        // and keeps the geometry copies `build_frame_list` lays out with.
+        let _ = self.core.apply(ToTerminal::Resize {
+            cols,
+            rows,
+            width: w,
+            height: h,
+            metrics: self.metrics,
+            pad,
+        });
     }
 
     /// Adopt a new compositor scale (in 120ths): reopen the fonts at the size it
@@ -713,7 +588,7 @@ impl State {
         self.resize_to(dw, dh);
         // Force the next frame even if the grid dimensions happened to land the
         // same, so the resent scale state (and rescaled glyphs) reach the screen.
-        self.dirty = true;
+        self.core.dirty = true;
     }
 
     /// Reopen the fonts at device-pixel `size` and recompute the cell metrics. On a
@@ -794,7 +669,7 @@ impl State {
                 self.resize_to(dw, dh);
             }
             self.configured = true;
-            self.dirty = true;
+            self.core.dirty = true;
             return Ok(());
         }
 
@@ -932,16 +807,12 @@ impl State {
             }
             wl_keyboard::EV_ENTER => {
                 let _serial = r.u32()?;
-                self.focused = true;
-                self.bump_cursor(); // start blinking from a lit cursor
-                self.dirty = true;
+                self.core.apply(ToTerminal::Focus(true))?;
             }
             wl_keyboard::EV_LEAVE => {
                 let _serial = r.u32()?;
-                self.focused = false;
-                self.blink_at = None; // stop the blink timer while unfocused
-                self.stop_repeat(); // and drop any held-key repeat
-                self.dirty = true;
+                self.core.apply(ToTerminal::Focus(false))?;
+                self.stop_repeat(); // drop any held-key repeat (window-side timer)
             }
             wl_keyboard::EV_MODIFIERS => {
                 let _serial = r.u32()?;
@@ -993,7 +864,9 @@ impl State {
             if let Some(c) = self.xkb.key_char(keycode) {
                 match c.to_ascii_lowercase() {
                     'c' => {
-                        self.copy_selection();
+                        // The core extracts the selection text and queues an
+                        // `OfferSelection`; the loop's outbox drain owns the clipboard.
+                        self.core.copy_selection();
                         return Ok(());
                     }
                     'v' => {
@@ -1004,48 +877,33 @@ impl State {
                 }
             }
         }
-        // Shift + Page/Home/End scrolls the scrollback view instead of reaching
-        // the child (the alt screen has no history, so there it is a normal key).
-        if self.handle_scroll_key(keycode, mods) {
-            return Ok(());
+        // Shift + Page/Home/End scrolls the scrollback view instead of reaching the
+        // child (the alt screen has no history, so there it is a normal key). The
+        // window resolves the keycode to a named key; the core does the scrolling.
+        if let Some(named) = input::key_from_keycode(keycode) {
+            if self.core.handle_scroll_key(named, mods) {
+                return Ok(());
+            }
         }
         // Send the key, and if it produced bytes and the keymap marks it
         // repeatable, arm auto-repeat on it.
-        if self.send_key(keycode)? {
-            self.arm_repeat(keycode);
+        if let Some(key) = self.resolve_key(keycode) {
+            if self.core.apply(ToTerminal::Key { key, mods })? {
+                self.arm_repeat(keycode);
+            }
         }
         Ok(())
     }
 
-    /// Encode `keycode` under the current modifiers and write it to the child,
-    /// returning whether any bytes were sent. Shared by the first press and each
-    /// auto-repeat, so a held arrow repeats exactly as it first fired.
-    fn send_key(&mut self, keycode: u32) -> Result<bool> {
-        let mods = self.current_mods();
-        let key = match input::key_from_keycode(keycode) {
-            Some(named) => named,
-            None => match self.xkb.key_char(keycode) {
-                Some(c) => input::Key::Char(c),
-                None => return Ok(false), // a modifier or unresolved key: nothing to send
-            },
-        };
-        let modes = input::Modes::from_screen(&self.screen);
-        self.key_buf.clear();
-        input::encode(key, mods, modes, &mut self.key_buf);
-        if self.key_buf.is_empty() {
-            return Ok(false);
+    /// The window half of a key press: resolve `keycode` to an [`input::Key`] via
+    /// the keymap (a named key by its keycode, else its layout character), or `None`
+    /// for a bare modifier / unresolved key. xkb belongs with the Wayland keyboard,
+    /// so this stays window-side; the terminal half is [`apply`](Self::apply).
+    fn resolve_key(&self, keycode: u32) -> Option<input::Key> {
+        match input::key_from_keycode(keycode) {
+            Some(named) => Some(named),
+            None => self.xkb.key_char(keycode).map(input::Key::Char),
         }
-        // Typing snaps the view back to the live bottom before the bytes go out,
-        // so a keystroke never lands "blind" while reading history.
-        if self.screen.is_scrolled() {
-            self.screen.scroll_view_to_bottom();
-            self.dirty = true;
-        }
-        self.bump_cursor(); // keep the cursor solid while typing
-        if let Some(pty) = &self.pty {
-            pty.write_all(&self.key_buf)?;
-        }
-        Ok(true)
     }
 
     /// Arm (or re-arm) auto-repeat on the just-pressed key. A key the keymap marks
@@ -1068,33 +926,20 @@ impl State {
             self.repeat_at = None;
             return Ok(());
         };
-        if self.send_key(keycode)? {
+        let sent = match self.resolve_key(keycode) {
+            Some(key) => self.core.apply(ToTerminal::Key {
+                key,
+                mods: self.current_mods(),
+            })?,
+            None => false,
+        };
+        if sent {
             self.repeat_at = Some(Instant::now() + interval);
         } else {
             self.repeat_key = None;
             self.repeat_at = None;
         }
         Ok(())
-    }
-
-    /// Intercept the scrollback-navigation chords (Shift + PageUp/PageDown/Home/
-    /// End) on the primary screen, returning whether the key was consumed. A page
-    /// is a screenful less one line, so a line of context carries across.
-    fn handle_scroll_key(&mut self, keycode: u32, mods: input::Mods) -> bool {
-        if !mods.contains(input::Mods::SHIFT) || self.screen.is_alt() {
-            return false;
-        }
-        let (_, rows) = self.screen.dimensions();
-        let page = rows.saturating_sub(1).max(1);
-        match input::key_from_keycode(keycode) {
-            Some(input::Key::PageUp) => self.screen.scroll_view_up(page),
-            Some(input::Key::PageDown) => self.screen.scroll_view_down(page),
-            Some(input::Key::Home) => self.screen.scroll_view_to_top(),
-            Some(input::Key::End) => self.screen.scroll_view_to_bottom(),
-            _ => return false,
-        }
-        self.dirty = true;
-        true
     }
 
     /// The current modifier chord from xkb, for both key and mouse encoding.
@@ -1109,7 +954,7 @@ impl State {
 
     /// The cell under the pointer, clamped into the grid. Used for mouse reports.
     fn pointer_cell(&self) -> (usize, usize) {
-        let (cols, rows) = self.screen.dimensions();
+        let (cols, rows) = self.grid_dims;
         // Pointer coordinates are logical (surface-local); the grid is device
         // pixels, so scale up first. The grid is then inset by the (device) padding;
         // a pointer in the margin maps to the nearest edge cell (floored at zero).
@@ -1139,18 +984,30 @@ impl State {
                 let _time = r.u32()?;
                 self.pointer_x = r.fixed()?;
                 self.pointer_y = r.fixed()?;
-                if self.selecting {
-                    self.extend_selection();
-                } else {
-                    self.report_mouse_motion()?;
-                }
+                let (col, row) = self.pointer_cell();
+                self.core.apply(ToTerminal::Pointer {
+                    event: PointerEvent::Motion { col, row },
+                    mods: self.current_mods(),
+                })?;
             }
             wl_pointer::EV_BUTTON => {
                 self.last_serial = r.u32()?;
                 let _time = r.u32()?;
                 let button = r.u32()?;
                 let pressed = r.u32()? == wl_pointer::BUTTON_STATE_PRESSED;
-                self.on_pointer_button(button, pressed)?;
+                // Map the raw Wayland button to ours (window-side); ignore unmapped.
+                if let Some(button) = pointer_button(button) {
+                    let (col, row) = self.pointer_cell();
+                    self.core.apply(ToTerminal::Pointer {
+                        event: PointerEvent::Button {
+                            button,
+                            pressed,
+                            col,
+                            row,
+                        },
+                        mods: self.current_mods(),
+                    })?;
+                }
             }
             wl_pointer::EV_AXIS => {
                 let _time = r.u32()?;
@@ -1165,154 +1022,31 @@ impl State {
         Ok(())
     }
 
-    /// A pointer button press/release. While a program is reporting the mouse (and
-    /// Shift is not held to force local use), the event is sent to the child;
-    /// otherwise a left button drives a local text selection.
-    fn on_pointer_button(&mut self, button: u32, pressed: bool) -> Result<()> {
-        let Some(btn) = pointer_button(button) else {
-            return Ok(());
-        };
-        let mode = self.screen.mouse_mode();
-        if mode.reports() && !self.xkb.shift_active() {
-            self.mouse_held = pressed.then_some(btn);
-            let kind = if pressed {
-                MouseKind::Press
-            } else {
-                MouseKind::Release
-            };
-            let (col, row) = self.pointer_cell();
-            self.key_buf.clear();
-            if mouse::encode(
-                mode,
-                btn,
-                kind,
-                col,
-                row,
-                self.current_mods(),
-                &mut self.key_buf,
-            ) {
-                if let Some(pty) = &self.pty {
-                    pty.write_all(&self.key_buf)?;
-                }
-            }
-        } else if btn == MouseButton::Left {
-            // Local selection: press begins a fresh one, release ends the drag.
-            if pressed {
-                let (col, row) = self.pointer_cell();
-                self.selection = Some(Selection {
-                    anchor: (row, col),
-                    head: (row, col),
-                });
-                self.selecting = true;
-            } else {
-                self.selecting = false;
-            }
-            self.dirty = true;
-        }
-        Ok(())
-    }
-
-    /// Extend the in-progress selection to the pointer's current cell.
-    fn extend_selection(&mut self) {
-        let (col, row) = self.pointer_cell();
-        if let Some(sel) = self.selection.as_mut() {
-            if sel.head != (row, col) {
-                sel.head = (row, col);
-                self.dirty = true;
-            }
-        }
-    }
-
-    /// Report pointer motion to a program that asked for it (drag under `?1002`,
-    /// any move under `?1003`). Silent otherwise.
-    fn report_mouse_motion(&mut self) -> Result<()> {
-        let mode = self.screen.mouse_mode();
-        if !mode.reports() || self.xkb.shift_active() {
-            return Ok(());
-        }
-        let button = self.mouse_held.unwrap_or(MouseButton::None);
-        let (col, row) = self.pointer_cell();
-        self.key_buf.clear();
-        if mouse::encode(
-            mode,
-            button,
-            MouseKind::Motion,
-            col,
-            row,
-            self.current_mods(),
-            &mut self.key_buf,
-        ) {
-            if let Some(pty) = &self.pty {
-                pty.write_all(&self.key_buf)?;
-            }
-        }
-        Ok(())
-    }
-
     /// The mouse wheel: report it to a program that grabbed the mouse; else scroll
     /// the local scrollback view; else (the alt screen, no history) send arrow
     /// keys, the conventional fallback so wheel-scrolling `less`/`man` works.
     /// `value` is the wl_fixed vertical delta (positive = down).
     fn on_wheel(&mut self, value: f32) -> Result<()> {
-        // Gather fractional deltas (touchpads send many small ones) into notches.
+        // Gather fractional deltas (touchpads send many small ones) into whole
+        // notches, then hand them to the terminal (which reports them, scrolls the
+        // view, or sends arrow keys — see `apply_pointer`).
         self.axis_accum += value;
         let step = 15.0; // a typical wheel notch in wl_fixed units
-        let mut notches = (self.axis_accum / step) as i32;
+        let notches = (self.axis_accum / step) as i32;
         if notches == 0 {
             return Ok(());
         }
         self.axis_accum -= notches as f32 * step;
-        let down = notches > 0;
-        notches = notches.abs();
-
-        let mode = self.screen.mouse_mode();
-        if mode.reports() && !self.xkb.shift_active() {
-            let button = if down {
-                MouseButton::WheelDown
-            } else {
-                MouseButton::WheelUp
-            };
-            let (col, row) = self.pointer_cell();
-            for _ in 0..notches {
-                self.key_buf.clear();
-                if mouse::encode(
-                    mode,
-                    button,
-                    MouseKind::Press,
-                    col,
-                    row,
-                    self.current_mods(),
-                    &mut self.key_buf,
-                ) {
-                    if let Some(pty) = &self.pty {
-                        pty.write_all(&self.key_buf)?;
-                    }
-                }
-            }
-        } else if !self.screen.is_alt() {
-            let lines = notches as usize * WHEEL_LINES;
-            if down {
-                self.screen.scroll_view_down(lines);
-            } else {
-                self.screen.scroll_view_up(lines);
-            }
-            self.dirty = true;
-        } else {
-            // Alt screen without mouse reporting: wheel becomes arrow keys.
-            let key = if down {
-                input::Key::Down
-            } else {
-                input::Key::Up
-            };
-            let modes = input::Modes::from_screen(&self.screen);
-            for _ in 0..(notches as usize * WHEEL_LINES) {
-                self.key_buf.clear();
-                input::encode(key, input::Mods::NONE, modes, &mut self.key_buf);
-                if let Some(pty) = &self.pty {
-                    pty.write_all(&self.key_buf)?;
-                }
-            }
-        }
+        let (col, row) = self.pointer_cell();
+        self.core.apply(ToTerminal::Pointer {
+            event: PointerEvent::Wheel {
+                down: notches > 0,
+                notches: notches.unsigned_abs(),
+                col,
+                row,
+            },
+            mods: self.current_mods(),
+        })?;
         Ok(())
     }
 
@@ -1375,22 +1109,26 @@ impl State {
         Ok(())
     }
 
-    /// Send the toplevel title only if it changed. The child sets it via OSC 0/2
-    /// (tracked on the grid); an empty title falls back to the app name. The
-    /// change-guard dedupes the request on the common unchanged path.
-    fn refresh_title(&mut self) {
-        let desired = match self.screen.title() {
-            "" => "bnkterm".to_string(),
-            t => t.to_string(),
-        };
-        if desired != self.title {
-            self.conn.request(
-                self.toplevel,
-                xdg_toplevel::SET_TITLE,
-                &[Arg::Str(&desired)],
-            );
-            self.title = desired;
+    /// Set the toplevel title. The core deduplicates on the sending side (it only
+    /// emits a `Title` when the child's title actually changes), so this just makes
+    /// the request; bring-up calls it once for the initial app name.
+    fn set_toplevel_title(&mut self, title: &str) {
+        self.conn
+            .request(self.toplevel, xdg_toplevel::SET_TITLE, &[Arg::Str(title)]);
+    }
+
+    /// Act on the terminal core's outbound messages after a `pump_pty` (or a copy):
+    /// each is a Wayland request the terminal cannot make itself. Window-side by
+    /// necessity; Stage 2 turns this outbox into the terminal→window channel.
+    fn drain_outbox(&mut self) -> Result<()> {
+        for msg in self.core.take_outbox() {
+            match msg {
+                ToWindow::Title(title) => self.set_toplevel_title(&title),
+                ToWindow::OfferSelection(bytes) => self.set_clipboard(bytes),
+                ToWindow::Closed => self.closed = true,
+            }
         }
+        Ok(())
     }
 
     /// Bind the just-advertised global at the version we negotiate: the
@@ -1466,15 +1204,6 @@ fn config_text_gamma() -> f32 {
         .clamp(0.5, 4.0)
 }
 
-/// Map the grid's cursor style (from DECSCUSR) to how the renderer paints it.
-fn cursor_shape(style: CursorStyle) -> CursorShape {
-    match style {
-        CursorStyle::Block => CursorShape::Block,
-        CursorStyle::Underline => CursorShape::Underline,
-        CursorStyle::Bar => CursorShape::Bar,
-    }
-}
-
 /// Map a Wayland pointer button (a `linux/input-event-codes.h` code) to the
 /// logical button the mouse encoder speaks. Unknown buttons (side buttons) are
 /// ignored.
@@ -1487,126 +1216,9 @@ fn pointer_button(code: u32) -> Option<MouseButton> {
     }
 }
 
-/// Fill a fresh grid with a static demo that exercises the phase-2 acceptance
-/// list: the 16 ANSI colors, the text styles, DEC box drawing, a CJK wide char,
-/// an emoji cluster, a combining mark, and truecolor. Driven through the real
-/// `Parser` -> `Screen`, so what the window shows is exactly what the VT pipeline
-/// produces, not a bespoke fixture.
-fn demo_screen(cols: usize, rows: usize) -> Screen {
-    let mut s = Screen::new(cols.max(1), rows.max(1));
-    let mut p = Parser::new();
-    let mut out: Vec<u8> = Vec::new();
-
-    // Move the cursor to 1-based (row, col) and reset the pen.
-    let at = |out: &mut Vec<u8>, row: usize, col: usize| {
-        out.extend_from_slice(format!("\x1b[{row};{col}H\x1b[0m").as_bytes());
-    };
-
-    at(&mut out, 1, 1);
-    out.extend_from_slice(
-        b"\x1b[1;36mbnkterm\x1b[0m \x1b[2m-- Wayland + Vulkan terminal, phase 2 static demo\x1b[0m",
-    );
-
-    at(&mut out, 3, 1);
-    out.extend_from_slice(b"ANSI: ");
-    for c in 0..8 {
-        out.extend_from_slice(format!("\x1b[4{c}m  ").as_bytes());
-    }
-    out.extend_from_slice(b"\x1b[0m ");
-    for c in 0..8 {
-        out.extend_from_slice(format!("\x1b[10{c}m  ").as_bytes());
-    }
-
-    at(&mut out, 5, 1);
-    out.extend_from_slice(
-        b"styles: normal \x1b[1mbold\x1b[0m \x1b[3mitalic\x1b[0m \x1b[4munderline\x1b[0m \
-          \x1b[9mstrike\x1b[0m \x1b[7mreverse\x1b[0m \x1b[2mdim\x1b[0m",
-    );
-
-    // A box via DEC Special Graphics (ESC ( 0 designates G0), then back to ASCII.
-    let box_w = 22.min(cols.saturating_sub(2)).max(2);
-    let mid = "q".repeat(box_w.saturating_sub(2));
-    at(&mut out, 7, 1);
-    out.extend_from_slice(format!("\x1b(0l{mid}k\x1b(B").as_bytes());
-    at(&mut out, 8, 1);
-    out.extend_from_slice(b"\x1b(0x\x1b(B");
-    out.extend_from_slice(b" box drawing (DEC) ");
-    at(&mut out, 8, box_w);
-    out.extend_from_slice(b"\x1b(0x\x1b(B");
-    at(&mut out, 9, 1);
-    out.extend_from_slice(format!("\x1b(0m{mid}j\x1b(B").as_bytes());
-
-    at(&mut out, 11, 1);
-    out.extend_from_slice(
-        "unicode: CJK \u{6f22}\u{5b57}  emoji \u{1F600}\u{1F389}  accent cafe\u{0301}".as_bytes(),
-    );
-
-    at(&mut out, 13, 1);
-    out.extend_from_slice(b"256-color: ");
-    for i in (16..=231).step_by(18) {
-        out.extend_from_slice(format!("\x1b[48;5;{i}m  ").as_bytes());
-    }
-    out.extend_from_slice(b"\x1b[0m");
-
-    at(&mut out, 15, 1);
-    out.extend_from_slice(b"truecolor: ");
-    for step in 0..24 {
-        let r = 255 - step * 10;
-        let g = step * 10;
-        let b = 128;
-        out.extend_from_slice(format!("\x1b[48;2;{r};{g};{b}m ").as_bytes());
-    }
-    out.extend_from_slice(b"\x1b[0m");
-
-    // Park the cursor somewhere visible for the block-cursor demo.
-    at(&mut out, 17, 1);
-    out.extend_from_slice(b"prompt$ ");
-
-    p.advance_bytes(&mut s, &out);
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn demo_screen_fills_a_grid_without_panicking() {
-        // The demo drives the real parser into the grid; it must stay in bounds
-        // for a range of sizes (including tiny ones the box math must clamp for).
-        // On a small grid the content wraps and scrolls, so only its dimensions
-        // are asserted; a full grid keeps its title (checked below).
-        for &(cols, rows) in &[(80, 24), (40, 12), (10, 4), (2, 2), (1, 1)] {
-            let s = demo_screen(cols, rows);
-            assert_eq!(s.dimensions(), (cols, rows));
-        }
-        // At a comfortable size the title sits untouched on the top-left.
-        assert_eq!(demo_screen(80, 24).cell(0, 0).rune, 'b');
-    }
-
-    #[test]
-    fn demo_screen_renders_to_a_nonempty_display_list() {
-        // The bring-up seam: a demo grid produces real draw commands (a base
-        // fill plus glyph runs), so the window would show content.
-        let s = demo_screen(80, 24);
-        let metrics = CellMetrics {
-            size: 16,
-            w: 8,
-            h: 16,
-            ascent: 12,
-            descent: 4,
-        };
-        let list = term_render::build_display_list(
-            &s,
-            &Theme::default(),
-            metrics,
-            (80 * 8, 24 * 16),
-            (0, 0),
-            CursorRender::default(),
-            None,
-        );
-        assert!(list.len() > 1, "more than just the background fill");
-    }
 
     #[test]
     fn points_to_px_scales_with_the_display() {

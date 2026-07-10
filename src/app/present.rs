@@ -431,7 +431,7 @@ impl State {
         };
         let started = self.stats.then(Instant::now);
         let (sw, sh) = (self.width as i32, self.height as i32);
-        let new_list = self.build_frame_list();
+        let new_list = self.core.build_frame_list();
 
         // Nothing changed since the on-screen frame: nothing to present (idle).
         let screen_dmg = display::damage(&self.presentation.present_list, &new_list, sw, sh);
@@ -459,7 +459,7 @@ impl State {
             self.declare_surface_scale();
         }
 
-        let background = color_f32(self.theme.bg.to_u32());
+        let background = color_f32(self.core.clear_color());
         // Render, returning the render-done fence under explicit sync (`None` on
         // the bridge path, or when the driver could not export one).
         let render_done = {
