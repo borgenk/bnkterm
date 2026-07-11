@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- App tile -->
+  <rect width="64" height="64" rx="14" fill="#1e2732"/>
+  <!-- Shell prompt chevron -->
+  <path d="M18 22 L30 32 L18 42" fill="none" stroke="#7cc4ff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Command-line cursor -->
+  <path d="M34 42 h14" fill="none" stroke="#8fa1b3" stroke-width="5" stroke-linecap="round"/>
+</svg>

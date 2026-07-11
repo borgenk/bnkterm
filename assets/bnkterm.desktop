@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Bnkterm
+Comment=Wayland + Vulkan terminal emulator
+Exec=bnkterm
+Icon=bnkterm
+Terminal=false
+StartupNotify=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;prompt;command;console;
