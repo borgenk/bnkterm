@@ -578,29 +578,37 @@ impl Face {
         cluster.chars().map(|c| self.advance(c)).sum()
     }
 
-    /// Run `f` over the color glyph for an emoji cluster, or return `None` when
-    /// the cluster renders through the ordinary per-character path (not an
-    /// emoji, no emoji font installed, or the emoji font cannot form it).
-    /// `None` tells the caller to draw the cluster's characters instead, which
-    /// matches what [`Self::cluster_advance`] measured for that case.
+    /// Run `f` over the color glyph for an emoji cluster rasterized at `target`
+    /// pixels, or return `None` when the cluster renders through the ordinary
+    /// per-character path (not an emoji, no emoji font installed, or the emoji
+    /// font cannot form it). `None` tells the caller to draw the cluster's
+    /// characters instead, matching what [`Self::cluster_advance`] measured.
+    ///
+    /// The caller passes `target` because the fit differs by path: a wide
+    /// cluster (two grid cells) is drawn at the em (its natural ~square size
+    /// filling both cells), but a single-width emoji is scaled down to one cell
+    /// so it does not spill into the next column.
     pub fn with_cluster_glyph<R>(
         &self,
         cluster: &str,
+        target: u32,
         f: impl FnOnce(&ColorGlyph) -> R,
     ) -> Option<R> {
-        let (emoji, px) = self.emoji_cluster(cluster)?;
-        emoji.with_glyph(cluster, px, f)
+        self.emoji_font(cluster)?.with_glyph(cluster, target, f)
     }
 
-    /// The emoji font and target pixel size for `cluster`, or `None` when the
-    /// cluster should take the per-character path. The single routing decision
-    /// both the measure and draw paths go through.
-    fn emoji_cluster(&self, cluster: &str) -> Option<(&Rc<EmojiFont>, u32)> {
+    /// The emoji font for `cluster`, or `None` when the cluster should take the
+    /// per-character path. The single routing decision the measure and draw
+    /// paths share, so they never disagree on what is an emoji.
+    fn emoji_font(&self, cluster: &str) -> Option<&Rc<EmojiFont>> {
         let emoji = self.emoji.as_ref()?;
-        if !wants_emoji(cluster, |c| self.has_scalar(c)) {
-            return None;
-        }
-        Some((emoji, self.pixel_size.get()))
+        wants_emoji(cluster, |c| self.has_scalar(c)).then_some(emoji)
+    }
+
+    /// The emoji font and its natural (em) target size for `cluster`. The
+    /// measure path uses this so a run's width matches an emoji drawn at the em.
+    fn emoji_cluster(&self, cluster: &str) -> Option<(&Rc<EmojiFont>, u32)> {
+        Some((self.emoji_font(cluster)?, self.pixel_size.get()))
     }
 
     /// Whether this face's character map has a real glyph for `ch` (a missing
@@ -1158,13 +1166,15 @@ mod tests {
         let face = fonts.face(32, FontStyle::Regular);
         let advance = face.cluster_advance("😀");
         assert!(advance > 0.0);
+        // Drawn at the em (32px), the measure twin: `cluster_advance` measures at
+        // the em too, so the two agree for a wide cluster.
         assert_eq!(
-            face.with_cluster_glyph("😀", |g| g.advance),
+            face.with_cluster_glyph("😀", 32, |g| g.advance),
             Some(advance),
             "draw and measure route identically"
         );
         assert!(
-            face.with_cluster_glyph("a", |_| ()).is_none(),
+            face.with_cluster_glyph("a", 32, |_| ()).is_none(),
             "ASCII never routes to the emoji path"
         );
         assert_eq!(

@@ -479,8 +479,11 @@ impl Batcher<'_> {
         // Only the emoji cluster path needs the keyed face directly; the
         // per-scalar path resolves its own face (primary or fallback) per glyph.
         let face = self.fonts.face_for(face_key);
+        // A wide cluster spans two cells, so its emoji is drawn at the em (its
+        // natural, ~square size fills both cells and its advance carries the pen).
+        let target = face_key.size();
         for (_, cluster) in grapheme::graphemes(text) {
-            match self.packed_cluster(face, face_key, cluster) {
+            match self.packed_cluster(face, face_key, cluster, target) {
                 Some(packed) => {
                     self.emit_glyph(&packed, pen, baseline, MODE_EMOJI, 0);
                     pen += packed.advance;
@@ -527,8 +530,18 @@ impl Batcher<'_> {
                 self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, color);
                 continue;
             }
-            match self.packed_cluster(face, face_key, cluster) {
-                Some(packed) => self.emit_glyph(&packed, pen, baseline, MODE_EMOJI, 0),
+            // A single-width color emoji (e.g. a bare ⚠) is scaled to one cell so
+            // it does not balloon to the em (~two cells) and spill past its
+            // column; the emoji is roughly square, so fitting the cell width caps
+            // it at one cell.
+            match self.packed_cluster(face, face_key, cluster, cell_w.max(1) as u32) {
+                Some(packed) => self.emit_glyph(
+                    &center_in_cell(packed, cell_w),
+                    pen,
+                    baseline,
+                    MODE_EMOJI,
+                    0,
+                ),
                 None => {
                     // Draw the cluster's characters from the anchored pen; a base
                     // glyph advances and any combining marks land back over it.
@@ -622,11 +635,19 @@ impl Batcher<'_> {
     /// cached, so a steady-state frame neither re-shapes nor touches the `Face`
     /// (beyond reporting the atlas hit for the frame stats). Non-emoji clusters
     /// are not tallied, matching the pre-atlas emoji-cache accounting.
+    ///
+    /// `target` is the pixel size to rasterize the color glyph at, chosen by the
+    /// caller to fit its path: the em for a wide (two-cell) cluster on the
+    /// [`Self::text`] path, one cell width for a single-width emoji on the
+    /// [`Self::cells`] path so it does not overflow its column. A cluster only
+    /// ever travels one path (its grid width is fixed), so the `(face_key,
+    /// cluster)` cache key stays unique despite the per-path `target`.
     fn packed_cluster(
         &mut self,
         face: &Face,
         face_key: FaceKey,
         cluster: &str,
+        target: u32,
     ) -> Option<PackedGlyph> {
         if let Some(&packed) = self
             .cache
@@ -640,7 +661,7 @@ impl Batcher<'_> {
             return packed;
         }
         let atlas = &mut self.cache.emoji;
-        let packed = face.with_cluster_glyph(cluster, |g| PackedGlyph {
+        let packed = face.with_cluster_glyph(cluster, target, |g| PackedGlyph {
             slot: pack_argb(atlas, g.width as u32, g.rows as u32, &g.argb),
             left: g.left,
             top: g.top,
@@ -683,6 +704,32 @@ fn pack_argb(atlas: &mut Atlas, w: u32, h: u32, argb: &[u32]) -> Option<Slot> {
     // ARGB words are B,G,R,A bytes in memory: B8G8R8A8 verbatim.
     let bytes: Vec<u8> = argb.iter().flat_map(|px| px.to_ne_bytes()).collect();
     atlas.pack(w, h, &bytes)
+}
+
+/// Re-place a single-width color-emoji glyph so it sits on the text line rather
+/// than on its natural pen bearing (which seats it near the cell's vertical
+/// middle and reads *low* beside baseline-aligned text). The glyph is
+/// bottom-aligned to the baseline and centered horizontally in the column, so it
+/// rests on the line like the caps and digits around it and rises a little above
+/// the x-height, exactly how a warning sign reads in other terminals.
+///
+/// The bottom dips `h / 12` below the baseline on purpose: a color glyph carries
+/// a thin band of transparent padding beneath its ink, so dropping the raster
+/// edge a hair below the line seats the *visible* bottom on it. An inkless glyph
+/// (`slot` `None`) is returned unchanged. Only the fixed-pitch [`Batcher::cells`]
+/// path uses this; a wide emoji keeps its advance-based place.
+fn center_in_cell(packed: PackedGlyph, cell_w: i32) -> PackedGlyph {
+    match packed.slot {
+        Some(slot) => {
+            let h = slot.h as i32;
+            PackedGlyph {
+                left: (cell_w - slot.w as i32) / 2,
+                top: h - h / 12,
+                ..packed
+            }
+        }
+        None => packed,
+    }
 }
 
 /// The lone box/block scalar in `cluster`, or `None` if the cluster is not
@@ -1025,6 +1072,126 @@ mod tests {
         // crash, and with color output there must be an emoji upload.
         if f.vertices.iter().any(|v| v.mode == MODE_EMOJI) {
             assert!(f.emoji_upload.is_some(), "the color raster was uploaded");
+        }
+    }
+
+    #[test]
+    fn single_width_emoji_is_scaled_to_its_cell_not_the_em() {
+        // A single-width color emoji (a bare ⚠) on the fixed-pitch `cells` path
+        // is sized to one cell, so it does not balloon to the em (~two cells) and
+        // spill past its column the way it does on the advance-based `text` path.
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let key = FaceKey::Prose {
+            size: 16,
+            style: crate::platform::freetype::FontStyle::Regular,
+        };
+        let warn = "\u{26A0}".to_string();
+        let cell_w = 10;
+
+        let mut cache = GlyphCache::new();
+        let cells = build_frame(
+            &fonts,
+            &[DrawCmd::Cells {
+                bounds: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 100,
+                    h: 20,
+                },
+                x: 0,
+                baseline: 16,
+                cell_w,
+                face: key,
+                color: 0x00ff_ffff,
+                text: warn.clone(),
+            }],
+            &mut cache,
+        );
+        let mut cache2 = GlyphCache::new();
+        let text = build_frame(
+            &fonts,
+            &[DrawCmd::Text {
+                bounds: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 100,
+                    h: 20,
+                },
+                x: 0,
+                baseline: 16,
+                face: key,
+                color: 0x00ff_ffff,
+                text: warn,
+            }],
+            &mut cache2,
+        );
+
+        // The width of the (single) emoji quad, if the cluster took the color
+        // path at all; `None` when no emoji font is installed or it cannot form
+        // the glyph, in which case there is nothing to compare.
+        let emoji_width = |f: &FrameData| {
+            f.vertices
+                .iter()
+                .any(|v| v.mode == MODE_EMOJI)
+                .then(|| f.vertices[4].pos[0] - f.vertices[0].pos[0])
+        };
+        if let (Some(cell_px), Some(em_px)) = (emoji_width(&cells), emoji_width(&text)) {
+            assert!(
+                cell_px < em_px,
+                "the fixed-pitch emoji ({cell_px}) is smaller than the em-sized one ({em_px})"
+            );
+            assert!(
+                cell_px <= 1.5 * cell_w as f32,
+                "and it fits about one cell (cell_w = {cell_w}, got {cell_px})"
+            );
+        }
+    }
+
+    #[test]
+    fn single_width_emoji_sits_on_the_baseline_like_text() {
+        // A single-width color emoji is bottom-aligned to the baseline (dipping a
+        // little below it to seat the visible ink on the line) and rises above
+        // the x-height, so it lines up with the text beside it rather than
+        // floating above the line on its natural bearing.
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let key = FaceKey::Prose {
+            size: 16,
+            style: crate::platform::freetype::FontStyle::Regular,
+        };
+        let (baseline, cell_w) = (16, 10);
+        let mut cache = GlyphCache::new();
+        let f = build_frame(
+            &fonts,
+            &[DrawCmd::Cells {
+                bounds: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 100,
+                    h: 30,
+                },
+                x: 0,
+                baseline,
+                cell_w,
+                face: key,
+                color: 0x00ff_ffff,
+                text: "\u{26A0}".to_string(),
+            }],
+            &mut cache,
+        );
+        if f.vertices.iter().any(|v| v.mode == MODE_EMOJI) {
+            let (top, bottom) = (f.vertices[0].pos[1], f.vertices[4].pos[1]);
+            let h = bottom - top;
+            // The raster bottom rests on the baseline, dipping at most ~a quarter
+            // of its height below it (never floating above the line).
+            assert!(
+                bottom >= baseline as f32 && bottom <= baseline as f32 + h / 4.0,
+                "emoji bottom {bottom} rests on the baseline {baseline} (h = {h})"
+            );
+            // And it rises above the baseline into the text height.
+            assert!(
+                top < baseline as f32,
+                "emoji {top} rises above the baseline"
+            );
         }
     }
 }
