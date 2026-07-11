@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use crate::platform::freetype::{Face, FaceKey, Fonts};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
+use crate::render::boxdraw;
 use crate::render::display::DrawCmd;
 use crate::render::display::RoundedCorners;
 
@@ -509,9 +510,23 @@ impl Batcher<'_> {
         text: &str,
         color: u32,
     ) {
+        // The cell box a procedurally-drawn box/block glyph fills: its height and
+        // the baseline offset that seats it, both from the same metrics the grid
+        // laid out on (read once, not per cluster).
+        let m = self.fonts.metrics(face_key.size());
+        let (cell_h, ascent) = (m.line_height.max(1), m.ascent);
         let face = self.fonts.face_for(face_key);
         for (i, (_, cluster)) in grapheme::graphemes(text).enumerate() {
             let pen = (x + i as i32 * cell_w) as f32;
+            // Box Drawing and Block Elements are rasterized here, not by the font,
+            // so they cover the cell exactly and tile (see `render::boxdraw`).
+            // They are single-width BMP scalars, so they only ever arrive as a
+            // lone-char cluster on this fixed-pitch path, never through `text`.
+            if let Some(ch) = box_glyph(cluster) {
+                let packed = self.packed_box(face_key, ch, cell_w, cell_h, ascent);
+                self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, color);
+                continue;
+            }
             match self.packed_cluster(face, face_key, cluster) {
                 Some(packed) => self.emit_glyph(&packed, pen, baseline, MODE_EMOJI, 0),
                 None => {
@@ -560,6 +575,42 @@ impl Batcher<'_> {
             left: g.left,
             top: g.top,
             advance: g.advance,
+        };
+        self.cache.scalar_slots.insert((face_key, ch), packed);
+        packed
+    }
+
+    /// The cached placement for a procedurally-drawn box/block glyph, sized to the
+    /// `w`-by-`h` cell. Its coverage comes from [`boxdraw::coverage`] instead of a
+    /// FreeType raster, and it is anchored at `left = 0, top = ascent` so the
+    /// bitmap fills the cell box `[pen, pen + w) x [baseline - ascent, + h)`
+    /// exactly, tiling with its neighbours. Cached in the same `scalar_slots` map
+    /// as a font glyph: the `(face_key, ch)` key stays unique because a given char
+    /// is always a box glyph or never one, and the cell size is fixed by the size
+    /// the key carries.
+    fn packed_box(
+        &mut self,
+        face_key: FaceKey,
+        ch: char,
+        w: i32,
+        h: i32,
+        ascent: i32,
+    ) -> PackedGlyph {
+        let primary = self.fonts.face_for(face_key);
+        if let Some(&packed) = self.cache.scalar_slots.get(&(face_key, ch)) {
+            primary.record_glyph_hit();
+            return packed;
+        }
+        primary.record_glyph_miss();
+        let cov = boxdraw::coverage(ch, w.max(0) as usize, h.max(0) as usize);
+        let packed = PackedGlyph {
+            slot: self
+                .cache
+                .glyphs
+                .pack(w.max(0) as u32, h.max(0) as u32, &cov),
+            left: 0,
+            top: ascent,
+            advance: w as f32,
         };
         self.cache.scalar_slots.insert((face_key, ch), packed);
         packed
@@ -632,6 +683,17 @@ fn pack_argb(atlas: &mut Atlas, w: u32, h: u32, argb: &[u32]) -> Option<Slot> {
     // ARGB words are B,G,R,A bytes in memory: B8G8R8A8 verbatim.
     let bytes: Vec<u8> = argb.iter().flat_map(|px| px.to_ne_bytes()).collect();
     atlas.pack(w, h, &bytes)
+}
+
+/// The lone box/block scalar in `cluster`, or `None` if the cluster is not
+/// exactly one such character. A box glyph never carries combining marks, so a
+/// multi-char cluster is disqualified outright.
+fn box_glyph(cluster: &str) -> Option<char> {
+    let mut chars = cluster.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if boxdraw::is_glyph(c) => Some(c),
+        _ => None,
+    }
 }
 
 /// A 0x00RRGGBB display-list color as straight-alpha RGBA floats.
@@ -885,6 +947,55 @@ mod tests {
         assert_eq!(
             f.vertices[6].pos[0] - f.vertices[0].pos[0],
             (2 * cell_w) as f32
+        );
+    }
+
+    #[test]
+    fn box_glyph_fills_its_cell_from_boxdraw_not_the_font() {
+        // `▛` (U+259B) is a quadrant block many monospace fonts lack, so through
+        // the font it would be `.notdef` tofu. It must instead be rasterized by
+        // `render::boxdraw` into a quad that covers the whole cell box exactly, so
+        // it tiles: top-left at (pen, baseline - ascent), size (cell_w, cell_h).
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let mut cache = GlyphCache::new();
+        let m = fonts.metrics(16);
+        let (ascent, cell_h) = (m.ascent, m.line_height.max(1));
+        let cell_w = 11;
+        let (x, baseline) = (7, 16);
+        let list = vec![DrawCmd::Cells {
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 40,
+            },
+            x,
+            baseline,
+            cell_w,
+            face: FaceKey::Code { size: 16 },
+            color: 0x00ff_ffff,
+            text: "▛".to_string(),
+        }];
+        let f = build_frame(&fonts, &list, &mut cache);
+        assert_eq!(
+            f.vertices.len(),
+            6,
+            "one full-cell quad for the block glyph"
+        );
+        assert!(
+            f.vertices.iter().all(|v| v.mode == MODE_GLYPH),
+            "drawn as a coverage glyph, not tofu or a solid fill"
+        );
+        // The quad is the cell box: top-left corner and bottom-right corner.
+        assert_eq!(
+            f.vertices[0].pos,
+            [x as f32, (baseline - ascent) as f32],
+            "top-left seats the glyph at the cell origin"
+        );
+        assert_eq!(
+            f.vertices[4].pos,
+            [(x + cell_w) as f32, (baseline - ascent + cell_h) as f32],
+            "bottom-right fills the whole cell, so the glyph tiles"
         );
     }
 

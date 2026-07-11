@@ -19,6 +19,7 @@
 //! itself, never on the app above it (the test at the bottom enforces that). An
 //! app sits on top and hands it a `DisplayList`.
 
+pub(crate) mod boxdraw;
 pub(crate) mod display;
 pub(crate) mod gpu;
 pub(crate) mod vulkan;
