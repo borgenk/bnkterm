@@ -461,10 +461,12 @@ impl State {
             while let Some(msg) = self.conn.next_message()? {
                 self.handle(msg)?;
             }
-            // Read a chunk of the child's output into the grid (a no-op with no
-            // PTY, or when nothing is ready), then act on what it produced (a title
-            // change, a copied selection to own, the child exiting).
-            self.core.pump_pty()?;
+            // Drain the child's output into the grid (a no-op with no PTY, or when
+            // nothing is ready), then act on what it produced (a title change, a
+            // copied selection to own, the child exiting). `more_pty` is true when a
+            // fairness-budgeted gather pump left batches queued, so the wait below
+            // must not block.
+            let more_pty = self.core.pump_pty()?;
             self.drain_outbox()?;
             // Fire any blink toggle or key repeat that has come due.
             self.service_timers()?;
@@ -481,7 +483,15 @@ impl State {
                 return Ok(());
             }
             self.conn.flush()?;
-            let ready = pty::wait_readable(self.conn.fd(), self.core.pty_fd(), self.next_wake())?;
+            // While the gather pump has more batches queued (it stopped on its
+            // fairness budget), take the next turn immediately rather than blocking,
+            // so a continuous producer drains without stalling Wayland input.
+            let wait = if more_pty {
+                Some(Duration::ZERO)
+            } else {
+                self.next_wake()
+            };
+            let ready = pty::wait_readable(self.conn.fd(), self.core.poll_fd(), wait)?;
             if ready.wayland {
                 // poll said the socket has data (or hung up); this recv returns
                 // immediately, its short timeout only a safety net.

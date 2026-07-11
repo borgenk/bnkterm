@@ -1,34 +1,35 @@
 //! The terminal core: the half of the app behind the terminal/window seam.
-//! [`TerminalCore`] owns the PTY, the VT
-//! parser, and the grid, plus everything that is a function of them: the text
-//! selection, the cursor blink phase, the theme, and the frame geometry it needs
-//! to lay the grid out. It never touches Wayland, xkb, or the GPU.
+//! [`TerminalCore`] owns the PTY, the VT parser, and the grid, plus everything
+//! that is a function of them: the text selection, the cursor blink phase, the
+//! theme, and the frame geometry it needs to lay the grid out. It never touches
+//! Wayland, xkb, or the GPU.
 //!
 //! ```text
 //!   ToTerminal ─▶ TerminalCore::apply ─┬─▶ PTY write   (input → child)
 //!                                      └─▶ grid mutate  (parser, selection, scroll)
-//!   PTY read   ─▶ pump_pty ─▶ parser ─▶ grid ─▶ outbox (Title / Closed)
+//!   PTY master ─▶ gather thread ─▶ pump_pty ─▶ parser ─▶ grid ─▶ outbox (Title / Closed)
 //!   grid state ─▶ fill_frame_list ─▶ DisplayList (pulled by the window each frame)
 //! ```
 //!
-//! The window drives it: it resolves compositor events into [`ToTerminal`]
-//! messages (which turn into PTY bytes and grid mutations here), pulls a
-//! [`DisplayList`] each frame, and drains the [`ToWindow`] outbox for the few
-//! actions only the window can take (set the title, own the clipboard, shut
-//! down). Right now the window calls straight into the core on one thread; Stage 2
-//! moves the core onto its own thread and swaps these calls for the two channels,
-//! with this seam unchanged.
+//! The window drives it on the main thread: it resolves compositor events into
+//! [`ToTerminal`] messages (which turn into PTY bytes and grid mutations here),
+//! pulls a [`DisplayList`] each frame, and drains the [`ToWindow`] outbox for the
+//! few actions only the window can take (set the title, own the clipboard, shut
+//! down). The child's output is drained off-thread by [`crate::gather`] (see
+//! off-thread); `pump_pty` consumes the published batches. Only
+//! reads move off the main thread; the parser, grid, and every write stay here.
 
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
 use super::message::{PointerEvent, ToTerminal, ToWindow};
 use crate::color::Theme;
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::gather::{GatherEnd, Gatherer};
 use crate::grid::{CursorStyle, Screen};
 use crate::input;
 use crate::mouse::{self, MouseButton, MouseKind};
-use crate::pty::{Pty, ReadOutcome};
+use crate::pty::Pty;
 use crate::render::display::DisplayList;
 use crate::term_render::{self, CellMetrics, CursorRender, CursorShape, Selection};
 use crate::vt::Parser;
@@ -36,8 +37,12 @@ use crate::vt::Parser;
 /// The cursor blink half-period: how long each of the on/off phases lasts.
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
-/// The PTY read chunk: large so a burst of output drains in few syscalls.
-const PTY_READ_CHUNK: usize = 64 * 1024;
+/// One gather pump's fairness budget: stop draining published batches after this
+/// much wall time, or [`GATHER_BYTE_BUDGET`] bytes, whichever comes first, so a
+/// continuous producer cannot starve Wayland input. The loop then bypasses its
+/// next blocking wait while batches remain, taking another turn at once.
+const GATHER_TIME_BUDGET: Duration = Duration::from_millis(2);
+const GATHER_BYTE_BUDGET: usize = 1024 * 1024;
 
 /// Lines the scrollback view moves per wheel notch, and arrows sent per notch
 /// when the wheel falls back to arrow keys on the alt screen.
@@ -53,13 +58,16 @@ pub(super) struct TerminalCore {
     screen: Screen,
     /// The VT state machine driving `screen` from the child's output bytes.
     parser: Parser,
+    /// The dedicated PTY reader: it drains the master on its own thread into a
+    /// bounded pool, and `pump_pty` consumes the published batches. `None` in demo
+    /// mode and before the shell is spawned. Declared before `pty` so it stops and
+    /// joins before the master fd closes.
+    gatherer: Option<Gatherer>,
     /// The child on the far side of the PTY; `None` in demo mode (and before the
     /// first configure, since the PTY is sized to the granted window).
     pty: Option<Pty>,
     /// Demo mode: a static grid, no shell.
     demo: bool,
-    /// Reused PTY read buffer (allocated once, not per drain).
-    pty_read_buf: Vec<u8>,
     /// Reused key-encoding buffer (allocated once, not per key press).
     key_buf: Vec<u8>,
     /// The color palette the grid renders with, and the clear color the window
@@ -119,9 +127,9 @@ impl TerminalCore {
         Self {
             screen,
             parser: Parser::new(),
+            gatherer: None,
             pty: None,
             demo,
-            pty_read_buf: vec![0u8; PTY_READ_CHUNK],
             key_buf: Vec::new(),
             theme: Theme::default(),
             focused: false,
@@ -141,11 +149,16 @@ impl TerminalCore {
     }
 
     /// Spawn the shell on a PTY sized to the current grid, returning the grid it
-    /// was sized to (for the startup log). Only the live path calls this; demo
-    /// mode never spawns a child.
+    /// was sized to (for the startup log). Only the live path calls this; demo mode
+    /// never spawns a child. A gather thread is started on a duplicate of the master
+    /// fd to drain the child's output; if it cannot start (no eventfd or thread,
+    /// which on Linux means the process is already out of descriptors or threads),
+    /// shell startup fails cleanly rather than limping on.
     pub(super) fn spawn_shell(&mut self) -> Result<(usize, usize)> {
         let (cols, rows) = self.screen.dimensions();
-        self.pty = Some(Pty::spawn(cols, rows)?);
+        let pty = Pty::spawn(cols, rows)?;
+        self.gatherer = Some(Gatherer::start(pty.fd())?);
+        self.pty = Some(pty);
         Ok((cols, rows))
     }
 
@@ -154,10 +167,11 @@ impl TerminalCore {
         self.demo
     }
 
-    /// The PTY master fd for the event-loop `poll`, or `None` before the shell is
-    /// spawned (and in demo mode).
-    pub(super) fn pty_fd(&self) -> Option<RawFd> {
-        self.pty.as_ref().map(Pty::fd)
+    /// The fd for the event-loop `poll`: the gather thread's ready eventfd, which
+    /// signals when the child produced output. `None` before the shell is spawned
+    /// (and in demo mode).
+    pub(super) fn poll_fd(&self) -> Option<RawFd> {
+        self.gatherer.as_ref().map(Gatherer::ready_fd)
     }
 
     /// The frame background as a `0x00RRGGBB`, for the GPU clear (which must match
@@ -420,44 +434,89 @@ impl TerminalCore {
         }
     }
 
-    /// Read one chunk of the child's output through the parser into the grid. A
-    /// closed PTY (the shell exited) queues `Closed`; new output may change the
-    /// title, which queues `Title`.
-    pub(super) fn pump_pty(&mut self) -> Result<()> {
-        // Borrow the PTY and its buffer as distinct fields, so the read does not
-        // conflict with the parser/screen borrows below.
-        let outcome = match &self.pty {
-            Some(pty) => pty.read(&mut self.pty_read_buf)?,
-            None => return Ok(()),
-        };
-        match outcome {
-            ReadOutcome::Data(n) => {
-                self.parser
-                    .advance_bytes(&mut self.screen, &self.pty_read_buf[..n]);
-                // Answer any query the child made (DA/DSR): the grid queued the
-                // reply bytes; write them back through the PTY.
-                let responses = self.screen.take_responses();
-                if !responses.is_empty() {
-                    if let Some(pty) = &self.pty {
-                        pty.write_all(&responses)?;
-                    }
-                }
-                // New output snaps the view to the live bottom (xterm behavior),
-                // so a stream of output always shows its latest line.
-                self.screen.scroll_view_to_bottom();
-                // The cells under any selection just changed meaning; drop it
-                // rather than leave a highlight over stale content.
-                self.selection = None;
-                self.selecting = false;
-                self.bump_cursor(); // output shows the cursor solid, then blinks
-                self.dirty = true;
-                // The child may have set its title via OSC 0/2.
-                self.refresh_title();
+    /// Drain the child's output, published by the gather thread, through the parser
+    /// into the grid under a fairness budget: at most [`GATHER_TIME_BUDGET`] of wall
+    /// time or [`GATHER_BYTE_BUDGET`] bytes per call, so a flooding child cannot
+    /// starve Wayland input. Returns whether ready batches remain (the budget was
+    /// hit), so the event loop takes another turn at once instead of blocking. Query
+    /// responses are flushed after each batch; the child-exit `Closed` and any read
+    /// error surface only once the queue is fully drained, so no byte is lost ahead
+    /// of the end marker. A no-op in demo mode and before the shell is spawned.
+    pub(super) fn pump_pty(&mut self) -> Result<bool> {
+        if self.gatherer.is_none() {
+            return Ok(false);
+        }
+        // Drain the wake eventfd once per pump; a publish that races this still
+        // re-arms it (empty→nonempty), so the next poll returns and we catch it.
+        if let Some(g) = &self.gatherer {
+            g.clear_wakeup();
+        }
+
+        let start = Instant::now();
+        let mut consumed_bytes = 0usize;
+        let mut consumed_any = false;
+        loop {
+            let Some(batch) = self.gatherer.as_ref().and_then(|g| g.next_batch()) else {
+                break;
+            };
+            let n = {
+                let data = batch.bytes();
+                self.parser.advance_bytes(&mut self.screen, data);
+                data.len()
+            };
+            drop(batch); // return the buffer to the pool before anything else
+            consumed_bytes += n;
+            consumed_any = true;
+            // Answer any query the child made in this batch (DA/DSR) promptly,
+            // rather than after the whole queue: parsing 64 KiB is well under a
+            // millisecond, so this bounds reply latency while keeping batching.
+            self.flush_responses()?;
+            if consumed_bytes >= GATHER_BYTE_BUDGET || start.elapsed() >= GATHER_TIME_BUDGET {
+                break;
             }
-            ReadOutcome::WouldBlock => {}
-            ReadOutcome::Eof => self.outbox.push(ToWindow::Closed),
+        }
+        if consumed_any {
+            self.after_output();
+        }
+
+        // The end marker is withheld until the ready queue drains, so this only
+        // fires once every buffered byte has reached the grid.
+        let (end, more) = match &self.gatherer {
+            Some(g) => (g.completion(), g.has_pending()),
+            None => (None, false),
+        };
+        match end {
+            Some(GatherEnd::Eof) => self.outbox.push(ToWindow::Closed),
+            Some(GatherEnd::ReadError(e)) => {
+                return Err(Error::msg(format!("pty gather read error: errno {e}")));
+            }
+            None => {}
+        }
+        Ok(more)
+    }
+
+    /// Write back any query replies (DA/DSR) the grid queued while parsing, through
+    /// the main PTY handle (writes stay on this thread).
+    fn flush_responses(&mut self) -> Result<()> {
+        let responses = self.screen.take_responses();
+        if !responses.is_empty() {
+            if let Some(pty) = &self.pty {
+                pty.write_all(&responses)?;
+            }
         }
         Ok(())
+    }
+
+    /// The bookkeeping every burst of child output triggers: snap the view to the
+    /// live bottom (xterm behavior), drop a selection now over stale cells, show the
+    /// cursor solid, mark dirty, and refresh the title if the child changed it.
+    fn after_output(&mut self) {
+        self.screen.scroll_view_to_bottom();
+        self.selection = None;
+        self.selecting = false;
+        self.bump_cursor();
+        self.dirty = true;
+        self.refresh_title();
     }
 
     /// Queue a `Title` for the window when the child's title changed since the last

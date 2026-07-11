@@ -23,6 +23,7 @@ pub mod app;
 pub mod color;
 pub mod config;
 pub mod error;
+pub mod gather;
 pub mod grid;
 pub mod input;
 pub mod mouse;
