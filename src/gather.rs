@@ -17,12 +17,13 @@
 //! bnkterm runs one thread: it reads the PTY, parses, and submits the GPU frame in
 //! a loop. During a paint (~2–8 ms) the loop is not calling `read`, the tty's small
 //! output buffer fills, the child blocks on `write`, and drain throughput is lost.
-//! The Stage 0 probe (`docs/probes/gather_probe.rs`, recorded in
-//! measured that a gather thread recovers that loss:
-//! it holds the ~145 MB/s drain ceiling through a simulated 8 ms render stall,
-//! where a single-threaded reader collapses to ~72 MB/s. This module is the
-//! production form of that mechanism, *baseline only* (publish every nonempty
-//! buffer on the first `EAGAIN`); the adaptive bridge is a later, switchable step.
+//! A standalone mechanism probe measured that a
+//! gather thread recovers that loss: it holds the ~145 MB/s drain ceiling through a
+//! simulated 8 ms render stall, where a single-threaded reader collapses to
+//! ~72 MB/s. This module publishes every nonempty buffer on the first `EAGAIN` (the
+//! baseline policy). An adaptive bridge that coalesced reads into larger batches was
+//! prototyped and measured no faster once baseline already sits on the ceiling, so
+//! it is not carried here; the number that killed it was measured, not argued.
 //!
 //! # Ownership and the stage boundary
 //!

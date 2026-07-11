@@ -1,13 +1,13 @@
 //! The typed messages crossing the terminal/window seam.
 //!
-//! The window thread owns Wayland, xkb, and the GPU; the terminal thread owns the
-//! PTY, parser, and grid. The window resolves compositor events into [`ToTerminal`]
+//! The window side owns Wayland, xkb, and the GPU; the terminal side owns the PTY,
+//! parser, and grid. The window resolves compositor events into [`ToTerminal`]
 //! messages, and the terminal turns them into PTY bytes, grid mutations, and frames
-//! (which come back the other way as `ToWindow`). Right now everything runs on one
-//! thread (`app::State`) and these are applied inline; Stage 2 sends them across the
-//! two threads unchanged. The vocabulary grows one path at a time as each concern
-//! moves behind the seam — see the staged plan in the design doc. This starts with
-//! the keyboard path.
+//! (which come back the other way as `ToWindow`). Both run on one thread
+//! (`app::State`) and these are applied inline; the seam keeps the two concerns
+//! cleanly separable and independently testable. (Moving the whole core onto its
+//! own thread was measured and not adopted; only the PTY *read* was split off, onto
+//! the gather thread.)
 
 use crate::input::{Key, Mods};
 use crate::mouse::MouseButton;
