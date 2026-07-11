@@ -146,6 +146,39 @@ pub mod wl_data_offer {
     pub const EV_OFFER: u16 = 0;
 }
 
+// Primary selection (`primary-selection-unstable-v1`, version 1): the middle-click
+// "selection" clipboard. A near-twin of `wl_data_device` without drag-and-drop, so
+// the same three object families (device, source, offer) recur with their own
+// opcodes; the app drives both through one code path keyed by these constants.
+pub mod zwp_primary_selection_device_manager_v1 {
+    pub const CREATE_SOURCE: u16 = 0;
+    pub const GET_DEVICE: u16 = 1;
+}
+
+pub mod zwp_primary_selection_device_v1 {
+    pub const SET_SELECTION: u16 = 0;
+    /// The compositor introduces a new offer (carries its new id).
+    pub const EV_DATA_OFFER: u16 = 0;
+    /// The primary selection changed to an offer (or null = cleared).
+    pub const EV_SELECTION: u16 = 1;
+}
+
+pub mod zwp_primary_selection_source_v1 {
+    pub const OFFER: u16 = 0;
+    pub const DESTROY: u16 = 1;
+    /// A target pasted (middle-click): write our data to the fd, then close it.
+    pub const EV_SEND: u16 = 0;
+    /// Our source is no longer the primary selection; tear it down.
+    pub const EV_CANCELLED: u16 = 1;
+}
+
+pub mod zwp_primary_selection_offer_v1 {
+    pub const RECEIVE: u16 = 0;
+    pub const DESTROY: u16 = 1;
+    /// One MIME type this offer can provide.
+    pub const EV_OFFER: u16 = 0;
+}
+
 pub mod xdg_wm_base {
     pub const GET_XDG_SURFACE: u16 = 2;
     pub const PONG: u16 = 3;
@@ -243,6 +276,7 @@ pub const IFACE_COMPOSITOR: &str = "wl_compositor";
 pub const IFACE_WM_BASE: &str = "xdg_wm_base";
 pub const IFACE_SEAT: &str = "wl_seat";
 pub const IFACE_DATA_DEVICE_MANAGER: &str = "wl_data_device_manager";
+pub const IFACE_PRIMARY_SELECTION: &str = "zwp_primary_selection_device_manager_v1";
 pub const IFACE_CURSOR_SHAPE_MANAGER: &str = "wp_cursor_shape_manager_v1";
 pub const IFACE_DMABUF: &str = "zwp_linux_dmabuf_v1";
 pub const IFACE_DRM_SYNCOBJ: &str = "wp_linux_drm_syncobj_manager_v1";
@@ -254,6 +288,8 @@ pub const VERSION_COMPOSITOR: u32 = 4;
 pub const VERSION_WM_BASE: u32 = 1;
 pub const VERSION_SEAT: u32 = 5;
 pub const VERSION_DATA_DEVICE_MANAGER: u32 = 3;
+/// Primary selection is a single version; we drive only what version 1 defines.
+pub const VERSION_PRIMARY_SELECTION: u32 = 1;
 /// We only need the `text` shape, which exists in version 1.
 pub const VERSION_CURSOR_SHAPE_MANAGER: u32 = 1;
 /// Version 4 introduced the feedback object (format table, main device,

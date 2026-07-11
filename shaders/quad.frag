@@ -61,10 +61,15 @@ void main() {
     } else if (v_mode == 1u) {
         // Mask gamma thins the anti-aliased edges: linear-light compositing is
         // physically correct but renders light-on-dark text heavier than the
-        // gamma-space stacks beside it, so raising coverage to this power lowers
-        // partial-coverage alpha back to a matching weight. Solid pixels
-        // (coverage 1) are unchanged, so colour fills keep full strength.
-        float cov = pow(texelFetch(glyph_atlas, ivec2(v_uv), 0).r, push.glyph_coverage_gamma);
+        // gamma-space stacks beside it, so raising coverage to a power > 1 lowers
+        // partial-coverage alpha back to a matching weight. v_extra.x steers that
+        // power per run by contrast direction (gpu.rs contrast_factor): the exponent
+        // is G^factor, so factor 1 keeps the tuned light-on-dark thinning, while dark
+        // text on a light background (factor < 1, down to G^-1) is thickened back
+        // from the washout the same compositing gives it. Solid pixels (coverage 1)
+        // are unchanged, so colour fills keep full strength.
+        float exponent = pow(push.glyph_coverage_gamma, v_extra.x);
+        float cov = pow(texelFetch(glyph_atlas, ivec2(v_uv), 0).r, exponent);
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
     } else if (v_mode == 2u) {
         vec4 e = texelFetch(emoji_atlas, ivec2(v_uv), 0);

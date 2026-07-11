@@ -48,6 +48,16 @@ const GATHER_BYTE_BUDGET: usize = 1024 * 1024;
 /// when the wheel falls back to arrow keys on the alt screen.
 const WHEEL_LINES: usize = 3;
 
+/// The granularity a selection drag extends by, chosen from the press's click
+/// count: a single click selects by character, a double-click by word, a
+/// triple-click by whole (soft-wrapped) line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectMode {
+    Char,
+    Word,
+    Line,
+}
+
 /// The terminal half of the app: the PTY, parser, and grid, plus the state that
 /// is a pure function of them. The window feeds it [`ToTerminal`] messages, pulls
 /// a [`DisplayList`], and drains the [`ToWindow`] outbox. It holds its own copies
@@ -87,6 +97,12 @@ pub(super) struct TerminalCore {
     selection: Option<Selection>,
     /// Whether a selection drag is in progress (the button is down).
     selecting: bool,
+    /// The granularity the active drag extends by, set from the click count on press
+    /// (one click a character, two a word, three a line).
+    select_mode: SelectMode,
+    /// The clicked unit's inclusive cell range (a character, word, or line), the
+    /// pivot a drag extends around so the anchored unit always stays selected.
+    select_anchor: ((usize, usize), (usize, usize)),
     /// The content changed and a frame should be drawn. The window reads it to
     /// pace repaints, and sets it on a geometry change it drives.
     pub(super) dirty: bool,
@@ -138,6 +154,8 @@ impl TerminalCore {
             mouse_held: None,
             selection: None,
             selecting: false,
+            select_mode: SelectMode::Char,
+            select_anchor: ((0, 0), (0, 0)),
             dirty: true,
             metrics,
             width,
@@ -295,6 +313,7 @@ impl TerminalCore {
                 pressed,
                 col,
                 row,
+                count,
             } => {
                 if reporting {
                     self.mouse_held = pressed.then_some(button);
@@ -305,28 +324,26 @@ impl TerminalCore {
                     };
                     self.write_mouse(button, kind, col, row, mods)?;
                 } else if button == MouseButton::Left {
-                    // Local selection: press begins a fresh one, release ends the drag.
+                    // Local selection: a press begins one at the click's granularity
+                    // (character/word/line), a release ends the drag and offers the
+                    // text to the clipboard and primary selection.
                     if pressed {
-                        self.selection = Some(Selection {
-                            anchor: (row, col),
-                            head: (row, col),
-                        });
-                        self.selecting = true;
+                        self.begin_selection(row, col, count);
                     } else {
                         self.selecting = false;
+                        self.finish_selection();
                     }
                     self.dirty = true;
+                } else if button == MouseButton::Middle && pressed {
+                    // Middle-click pastes the primary selection (the Linux
+                    // convention). The window owns the data device, so it does the
+                    // receive; the core only asks.
+                    self.outbox.push(ToWindow::PastePrimary);
                 }
             }
             PointerEvent::Motion { col, row } => {
                 if self.selecting {
-                    // Extend the in-progress selection to the pointer's current cell.
-                    if let Some(sel) = self.selection.as_mut() {
-                        if sel.head != (row, col) {
-                            sel.head = (row, col);
-                            self.dirty = true;
-                        }
-                    }
+                    self.extend_selection(row, col);
                 } else if reporting {
                     // Report motion to a program that asked for it (drag under ?1002,
                     // any move under ?1003).
@@ -432,6 +449,68 @@ impl TerminalCore {
             self.outbox
                 .push(ToWindow::OfferSelection(text.into_bytes()));
         }
+    }
+
+    /// Begin a selection at display `(row, col)` with the granularity the click
+    /// `count` picks: one click a character, two the word, three the whole
+    /// (soft-wrapped) line. The clicked unit is the anchor a drag pivots around. A
+    /// plain click paints nothing yet (its selection appears only once the drag
+    /// leaves the cell, see [`Self::extend_selection`]), so a single click never
+    /// flashes the cell under it; a word/line click is a real selection at once.
+    fn begin_selection(&mut self, row: usize, col: usize, count: usize) {
+        let (mode, anchor) = match count {
+            2 => (SelectMode::Word, self.screen.word_at(row, col)),
+            n if n >= 3 => (SelectMode::Line, self.screen.line_at(row)),
+            _ => (SelectMode::Char, ((row, col), (row, col))),
+        };
+        self.select_mode = mode;
+        self.select_anchor = anchor;
+        self.selection = (mode != SelectMode::Char).then_some(Selection {
+            anchor: anchor.0,
+            head: anchor.1,
+        });
+        self.selecting = true;
+    }
+
+    /// Extend the in-progress drag to display `(row, col)`, snapped to its
+    /// granularity: the span runs from the anchored unit to the unit under the
+    /// pointer, so a word/line drag never splits a word or line. A character drag
+    /// that has not yet left the anchor cell stays empty, so it reads as a click.
+    fn extend_selection(&mut self, row: usize, col: usize) {
+        let unit = match self.select_mode {
+            SelectMode::Char => ((row, col), (row, col)),
+            SelectMode::Word => self.screen.word_at(row, col),
+            SelectMode::Line => self.screen.line_at(row),
+        };
+        let start = self.select_anchor.0.min(unit.0);
+        let end = self.select_anchor.1.max(unit.1);
+        let sel = (self.select_mode != SelectMode::Char || start != end).then_some(Selection {
+            anchor: start,
+            head: end,
+        });
+        if self.selection != sel {
+            self.selection = sel;
+            self.dirty = true;
+        }
+    }
+
+    /// End a left-drag: a real selection is offered to both the clipboard and the
+    /// primary selection (copy-on-select, matching the `copy-on-select = clipboard`
+    /// convention), so Ctrl+V and middle-click both paste it. A plain click leaves no
+    /// selection (nothing to offer); a word/line selection over only blank cells has
+    /// no text, so it too is dropped rather than owning an empty selection.
+    fn finish_selection(&mut self) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let text = self.screen.selection_text(sel.anchor, sel.head);
+        if text.is_empty() {
+            self.selection = None;
+            return;
+        }
+        let bytes = text.into_bytes();
+        self.outbox.push(ToWindow::OfferPrimary(bytes.clone()));
+        self.outbox.push(ToWindow::OfferSelection(bytes));
     }
 
     /// Drain the child's output, published by the gather thread, through the parser
@@ -726,5 +805,152 @@ mod tests {
             None,
         );
         assert!(list.len() > 1, "more than just the background fill");
+    }
+
+    /// A demo core (static grid with content in the top-left) for driving pointer
+    /// events through the real selection path.
+    fn pointer_core() -> TerminalCore {
+        let metrics = CellMetrics {
+            size: 16,
+            w: 8,
+            h: 16,
+            ascent: 12,
+            descent: 4,
+        };
+        TerminalCore::new(true, 80, 24, metrics, 80 * 8, 24 * 16, 0)
+    }
+
+    fn press(core: &mut TerminalCore, button: MouseButton, pressed: bool, col: usize, row: usize) {
+        click(core, button, pressed, col, row, 1);
+    }
+
+    fn click(
+        core: &mut TerminalCore,
+        button: MouseButton,
+        pressed: bool,
+        col: usize,
+        row: usize,
+        count: usize,
+    ) {
+        core.apply(ToTerminal::Pointer {
+            event: PointerEvent::Button {
+                button,
+                pressed,
+                col,
+                row,
+                count,
+            },
+            mods: input::Mods::NONE,
+        })
+        .unwrap();
+    }
+
+    fn drag_to(core: &mut TerminalCore, col: usize, row: usize) {
+        core.apply(ToTerminal::Pointer {
+            event: PointerEvent::Motion { col, row },
+            mods: input::Mods::NONE,
+        })
+        .unwrap();
+    }
+
+    /// The text of the sole primary offer in `core`'s outbox, if any.
+    fn primary_offer(core: &mut TerminalCore) -> Option<String> {
+        core.take_outbox().into_iter().find_map(|m| match m {
+            ToWindow::OfferPrimary(bytes) => String::from_utf8(bytes).ok(),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_drag_offers_the_selection_to_clipboard_and_primary() {
+        // Dragging across the demo title (row 0 begins "bnkterm") offers that text on
+        // release to *both* the clipboard and the primary selection, so Ctrl+V and
+        // middle-click both paste it.
+        let mut core = pointer_core();
+        press(&mut core, MouseButton::Left, true, 0, 0);
+        drag_to(&mut core, 3, 0);
+        press(&mut core, MouseButton::Left, false, 3, 0);
+        let out = core.take_outbox();
+        let primary = out.iter().find_map(|m| match m {
+            ToWindow::OfferPrimary(b) => Some(b.as_slice()),
+            _ => None,
+        });
+        let clipboard = out.iter().find_map(|m| match m {
+            ToWindow::OfferSelection(b) => Some(b.as_slice()),
+            _ => None,
+        });
+        assert_eq!(primary, Some(b"bnkt".as_slice()), "primary gets the text");
+        assert_eq!(clipboard, Some(b"bnkt".as_slice()), "clipboard too");
+    }
+
+    #[test]
+    fn a_double_click_selects_the_word() {
+        // A double-click inside "bnkterm" selects the whole word, bounded by the
+        // trailing space, with no drag needed.
+        let mut core = pointer_core();
+        click(&mut core, MouseButton::Left, true, 2, 0, 2);
+        click(&mut core, MouseButton::Left, false, 2, 0, 1);
+        assert_eq!(primary_offer(&mut core).as_deref(), Some("bnkterm"));
+    }
+
+    #[test]
+    fn a_triple_click_selects_the_line() {
+        // A triple-click selects the whole logical line (row 0's title), trailing
+        // blanks trimmed.
+        let mut core = pointer_core();
+        let expected = core.screen.selection_text((0, 0), (0, 79));
+        click(&mut core, MouseButton::Left, true, 5, 0, 3);
+        click(&mut core, MouseButton::Left, false, 5, 0, 1);
+        let offered = primary_offer(&mut core);
+        assert_eq!(offered.as_deref(), Some(expected.as_str()));
+        assert!(
+            offered.as_deref().is_some_and(|t| t.starts_with("bnkterm")),
+            "the line begins with the title"
+        );
+    }
+
+    #[test]
+    fn a_bare_click_selects_nothing() {
+        // Press and release on the same cell (no drag) selects nothing: no primary
+        // offer, and the selection is cleared so no stray cell stays highlighted.
+        let mut core = pointer_core();
+        press(&mut core, MouseButton::Left, true, 0, 0);
+        press(&mut core, MouseButton::Left, false, 0, 0);
+        assert!(
+            !core
+                .take_outbox()
+                .iter()
+                .any(|m| matches!(m, ToWindow::OfferPrimary(_))),
+            "a bare click offers nothing"
+        );
+        assert!(core.selection.is_none(), "and leaves no selection");
+    }
+
+    #[test]
+    fn a_click_never_highlights_the_clicked_cell() {
+        // The single-click "blink": a plain click, even with sub-cell motion that
+        // stays in the same cell, must never create a selection, so the clicked cell
+        // does not flash the selection colour.
+        let mut core = pointer_core();
+        press(&mut core, MouseButton::Left, true, 2, 0);
+        assert!(core.selection.is_none(), "the press alone shows nothing");
+        drag_to(&mut core, 2, 0); // motion that does not leave the cell
+        assert!(core.selection.is_none(), "same-cell motion shows nothing");
+        press(&mut core, MouseButton::Left, false, 2, 0);
+        assert!(core.selection.is_none(), "and the release leaves nothing");
+    }
+
+    #[test]
+    fn middle_click_requests_a_primary_paste() {
+        // With no program grabbing the mouse, a middle-click asks the window to paste
+        // the primary selection (the window owns the data device).
+        let mut core = pointer_core();
+        press(&mut core, MouseButton::Middle, true, 5, 5);
+        assert!(
+            core.take_outbox()
+                .iter()
+                .any(|m| matches!(m, ToWindow::PastePrimary)),
+            "middle-click requests a primary paste"
+        );
     }
 }

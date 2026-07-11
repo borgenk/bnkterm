@@ -29,6 +29,24 @@ pub const MODE_GLYPH: u32 = 1;
 pub const MODE_EMOJI: u32 = 2;
 pub const MODE_ROUND: u32 = 4;
 
+/// A glyph run's paint, threaded through the glyph emitters as one value: the
+/// foreground `color` and the coverage-gamma `factor` derived once from its
+/// contrast with the run background (see [`contrast_factor`]).
+#[derive(Clone, Copy)]
+struct Paint {
+    color: u32,
+    factor: f32,
+}
+
+impl Paint {
+    fn new(color: u32, bg: u32) -> Self {
+        Paint {
+            color,
+            factor: contrast_factor(color, bg),
+        }
+    }
+}
+
 /// Atlases start here and double when full, up to [`ATLAS_MAX`]; growth wipes
 /// the atlas (sources are cached in `Fonts`, so re-inserting is cheap) and the
 /// frame build restarts so no stale coordinates survive.
@@ -376,18 +394,20 @@ impl Batcher<'_> {
                 baseline,
                 face,
                 color,
+                bg,
                 text,
                 ..
-            } => self.text(*face, *x, *baseline, text, *color),
+            } => self.text(*face, *x, *baseline, text, Paint::new(*color, *bg)),
             DrawCmd::Cells {
                 x,
                 baseline,
                 cell_w,
                 face,
                 color,
+                bg,
                 text,
                 ..
-            } => self.cells(*face, *x, *baseline, *cell_w, text, *color),
+            } => self.cells(*face, *x, *baseline, *cell_w, text, Paint::new(*color, *bg)),
         }
     }
 
@@ -468,11 +488,11 @@ impl Batcher<'_> {
     /// Emit a run's glyph quads: the ASCII fast path, then grapheme clusters
     /// routed to the emoji glyph or per-character drawing. The routing mirrors
     /// `shape::text_advance`, so the quads land where layout measured.
-    fn text(&mut self, face_key: FaceKey, x: i32, baseline: i32, text: &str, color: u32) {
+    fn text(&mut self, face_key: FaceKey, x: i32, baseline: i32, text: &str, paint: Paint) {
         let mut pen = x as f32;
         if text.is_ascii() {
             for ch in text.chars() {
-                pen = self.scalar(face_key, ch, pen, baseline, color);
+                pen = self.scalar(face_key, ch, pen, baseline, paint);
             }
             return;
         }
@@ -485,12 +505,12 @@ impl Batcher<'_> {
         for (_, cluster) in grapheme::graphemes(text) {
             match self.packed_cluster(face, face_key, cluster, target) {
                 Some(packed) => {
-                    self.emit_glyph(&packed, pen, baseline, MODE_EMOJI, 0);
+                    self.emit_glyph(&packed, pen, baseline, MODE_EMOJI, paint);
                     pen += packed.advance;
                 }
                 None => {
                     for ch in cluster.chars() {
-                        pen = self.scalar(face_key, ch, pen, baseline, color);
+                        pen = self.scalar(face_key, ch, pen, baseline, paint);
                     }
                 }
             }
@@ -511,7 +531,7 @@ impl Batcher<'_> {
         baseline: i32,
         cell_w: i32,
         text: &str,
-        color: u32,
+        paint: Paint,
     ) {
         // The cell box a procedurally-drawn box/block glyph fills: its height and
         // the baseline offset that seats it, both from the same metrics the grid
@@ -527,7 +547,7 @@ impl Batcher<'_> {
             // lone-char cluster on this fixed-pitch path, never through `text`.
             if let Some(ch) = box_glyph(cluster) {
                 let packed = self.packed_box(face_key, ch, cell_w, cell_h, ascent);
-                self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, color);
+                self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, paint);
                 continue;
             }
             // A single-width color emoji (e.g. a bare ⚠) is scaled to one cell so
@@ -540,14 +560,14 @@ impl Batcher<'_> {
                     pen,
                     baseline,
                     MODE_EMOJI,
-                    0,
+                    paint,
                 ),
                 None => {
                     // Draw the cluster's characters from the anchored pen; a base
                     // glyph advances and any combining marks land back over it.
                     let mut p = pen;
                     for ch in cluster.chars() {
-                        p = self.scalar(face_key, ch, p, baseline, color);
+                        p = self.scalar(face_key, ch, p, baseline, paint);
                     }
                 }
             }
@@ -558,9 +578,16 @@ impl Batcher<'_> {
     /// returning the advanced pen. Its placement is cached beside the atlas
     /// slot, so a steady-state frame emits the quad without re-rasterising the
     /// glyph.
-    fn scalar(&mut self, face_key: FaceKey, ch: char, pen: f32, baseline: i32, color: u32) -> f32 {
+    fn scalar(
+        &mut self,
+        face_key: FaceKey,
+        ch: char,
+        pen: f32,
+        baseline: i32,
+        paint: Paint,
+    ) -> f32 {
         let packed = self.packed_scalar(face_key, ch);
-        self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, color);
+        self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, paint);
         pen + packed.advance
     }
 
@@ -680,7 +707,14 @@ impl Batcher<'_> {
 
     /// Emit a cached glyph's textured quad. An inkless or unplaced glyph (slot
     /// `None`) draws nothing; the caller advances the pen regardless.
-    fn emit_glyph(&mut self, packed: &PackedGlyph, pen: f32, baseline: i32, mode: u32, color: u32) {
+    fn emit_glyph(
+        &mut self,
+        packed: &PackedGlyph,
+        pen: f32,
+        baseline: i32,
+        mode: u32,
+        paint: Paint,
+    ) {
         let Some(slot) = packed.slot else {
             return;
         };
@@ -690,7 +724,20 @@ impl Batcher<'_> {
             w: slot.w as i32,
             h: slot.h as i32,
         };
-        self.quad(rect, mode, color, [slot.x as f32, slot.y as f32], [0.0; 4]);
+        // A coverage glyph (mode 1) carries its per-run contrast factor in extra.x,
+        // steering the shader's coverage gamma; emoji (mode 2) ignore it.
+        let extra = if mode == MODE_GLYPH {
+            [paint.factor, 0.0, 0.0, 0.0]
+        } else {
+            [0.0; 4]
+        };
+        self.quad(
+            rect,
+            mode,
+            paint.color,
+            [slot.x as f32, slot.y as f32],
+            extra,
+        );
     }
 }
 
@@ -751,6 +798,39 @@ fn color_f32(color: u32) -> [f32; 4] {
         (color & 0xff) as f32 / 255.0,
         1.0,
     ]
+}
+
+/// The per-run coverage-gamma exponent driver in `[-1, 1]`, from the run's
+/// foreground and background colours. The fragment shader raises glyph coverage to
+/// `G^factor` (`G` the base [`crate::app`] gamma):
+///
+/// - `+1` — foreground lighter than background, the usual light-on-dark terminal
+///   text: reproduces the tuned thinning that offsets linear-light compositing,
+///   byte-for-byte with the old single-gamma behaviour.
+/// - `< 1` — dark text on a lighter background (a reverse-video paste highlight, a
+///   light theme): thickens the anti-aliased edges that linear-light compositing
+///   would otherwise wash out, reaching `-1` (`G^-1`, the inverse) at maximum
+///   contrast. `0` leaves coverage untouched.
+///
+/// Only the sign-crossing near equal luminance matters; the magnitude is a soft
+/// weight, so a perceptual (gamma-space) luma is enough.
+fn contrast_factor(fg: u32, bg: u32) -> f32 {
+    let d = luma(fg) - luma(bg);
+    if d >= 0.0 {
+        1.0
+    } else {
+        (1.0 + 2.0 * d).clamp(-1.0, 1.0)
+    }
+}
+
+/// Rec. 709 relative luminance of a `0x00RRGGBB` colour in `[0, 1]`, taken in the
+/// gamma-encoded byte space as a perceptual stand-in (enough to pick the contrast
+/// direction and a soft strength; see [`contrast_factor`]).
+fn luma(color: u32) -> f32 {
+    let r = ((color >> 16) & 0xff) as f32;
+    let g = ((color >> 8) & 0xff) as f32;
+    let b = (color & 0xff) as f32;
+    (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
 }
 
 #[cfg(test)]
@@ -827,6 +907,7 @@ mod tests {
                 style: crate::platform::freetype::FontStyle::Regular,
             },
             color: 0x00ff_ffff,
+            bg: 0,
             text: "abcabc".to_string(),
         }];
         let f1 = build_frame(&fonts, &list, &mut cache);
@@ -869,6 +950,7 @@ mod tests {
                     style: crate::platform::freetype::FontStyle::Regular,
                 },
                 color: 0x00ff_ffff,
+                bg: 0,
                 text: "hi".to_string(),
             },
         ];
@@ -948,6 +1030,7 @@ mod tests {
             cell_w,
             face: FaceKey::Code { size: 16 },
             color: 0x00ff_ffff,
+            bg: 0,
             text: "MMMM".to_string(),
         }];
         let f = build_frame(&fonts, &list, &mut cache);
@@ -986,6 +1069,7 @@ mod tests {
             cell_w,
             face: FaceKey::Code { size: 16 },
             color: 0x00ff_ffff,
+            bg: 0,
             text: "M M".to_string(),
         }];
         let f = build_frame(&fonts, &list, &mut cache);
@@ -1021,6 +1105,7 @@ mod tests {
             cell_w,
             face: FaceKey::Code { size: 16 },
             color: 0x00ff_ffff,
+            bg: 0,
             text: "▛".to_string(),
         }];
         let f = build_frame(&fonts, &list, &mut cache);
@@ -1064,6 +1149,7 @@ mod tests {
                 style: crate::platform::freetype::FontStyle::Regular,
             },
             color: 0x00ff_ffff,
+            bg: 0,
             text: "😀".to_string(),
         }];
         let f = build_frame(&fonts, &list, &mut cache);
@@ -1103,6 +1189,7 @@ mod tests {
                 cell_w,
                 face: key,
                 color: 0x00ff_ffff,
+                bg: 0,
                 text: warn.clone(),
             }],
             &mut cache,
@@ -1121,6 +1208,7 @@ mod tests {
                 baseline: 16,
                 face: key,
                 color: 0x00ff_ffff,
+                bg: 0,
                 text: warn,
             }],
             &mut cache2,
@@ -1174,6 +1262,7 @@ mod tests {
                 cell_w,
                 face: key,
                 color: 0x00ff_ffff,
+                bg: 0,
                 text: "\u{26A0}".to_string(),
             }],
             &mut cache,
@@ -1192,6 +1281,28 @@ mod tests {
                 top < baseline as f32,
                 "emoji {top} rises above the baseline"
             );
+        }
+    }
+
+    #[test]
+    fn contrast_factor_preserves_light_on_dark_and_thickens_dark_on_light() {
+        let white = 0x00ff_ffff;
+        let black = 0x0000_0000;
+        // Light text on a dark background is the tuned default: factor 1 reproduces
+        // the old single-gamma thinning exactly (exponent G^1 = G).
+        assert_eq!(contrast_factor(white, black), 1.0);
+        // A mid-grey background is still darker than white text: unchanged.
+        assert_eq!(contrast_factor(white, 0x0080_8080), 1.0);
+        // Dark text on white (a reverse-video paste highlight) is thickened: the
+        // factor drops below 1, bottoming at -1 for maximum contrast (exponent G^-1).
+        assert_eq!(contrast_factor(black, white), -1.0);
+        assert!(contrast_factor(black, white) < contrast_factor(0x0060_6060, white));
+        // Equal luminance takes the no-thinning branch rather than a discontinuity.
+        assert_eq!(contrast_factor(0x0044_4444, 0x0044_4444), 1.0);
+        // The driver never escapes the range the shader's pow expects.
+        for &(fg, bg) in &[(white, black), (black, white), (0x0012_3456, 0x00fe_dcba)] {
+            let f = contrast_factor(fg, bg);
+            assert!((-1.0..=1.0).contains(&f), "factor {f} in range");
         }
     }
 }

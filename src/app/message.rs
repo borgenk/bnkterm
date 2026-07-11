@@ -19,12 +19,14 @@ use crate::term_render::CellMetrics;
 pub enum PointerEvent {
     /// The pointer moved to a cell (a selection drag, or a motion report).
     Motion { col: usize, row: usize },
-    /// A mapped button pressed or released at a cell.
+    /// A mapped button pressed or released at a cell. `count` is the multi-click
+    /// count on a left press (1 character, 2 word, 3 line); it is 1 otherwise.
     Button {
         button: MouseButton,
         pressed: bool,
         col: usize,
         row: usize,
+        count: usize,
     },
     /// Whole vertical wheel notches at a cell (the window coalesced the fractional
     /// axis deltas). `down` is the scroll direction.
@@ -79,9 +81,16 @@ pub enum ToWindow {
     /// The child's window title changed (OSC 0/2), already mapped to the shown
     /// string (the app name when empty). The window sets the toplevel title.
     Title(String),
-    /// A fresh selection's text to own on the clipboard. The window becomes the
-    /// data-device selection owner serving these bytes.
+    /// A fresh selection's text to own on the clipboard (Ctrl+Shift+C). The window
+    /// becomes the data-device selection owner serving these bytes.
     OfferSelection(Vec<u8>),
+    /// A fresh selection's text to own on the primary selection (copy-on-select).
+    /// The window becomes the primary-selection owner; a middle-click elsewhere then
+    /// pastes it, the Linux convention.
+    OfferPrimary(Vec<u8>),
+    /// A middle-click asked to paste the primary selection. The window owns the data
+    /// device, so it does the receive and feeds the bytes back as a [`ToTerminal::Paste`].
+    PastePrimary,
     /// The child exited (PTY EOF). The window begins shutdown.
     Closed,
 }

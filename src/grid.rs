@@ -935,6 +935,51 @@ impl Screen {
         out
     }
 
+    /// The inclusive cell range of the word at display `(row, col)`, for a
+    /// double-click selection. A word is a maximal run of non-boundary runes (see
+    /// [`is_word_boundary`]); a wide glyph's spacer continues its leader's word.
+    /// Clicking a boundary cell (whitespace, a bracket) selects just that cell.
+    pub fn word_at(&self, row: usize, col: usize) -> ((usize, usize), (usize, usize)) {
+        let cols = self.dimensions().0;
+        if col >= cols {
+            return ((row, col), (row, col));
+        }
+        let is_word = |c: usize| {
+            let cell = self.view_cell(row, c);
+            cell.is_wide_spacer() || !is_word_boundary(cell.rune)
+        };
+        if !is_word(col) {
+            return ((row, col), (row, col));
+        }
+        let mut start = col;
+        while start > 0 && is_word(start - 1) {
+            start -= 1;
+        }
+        let mut end = col;
+        while end + 1 < cols && is_word(end + 1) {
+            end += 1;
+        }
+        ((row, start), (row, end))
+    }
+
+    /// The inclusive cell range of the whole logical line at display `row`, for a
+    /// triple-click selection: it spans every display row a soft wrap joined (the
+    /// `WRAPPED` flag on a row's last cell continues it into the next), edge to edge.
+    pub fn line_at(&self, row: usize) -> ((usize, usize), (usize, usize)) {
+        let (cols, rows) = self.dimensions();
+        let last = cols.saturating_sub(1);
+        let wrapped = |r: usize| self.view_cell(r, last).attrs.contains(Attrs::WRAPPED);
+        let mut start = row;
+        while start > 0 && wrapped(start - 1) {
+            start -= 1;
+        }
+        let mut end = row;
+        while end + 1 < rows && wrapped(end) {
+            end += 1;
+        }
+        ((start, 0), (end, last))
+    }
+
     /// A visible row as text: base runes with their combining marks, wide spacers
     /// skipped. For selection/copy later, and for readable test assertions.
     pub fn row_string(&self, row: usize) -> String {
@@ -1786,6 +1831,14 @@ impl Screen {
 /// Tab stops every [`TAB_WIDTH`] columns (the terminal default).
 fn default_tabs(cols: usize) -> Vec<bool> {
     (0..cols).map(|c| c % TAB_WIDTH == 0).collect()
+}
+
+/// Whether a rune bounds a double-click word selection: whitespace, or one of the
+/// brackets/quotes that fence a token. The set matches the common terminal default
+/// (wezterm/xterm), so double-clicking selects a path or URL whole but stops at a
+/// delimiter. A blank cell's rune is a space, so it bounds a word too.
+fn is_word_boundary(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '{' | '}' | '[' | ']' | '(' | ')' | '"' | '\'' | '`')
 }
 
 /// Clamp an SGR color component (`0..=255`) to a byte; the parser already bounds
@@ -2854,6 +2907,41 @@ mod tests {
         feed(&mut s, b"one\r\ntwo\r\nthree\r\nfour");
         s.scroll_view_up(2); // top: "one" over "two"
         assert_eq!(s.selection_text((0, 0), (0, 2)), "one");
+    }
+
+    #[test]
+    fn word_at_spans_a_token_and_stops_at_boundaries() {
+        let mut s = Screen::new(20, 1);
+        feed(&mut s, b"cd /usr/bin (ok)");
+        // A click anywhere in "cd" selects just "cd" (cols 0..=1); a space bounds it.
+        assert_eq!(s.word_at(0, 1), ((0, 0), (0, 1)));
+        // The path is one word: '/' is not a boundary, so double-click grabs it whole.
+        assert_eq!(
+            s.selection_text(s.word_at(0, 5).0, s.word_at(0, 5).1),
+            "/usr/bin"
+        );
+        // A parenthesis bounds the token, and clicking the space between words
+        // selects just that cell.
+        assert_eq!(
+            s.word_at(0, 11),
+            ((0, 11), (0, 11)),
+            "the space is its own cell"
+        );
+        assert_eq!(
+            s.selection_text(s.word_at(0, 13).0, s.word_at(0, 13).1),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn line_at_spans_a_soft_wrapped_logical_line() {
+        // "abcdef" in a 4-wide grid wraps to "abcd" | "ef"; a triple-click on either
+        // display row selects the whole logical line, edge to edge.
+        let mut s = Screen::new(4, 3);
+        feed(&mut s, b"abcdef");
+        assert_eq!(s.line_at(0), ((0, 0), (1, 3)));
+        assert_eq!(s.line_at(1), ((0, 0), (1, 3)));
+        assert_eq!(s.selection_text(s.line_at(1).0, s.line_at(1).1), "abcdef");
     }
 
     #[test]

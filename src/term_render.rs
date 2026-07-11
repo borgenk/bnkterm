@@ -142,9 +142,10 @@ impl Default for CursorRender {
 
 /// A linear text selection over the visible grid, in `(row, col)` cell
 /// coordinates. `anchor` is where the drag began and `head` where it is now,
-/// either order; a cell is selected when it falls between them in reading order
-/// (whole rows in the middle, partial rows at the ends). This is the render half
-/// of selection; the pointer handling and clipboard hand-off land in phase 4.
+/// either order; a cell falls in the selection when it lies between them in reading
+/// order (whole rows in the middle, partial rows at the ends). The painter then
+/// trims each row's highlight to its content (see `Painter::selection_cols`), so
+/// trailing blanks never paint and the highlight matches what is copied.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Selection {
     pub anchor: (usize, usize),
@@ -159,13 +160,6 @@ impl Selection {
         } else {
             (self.head, self.anchor)
         }
-    }
-
-    /// Whether cell `(row, col)` lies within the selection, inclusive of both
-    /// ends. Rows strictly between the endpoints are wholly selected.
-    fn contains(self, row: usize, col: usize) -> bool {
-        let (start, end) = self.ordered();
-        (row, col) >= start && (row, col) <= end
     }
 }
 
@@ -376,12 +370,16 @@ impl Painter<'_> {
     /// colours, so it coalesces with the leader with no special case here.
     fn background_row(&mut self, row: usize, cols: usize) {
         let m = self.metrics;
+        // The selected span is content-trimmed once per row, so a cell past the last
+        // glyph never takes the highlight (and the per-cell test below stays O(1)).
+        let sel = self.selection_cols(row);
+        let selected = |col: usize| sel.is_some_and(|(a, b)| a <= col && col <= b);
         let mut col = 0;
         while col < cols {
-            let bg = self.cell_bg(row, col);
+            let bg = self.cell_bg(row, col, selected(col));
             let start = col;
             col += 1;
-            while col < cols && self.cell_bg(row, col) == bg {
+            while col < cols && self.cell_bg(row, col, selected(col)) == bg {
                 col += 1;
             }
             if bg != self.theme.bg {
@@ -437,7 +435,10 @@ impl Painter<'_> {
     /// rule (xterm draws it).
     fn push_run(&mut self, row: usize, col: usize, cols: usize, first: Cell, baseline: i32) {
         let m = self.metrics;
-        let fg = self.cell_fg(first);
+        // The run breaks on foreground, not background, so the first cell's background
+        // stands in for the run when weighting the glyph anti-aliasing; a same-fg run
+        // over a mixed background is rare (reverse video and selection tint uniformly).
+        let (fg, bg) = self.resolve(first, false);
         let style = style_of(first);
         let end = self.run_end(row, col, cols, first);
         // A recycled buffer (from the pool) usually already has the capacity a run
@@ -475,6 +476,7 @@ impl Painter<'_> {
                     style,
                 },
                 color: fg.to_u32(),
+                bg: bg.to_u32(),
                 text,
             });
         }
@@ -520,6 +522,7 @@ impl Painter<'_> {
         let m = self.metrics;
         let x = self.cell_x(col);
         let width_cells = if cell.is_wide_leader() { 2 } else { 1 };
+        let (fg, bg) = self.resolve(cell, false);
         let mut text = self.take_string();
         text.push(cell.rune);
         if let Some(marks) = self.marks(row, col) {
@@ -533,7 +536,8 @@ impl Painter<'_> {
                 size: m.size,
                 style: style_of(cell),
             },
-            color: self.cell_fg(cell).to_u32(),
+            color: fg.to_u32(),
+            bg: bg.to_u32(),
             text,
         });
     }
@@ -648,8 +652,10 @@ impl Painter<'_> {
             text.extend(marks);
         }
         // The inverted glyph takes the cell's own background (reverse honoured),
-        // ignoring any selection so the cursor stays legible over a selection.
-        let (_, bg) = self.resolve(cell, false);
+        // ignoring any selection so the cursor stays legible over a selection. It is
+        // stamped over the cursor block, so that colour is the background the glyph
+        // anti-aliasing is weighted against.
+        let (_, ink) = self.resolve(cell, false);
         self.list.push(DrawCmd::Text {
             bounds: text_bounds(x, baseline, width_cells * m.w, m),
             x,
@@ -658,7 +664,8 @@ impl Painter<'_> {
                 size: m.size,
                 style: style_of(cell),
             },
-            color: bg.to_u32(),
+            color: ink.to_u32(),
+            bg: self.theme.cursor.to_u32(),
             text,
         });
     }
@@ -732,10 +739,44 @@ impl Painter<'_> {
         self.resolve(cell, false).0
     }
 
-    /// The resolved background colour of cell `(row, col)`, selection applied.
-    fn cell_bg(&self, row: usize, col: usize) -> Rgb {
-        let selected = self.selection.is_some_and(|s| s.contains(row, col));
+    /// The resolved background colour of cell `(row, col)`; `selected` (precomputed
+    /// by the caller from the content-trimmed row span) swaps in the selection tint.
+    fn cell_bg(&self, row: usize, col: usize, selected: bool) -> Rgb {
         self.resolve(self.cell(row, col), selected).1
+    }
+
+    /// The inclusive column span of `row` the selection highlights, trimmed to the
+    /// row's content: past the last glyph in the selected range lie only trailing
+    /// blanks, which neither highlight nor copy. `None` when the row is outside the
+    /// selection or the selected span holds no content (a blank line, or a drag over
+    /// empty cells). This keeps the highlight identical to what [`Screen::selection_text`]
+    /// copies, and stops the "select any empty cell" behaviour wezterm/ghostty lack.
+    fn selection_cols(&self, row: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.selection?.ordered();
+        if row < start.0 || row > end.0 {
+            return None;
+        }
+        let cols = self.screen.dimensions().0;
+        let first = if row == start.0 { start.1 } else { 0 };
+        let geom_last = if row == end.0 {
+            end.1
+        } else {
+            cols.saturating_sub(1)
+        }
+        .min(cols.saturating_sub(1));
+        // Walk in from the right edge of the selected span to the last inked cell.
+        let last = (first..=geom_last)
+            .rev()
+            .find(|&col| self.cell_has_content(row, col))?;
+        Some((first, last))
+    }
+
+    /// Whether a cell carries content for selection purposes: a wide glyph's spacer
+    /// (its leader owns the glyph that covers this cell), a non-space rune, or a
+    /// combining mark. A blank space is not content, so it trims like `selection_text`.
+    fn cell_has_content(&self, row: usize, col: usize) -> bool {
+        let cell = self.cell(row, col);
+        cell.is_wide_spacer() || cell.rune != ' ' || !self.marks_empty(row, col)
     }
 
     /// Resolve a cell's `(fg, bg)` to concrete colours: reverse swaps the two, dim
@@ -1175,6 +1216,70 @@ mod tests {
                 w: 3 * M.w,
                 h: M.h
             }
+        );
+    }
+
+    #[test]
+    fn selection_trims_trailing_blanks() {
+        // "abc" in a 6-wide row, selected edge to edge. Only the three inked cells
+        // highlight; the trailing blanks (cols 3..=5) do not, matching the copy.
+        let mut s = Screen::new(6, 1);
+        feed(&mut s, b"abc");
+        let list = build_display_list(
+            &s,
+            &Theme::default(),
+            M,
+            (60, 20),
+            (0, 0),
+            CursorRender {
+                visible: false,
+                ..CursorRender::default()
+            },
+            Some(Selection {
+                anchor: (0, 0),
+                head: (0, 5),
+            }),
+        );
+        let band = fills(&list)
+            .into_iter()
+            .find(|(_, c)| *c == SELECTION_BG.to_u32())
+            .expect("a selection band");
+        assert_eq!(
+            band.0,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 3 * M.w,
+                h: M.h
+            }
+        );
+    }
+
+    #[test]
+    fn selection_over_blank_cells_paints_nothing() {
+        // Dragging across an empty region highlights no cell (the "select any block
+        // cell" behaviour wezterm/ghostty lack): there is no selection band at all.
+        let s = Screen::new(6, 1);
+        let list = build_display_list(
+            &s,
+            &Theme::default(),
+            M,
+            (60, 20),
+            (0, 0),
+            CursorRender {
+                visible: false,
+                ..CursorRender::default()
+            },
+            Some(Selection {
+                anchor: (0, 0),
+                head: (0, 5),
+            }),
+        );
+        assert!(
+            fills(&list)
+                .into_iter()
+                .all(|(_, c)| c != SELECTION_BG.to_u32()),
+            "no selection band over blank cells"
         );
     }
 

@@ -28,7 +28,7 @@ mod terminal;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
-use self::clipboard::ClipboardState;
+use self::clipboard::SelectionState;
 use self::message::{PointerEvent, ToTerminal, ToWindow};
 use self::present::GpuPresentation;
 use self::terminal::TerminalCore;
@@ -45,8 +45,9 @@ use crate::platform::freetype::Fonts;
 use crate::platform::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_device_manager, wl_data_offer, wl_display,
     wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_surface,
-    wp_fractional_scale_manager_v1, wp_fractional_scale_v1, wp_viewporter, xdg_surface,
-    xdg_toplevel, xdg_wm_base,
+    wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1, wp_fractional_scale_manager_v1,
+    wp_fractional_scale_v1, wp_viewporter, xdg_surface, xdg_toplevel, xdg_wm_base,
+    zwp_primary_selection_device_manager_v1, zwp_primary_selection_offer_v1,
 };
 use crate::platform::wire::{Arg, Message, Reader};
 use crate::platform::xkb::Xkb;
@@ -88,6 +89,10 @@ const WINDOW_PADDING: i32 = 5;
 /// `linux/input-event-codes.h`; `BTN_LEFT` is in `protocol`.
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
+
+/// The window, in milliseconds, within which successive left presses on the same
+/// cell count as a double/triple click (a common desktop default).
+const MULTI_CLICK_MS: u32 = 400;
 
 /// Upper bound on either surface dimension, applied to a compositor-supplied
 /// configure size. Far beyond any real display, it just keeps a bogus or hostile
@@ -220,14 +225,29 @@ struct State {
     compositor: Option<u32>,
     wm_base: Option<u32>,
     seat: Option<u32>,
+    /// The cursor-shape manager, absent when the compositor lacks
+    /// `wp_cursor_shape_manager_v1`; the pointer then keeps the compositor's default
+    /// shape (an arrow) rather than the I-beam we would ask for over the grid.
+    cursor_shape_manager: Option<u32>,
     keyboard: u32,
     pointer: u32,
+    /// The per-pointer shape device the manager hands out, `0` until the pointer
+    /// exists (and forever if there is no manager).
+    cursor_shape_device: u32,
+    /// The serial of the latest `wl_pointer.enter`, which `set_shape` must cite to
+    /// change the cursor (`0` before the pointer has entered).
+    pointer_enter_serial: u32,
     /// Latest pointer position in surface pixels. `axis_accum` gathers fractional
     /// wheel deltas into whole notches (the button held for drag reporting lives
     /// on the core, with the mouse mode it reports under).
     pointer_x: f32,
     pointer_y: f32,
     axis_accum: f32,
+    /// Multi-click tracking for word/line selection: the wl time (ms) and cell of the
+    /// last left press, and the running count (1 character, 2 word, 3 line, cycling).
+    last_click_time: u32,
+    last_click_cell: (usize, usize),
+    click_count: usize,
     surface: u32,
     xdg_surface: u32,
     toplevel: u32,
@@ -235,8 +255,14 @@ struct State {
     /// `wl_data_device_manager`; copy/paste is then a no-op), plus our state.
     data_device_manager: Option<u32>,
     data_device: u32,
-    clipboard: ClipboardState,
-    /// The latest input-event serial, needed to claim the clipboard selection.
+    clipboard: SelectionState,
+    /// The primary-selection device and manager (absent if the compositor has no
+    /// `zwp_primary_selection_device_manager_v1`; select-to-copy and middle-click
+    /// paste are then a no-op), plus our state. Same machinery as the clipboard.
+    primary_manager: Option<u32>,
+    primary_device: u32,
+    primary: SelectionState,
+    /// The latest input-event serial, needed to claim a selection.
     last_serial: u32,
     /// GPU/dmabuf presentation resources.
     presentation: GpuPresentation,
@@ -298,17 +324,26 @@ impl State {
             compositor: None,
             wm_base: None,
             seat: None,
+            cursor_shape_manager: None,
             keyboard: 0,
             pointer: 0,
+            cursor_shape_device: 0,
+            pointer_enter_serial: 0,
             pointer_x: 0.0,
             pointer_y: 0.0,
             axis_accum: 0.0,
+            last_click_time: 0,
+            last_click_cell: (0, 0),
+            click_count: 0,
             surface: 0,
             xdg_surface: 0,
             toplevel: 0,
             data_device_manager: None,
             data_device: 0,
-            clipboard: ClipboardState::new(),
+            clipboard: SelectionState::new(),
+            primary_manager: None,
+            primary_device: 0,
+            primary: SelectionState::new(),
             last_serial: 0,
             presentation: GpuPresentation::new(),
             next_id: 2, // 1 is wl_display
@@ -415,6 +450,18 @@ impl State {
                 &[Arg::NewId(device), Arg::Object(seat)],
             );
             self.data_device = device;
+        }
+
+        // The primary-selection device drives select-to-copy / middle-click paste,
+        // the same way; skip it when the compositor has no manager.
+        if let (Some(manager), Some(seat)) = (self.primary_manager, self.seat) {
+            let device = self.alloc_id();
+            self.conn.request(
+                manager,
+                zwp_primary_selection_device_manager_v1::GET_DEVICE,
+                &[Arg::NewId(device), Arg::Object(seat)],
+            );
+            self.primary_device = device;
         }
 
         self.create_buffers()?;
@@ -760,6 +807,19 @@ impl State {
                 self.conn
                     .request(msg.object, wl_seat::GET_POINTER, &[Arg::NewId(pointer)]);
                 self.pointer = pointer;
+                // Pair the pointer with a cursor-shape device so we can ask for the
+                // I-beam over the grid. The manager is bound in the same global burst
+                // as the seat, so it is known by the time capabilities arrive; without
+                // it the pointer keeps the compositor default shape.
+                if let Some(manager) = self.cursor_shape_manager {
+                    let device = self.alloc_id();
+                    self.conn.request(
+                        manager,
+                        wp_cursor_shape_manager_v1::GET_POINTER,
+                        &[Arg::NewId(device), Arg::Object(pointer)],
+                    );
+                    self.cursor_shape_device = device;
+                }
             }
             return Ok(());
         }
@@ -785,6 +845,21 @@ impl State {
             && msg.opcode == wl_data_offer::EV_OFFER
         {
             return self.on_offer_mime(&mut r);
+        }
+
+        if self.primary_device != 0 && msg.object == self.primary_device {
+            return self.on_primary_device(msg.opcode, &mut r);
+        }
+
+        if self.primary.source != 0 && msg.object == self.primary.source {
+            return self.on_primary_source(msg.opcode, &mut r);
+        }
+
+        if self.primary.incoming_offer != 0
+            && msg.object == self.primary.incoming_offer
+            && msg.opcode == zwp_primary_selection_offer_v1::EV_OFFER
+        {
+            return self.on_primary_offer_mime(&mut r);
         }
 
         if self.presentation.feedback_id != 0 && msg.object == self.presentation.feedback_id {
@@ -980,15 +1055,53 @@ impl State {
         )
     }
 
+    /// Ask the compositor to show the I-beam ("text") pointer over our surface, the
+    /// shape every terminal uses to signal selectable text. A no-op when the
+    /// compositor lacks `wp_cursor_shape_manager_v1` (no device, so the default arrow
+    /// stands) or before the pointer has entered (no serial to cite).
+    fn set_text_cursor(&mut self) {
+        if self.cursor_shape_device != 0 && self.pointer_enter_serial != 0 {
+            self.conn.request(
+                self.cursor_shape_device,
+                wp_cursor_shape_device_v1::SET_SHAPE,
+                &[
+                    Arg::Uint(self.pointer_enter_serial),
+                    Arg::Uint(wp_cursor_shape_device_v1::SHAPE_TEXT),
+                ],
+            );
+        }
+    }
+
+    /// The click multiplicity of a left press: 1, 2, or 3 for successive presses on
+    /// the same cell within [`MULTI_CLICK_MS`], cycling back to 1 past a triple so a
+    /// fourth click starts fresh. A press elsewhere or after the window restarts the
+    /// count. `wrapping_sub` keeps the comparison correct across the wl clock's u32
+    /// wrap.
+    fn click_count(&mut self, time: u32, cell: (usize, usize)) -> usize {
+        let quick = time.wrapping_sub(self.last_click_time) <= MULTI_CLICK_MS;
+        self.click_count = if quick && self.last_click_cell == cell && self.click_count < 3 {
+            self.click_count + 1
+        } else {
+            1
+        };
+        self.last_click_time = time;
+        self.last_click_cell = cell;
+        self.click_count
+    }
+
     /// One wl_pointer event: track the position, and either report to the child or
     /// drive local selection/scroll.
     fn on_pointer(&mut self, opcode: u16, r: &mut Reader) -> Result<()> {
         match opcode {
             wl_pointer::EV_ENTER => {
-                let _serial = r.u32()?;
+                // The enter serial is the one `set_shape` must cite; a fresh enter is
+                // also where the compositor resets the cursor, so this is when we (re)ask
+                // for the I-beam.
+                self.pointer_enter_serial = r.u32()?;
                 let _surface = r.u32()?;
                 self.pointer_x = r.fixed()?;
                 self.pointer_y = r.fixed()?;
+                self.set_text_cursor();
             }
             wl_pointer::EV_MOTION => {
                 let _time = r.u32()?;
@@ -1002,18 +1115,26 @@ impl State {
             }
             wl_pointer::EV_BUTTON => {
                 self.last_serial = r.u32()?;
-                let _time = r.u32()?;
+                let time = r.u32()?;
                 let button = r.u32()?;
                 let pressed = r.u32()? == wl_pointer::BUTTON_STATE_PRESSED;
                 // Map the raw Wayland button to ours (window-side); ignore unmapped.
                 if let Some(button) = pointer_button(button) {
                     let (col, row) = self.pointer_cell();
+                    // A left press carries its click multiplicity (word/line select);
+                    // any other event is a plain single.
+                    let count = if button == MouseButton::Left && pressed {
+                        self.click_count(time, (col, row))
+                    } else {
+                        1
+                    };
                     self.core.apply(ToTerminal::Pointer {
                         event: PointerEvent::Button {
                             button,
                             pressed,
                             col,
                             row,
+                            count,
                         },
                         mods: self.current_mods(),
                     })?;
@@ -1077,6 +1198,15 @@ impl State {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_SEAT);
                 self.seat = Some(id);
             }
+            protocol::IFACE_CURSOR_SHAPE_MANAGER => {
+                let id = self.bind_capped(
+                    name,
+                    interface,
+                    version,
+                    protocol::VERSION_CURSOR_SHAPE_MANAGER,
+                );
+                self.cursor_shape_manager = Some(id);
+            }
             protocol::IFACE_DATA_DEVICE_MANAGER => {
                 let id = self.bind_capped(
                     name,
@@ -1085,6 +1215,15 @@ impl State {
                     protocol::VERSION_DATA_DEVICE_MANAGER,
                 );
                 self.data_device_manager = Some(id);
+            }
+            protocol::IFACE_PRIMARY_SELECTION => {
+                let id = self.bind_capped(
+                    name,
+                    interface,
+                    version,
+                    protocol::VERSION_PRIMARY_SELECTION,
+                );
+                self.primary_manager = Some(id);
             }
             protocol::IFACE_DMABUF if version >= protocol::VERSION_DMABUF => {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_DMABUF);
@@ -1135,6 +1274,8 @@ impl State {
             match msg {
                 ToWindow::Title(title) => self.set_toplevel_title(&title),
                 ToWindow::OfferSelection(bytes) => self.set_clipboard(bytes),
+                ToWindow::OfferPrimary(bytes) => self.set_primary(bytes),
+                ToWindow::PastePrimary => self.paste_primary()?,
                 ToWindow::Closed => self.closed = true,
             }
         }

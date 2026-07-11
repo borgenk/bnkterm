@@ -71,6 +71,10 @@ pub enum DrawCmd {
         baseline: i32,
         face: FaceKey,
         color: u32,
+        /// The background colour the run is drawn over, so the backend can weight
+        /// the glyph anti-aliasing for its contrast direction (dark-on-light text is
+        /// thickened, light-on-dark thinned; see [`crate::render::gpu`]).
+        bg: u32,
         text: String,
     },
     /// A run of monospace cells drawn at a fixed pitch: the `i`th grapheme
@@ -91,6 +95,10 @@ pub enum DrawCmd {
         cell_w: i32,
         face: FaceKey,
         color: u32,
+        /// The background colour the run is drawn over (its first cell's), so the
+        /// backend can weight the glyph anti-aliasing for its contrast direction (see
+        /// [`Text`](DrawCmd::Text) and [`crate::render::gpu`]).
+        bg: u32,
         text: String,
     },
 }
@@ -356,6 +364,7 @@ mod tests {
             cell_w: 10,
             face: FaceKey::Code { size: 16 },
             color: 0x00ff_ffff,
+            bg: 0,
             text: text.to_string(),
         };
         let old = vec![run("hello")];
