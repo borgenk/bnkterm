@@ -1,15 +1,22 @@
 //! Opening a clicked link in the user's default browser.
 //!
-//! A URL in the terminal's output follows on Ctrl+click: [`crate::link`] finds it in
-//! the text, [`crate::app`] resolves the click to it, and hands it here. We shell out
-//! to `xdg-open`, the freedesktop way to reach whatever the user set as their default
+//! The app resolves a click to a destination ([`crate::platform::link`] finds the
+//! ones the text carries no markup for) and hands it here. We shell out to
+//! `xdg-open`, the freedesktop way to reach whatever the user set as their default
 //! handler, rather than hardcoding a browser.
 
 use std::process::{Command, Stdio};
 
 use crate::platform::error::{Error, Result};
 
-/// Open `url` in the default browser via `xdg-open`, detached from the editor.
+/// The schemes we are willing to open, and so also exactly the schemes
+/// [`crate::platform::link`] detects: a link the app decorates and then refuses to
+/// follow is a worse bug than one it never decorated. Kept deliberately small: the
+/// web and mail schemes text links to, plus `file:` for local references. Nothing
+/// executable (`javascript:`, `data:`) is reachable.
+pub const OPENABLE_SCHEMES: [&str; 4] = ["https://", "http://", "file://", "mailto:"];
+
+/// Open `url` in the default browser via `xdg-open`, detached from the app.
 ///
 /// `xdg-open` is a thin shell wrapper, so the URL is vetted first: a leading dash
 /// (which it could read as an option) and any scheme not in [`has_allowed_scheme`]
@@ -35,19 +42,19 @@ pub fn open_url(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether [`open_url`] would launch `url`: it carries a scheme we open (see
-/// [`has_allowed_scheme`]) and does not start with a dash `xdg-open` could read as
-/// an option. The terminal checks this before queueing a Ctrl+clicked link, so a
-/// scheme we would refuse never leaves the grid.
+/// Whether [`open_url`] would launch `url`: it carries an [`OPENABLE_SCHEMES`]
+/// scheme and does not start with a dash `xdg-open` could read as an option. The app
+/// checks this before offering a link to the pointer, so a target we would refuse
+/// never presents itself as clickable in the first place.
 pub fn can_open(url: &str) -> bool {
     !url.starts_with('-') && has_allowed_scheme(url)
 }
 
-/// Whether `url` carries a scheme we are willing to open. Kept deliberately small:
-/// the web and mail schemes a note links to, plus `file:` for local references.
+/// Whether `url` carries a scheme we are willing to open.
 fn has_allowed_scheme(url: &str) -> bool {
-    const ALLOWED: [&str; 4] = ["http://", "https://", "file://", "mailto:"];
-    ALLOWED.iter().any(|scheme| url.starts_with(scheme))
+    OPENABLE_SCHEMES
+        .iter()
+        .any(|scheme| url.starts_with(scheme))
 }
 
 #[cfg(test)]

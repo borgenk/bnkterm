@@ -693,7 +693,7 @@ pub enum CursorStyle {
 #[derive(Default)]
 pub struct LinkProbe {
     /// The logical line under the pointer: its soft-wrapped display rows joined, wide
-    /// spacers dropped. Exactly the text [`crate::link`] scans.
+    /// spacers dropped. Exactly the text [`crate::platform::link`] scans.
     text: String,
     /// Where each rune of `text` came from: its byte offset, and the display cell that
     /// printed it. Ascending in both, so a byte offset maps back to a cell by binary
@@ -1072,7 +1072,7 @@ impl Screen {
             }
         }
 
-        let found = crate::link::find_at(&probe.text, at?)?;
+        let found = crate::platform::link::find_at(&probe.text, at?)?;
         // `found.end` is exclusive, so the last rune inside the link is the one
         // covering the byte before it.
         let start = probe.cell_at(found.start)?;

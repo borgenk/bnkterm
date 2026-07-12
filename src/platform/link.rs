@@ -1,12 +1,11 @@
-//! Finding a URL inside a line of terminal text.
+//! Finding a URL inside a line of text.
 //!
-//! Terminal output is unstructured prose: `git push` prints a pull-request URL,
-//! `cargo` prints a docs link, a dev server prints `http://localhost:3000`. None of
-//! them mark those as links (OSC 8, the escape sequence that would, is emitted by
-//! almost nothing), so a terminal that wants them clickable has to *find* them in
-//! the text. That is this module, and nothing else: a pure `&str -> Option<Range>`
-//! scan holding no grid and no parser state, so it is exhaustively testable without
-//! a window, a PTY, or a GPU.
+//! A URL usually arrives with no markup around it: a note is typed with one straight
+//! in the prose, and a terminal's output prints one (`git push` prints a pull-request
+//! URL, a dev server prints `http://localhost:3000`). Nothing marks those as links, so
+//! an app that wants them clickable has to *find* them in the text. That is this
+//! module, and nothing else: a pure `&str -> Range` scan holding no buffer and no
+//! parser state, so it is exhaustively testable without a window or a GPU.
 //!
 //! ```text
 //!   "see (https://en.wikipedia.org/wiki/Cure_(album)) for more."
@@ -38,65 +37,69 @@
 //!   `en.wikipedia.org/wiki/Cure_(album)` keeps its parentheses; `(see example.com/a)`
 //!   gives its `)` back to the prose.
 //!
-//! We detect exactly the schemes [`crate::platform::browser`] is willing to open and
-//! no others. A link the terminal underlines and then refuses to follow is a worse
-//! bug than one it never underlined, and the text being scanned is hostile by
-//! construction (any program can print anything), so `javascript:` and `data:` are
-//! never even candidates.
+//! We detect exactly the schemes [`browser::OPENABLE_SCHEMES`] lists, by scanning for
+//! that same constant. A link the app decorates and then refuses to follow is a worse
+//! bug than one it never decorated, and the text being scanned may be hostile (a note
+//! can be pasted, a program can print anything), so `javascript:` and `data:` are never
+//! even candidates.
 //!
 //! [uts58]: https://www.unicode.org/reports/tr58/
 
 use std::ops::Range;
 
-/// The schemes we detect, deliberately the same set [`crate::platform::browser`]
-/// will launch. `https` precedes `http` only for readability; they cannot collide,
-/// since neither is a prefix of the other.
-const SCHEMES: [&str; 4] = ["https://", "http://", "file://", "mailto:"];
+use crate::platform::browser;
 
 /// How deep a URL may nest brackets before we stop believing it is one. UTS #58
 /// allows 125; a real URL never passes two or three, and a fixed array keeps the
 /// scan allocation-free, which matters because it runs on pointer motion.
 const MAX_NESTING: usize = 16;
 
+/// The URLs in `text`, left to right and non-overlapping. A scheme *inside* an
+/// already-yielded URL (the `http://` in a `?to=` query string) belongs to that URL
+/// and is not reported again.
+pub fn urls(text: &str) -> impl Iterator<Item = Range<usize>> + '_ {
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        while at < text.len() {
+            match scheme_at(text, at).and_then(|len| extent(text, at, len)) {
+                Some(range) => {
+                    at = range.end;
+                    return Some(range);
+                }
+                // Not a link here (or a scheme with no host, or mid-character): the
+                // next byte is the next candidate.
+                None => at += 1,
+            }
+        }
+        None
+    })
+}
+
 /// The byte range of the URL covering `at` in `text`, or `None` when that offset is
-/// not inside one. `at` is a byte offset of the character being asked about (the
-/// cell under the pointer, in the caller's case).
+/// not inside one. `at` is a byte offset of the character being asked about (the cell
+/// or glyph under the pointer, in the caller's case).
 ///
 /// Candidates are examined left to right rather than searched outward from `at`,
 /// because a URL's extent is a function of where it *starts*: only the scheme says
-/// which characters are still part of it, so scanning backwards from a cell in the
-/// middle could not tell `?` in a query string from `?` at the end of a question.
+/// which characters are still part of it, so scanning backwards from a byte in the
+/// middle could not tell `?` in a query string from `?` at the end of a question. The
+/// first URL reaching past `at` therefore either covers it or begins after it, and in
+/// the latter case nothing else can cover it.
 pub fn find_at(text: &str, at: usize) -> Option<Range<usize>> {
-    for (start, scheme_len) in scheme_starts(text) {
-        let Some(range) = extent(text, start, scheme_len) else {
-            continue;
-        };
-        if range.end <= at {
-            // This link ends before the offset asked about; a later one may cover it.
-            continue;
-        }
-        // Candidates are ascending, so the first one reaching past `at` either covers
-        // it or begins after it, and in the latter case nothing else can cover it.
-        return (range.start <= at).then_some(range);
-    }
-    None
-}
-
-/// Every offset where a [`SCHEMES`] entry begins a token, with that scheme's length.
-/// Ascending, which is what lets [`find_at`] stop at its first candidate past `at`.
-fn scheme_starts(text: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
-    (0..text.len()).filter_map(|at| Some((at, scheme_at(text, at)?)))
+    urls(text).find(|r| r.end > at).filter(|r| r.start <= at)
 }
 
 /// The length of the scheme starting exactly at `at`, or `None` when no scheme does.
 ///
-/// The token-boundary check is what stops `xhttps://x` and `see-mailto:x` from
-/// reading as links: a character that could *continue* a scheme (RFC 3986 §3.1's
-/// `ALPHA / DIGIT / "+" / "-" / "."`) sitting immediately before means the match is
-/// the tail of a longer word, not a scheme.
+/// The token-boundary check is what stops `xhttps://x` and `see-mailto:x` from reading
+/// as links: a character that could *continue* a scheme (RFC 3986 §3.1's `ALPHA /
+/// DIGIT / "+" / "-" / "."`) sitting immediately before means the match is the tail of
+/// a longer word, not a scheme.
 fn scheme_at(text: &str, at: usize) -> Option<usize> {
     let rest = text.get(at..)?;
-    let scheme = SCHEMES.iter().find(|scheme| rest.starts_with(**scheme))?;
+    let scheme = browser::OPENABLE_SCHEMES
+        .iter()
+        .find(|scheme| rest.starts_with(**scheme))?;
     let preceded = text
         .get(..at)
         .and_then(|before| before.chars().next_back())
@@ -116,7 +119,7 @@ fn extent(text: &str, start: usize, scheme_len: usize) -> Option<Range<usize>> {
     let mut last_safe = body;
     let mut stack = ['\0'; MAX_NESTING];
     let mut depth = 0usize;
-    for (offset, c) in text[body..].char_indices() {
+    for (offset, c) in text.get(body..)?.char_indices() {
         let next = body + offset + c.len_utf8();
         match classify(c) {
             Class::Hard => break,
@@ -182,9 +185,9 @@ fn classify(c: char) -> Class {
         // `%` of a percent-escape.
         '-' | '_' | '~' | '/' | '#' | '@' | '$' | '&' | '*' | '+' | '=' | '%' => Class::Url,
         // Every other ASCII character (`"`, `<`, `>`, `\`, `^`, backtick, `{`, `|`,
-        // `}`) is illegal in a URL, so it ends one. This is what makes the common
-        // ways of quoting a link — `<http://x>`, `"http://x"` — come out clean with
-        // no special case for them.
+        // `}`) is illegal in a URL, so it ends one. This is what makes the common ways
+        // of quoting a link — `<http://x>`, `"http://x"` — come out clean with no
+        // special case for them.
         c if c.is_ascii() => Class::Hard,
         // Non-ASCII: an IRI may carry it (an accented Wikipedia title), and it is
         // never prose punctuation we would have to guess about.
@@ -204,11 +207,16 @@ mod tests {
     }
 
     /// The URL covering the offset of the first `|` in `marked`, which is removed
-    /// before scanning. Lets a case point at the exact cell being hovered.
+    /// before scanning. Lets a case point at the exact character being hovered.
     fn at_cursor(marked: &str) -> Option<String> {
         let at = marked.find('|').expect("no cursor in case");
         let text = marked.replace('|', "");
         find_at(&text, at).map(|r| text[r].to_string())
+    }
+
+    /// Every URL in `text`, as [`urls`] yields them.
+    fn all(text: &str) -> Vec<&str> {
+        urls(text).map(|r| &text[r]).collect()
     }
 
     #[test]
@@ -220,13 +228,13 @@ mod tests {
     }
 
     #[test]
-    fn a_url_is_found_from_any_cell_inside_it() {
+    fn a_url_is_found_from_any_byte_inside_it() {
         let text = "see https://example.com/path now";
         // Every offset from the scheme's `h` to the path's last character resolves to
-        // the same link, so hovering anywhere along it underlines the whole thing.
-        // The word after it resolves to nothing.
+        // the same link, so hovering anywhere along it decorates the whole thing. The
+        // word after it resolves to nothing.
         for needle in ["https", "//", "example", "com", "/path", "now"] {
-            let at = text.find(needle).unwrap();
+            let at = text.find(needle).expect("needle");
             let found = find_at(text, at).map(|r| &text[r]);
             let expected = (needle != "now").then_some("https://example.com/path");
             assert_eq!(found, expected, "at {needle:?}");
@@ -323,7 +331,8 @@ mod tests {
     #[test]
     fn the_usual_ways_of_quoting_a_link_come_out_clean() {
         // `<`, `>`, and `"` cannot appear in a URL, so they end one with no special
-        // case: this is RFC 3986 doing the work.
+        // case: this is RFC 3986 doing the work. The `<https://x>` form is also how
+        // markdown writes an autolink, so it falls out for free.
         assert_eq!(
             at_needle("<https://example.com/a>", "https"),
             Some("https://example.com/a".into())
@@ -353,8 +362,8 @@ mod tests {
 
     #[test]
     fn only_schemes_we_can_open_are_detected() {
-        // The detect set is the open set: never underline what we would then refuse
-        // to follow, and never make a hostile scheme reachable in the first place.
+        // The detect set is the open set: never decorate what we would then refuse to
+        // follow, and never make a hostile scheme reachable in the first place.
         assert_eq!(at_needle("javascript:alert(1)", "javascript"), None);
         assert_eq!(at_needle("data:text/html,<h1>x", "data"), None);
         assert_eq!(at_needle("ftp://example.com/a", "ftp"), None);
@@ -367,6 +376,10 @@ mod tests {
             at_needle("file:///etc/hosts", "file"),
             Some("file:///etc/hosts".into())
         );
+        // Whatever we do detect, the browser will in fact launch.
+        for url in all("https://a.com http://b.com file:///c mailto:d@e.com") {
+            assert!(browser::can_open(url), "{url} is detected but not openable");
+        }
     }
 
     #[test]
@@ -375,6 +388,22 @@ mod tests {
         assert_eq!(find_at("https://", 0), None);
         assert_eq!(find_at("say https:// then", 4), None);
         assert_eq!(find_at("mailto:", 0), None);
+        assert!(all("https:// and mailto: alone").is_empty());
+    }
+
+    #[test]
+    fn every_url_in_a_line_is_yielded_left_to_right() {
+        assert_eq!(
+            all("a https://one.com/x b http://two.com/y c"),
+            ["https://one.com/x", "http://two.com/y"]
+        );
+        assert!(all("no links here at all").is_empty());
+        // A scheme nested in a query string is swallowed by the URL that contains it,
+        // not reported a second time on its own.
+        assert_eq!(
+            all("https://a.com/r?to=http://b.com/x"),
+            ["https://a.com/r?to=http://b.com/x"]
+        );
     }
 
     #[test]
@@ -392,8 +421,6 @@ mod tests {
         );
         // The gap between them belongs to neither.
         assert_eq!(at_cursor("a https://one.com/x |b http://two.com/y c"), None);
-        // A scheme nested in a query string is swallowed by the outer URL, not
-        // reported as a second link.
         assert_eq!(
             at_needle("https://a.com/r?to=http://b.com/x", "http://b"),
             Some("https://a.com/r?to=http://b.com/x".into())
@@ -405,6 +432,12 @@ mod tests {
         assert_eq!(
             at_needle("https://de.wikipedia.org/wiki/Grüße ok", "https"),
             Some("https://de.wikipedia.org/wiki/Grüße".into())
+        );
+        // A multi-byte character before a scheme is a boundary, and one that lands
+        // mid-character never splits it.
+        assert_eq!(
+            at_needle("så https://example.com/a", "https"),
+            Some("https://example.com/a".into())
         );
     }
 
@@ -422,8 +455,8 @@ mod tests {
 
     #[test]
     fn control_characters_end_a_url() {
-        // A program can print anything, including a URL run up against a control
-        // byte; it must never be swallowed into the link.
+        // Pasted or printed text can run a URL up against a control byte; it must
+        // never be swallowed into the link.
         assert_eq!(
             at_needle("https://example.com/a\u{7}b", "https"),
             Some("https://example.com/a".into())
@@ -436,8 +469,8 @@ mod tests {
 
     #[test]
     fn absurd_bracket_nesting_is_refused_rather_than_trusted() {
-        // Past MAX_NESTING we stop believing this is a URL and keep only what was
-        // safe before the nesting ran away. Bounded work on hostile input.
+        // Past MAX_NESTING we stop believing this is a URL and keep only what was safe
+        // before the nesting ran away. Bounded work on hostile input.
         let deep = format!("https://example.com/{}x", "(".repeat(MAX_NESTING + 4));
         assert_eq!(
             at_needle(&deep, "https"),

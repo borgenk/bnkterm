@@ -10,7 +10,7 @@
 //!   segmentation (`grapheme`), and ARGB pixel math (`pixel`).
 //! - **Foundation**: the syscall FFI surface (`ffi`), the minimal error type
 //!   (`error`), branchless byte scanning (`bytes`), scroll math (`scroll`), and
-//!   opening a URL in the browser (`browser`).
+//!   finding a URL in text (`link`) so it can be opened in the browser (`browser`).
 //!
 //! It is a clean, self-contained leaf: a module here may depend only on other
 //! `platform` modules and `std`, never on the app or GPU-render layers above it,
@@ -27,6 +27,7 @@ pub(crate) mod ffi;
 pub(crate) mod freetype;
 pub(crate) mod geom;
 pub(crate) mod grapheme;
+pub(crate) mod link;
 pub(crate) mod pixel;
 pub(crate) mod protocol;
 pub(crate) mod scroll;

@@ -27,7 +27,6 @@ pub mod gather;
 pub mod grid;
 pub mod input;
 mod keymode;
-pub mod link;
 pub mod mouse;
 pub mod pty;
 mod tab_bar;
