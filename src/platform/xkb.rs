@@ -1,20 +1,20 @@
 //! Keyboard translation backed by libxkbcommon (libxkbcommon.so.0).
 //!
 //! The compositor hands us an XKB keymap over wl_keyboard.keymap; we give it to
-//! libxkbcommon and let it own layout and modifier state. Each pressed key
-//! becomes a [`KeyAction`]: a few layout-independent special keys dispatch on
-//! the physical evdev keycode, and everything else asks xkb for the UTF-8 string
-//! the key produces under the current modifiers.
+//! libxkbcommon and let it own layout and modifier state.
 //!
-//! Character input also runs through libxkbcommon's Compose machine (a compose
-//! table built from the user's locale), so dead keys and compose sequences
-//! resolve: on a Nordic layout `dead_grave` then Space yields `` ` ``, then `a`
-//! yields `à`, and so on. A key mid-sequence produces no input until the
-//! sequence completes; keys that are not part of one fall through to their own
-//! UTF-8.
+//! What a key *means* belongs to the app that binds it, so this layer answers only
+//! the questions the machine can answer about a keycode: the keysym it resolves to
+//! under the current layout ([`Xkb::key_sym`]), the text it produces
+//! ([`Xkb::key_text`], [`Xkb::key_char`]), whether it auto-repeats, and which
+//! modifiers are held. The app turns those into its own actions, which is what keeps
+//! one app's shortcuts out of the layer every app shares.
 //!
-//! Trimmed to the actions this milestone needs (character input, Backspace,
-//! left/right).
+//! Text runs through libxkbcommon's Compose machine (a compose table built from the
+//! user's locale), so dead keys and compose sequences resolve: on a Nordic layout
+//! `dead_grave` then Space yields `` ` ``, then `a` yields `à`, and so on. A key
+//! mid-sequence produces no text until the sequence completes; keys that are not part
+//! of one fall through to their own UTF-8.
 
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr::NonNull;
@@ -24,7 +24,10 @@ use crate::platform::error::{Error, Result};
 /// Wayland passes raw evdev keycodes; XKB expects them offset by +8.
 const EVDEV_OFFSET: u32 = 8;
 
-mod keycode {
+/// Raw Linux evdev keycodes, as `wl_keyboard.key` reports them (before the
+/// libxkbcommon `+8` offset). From `linux/input-event-codes.h`, a kernel ABI, which
+/// is why they live down here: an app binds them, but it does not get to define them.
+pub mod keycode {
     pub const ESC: u32 = 1;
     pub const BACKSPACE: u32 = 14;
     pub const TAB: u32 = 15;
@@ -97,61 +100,6 @@ extern "C" {
     fn xkb_compose_state_feed(st: *mut c_void, keysym: u32) -> c_int;
     fn xkb_compose_state_get_status(st: *mut c_void) -> c_int;
     fn xkb_compose_state_get_utf8(st: *mut c_void, buf: *mut c_char, size: usize) -> c_int;
-}
-
-/// What a key press should do to the editor. The cursor-motion variants (Left,
-/// Right, Up, Down, Home, End, the word/document variants, and the page moves)
-/// are the ones a held Shift turns into selection-extending moves; the editing
-/// variants ignore Shift.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KeyAction {
-    Char(char),
-    Enter,
-    /// Insert indentation (a soft tab); see the app's handling.
-    Tab,
-    Backspace,
-    Delete,
-    /// Delete to the previous/next word boundary (Ctrl+Backspace / Ctrl+Delete).
-    DeleteWordBack,
-    DeleteWordForward,
-    /// Delete the whole line(s) the cursor or selection touches (Ctrl+Shift+K).
-    DeleteLine,
-    Left,
-    Right,
-    Up,
-    Down,
-    Home,
-    End,
-    /// Move one word left/right (Ctrl+Left / Ctrl+Right).
-    WordLeft,
-    WordRight,
-    /// Move to the very start/end of the buffer (Ctrl+Home / Ctrl+End).
-    DocStart,
-    DocEnd,
-    /// Move up/down one viewport height (Page Up / Page Down).
-    PageUp,
-    PageDown,
-    SelectAll,
-    Copy,
-    Cut,
-    Paste,
-    Undo,
-    Redo,
-    Save,
-    /// Open (or, while open, close) the find bar (Ctrl+F).
-    Find,
-    /// Open the find bar with its replace row (Ctrl+H).
-    Replace,
-    /// Leave a transient mode such as the find bar (Escape).
-    Escape,
-    /// Pane management: toggle the file tree (Ctrl+B), toggle the second content
-    /// pane (Ctrl+\), and focus the tree / editor A / editor B (Ctrl+0/1/2).
-    ToggleTree,
-    ToggleSecondPane,
-    FocusTree,
-    FocusPaneA,
-    FocusPaneB,
-    None,
 }
 
 /// Owns the libxkbcommon context, and (once a keymap arrives) the keymap and
@@ -313,51 +261,35 @@ impl Xkb {
         repeats != 0
     }
 
-    /// Translate a Wayland (evdev) keycode into an editor action.
-    pub fn action(&self, keycode: u32) -> KeyAction {
-        // The navigation and deletion keys do bigger jumps when Ctrl is held:
-        // Ctrl+Arrow moves by word, Ctrl+Home/End to the document ends, and
-        // Ctrl+Backspace/Delete remove a whole word.
-        let ctrl = self.ctrl_active();
-        match keycode {
-            keycode::BACKSPACE => {
-                return ctrl_or(ctrl, KeyAction::DeleteWordBack, KeyAction::Backspace);
-            }
-            keycode::DELETE => {
-                return ctrl_or(ctrl, KeyAction::DeleteWordForward, KeyAction::Delete);
-            }
-            keycode::ESC => return KeyAction::Escape,
-            keycode::ENTER | keycode::KP_ENTER => return KeyAction::Enter,
-            // Ctrl+Tab falls through to the (empty) Ctrl handler so it does not
-            // insert; plain Tab inserts indentation.
-            keycode::TAB if !ctrl => return KeyAction::Tab,
-            keycode::LEFT => return ctrl_or(ctrl, KeyAction::WordLeft, KeyAction::Left),
-            keycode::RIGHT => return ctrl_or(ctrl, KeyAction::WordRight, KeyAction::Right),
-            keycode::UP => return KeyAction::Up,
-            keycode::DOWN => return KeyAction::Down,
-            keycode::HOME => return ctrl_or(ctrl, KeyAction::DocStart, KeyAction::Home),
-            keycode::END => return ctrl_or(ctrl, KeyAction::DocEnd, KeyAction::End),
-            keycode::PAGEUP => return KeyAction::PageUp,
-            keycode::PAGEDOWN => return KeyAction::PageDown,
-            _ => {}
-        }
+    /// The keysym `keycode` resolves to under the current layout and modifiers.
+    /// `None` before a keymap arrives.
+    ///
+    /// An app binds its modifier shortcuts on this rather than on the physical
+    /// keycode, so a shortcut follows the letter the user sees: Ctrl+W is the `w` key
+    /// on QWERTY and on Dvorak alike.
+    pub fn key_sym(&self, keycode: u32) -> Option<u32> {
+        let state = self.state?;
+        // SAFETY: state is valid; the call returns the effective keysym.
+        Some(unsafe { xkb_state_key_get_one_sym(state.as_ptr(), keycode + EVDEV_OFFSET) })
+    }
 
-        // Other Control combos: read the layout's keysym so the shortcut follows
-        // the letter, not the physical key, and never insert a control character.
-        if ctrl {
-            return self.ctrl_action(keycode);
-        }
-
-        let Some(state) = self.state else {
-            return KeyAction::None;
-        };
+    /// The character `keycode` types under the current modifiers and the Compose
+    /// machine, or `None` when it produces no text: a modifier, a named key, a key
+    /// part-way through a dead-key sequence, or one that cancelled an invalid one.
+    ///
+    /// This is the typing path and the only caller of the Compose state, which is
+    /// what makes `dead_grave` then `a` arrive as one `à` rather than two keys. Only
+    /// a single non-control scalar is returned; a sequence yielding several is
+    /// dropped.
+    pub fn key_text(&self, keycode: u32) -> Option<char> {
+        let state = self.state?;
         let key = keycode + EVDEV_OFFSET;
         let mut buf = [0u8; 16];
-        // Feed the key's keysym through the Compose machine first, so dead keys
-        // and compose sequences resolve. A key mid-sequence (or one that cancels
-        // an invalid sequence) produces no input; a completed sequence yields its
-        // composed text; a key that is part of no sequence falls through to its
-        // own UTF-8 (the common path for ordinary typing).
+        // Feed the key's keysym through the Compose machine first, so dead keys and
+        // compose sequences resolve. A key mid-sequence (or one that cancels an
+        // invalid sequence) produces nothing; a completed sequence yields its composed
+        // text; a key that is part of no sequence falls through to its own UTF-8 (the
+        // common path for ordinary typing).
         let n = match self.compose {
             Some(compose) => {
                 // SAFETY: state and compose are valid; the sym lookup reads state,
@@ -366,11 +298,11 @@ impl Xkb {
                 unsafe { xkb_compose_state_feed(compose.as_ptr(), sym) };
                 // SAFETY: compose is valid.
                 match unsafe { xkb_compose_state_get_status(compose.as_ptr()) } {
-                    XKB_COMPOSE_COMPOSING => return KeyAction::None,
+                    XKB_COMPOSE_COMPOSING => return None,
                     XKB_COMPOSE_CANCELLED => {
                         // SAFETY: compose is valid; clear the abandoned sequence.
                         unsafe { xkb_compose_state_reset(compose.as_ptr()) };
-                        return KeyAction::None;
+                        return None;
                     }
                     XKB_COMPOSE_COMPOSED => {
                         // SAFETY: compose is valid; buf is writable and sized for
@@ -393,19 +325,15 @@ impl Xkb {
             None => self.key_utf8(state, key, &mut buf),
         };
         if n <= 0 {
-            return KeyAction::None;
+            return None;
         }
         // Like snprintf, the return is the required length; clamp before slicing.
         let n = (n as usize).min(buf.len());
-        let Ok(s) = core::str::from_utf8(&buf[..n]) else {
-            return KeyAction::None;
-        };
-        // Only single, non-control scalars become input. Sequences (composed or
-        // raw) that yield multiple scalars are dropped for now.
+        let s = core::str::from_utf8(&buf[..n]).ok()?;
         let mut chars = s.chars();
         match (chars.next(), chars.next()) {
-            (Some(c), None) if (c as u32) >= 0x20 && c != '\x7f' => KeyAction::Char(c),
-            _ => KeyAction::None,
+            (Some(c), None) if (c as u32) >= 0x20 && c != '\x7f' => Some(c),
+            _ => None,
         }
     }
 
@@ -425,41 +353,6 @@ impl Xkb {
         }
     }
 
-    /// Map a Ctrl+key combo to an editor shortcut, by the key's layout keysym.
-    fn ctrl_action(&self, keycode: u32) -> KeyAction {
-        let Some(state) = self.state else {
-            return KeyAction::None;
-        };
-        // SAFETY: state is valid; the call returns the effective keysym.
-        let sym = unsafe { xkb_state_key_get_one_sym(state.as_ptr(), keycode + EVDEV_OFFSET) };
-        // Fold an upper-case keysym (Ctrl+Shift+letter) to lower-case ASCII.
-        let sym = if (0x41..=0x5A).contains(&sym) {
-            sym + 0x20
-        } else {
-            sym
-        };
-        match sym {
-            0x61 => KeyAction::SelectAll,                         // a
-            0x63 => KeyAction::Copy,                              // c
-            0x66 => KeyAction::Find,                              // f
-            0x68 => KeyAction::Replace,                           // h
-            0x73 => KeyAction::Save,                              // s
-            0x78 => KeyAction::Cut,                               // x
-            0x76 => KeyAction::Paste,                             // v
-            0x6B if self.shift_active() => KeyAction::DeleteLine, // Ctrl+Shift+K
-            0x62 => KeyAction::ToggleTree,                        // b: toggle sidebar
-            0x5C => KeyAction::ToggleSecondPane,                  // backslash: split
-            0x30 => KeyAction::FocusTree,                         // 0: focus tree
-            0x31 => KeyAction::FocusPaneA,                        // 1: focus editor A
-            0x32 => KeyAction::FocusPaneB,                        // 2: focus editor B
-            // Ctrl+Z undoes; Ctrl+Shift+Z and Ctrl+Y redo.
-            0x7A if self.shift_active() => KeyAction::Redo, // Z
-            0x7A => KeyAction::Undo,                        // z
-            0x79 => KeyAction::Redo,                        // y
-            _ => KeyAction::None,
-        }
-    }
-
     fn replace(&mut self, keymap: NonNull<c_void>, state: NonNull<c_void>) {
         if let Some(old) = self.state.replace(state) {
             // SAFETY: old came from xkb_state_new and is freed once.
@@ -469,17 +362,6 @@ impl Xkb {
             // SAFETY: old came from xkb_keymap_new_* and is freed once.
             unsafe { xkb_keymap_unref(old.as_ptr()) };
         }
-    }
-}
-
-/// The Ctrl-held action when `ctrl`, else the plain one. The navigation and
-/// delete keys that jump further with Ctrl (word/document motion, word delete)
-/// share this shape.
-fn ctrl_or(ctrl: bool, with_ctrl: KeyAction, plain: KeyAction) -> KeyAction {
-    if ctrl {
-        with_ctrl
-    } else {
-        plain
     }
 }
 
@@ -507,35 +389,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn special_keys_dispatch_without_a_keymap() {
-        // With no keymap there is no modifier state, so Ctrl reads as inactive
-        // and the navigation keys take their plain (non-word) meaning.
+    fn queries_are_inert_without_a_keymap() {
+        // Before wl_keyboard.keymap arrives there is no state, so every question
+        // about a key answers "nothing" rather than guessing or panicking. Keycode
+        // 30 is `a` on a Linux keyboard.
         let xkb = Xkb::new().expect("xkb context");
-        assert_eq!(xkb.action(keycode::BACKSPACE), KeyAction::Backspace);
-        assert_eq!(xkb.action(keycode::DELETE), KeyAction::Delete);
-        assert_eq!(xkb.action(keycode::ENTER), KeyAction::Enter);
-        assert_eq!(xkb.action(keycode::KP_ENTER), KeyAction::Enter);
-        assert_eq!(xkb.action(keycode::TAB), KeyAction::Tab);
-        assert_eq!(xkb.action(keycode::LEFT), KeyAction::Left);
-        assert_eq!(xkb.action(keycode::RIGHT), KeyAction::Right);
-        assert_eq!(xkb.action(keycode::UP), KeyAction::Up);
-        assert_eq!(xkb.action(keycode::DOWN), KeyAction::Down);
-        assert_eq!(xkb.action(keycode::HOME), KeyAction::Home);
-        assert_eq!(xkb.action(keycode::END), KeyAction::End);
-        assert_eq!(xkb.action(keycode::PAGEUP), KeyAction::PageUp);
-        assert_eq!(xkb.action(keycode::PAGEDOWN), KeyAction::PageDown);
+        assert_eq!(xkb.key_sym(30), None);
+        assert_eq!(xkb.key_text(30), None);
+        assert_eq!(xkb.key_char(30), None);
+        assert!(!xkb.key_repeats(30));
     }
 
     #[test]
-    fn character_keys_without_a_keymap_are_none() {
-        // 'a' is evdev keycode 30; with no keymap loaded there is no state.
-        let xkb = Xkb::new().expect("xkb context");
-        assert_eq!(xkb.action(30), KeyAction::None);
-    }
-
-    #[test]
-    fn shift_is_inactive_without_a_keymap() {
+    fn modifiers_are_inactive_without_a_keymap() {
         let xkb = Xkb::new().expect("xkb context");
         assert!(!xkb.shift_active());
+        assert!(!xkb.ctrl_active());
+        assert!(!xkb.alt_active());
     }
 }

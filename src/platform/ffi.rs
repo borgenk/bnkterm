@@ -840,7 +840,8 @@ mod tests {
     #[test]
     fn drm_syncobj_round_trips_a_fence_through_a_timeline_point() {
         let Some(drm) = open_any_render_node() else {
-            eprintln!("bnkterm: no DRM render node; skipping syncobj round-trip");
+            let app = env!("CARGO_PKG_NAME");
+            eprintln!("{app}: no DRM render node; skipping syncobj round-trip");
             return;
         };
         let fd = drm.as_raw_fd();
