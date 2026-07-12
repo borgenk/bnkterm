@@ -388,6 +388,14 @@ impl Tabs {
             .and_then(|entry| entry.core.blink_deadline())
     }
 
+    /// Whether the visible terminal has a hyperlink under the pointer, so the window
+    /// can offer the hand cursor.
+    pub(super) fn hovering_link(&self) -> bool {
+        self.entries
+            .get(self.active)
+            .is_some_and(|entry| entry.core.hovering_link())
+    }
+
     /// Whether the active grid or future tab bar needs a frame.
     pub(super) fn needs_frame(&self) -> bool {
         if self.is_empty() {

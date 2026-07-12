@@ -34,6 +34,10 @@ pub enum PointerEvent {
         col: usize,
         row: usize,
     },
+    /// The pointer is no longer over the grid: it left the surface, or crossed into
+    /// the tab strip. There is no cell, because there is no longer a cell under it.
+    /// The terminal drops the hovered hyperlink; nothing else is pointer-positional.
+    Left,
 }
 
 /// Window → terminal: input and geometry the terminal turns into PTY bytes, grid
@@ -90,6 +94,11 @@ pub enum ToWindow {
     /// A middle-click asked to paste the primary selection. The window owns the data
     /// device, so it does the receive and feeds the bytes back as a [`ToTerminal::Paste`].
     PastePrimary,
+    /// A Ctrl+click landed on a hyperlink: hand it to the user's default handler. The
+    /// core found it in the grid and vetted its scheme (see
+    /// [`crate::platform::browser::can_open`]); the window spawns the opener, since
+    /// launching a process is a window-side concern like every other action here.
+    OpenUrl(String),
     /// The window should shut down: every tab is gone. A core signals its own
     /// child's exit to [`super::tabs::Tabs`] through the pump's stream-end, not
     /// this message; `Tabs` removes that tab and synthesizes `Closed` only once

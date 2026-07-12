@@ -33,10 +33,17 @@
 //! background runs where a cell's background differs from the theme's, then the
 //! foreground as fixed-pitch [`DrawCmd::Cells`] runs (with wide glyphs and
 //! astral-plane runes broken out into their own [`DrawCmd::Text`] so the pitch
-//! stays uniform), then underline/strike rules, and finally the cursor on top.
-//! Everything past the base fill is emitted only where it is not the default, so
-//! an idle screen of mostly-blank cells produces a short list and an unchanged
-//! frame diffs to nothing.
+//! stays uniform), then underline/strike rules and the hovered link's rule, and
+//! finally the cursor on top. Everything past the base fill is emitted only where it
+//! is not the default, so an idle screen of mostly-blank cells produces a short list
+//! and an unchanged frame diffs to nothing.
+//!
+//! The two overlays the app hands in — the selection band and the hovered hyperlink's
+//! underline — are both a [`CellSpan`], and both resolve to *one inclusive column
+//! range per row* (`span_cols`) before anything per-cell happens. That is a
+//! performance rule, not a stylistic one: `Painter::cell` runs about four times per
+//! cell, so an overlay tested there is tested a quarter of a million times a frame to
+//! serve a span that is usually empty. A 13% frame regression established it.
 
 use crate::color::{Ground, Rgb, Theme};
 use crate::grid::{Attrs, Cell, Screen};
@@ -183,13 +190,23 @@ impl Selection {
     }
 }
 
+/// An inclusive span of display cells in reading order: every cell from `start` to
+/// `end` row-major is inside it, so a span may run off the right edge of one row and
+/// resume at the left of the next. That is the shape of the hovered hyperlink, whose
+/// text is contiguous across a soft wrap (see [`crate::grid::Screen::link_at`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CellSpan {
+    pub start: (usize, usize),
+    pub end: (usize, usize),
+}
+
 /// The inputs a frame build reads: the grid and its theme, the fixed cell metrics,
 /// the `surface`/`origin` geometry (`origin` is the grid's top-left pixel, the window
 /// padding; the background still fills the whole `surface`, so the inset shows as a
-/// margin), and the transient cursor and selection. Grouped so the pooled and
-/// one-shot builders share one parameter and the window/bench assemble it in one
-/// place. Pure data (no fonts, no GPU), so a test asserts the exact primitives a
-/// grid state produces.
+/// margin), and the transient cursor, selection, and hovered link. Grouped so the
+/// pooled and one-shot builders share one parameter and the window/bench assemble it
+/// in one place. Pure data (no fonts, no GPU), so a test asserts the exact primitives
+/// a grid state produces.
 pub struct FrameInputs<'a> {
     pub screen: &'a Screen,
     pub theme: &'a Theme,
@@ -198,6 +215,9 @@ pub struct FrameInputs<'a> {
     pub origin: (i32, i32),
     pub cursor: CursorRender,
     pub selection: Option<Selection>,
+    /// The hyperlink under the pointer, which paints underlined. The app finds it
+    /// (the grid holds the text); the painter only draws it.
+    pub hover: Option<CellSpan>,
 }
 
 /// Build the frame's display list into `out` (cleared first), drawing every run's
@@ -217,6 +237,7 @@ pub fn build_display_list_into(
         metrics: inputs.metrics,
         origin: inputs.origin,
         selection: inputs.selection,
+        hover: inputs.hover,
         list: out,
         strings,
     };
@@ -234,30 +255,10 @@ pub fn build_display_list_into(
 /// path for tests and callers that do not keep frame-to-frame state; the windowed
 /// render loop uses [`build_display_list_into`] with a [`DisplayListPool`] to stay
 /// allocation-free in steady state.
-pub fn build_display_list(
-    screen: &Screen,
-    theme: &Theme,
-    metrics: CellMetrics,
-    surface: (i32, i32),
-    origin: (i32, i32),
-    cursor: CursorRender,
-    selection: Option<Selection>,
-) -> DisplayList {
+pub fn build_display_list(inputs: &FrameInputs) -> DisplayList {
     let mut out = DisplayList::new();
     let mut strings = Vec::new();
-    build_display_list_into(
-        &mut out,
-        &mut strings,
-        &FrameInputs {
-            screen,
-            theme,
-            metrics,
-            surface,
-            origin,
-            cursor,
-            selection,
-        },
-    );
+    build_display_list_into(&mut out, &mut strings, inputs);
     out
 }
 
@@ -337,6 +338,8 @@ struct Painter<'a> {
     /// so the whole grid rides the same rigid offset and can never drift from it.
     origin: (i32, i32),
     selection: Option<Selection>,
+    /// The hovered hyperlink's cells, underlined by [`Self::push_hover_rule`].
+    hover: Option<CellSpan>,
     /// The list being appended to, owned by the caller's [`DisplayListPool`] and
     /// reused across frames.
     list: &'a mut DisplayList,
@@ -450,6 +453,8 @@ impl Painter<'_> {
             self.push_run(row, col, cols, cell, baseline);
             col = self.run_end(row, col, cols, cell);
         }
+        // Over the glyphs, like a run's own rules.
+        self.push_hover_rule(row);
     }
 
     /// Emit a fixed-pitch run starting at `col`: the maximal span of single-width,
@@ -517,19 +522,28 @@ impl Painter<'_> {
         self.push_decorations(first, x, (end - col) as i32 * m.w, baseline, fg);
     }
 
+    /// The box an underline rule occupies: `w` pixels from `x`, just below `baseline`.
+    /// Shared by the SGR underline and the hovered link's rule, so the two can never
+    /// end up at different heights.
+    fn underline_rect(&self, x: i32, w: i32, baseline: i32) -> Rect {
+        let m = self.metrics;
+        Rect {
+            x,
+            y: baseline + (m.descent / 2).max(1),
+            w,
+            h: (m.size as i32 / 12).max(1),
+        }
+    }
+
     /// The underline and strike rules for a run, drawn as solid fills spanning the
     /// run's width in the run's foreground colour.
     fn push_decorations(&mut self, cell: Cell, x: i32, run_w: i32, baseline: i32, fg: Rgb) {
         let m = self.metrics;
         let thickness = (m.size as i32 / 12).max(1);
         if cell.attrs.contains(Attrs::UNDERLINE) {
+            let rect = self.underline_rect(x, run_w, baseline);
             self.list.push(DrawCmd::Fill {
-                rect: Rect {
-                    x,
-                    y: baseline + (m.descent / 2).max(1),
-                    w: run_w,
-                    h: thickness,
-                },
+                rect,
                 color: fg.to_u32(),
             });
         }
@@ -548,32 +562,39 @@ impl Painter<'_> {
 
     /// One cell's glyph as a standalone [`DrawCmd::Text`] at its exact column,
     /// used for wide glyphs and astral runes (base rune plus any combining marks).
-    /// A hidden or blank cell draws nothing.
+    /// A hidden or blank cell draws no glyph, but still takes its decorations: an
+    /// underline runs under the cells it covers whether or not they have ink, the
+    /// same rule [`Self::push_run`] follows for a styled trailing space.
     fn push_glyph(&mut self, row: usize, col: usize, cell: Cell, baseline: i32) {
-        if cell.attrs.contains(Attrs::HIDDEN) || (cell.rune == ' ' && self.marks_empty(row, col)) {
-            return;
-        }
         let m = self.metrics;
         let x = self.cell_x(col);
         let width_cells = if cell.is_wide_leader() { 2 } else { 1 };
         let (fg, bg) = self.resolve(cell, false);
-        let mut text = self.take_string();
-        text.push(cell.rune);
-        if let Some(marks) = self.marks(row, col) {
-            text.extend(marks);
+        let inked = !cell.attrs.contains(Attrs::HIDDEN)
+            && (cell.rune != ' ' || !self.marks_empty(row, col));
+        if inked {
+            let mut text = self.take_string();
+            text.push(cell.rune);
+            if let Some(marks) = self.marks(row, col) {
+                text.extend(marks);
+            }
+            self.list.push(DrawCmd::Text {
+                bounds: text_bounds(x, baseline, width_cells * m.w, m),
+                x,
+                baseline,
+                face: FaceKey::Prose {
+                    size: m.size,
+                    style: style_of(cell),
+                },
+                color: fg.to_u32(),
+                bg: bg.to_u32(),
+                text,
+            });
         }
-        self.list.push(DrawCmd::Text {
-            bounds: text_bounds(x, baseline, width_cells * m.w, m),
-            x,
-            baseline,
-            face: FaceKey::Prose {
-                size: m.size,
-                style: style_of(cell),
-            },
-            color: fg.to_u32(),
-            bg: bg.to_u32(),
-            text,
-        });
+        // A wide glyph is drawn standalone, so it never rides a run's rule; without
+        // this it would be the one gap in an underlined span (an SGR 4 CJK character,
+        // or a hovered link with one in its path).
+        self.push_decorations(cell, x, width_cells * m.w, baseline, fg);
     }
 
     /// The cursor, drawn last so it stacks over the cell it sits on. Nothing is
@@ -759,6 +780,13 @@ impl Painter<'_> {
     /// The cell shown at display `(row, col)`, honouring the scroll offset (the
     /// live cell when pinned to the bottom). Every content path goes through this
     /// so scrollback and the live screen paint identically.
+    ///
+    /// Deliberately does nothing else. This is the painter's hottest funnel — four
+    /// calls per cell, across the background runs, the run scan, and the glyph pass —
+    /// so anything tested here is tested a quarter of a million times a frame. An
+    /// earlier cut of the hovered link handed the cell out with `UNDERLINE` already
+    /// set, which reads nicely and cost 13% of the frame; the rule is drawn from a
+    /// per-row column span instead (see [`Self::push_hover_rule`]).
     fn cell(&self, row: usize, col: usize) -> Cell {
         self.screen.view_cell(row, col)
     }
@@ -779,23 +807,60 @@ impl Painter<'_> {
         self.resolve(self.cell(row, col), selected).1
     }
 
-    /// The inclusive column span of `row` the selection highlights: the whole
-    /// geometric span the drag covers, blank cells included. A linear selection
-    /// paints the first row from its start column to the row's right edge, every
-    /// whole middle row edge to edge, and the last row from the left edge to its end
-    /// column, so dragging across the empty area below the prompt highlights it, the
-    /// way xterm/wezterm/ghostty do. `None` only when `row` lies outside the
-    /// selection. The paint is deliberately wider than [`Screen::selection_text`]
-    /// copies: it shows the drag for feedback while the copy trims trailing blanks.
-    fn selection_cols(&self, row: usize) -> Option<(usize, usize)> {
-        let (start, end) = self.selection?.ordered();
-        if row < start.0 || row > end.0 {
+    /// The inclusive column span of `row` covered by a reading-order [`CellSpan`]: the
+    /// first row from its start column to the right edge, whole rows in between, and
+    /// the last row from the left edge to its end column. `None` when `row` lies
+    /// outside it. One inclusive range per row is what keeps the per-cell test that
+    /// consumes it O(1), and both things the painter overlays — the selection band and
+    /// the hovered link's rule — are this same shape.
+    fn span_cols(&self, span: CellSpan, row: usize) -> Option<(usize, usize)> {
+        if row < span.start.0 || row > span.end.0 {
             return None;
         }
         let last_col = self.screen.dimensions().0.saturating_sub(1);
-        let first = if row == start.0 { start.1 } else { 0 };
-        let last = if row == end.0 { end.1 } else { last_col }.min(last_col);
+        let first = if row == span.start.0 { span.start.1 } else { 0 };
+        let last = if row == span.end.0 {
+            span.end.1
+        } else {
+            last_col
+        }
+        .min(last_col);
         Some((first, last))
+    }
+
+    /// The inclusive column span of `row` the selection highlights: the whole
+    /// geometric span the drag covers, blank cells included, so dragging across the
+    /// empty area below the prompt highlights it, the way xterm/wezterm/ghostty do.
+    /// The paint is deliberately wider than [`Screen::selection_text`] copies: it
+    /// shows the drag for feedback while the copy trims trailing blanks.
+    fn selection_cols(&self, row: usize) -> Option<(usize, usize)> {
+        let (start, end) = self.selection?.ordered();
+        self.span_cols(CellSpan { start, end }, row)
+    }
+
+    /// The underline under the hovered hyperlink where it crosses `row`, drawn as one
+    /// rule over its columns. Nothing on a row the link does not reach, so an ordinary
+    /// frame pays a single `None` check per row for the whole feature.
+    ///
+    /// It takes the colour of the link's first cell on the row, so the rule reads as
+    /// part of the text it underlines rather than as chrome laid over it.
+    fn push_hover_rule(&mut self, row: usize) {
+        let Some(hover) = self.hover else {
+            return;
+        };
+        let Some((first, last)) = self.span_cols(hover, row) else {
+            return;
+        };
+        let fg = self.resolve(self.cell(row, first), false).0;
+        let rect = self.underline_rect(
+            self.cell_x(first),
+            (last + 1 - first) as i32 * self.metrics.w,
+            self.baseline(row),
+        );
+        self.list.push(DrawCmd::Fill {
+            rect,
+            color: fg.to_u32(),
+        });
     }
 
     /// Resolve a cell's `(fg, bg)` to concrete colours: reverse swaps the two, dim
@@ -1059,21 +1124,46 @@ mod tests {
         p.advance_bytes(s, bytes);
     }
 
-    /// Build a list for a screen with the default theme, no selection, cursor
-    /// hidden (so the tests that are about content are not perturbed by it).
-    fn list_of(s: &Screen) -> DisplayList {
-        build_display_list(
-            s,
-            &Theme::default(),
-            M,
-            (s.dimensions().0 as i32 * M.w, s.dimensions().1 as i32 * M.h),
-            (0, 0),
-            CursorRender {
+    /// The frame inputs for `s`: default theme, a surface exactly the grid's size, no
+    /// origin inset, no selection, no hovered link, and the cursor hidden (so a test
+    /// about content is not perturbed by it). A case varies one field with struct
+    /// update syntax: `FrameInputs { selection, ..inputs(&s, &t) }`.
+    fn inputs<'a>(s: &'a Screen, theme: &'a Theme) -> FrameInputs<'a> {
+        FrameInputs {
+            screen: s,
+            theme,
+            metrics: M,
+            surface: (s.dimensions().0 as i32 * M.w, s.dimensions().1 as i32 * M.h),
+            origin: (0, 0),
+            cursor: CursorRender {
                 visible: false,
                 ..CursorRender::default()
             },
-            None,
-        )
+            selection: None,
+            hover: None,
+        }
+    }
+
+    /// Build a list for a screen with the default theme, no selection, cursor
+    /// hidden (so the tests that are about content are not perturbed by it).
+    fn list_of(s: &Screen) -> DisplayList {
+        build_display_list(&inputs(s, &Theme::default()))
+    }
+
+    /// [`list_of`] with a selection over it.
+    fn list_selecting(s: &Screen, selection: Selection) -> DisplayList {
+        build_display_list(&FrameInputs {
+            selection: Some(selection),
+            ..inputs(s, &Theme::default())
+        })
+    }
+
+    /// [`list_of`] with a hovered hyperlink over it.
+    fn list_hovering(s: &Screen, hover: CellSpan) -> DisplayList {
+        build_display_list(&FrameInputs {
+            hover: Some(hover),
+            ..inputs(s, &Theme::default())
+        })
     }
 
     fn cells_runs(list: &[DrawCmd]) -> Vec<(i32, i32, String)> {
@@ -1260,7 +1350,10 @@ mod tests {
         feed(&mut s, b"X"); // cursor now rests at column 1 (after X)
         s.move_to(0, 0); // park it on the glyph
         let t = Theme::default();
-        let list = build_display_list(&s, &t, M, (40, 20), (0, 0), CursorRender::default(), None);
+        let list = build_display_list(&FrameInputs {
+            cursor: CursorRender::default(),
+            ..inputs(&s, &t)
+        });
         // The last commands are the cursor block then the inverted glyph.
         let cursor_fill = fills(&list)
             .into_iter()
@@ -1292,7 +1385,11 @@ mod tests {
         s.move_to(0, 0); // park the cursor on the glyph
         let t = Theme::default();
         let (ox, oy) = (5, 5);
-        let list = build_display_list(&s, &t, M, (40, 20), (ox, oy), CursorRender::default(), None);
+        let list = build_display_list(&FrameInputs {
+            origin: (ox, oy),
+            cursor: CursorRender::default(),
+            ..inputs(&s, &t)
+        });
         // The base fill still covers the whole surface: the inset is a margin of
         // background around the grid, not a smaller canvas.
         assert_eq!(
@@ -1334,19 +1431,15 @@ mod tests {
         let mut s = Screen::new(4, 1);
         feed(&mut s, b"X");
         s.move_to(0, 0);
+        let t = Theme::default();
         for shape in [CursorShape::Bar, CursorShape::Underline] {
-            let list = build_display_list(
-                &s,
-                &Theme::default(),
-                M,
-                (40, 20),
-                (0, 0),
-                CursorRender {
+            let list = build_display_list(&FrameInputs {
+                cursor: CursorRender {
                     shape,
                     ..CursorRender::default()
                 },
-                None,
-            );
+                ..inputs(&s, &t)
+            });
             // No inverted glyph: the only Text/Cells for 'X' is the normal one.
             let glyphs = list
                 .iter()
@@ -1361,40 +1454,126 @@ mod tests {
         let mut s = Screen::new(4, 1);
         feed(&mut s, b"X");
         s.move_to(0, 0);
-        let hidden = build_display_list(
-            &s,
-            &Theme::default(),
-            M,
-            (40, 20),
-            (0, 0),
-            CursorRender {
-                visible: false,
-                ..CursorRender::default()
-            },
-            None,
-        );
+        let hidden = list_of(&s);
         // Same as a plain render: base fill + the one glyph run.
         assert_eq!(hidden.len(), 2);
+    }
+
+    /// The underline rules in `list`: the fills that sit below the baseline.
+    fn rules(list: &DisplayList) -> Vec<Rect> {
+        fills(list)
+            .into_iter()
+            .filter(|(r, _)| r.y > M.ascent)
+            .map(|(r, _)| r)
+            .collect()
+    }
+
+    #[test]
+    fn a_hovered_link_is_underlined_across_exactly_its_cells() {
+        let mut s = Screen::new(10, 1);
+        feed(&mut s, b"a http://x");
+        // The link occupies cols 2..=9; the painter is told so and rules those cells.
+        let list = list_hovering(
+            &s,
+            CellSpan {
+                start: (0, 2),
+                end: (0, 9),
+            },
+        );
+        assert_eq!(
+            rules(&list),
+            vec![Rect {
+                x: 2 * M.w,
+                y: M.ascent + (M.descent / 2).max(1),
+                w: 8 * M.w,
+                h: (M.size as i32 / 12).max(1),
+            }],
+            "one rule, starting at the link and spanning exactly its cells"
+        );
+        // The row's text is untouched: the rule is drawn over the glyphs, so hovering
+        // never disturbs how they batch.
+        assert_eq!(
+            cells_runs(&list),
+            cells_runs(&list_of(&s)),
+            "the glyph runs are the same hovered or not"
+        );
+    }
+
+    #[test]
+    fn a_hovered_link_is_ruled_over_its_wide_glyphs_too() {
+        // One rule over the whole span, so a wide glyph inside a link is covered like
+        // any other cell rather than leaving a gap where the run breaks around it.
+        let mut s = Screen::new(6, 1);
+        feed(&mut s, "ab漢c".as_bytes()); // 漢 is wide: cols 2..=3
+        let list = list_hovering(
+            &s,
+            CellSpan {
+                start: (0, 0),
+                end: (0, 4),
+            },
+        );
+        assert_eq!(rules(&list).len(), 1, "one rule, not one per run");
+        assert_eq!(rules(&list)[0].x, 0);
+        assert_eq!(
+            rules(&list)[0].w,
+            5 * M.w,
+            "including the wide glyph's cells"
+        );
+    }
+
+    #[test]
+    fn a_hovered_link_wraps_onto_the_next_row() {
+        // A link that runs off the right margin is ruled on both rows: to the edge on
+        // the first, from the edge on the second.
+        let mut s = Screen::new(6, 2);
+        feed(&mut s, b"ab https://x"); // wraps after col 5
+        let list = list_hovering(
+            &s,
+            CellSpan {
+                start: (0, 3),
+                end: (1, 5),
+            },
+        );
+        let rules = rules(&list);
+        assert_eq!(rules.len(), 2, "one rule per row: {rules:?}");
+        assert_eq!(rules[0].x, 3 * M.w, "the first row starts at the link");
+        assert_eq!(rules[0].w, 3 * M.w, "and runs to the right edge");
+        assert_eq!(rules[1].x, 0, "the second row starts at the left edge");
+        assert_eq!(rules[1].w, 6 * M.w, "and runs to where the link ends");
+    }
+
+    #[test]
+    fn no_hover_means_no_underline() {
+        let mut s = Screen::new(10, 1);
+        feed(&mut s, b"a http://x");
+        assert!(
+            rules(&list_of(&s)).is_empty(),
+            "an unhovered link is plain text"
+        );
+    }
+
+    #[test]
+    fn a_wide_glyph_takes_its_sgr_underline() {
+        // A wide glyph is drawn standalone, outside any run, so it draws its own rules
+        // or none at all. Nothing to do with links: `\x1b[4m漢` must underline.
+        let mut s = Screen::new(4, 1);
+        feed(&mut s, "\x1b[4m漢".as_bytes());
+        let rules = rules(&list_of(&s));
+        assert_eq!(rules.len(), 1, "the wide glyph is underlined: {rules:?}");
+        assert_eq!(rules[0].x, 0);
+        assert_eq!(rules[0].w, 2 * M.w, "the rule spans both its cells");
     }
 
     #[test]
     fn selection_paints_the_selected_cells() {
         let mut s = Screen::new(6, 1);
         feed(&mut s, b"abcdef");
-        let list = build_display_list(
+        let list = list_selecting(
             &s,
-            &Theme::default(),
-            M,
-            (60, 20),
-            (0, 0),
-            CursorRender {
-                visible: false,
-                ..CursorRender::default()
-            },
-            Some(Selection {
+            Selection {
                 anchor: (0, 1),
                 head: (0, 3),
-            }),
+            },
         );
         // Columns 1..=3 get the selection background as one band.
         let band = fills(&list)
@@ -1419,20 +1598,12 @@ mod tests {
         // the copy still trims them (see grid::selection_text), so paint is wider.
         let mut s = Screen::new(6, 1);
         feed(&mut s, b"abc");
-        let list = build_display_list(
+        let list = list_selecting(
             &s,
-            &Theme::default(),
-            M,
-            (60, 20),
-            (0, 0),
-            CursorRender {
-                visible: false,
-                ..CursorRender::default()
-            },
-            Some(Selection {
+            Selection {
                 anchor: (0, 0),
                 head: (0, 5),
-            }),
+            },
         );
         let band = fills(&list)
             .into_iter()
@@ -1455,20 +1626,12 @@ mod tests {
         // "select the empty space below the prompt" behaviour): one full-width band,
         // even though the row holds no glyphs and would copy nothing.
         let s = Screen::new(6, 1);
-        let list = build_display_list(
+        let list = list_selecting(
             &s,
-            &Theme::default(),
-            M,
-            (60, 20),
-            (0, 0),
-            CursorRender {
-                visible: false,
-                ..CursorRender::default()
-            },
-            Some(Selection {
+            Selection {
                 anchor: (0, 0),
                 head: (0, 5),
-            }),
+            },
         );
         let band = fills(&list)
             .into_iter()
@@ -1564,18 +1727,7 @@ mod tests {
         let mut s = Screen::new(6, 2);
         feed(&mut s, b"one\r\ntwo\r\nthree\r\nfour");
         s.scroll_view_up(2); // to the top: "one" over "two"
-        let runs = cells_runs(&build_display_list(
-            &s,
-            &Theme::default(),
-            M,
-            (6 * M.w, 2 * M.h),
-            (0, 0),
-            CursorRender {
-                visible: false,
-                ..CursorRender::default()
-            },
-            None,
-        ));
+        let runs = cells_runs(&list_of(&s));
         let texts: Vec<&str> = runs.iter().map(|(_, _, t)| t.as_str()).collect();
         assert!(texts.contains(&"one"), "history row is painted: {texts:?}");
         assert!(
@@ -1589,15 +1741,11 @@ mod tests {
         let mut s = Screen::new(6, 2);
         feed(&mut s, b"one\r\ntwo\r\nthree\r\nfour"); // cursor on the live bottom row
         s.scroll_view_up(2); // live rows scrolled below the window
-        let list = build_display_list(
-            &s,
-            &Theme::default(),
-            M,
-            (6 * M.w, 2 * M.h),
-            (0, 0),
-            CursorRender::default(), // visible + focused
-            None,
-        );
+        let t = Theme::default();
+        let list = build_display_list(&FrameInputs {
+            cursor: CursorRender::default(), // visible + focused
+            ..inputs(&s, &t)
+        });
         // No inverted glyph and no cursor block colour: the cursor sits off-view.
         let cursor_color = Theme::default().cursor.to_u32();
         assert!(
@@ -1610,22 +1758,10 @@ mod tests {
     fn a_scroll_indicator_shows_only_while_scrolled() {
         let mut s = Screen::new(6, 2);
         feed(&mut s, b"one\r\ntwo\r\nthree\r\nfour");
-        let surface = (6 * M.w, 2 * M.h);
         let indicator = |s: &Screen| {
-            build_display_list(
-                s,
-                &Theme::default(),
-                M,
-                surface,
-                (0, 0),
-                CursorRender {
-                    visible: false,
-                    ..CursorRender::default()
-                },
-                None,
+            list_of(s).iter().any(
+                |c| matches!(c, DrawCmd::Fill { color, .. } if *color == SCROLL_INDICATOR_COLOR),
             )
-            .iter()
-            .any(|c| matches!(c, DrawCmd::Fill { color, .. } if *color == SCROLL_INDICATOR_COLOR))
         };
         assert!(!indicator(&s), "no indicator when pinned to the bottom");
         s.scroll_view_up(1);

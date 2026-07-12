@@ -1012,6 +1012,9 @@ impl State {
                 let locked = r.u32()?;
                 let group = r.u32()?;
                 self.xkb.update_modifiers(depressed, latched, locked, group);
+                // Ctrl is what turns a hovered link into a clickable one, so taking it
+                // or letting it go changes the cursor with the pointer standing still.
+                self.update_pointer_shape();
             }
             wl_keyboard::EV_KEY => {
                 self.last_serial = r.u32()?;
@@ -1337,15 +1340,23 @@ impl State {
     }
 
     /// Ask the compositor for the cursor shape that fits where the pointer is: the
-    /// plain arrow over the tab strip (it is chrome, a click target, not text) and
-    /// the I-beam ("text") over the grid, the shape every terminal uses to signal
-    /// selectable text. Only re-sent when the shape changes, so a stream of motion
-    /// events never spams `set_shape`. A no-op when the compositor lacks
+    /// plain arrow over the tab strip (it is chrome, a click target, not text), the
+    /// hand over a hyperlink Ctrl+click would follow, and otherwise the I-beam
+    /// ("text") over the grid, the shape every terminal uses to signal selectable
+    /// text. Only re-sent when the shape changes, so a stream of motion events never
+    /// spams `set_shape`. A no-op when the compositor lacks
     /// `wp_cursor_shape_manager_v1` (no device, so its default arrow stands) or
     /// before the pointer has entered (no serial to cite).
+    ///
+    /// The hand is gated on Ctrl actually being held, not merely on a link being
+    /// under the pointer, because the hand is a promise that clicking does something:
+    /// the underline says "this is a link", the hand says "and now a click follows
+    /// it". That is why the modifiers event re-runs this with the pointer parked.
     fn update_pointer_shape(&mut self) {
         let shape = if self.pointer_in_tab_bar() {
             wp_cursor_shape_device_v1::SHAPE_DEFAULT
+        } else if self.xkb.ctrl_active() && self.tabs.hovering_link() {
+            wp_cursor_shape_device_v1::SHAPE_POINTER
         } else {
             wp_cursor_shape_device_v1::SHAPE_TEXT
         };
@@ -1360,6 +1371,18 @@ impl State {
             );
             self.pointer_shape = shape;
         }
+    }
+
+    /// Tell the terminal the pointer is no longer over its grid, because it left the
+    /// surface or crossed into the tab strip. It drops the hovered hyperlink, so an
+    /// underline never outlives the pointer that summoned it.
+    fn pointer_left_grid(&mut self) -> Result<()> {
+        let mods = self.current_mods();
+        self.tabs.active_mut().apply(ToTerminal::Pointer {
+            event: PointerEvent::Left,
+            mods,
+        })?;
+        Ok(())
     }
 
     /// The click multiplicity of a left press: 1, 2, or 3 for successive presses on
@@ -1394,22 +1417,30 @@ impl State {
                 self.pointer_shape = 0;
                 self.update_pointer_shape();
             }
+            wl_pointer::EV_LEAVE => {
+                let _serial = r.u32()?;
+                let _surface = r.u32()?;
+                // The pointer is gone, so nothing is under it: drop any hovered link.
+                self.pointer_left_grid()?;
+            }
             wl_pointer::EV_MOTION => {
                 let _time = r.u32()?;
                 self.pointer_x = r.fixed()?;
                 self.pointer_y = r.fixed()?;
-                // Swap between the arrow (over the strip) and the I-beam (over the
-                // grid) as the pointer crosses the boundary.
-                self.update_pointer_shape();
                 if self.pointer_in_tab_bar() {
-                    return Ok(());
+                    self.pointer_left_grid()?;
+                } else {
+                    let (col, row) = self.pointer_cell();
+                    let mods = self.current_mods();
+                    self.tabs.active_mut().apply(ToTerminal::Pointer {
+                        event: PointerEvent::Motion { col, row },
+                        mods,
+                    })?;
                 }
-                let (col, row) = self.pointer_cell();
-                let mods = self.current_mods();
-                self.tabs.active_mut().apply(ToTerminal::Pointer {
-                    event: PointerEvent::Motion { col, row },
-                    mods,
-                })?;
+                // After the terminal has seen the move, so the shape reflects the link
+                // now under the pointer: the arrow over the strip, the hand over a
+                // Ctrl+clickable link, the I-beam over plain text.
+                self.update_pointer_shape();
             }
             wl_pointer::EV_BUTTON => {
                 self.last_serial = r.u32()?;
@@ -1599,6 +1630,7 @@ impl State {
                 ToWindow::OfferSelection(bytes) => self.set_clipboard(bytes),
                 ToWindow::OfferPrimary(bytes) => self.set_primary(bytes),
                 ToWindow::PastePrimary => self.paste_primary()?,
+                ToWindow::OpenUrl(url) => open_url(&url),
                 ToWindow::Closed => self.closed = true,
             }
         }
@@ -1695,6 +1727,16 @@ fn config_text_gamma() -> f32 {
         .filter(|g| g.is_finite() && *g > 0.0)
         .unwrap_or(TEXT_GAMMA)
         .clamp(0.5, 4.0)
+}
+
+/// Launch a Ctrl+clicked hyperlink in whatever the desktop has set as its handler.
+/// The core already vetted the scheme, so a refusal here means the desktop could not
+/// start a handler at all: report it and carry on, because a link that will not open
+/// is an annoyance and must never be allowed to take the terminal down with it.
+fn open_url(url: &str) {
+    if let Err(err) = crate::platform::browser::open_url(url) {
+        eprintln!("bnkterm: could not open {url}: {err}");
+    }
 }
 
 /// Map a Wayland pointer button (a `linux/input-event-codes.h` code) to the

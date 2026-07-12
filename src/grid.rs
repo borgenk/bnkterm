@@ -681,6 +681,43 @@ pub enum CursorStyle {
     Bar,
 }
 
+/// The reusable working set of a hyperlink probe (see [`Screen::link_at`]): the
+/// logical line being scanned, the map back from its bytes to the cells they came
+/// from, and the URL the last hit found.
+///
+/// It is owned by the caller and reused because a probe is not a rare event: it runs
+/// for every cell the pointer crosses, and again whenever output scrolls the screen
+/// under a parked pointer. Rebuilding these three buffers in place keeps that path
+/// allocation-free once they have reached their size, so hovering costs the scan and
+/// nothing else.
+#[derive(Default)]
+pub struct LinkProbe {
+    /// The logical line under the pointer: its soft-wrapped display rows joined, wide
+    /// spacers dropped. Exactly the text [`crate::link`] scans.
+    text: String,
+    /// Where each rune of `text` came from: its byte offset, and the display cell that
+    /// printed it. Ascending in both, so a byte offset maps back to a cell by binary
+    /// search (see [`LinkProbe::cell_at`]).
+    runes: Vec<(usize, (usize, usize))>,
+    /// The URL of the most recent hit (empty after a miss).
+    url: String,
+}
+
+impl LinkProbe {
+    /// The URL the last [`Screen::link_at`] hit found; empty after a miss.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// The display cell whose rune covers byte offset `at` in [`Self::text`]: the last
+    /// rune that starts at or before it, so an offset landing inside a multi-byte rune
+    /// still resolves to the cell that printed it.
+    fn cell_at(&self, at: usize) -> Option<(usize, usize)> {
+        let past = self.runes.partition_point(|(offset, _)| *offset <= at);
+        self.runes.get(past.checked_sub(1)?).map(|&(_, cell)| cell)
+    }
+}
+
 /// The terminal grid: primary and alternate buffers, the active graphic rendition
 /// (pen), and the terminal-wide modes. This is the type the VT parser drives (via
 /// the `Perform` impl below); the renderer reads the visible cells back out.
@@ -978,6 +1015,73 @@ impl Screen {
             end += 1;
         }
         ((start, 0), (end, last))
+    }
+
+    /// The hyperlink under display `(row, col)`: the inclusive cell range its text
+    /// occupies, in reading order, with the URL left in `probe` for
+    /// [`LinkProbe::url`] to read. `None` when that cell is not inside one.
+    ///
+    /// The scan runs over the whole *logical* line (soft wraps joined, the same walk
+    /// [`Self::line_at`] does), because a URL printed near the right margin routinely
+    /// continues on the next display row, and half a URL is not a URL. So the range
+    /// returned is contiguous in reading order and may span rows — the first row from
+    /// its start column to the right edge, then whole rows, then the last row to its
+    /// end column — which is exactly the geometry the painter already highlights for a
+    /// selection.
+    ///
+    /// Wide glyphs are handled at both ends: probing a spacer probes its leader (the
+    /// right half of a character is the character), and a range ending on a leader is
+    /// widened over its spacer, so the underline never stops half a glyph short.
+    pub fn link_at(
+        &self,
+        row: usize,
+        col: usize,
+        probe: &mut LinkProbe,
+    ) -> Option<((usize, usize), (usize, usize))> {
+        let (cols, _) = self.dimensions();
+        if col >= cols {
+            return None;
+        }
+        // The right half of a wide glyph belongs to the glyph on its left.
+        let col = if self.view_cell(row, col).is_wide_spacer() {
+            col.saturating_sub(1)
+        } else {
+            col
+        };
+
+        probe.text.clear();
+        probe.runes.clear();
+        probe.url.clear();
+        // Byte offset of the probed cell's rune, recorded as that rune is pushed.
+        let mut at = None;
+        let ((first, _), (last, _)) = self.line_at(row);
+        for r in first..=last {
+            for c in 0..cols {
+                let cell = self.view_cell(r, c);
+                if cell.is_wide_spacer() {
+                    continue;
+                }
+                if (r, c) == (row, col) {
+                    at = Some(probe.text.len());
+                }
+                probe.runes.push((probe.text.len(), (r, c)));
+                probe.text.push(cell.rune);
+                if let Some(marks) = self.view_marks(r, c) {
+                    probe.text.extend(marks);
+                }
+            }
+        }
+
+        let found = crate::link::find_at(&probe.text, at?)?;
+        // `found.end` is exclusive, so the last rune inside the link is the one
+        // covering the byte before it.
+        let start = probe.cell_at(found.start)?;
+        let mut end = probe.cell_at(found.end.checked_sub(1)?)?;
+        probe.url.push_str(probe.text.get(found)?);
+        if self.view_cell(end.0, end.1).is_wide_leader() && end.1 + 1 < cols {
+            end.1 += 1;
+        }
+        Some((start, end))
     }
 
     /// A visible row as text: base runes with their combining marks, wide spacers
@@ -2876,6 +2980,78 @@ mod tests {
         assert!(s.is_scrolled());
         s.resize(8, 4);
         assert_eq!(s.view_offset(), 0, "a resize reindexes history and re-pins");
+    }
+
+    #[test]
+    fn link_at_finds_a_url_and_spans_exactly_its_cells() {
+        let mut s = Screen::new(40, 2);
+        feed(&mut s, b"see https://example.com/a now");
+        let mut probe = LinkProbe::default();
+        // Cols 4..=24 hold the URL ("see " is 4 cells, the URL 21).
+        let hit = s.link_at(0, 10, &mut probe).unwrap();
+        assert_eq!(hit, ((0, 4), (0, 24)));
+        assert_eq!(probe.url(), "https://example.com/a");
+        // Every cell of the URL resolves to the same span, so the underline does not
+        // flicker as the pointer crosses it.
+        for col in 4..=24 {
+            assert_eq!(s.link_at(0, col, &mut probe), Some(hit), "col {col}");
+        }
+        // The prose on either side is not a link.
+        assert_eq!(s.link_at(0, 3, &mut probe), None, "the space before");
+        assert_eq!(s.link_at(0, 25, &mut probe), None, "the space after");
+        assert_eq!(probe.url(), "", "a miss leaves no stale URL behind");
+    }
+
+    #[test]
+    fn link_at_joins_a_soft_wrapped_url() {
+        // A URL that runs off the right margin continues on the next row; half of it
+        // is not a link, so the scan must read the logical line, not the display row.
+        let mut s = Screen::new(16, 3);
+        feed(&mut s, b"go https://example.com/xy");
+        assert!(s.cell(0, 15).attrs.contains(Attrs::WRAPPED));
+        let mut probe = LinkProbe::default();
+        // Hovering either half yields the whole link, spanning the wrap.
+        let hit = ((0, 3), (1, 8));
+        assert_eq!(s.link_at(0, 5, &mut probe), Some(hit), "the first row");
+        assert_eq!(probe.url(), "https://example.com/xy");
+        assert_eq!(s.link_at(1, 2, &mut probe), Some(hit), "past the wrap");
+        assert_eq!(probe.url(), "https://example.com/xy");
+    }
+
+    #[test]
+    fn link_at_reads_the_scrollback_when_scrolled() {
+        // The probe is a view concern: scrolled up, row 0 is history, and a link there
+        // must be found at the cell it is actually *shown* in.
+        let mut s = Screen::new(30, 2);
+        feed(&mut s, b"https://example.com/old\r\nb\r\nc");
+        s.scroll_view_up(2);
+        let mut probe = LinkProbe::default();
+        assert_eq!(s.link_at(0, 5, &mut probe), Some(((0, 0), (0, 22))));
+        assert_eq!(probe.url(), "https://example.com/old");
+    }
+
+    #[test]
+    fn link_at_covers_both_halves_of_a_wide_glyph() {
+        // A CJK character in an IRI occupies two cells. Probing the spacer must find
+        // the link (the right half of a character is the character), and the span must
+        // cover the spacer, or the underline would stop half a glyph short.
+        let mut s = Screen::new(20, 2);
+        feed(&mut s, "https://x.com/世".as_bytes());
+        assert!(s.cell(0, 14).is_wide_leader());
+        assert!(s.cell(0, 15).is_wide_spacer());
+        let mut probe = LinkProbe::default();
+        let hit = ((0, 0), (0, 15));
+        assert_eq!(s.link_at(0, 14, &mut probe), Some(hit), "the leader");
+        assert_eq!(s.link_at(0, 15, &mut probe), Some(hit), "the spacer");
+        assert_eq!(probe.url(), "https://x.com/世");
+    }
+
+    #[test]
+    fn link_at_ignores_a_column_past_the_grid() {
+        let mut s = Screen::new(30, 2);
+        feed(&mut s, b"https://example.com/a");
+        let mut probe = LinkProbe::default();
+        assert_eq!(s.link_at(0, 99, &mut probe), None);
     }
 
     #[test]

@@ -94,6 +94,7 @@ pub mod wl_seat {
 
 pub mod wl_pointer {
     pub const EV_ENTER: u16 = 0;
+    pub const EV_LEAVE: u16 = 1;
     pub const EV_MOTION: u16 = 2;
     pub const EV_BUTTON: u16 = 3;
     pub const EV_AXIS: u16 = 4;
