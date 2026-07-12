@@ -25,6 +25,7 @@ use super::terminal::{PumpOutcome, TerminalCore};
 use crate::config::TabBarConfig;
 use crate::error::Result;
 use crate::gather::GatherEnd;
+use crate::platform::freetype::Fonts;
 use crate::pty::ZombieChild;
 use crate::render::display::DisplayList;
 use crate::tab_bar::{self, BarGeom, Slot, TabLabel};
@@ -265,6 +266,7 @@ impl Tabs {
         width: u32,
         height: u32,
         metrics: CellMetrics,
+        label: CellMetrics,
         pad: i32,
         origin_y: i32,
         bar_y: i32,
@@ -284,6 +286,7 @@ impl Tabs {
         }
         self.bar_geom = Some(BarGeom {
             metrics,
+            label,
             surface_width: width as i32,
             pad,
             y: bar_y,
@@ -411,12 +414,19 @@ impl Tabs {
         self.bar_dirty = false;
     }
 
-    /// Compose the visible terminal's display list, then the tab strip over it.
-    pub(super) fn fill_frame_list(&self, out: &mut DisplayList, strings: &mut Vec<String>) {
+    /// Compose the visible terminal's display list, then the tab strip over it. The
+    /// strip's labels are the proportional interface font, so `fonts` is threaded to
+    /// [`tab_bar::fill_bar`] to measure and fit them.
+    pub(super) fn fill_frame_list(
+        &self,
+        out: &mut DisplayList,
+        strings: &mut Vec<String>,
+        fonts: &Fonts,
+    ) {
         self.active().fill_frame_list(out, strings);
         if self.shows_bar() {
             if let Some(bar) = &self.bar_geom {
-                tab_bar::fill_bar(out, strings, &self.bar_slots, bar, &self.cfg);
+                tab_bar::fill_bar(out, strings, &self.bar_slots, bar, &self.cfg, fonts);
             }
         }
     }
@@ -444,15 +454,16 @@ impl Tabs {
 
     /// After a core drained a burst of output with nothing left pending, its shell
     /// has likely printed a fresh prompt, so its working directory may have moved
-    /// (a bare `cd` reports nothing else). Re-read it, and when the shown label
-    /// actually changed and the bar is visible, rebuild and repaint it. The cwd is
-    /// refreshed even for a lone tab so it is current the moment a second opens; the
-    /// bar work is skipped while there is nothing to draw.
+    /// (a bare `cd` reports nothing else) or a foreground program may have started
+    /// or exited. Re-read both, and when either changed and the bar is visible,
+    /// rebuild and repaint it. They are refreshed even for a lone tab so they are
+    /// current the moment a second opens; the bar work is skipped while there is
+    /// nothing to draw.
     fn note_settle(&mut self, index: usize, bytes: usize, more: bool) {
         if bytes == 0 || more {
             return;
         }
-        if self.entries[index].core.refresh_cwd() && self.shows_bar() {
+        if self.entries[index].core.refresh_process() && self.shows_bar() {
             self.bar_dirty = true;
             self.rebuild_bar();
         }
@@ -464,12 +475,13 @@ impl Tabs {
             return;
         }
         let cols = self.active().dimensions().0;
-        // A tab's label (its cwd) is derived, not stored ready to lend, so gather
-        // the owned strings first and let the borrowed `TabLabel`s point into them.
+        // A tab's label (its cwd, and any path prefix) is derived, not stored ready
+        // to lend, so gather the owned strings first and let the borrowed
+        // `TabLabel`s point into them.
         let titles: Vec<String> = self
             .entries
             .iter()
-            .map(|entry| entry.core.tab_label())
+            .map(|entry| entry.core.tab_label(&self.cfg))
             .collect();
         let labels: Vec<_> = titles
             .iter()
@@ -479,7 +491,12 @@ impl Tabs {
                 active: index == self.active,
             })
             .collect();
-        self.bar_slots = tab_bar::layout(cols, &labels, &self.cfg);
+        // Blocks are sized in terminal cells. Before the first resize there is no
+        // geometry; the resulting slots are not painted until that resize rebuilds
+        // them, so a placeholder cell width is harmless (the labels, fitted at paint
+        // time, never see it).
+        let cell_w = self.bar_geom.as_ref().map_or(1, |geom| geom.metrics.w);
+        self.bar_slots = tab_bar::layout(cols, &labels, &self.cfg, cell_w);
     }
 
     /// Translate each core's outbox according to foreground/background routing.
@@ -648,7 +665,7 @@ mod tests {
     #[test]
     fn resize_updates_every_core() {
         let mut tabs = demo_tabs(3);
-        tabs.resize_all(100, 30, 800, 480, METRICS, 0, 16, 0, 16)
+        tabs.resize_all(100, 30, 800, 480, METRICS, METRICS, 0, 16, 0, 16)
             .expect("resize every demo core");
         assert!(tabs
             .entries
@@ -661,7 +678,7 @@ mod tests {
     fn bar_hit_testing_maps_to_stable_ids() {
         let mut tabs = demo_tabs(2);
         let ids: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
-        tabs.resize_all(20, 10, 160, 176, METRICS, 0, 16, 0, 16)
+        tabs.resize_all(20, 10, 160, 176, METRICS, METRICS, 0, 16, 0, 16)
             .expect("build bar layout");
 
         // Two tabs in 20 cols land at the floor width of 10 each: 0..10, 10..20.
@@ -675,10 +692,11 @@ mod tests {
 
     #[test]
     fn visible_bar_shifts_grid_down_exactly_one_cell() {
+        let fonts = Fonts::new(&[METRICS.size]).expect("fonts");
         let one = demo_tabs(1);
         let mut one_list = Vec::new();
         let mut one_strings = Vec::new();
-        one.fill_frame_list(&mut one_list, &mut one_strings);
+        one.fill_frame_list(&mut one_list, &mut one_strings, &fonts);
         let one_baseline = one_list.iter().find_map(|cmd| match cmd {
             DrawCmd::Cells { baseline, .. } => Some(*baseline),
             _ => None,
@@ -686,11 +704,13 @@ mod tests {
 
         // A top-anchored one-cell strip: grid origin drops one cell, strip at y 0.
         let mut two = demo_tabs(2);
-        two.resize_all(80, 23, 640, 384, METRICS, 0, METRICS.h, 0, METRICS.h)
-            .expect("shift both grids below the bar");
+        two.resize_all(
+            80, 23, 640, 384, METRICS, METRICS, 0, METRICS.h, 0, METRICS.h,
+        )
+        .expect("shift both grids below the bar");
         let mut two_list = Vec::new();
         let mut two_strings = Vec::new();
-        two.fill_frame_list(&mut two_list, &mut two_strings);
+        two.fill_frame_list(&mut two_list, &mut two_strings, &fonts);
         let two_baseline = two_list.iter().find_map(|cmd| match cmd {
             DrawCmd::Cells { baseline, .. } => Some(*baseline),
             _ => None,
@@ -698,9 +718,14 @@ mod tests {
 
         assert_eq!(one_baseline, Some(METRICS.ascent));
         assert_eq!(two_baseline, Some(METRICS.h + METRICS.ascent));
-        assert!(two_list.iter().any(|cmd| {
-            matches!(cmd, DrawCmd::Cells { baseline, .. } if *baseline == METRICS.ascent)
-        }));
+        // The tab strip paints its label (a proportional `Text` run) inside the top
+        // row, above the shifted-down grid whose runs baseline at METRICS.h + ascent.
+        assert!(
+            two_list.iter().any(|cmd| {
+                matches!(cmd, DrawCmd::Text { baseline, .. } if *baseline < METRICS.h)
+            }),
+            "the visible strip paints a label above the grid"
+        );
     }
 
     #[test]
@@ -709,38 +734,38 @@ mod tests {
         // the pool uncleared, and the bar's next run appended its label to those
         // stale spaces, shoving the inactive tab's label off screen. Build the bar
         // over a populated grid (which produces blank runs to recycle) and assert
-        // every slot's label lands as its own clean text at its own column.
+        // every label lands as its own clean run, never with recycled bytes glued in
+        // front. The label is the proportional interface font, so it is a `Text` run.
+        let fonts = Fonts::new(&[METRICS.size]).expect("fonts");
         let mut two = demo_tabs(2);
         let ids: Vec<_> = two.entries.iter().map(|entry| entry.id).collect();
-        two.resize_all(80, 23, 640, 384, METRICS, 0, METRICS.h, 0, METRICS.h)
-            .expect("build the bar");
+        two.resize_all(
+            80, 23, 640, 384, METRICS, METRICS, 0, METRICS.h, 0, METRICS.h,
+        )
+        .expect("build the bar");
         // The runtime path makes the newly opened tab active and tab zero inactive.
         assert!(two.select(ids[1], false));
 
         let mut list = Vec::new();
         let mut strings = Vec::new();
-        two.fill_frame_list(&mut list, &mut strings);
+        two.fill_frame_list(&mut list, &mut strings, &fonts);
 
-        let bar_cells: Vec<(i32, &str)> = list
+        // Both no-PTY demo cores label their tab with the directory fallback "shell".
+        // Each lands as its own clean `Text` run: exactly "shell", never " shell" or
+        // a recycled prefix. (The demo grid content carries no such string, so a
+        // match is unambiguously a bar label.)
+        let labels: Vec<&str> = list
             .iter()
             .filter_map(|cmd| match cmd {
-                DrawCmd::Cells {
-                    baseline, x, text, ..
-                } if *baseline == METRICS.ascent => Some((*x, text.as_str())),
+                DrawCmd::Text { text, .. } if text.contains("shell") => Some(text.as_str()),
                 _ => None,
             })
             .collect();
-
-        // Each tab's label (the numberless directory fallback "shell" for these
-        // no-PTY demo cores) lands as its own clean run at its centered origin,
-        // never with the previous run's recycled spaces glued in front.
-        for slot in [0, 1] {
-            let x = two.bar_slots[slot].text_start as i32 * METRICS.w;
-            assert!(
-                bar_cells.contains(&(x, "shell")),
-                "slot {slot} should paint a clean \"shell\" at x={x}, got {bar_cells:?}"
-            );
-        }
+        assert_eq!(
+            labels,
+            vec!["shell", "shell"],
+            "each tab paints a clean \"shell\", got {labels:?}"
+        );
     }
 
     #[test]

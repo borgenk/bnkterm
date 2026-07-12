@@ -202,6 +202,29 @@ impl Pty {
         std::fs::read_link(format!("/proc/{}/cwd", self.pid)).ok()
     }
 
+    /// The name (`comm`) of the program in the foreground of this PTY, e.g. `zsh` at
+    /// a prompt or `claude` while that runs. Resolved from `/proc/<pid>/stat`'s
+    /// `tpgid` field (the tty's foreground process group), then that leader's
+    /// `/proc/<tpgid>/comm`. `None` if `/proc` is unavailable or the fields cannot be
+    /// read. Like [`cwd`](Self::cwd) it is read only when a tab settles, never on the
+    /// byte path, so plain file reads are fine. Lets the tab bar prefix a directory
+    /// only for configured programs without depending on any shell integration.
+    ///
+    /// `/proc/<pid>/stat` layout: field 2 (`comm`) is parenthesized and may itself
+    /// contain spaces or `)`, so the fixed fields are parsed from *after the last*
+    /// `)`. Counting from there: state, ppid, pgrp, session, tty_nr, tpgid — so
+    /// `tpgid` is the sixth whitespace token.
+    pub fn foreground_program(&self) -> Option<String> {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)).ok()?;
+        let tpgid = parse_tpgid(&stat)?;
+        if tpgid <= 0 {
+            return None;
+        }
+        let comm = std::fs::read_to_string(format!("/proc/{tpgid}/comm")).ok()?;
+        let name = comm.trim_end_matches('\n');
+        (!name.is_empty()).then(|| name.to_string())
+    }
+
     /// Reap the child if it has exited, returning its exit status, else `None`
     /// (still running). Non-blocking.
     pub fn reap(&self) -> Option<c_int> {
@@ -235,6 +258,16 @@ impl ZombieChild {
         let r = unsafe { waitpid(self.pid, &mut status, WNOHANG) };
         r == self.pid || (r < 0 && errno() == ECHILD)
     }
+}
+
+/// Extract the `tpgid` (the tty's foreground process group) from a `/proc/<pid>/stat`
+/// line. Field 2, `comm`, is wrapped in parentheses and may itself contain spaces or
+/// `)`, so the fixed numeric fields are read from *after the last* `)`. Counting from
+/// there: state, ppid, pgrp, session, tty_nr, tpgid, so `tpgid` is the sixth token.
+/// Returns `None` if the line is malformed.
+fn parse_tpgid(stat: &str) -> Option<i32> {
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(5)?.parse().ok()
 }
 
 impl Drop for Pty {
@@ -548,6 +581,28 @@ mod tests {
         // These mirror C structs the kernel writes/reads; pin their sizes.
         assert_eq!(std::mem::size_of::<Winsize>(), 8);
         assert_eq!(std::mem::size_of::<Pollfd>(), 8);
+    }
+
+    #[test]
+    fn tpgid_is_parsed_past_a_paren_or_space_in_comm() {
+        // A normal line: comm "zsh", tpgid is the sixth field after ')'.
+        // pid (comm) state ppid pgrp session tty_nr tpgid ...
+        let stat = "1234 (zsh) S 1200 1234 1234 34816 5678 4194304 ...";
+        assert_eq!(parse_tpgid(stat), Some(5678));
+
+        // A hostile comm containing spaces and its own ')': the parse must key off
+        // the *last* ')', so the fields still align and tpgid reads correctly.
+        let nasty = "42 (weird ) name) R 1 42 42 0 -1 4194560 ...";
+        assert_eq!(parse_tpgid(nasty), Some(-1));
+
+        // At a prompt with no distinct foreground the caller treats tpgid == pgrp
+        // as "the shell"; a parse of it still succeeds (the filtering is elsewhere).
+        let prompt = "9 (bash) S 1 9 9 34816 9 4194304";
+        assert_eq!(parse_tpgid(prompt), Some(9));
+
+        // Malformed input yields None, never a panic on attacker-adjacent data.
+        assert_eq!(parse_tpgid("garbage with no paren"), None);
+        assert_eq!(parse_tpgid("7 (sh) S 1 7"), None);
     }
 
     #[test]

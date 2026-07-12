@@ -60,6 +60,17 @@ impl FontFamily {
 #[derive(Clone, Debug)]
 pub struct FontConfig {
     pub families: Vec<FontFamily>,
+    /// Proportional interface families (first installed wins) for chrome text such
+    /// as the tab bar, which is not grid content and reads better in a real UI sans
+    /// than in the monospace body family. Only `regular` and `bold` are used. Empty
+    /// (or none installed) falls back to the prose family, so UI text always
+    /// resolves.
+    pub ui: Vec<FontFamily>,
+    /// Medium-weight interface face candidates (first installed wins), one file each,
+    /// for the tab-bar label: a touch heavier than regular without bold's thickness.
+    /// Kept separate from [`ui`](Self::ui) because it is a lone weight file, not a
+    /// four-style family. Empty or none installed leaves the label at `ui` regular.
+    pub ui_medium: Vec<String>,
     pub code: Vec<String>,
     /// Regular-weight faces consulted, in order, for a scalar the prose or code
     /// face has no glyph for: a symbols/icon font (a terminal's Nerd Font and
@@ -78,6 +89,25 @@ impl FontConfig {
             .iter()
             .find(|f| std::path::Path::new(&f.regular).exists())
             .ok_or_else(|| Error::msg("no usable font family found in the candidate list"))
+    }
+
+    /// The first interface family whose regular face is installed, or the prose
+    /// `fallback` family when none is (so UI text always resolves to something). The
+    /// caller passes the already-resolved prose family as that fallback.
+    fn default_ui_family<'a>(&'a self, prose: &'a FontFamily) -> &'a FontFamily {
+        self.ui
+            .iter()
+            .find(|f| std::path::Path::new(&f.regular).exists())
+            .unwrap_or(prose)
+    }
+
+    /// The first installed medium-weight interface face, or `None` (the label then
+    /// stays at the UI regular weight).
+    fn default_ui_medium(&self) -> Option<&str> {
+        self.ui_medium
+            .iter()
+            .map(String::as_str)
+            .find(|p| std::path::Path::new(p).exists())
     }
 
     /// The first installed code face whose path differs from the prose family's
@@ -99,6 +129,11 @@ impl FontConfig {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum FontStyle {
     Regular,
+    /// A mid weight between regular and bold, used by the interface face for chrome
+    /// text (the tab bar) so labels read a touch heavier than body text without the
+    /// thickness of bold. The prose family carries no medium file and falls back to
+    /// its regular face, exactly as it does for a missing italic.
+    Medium,
     Bold,
     Italic,
     BoldItalic,
@@ -111,15 +146,26 @@ pub enum FontStyle {
 /// [`Fonts`] holds: the prose family at a style, and the distinct code family.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum FaceKey {
-    Prose { size: u32, style: FontStyle },
-    Code { size: u32 },
+    Prose {
+        size: u32,
+        style: FontStyle,
+    },
+    Code {
+        size: u32,
+    },
+    /// The proportional interface family, for chrome (the tab bar). Only regular
+    /// and bold are opened; italic keys resolve to their upright weight.
+    Ui {
+        size: u32,
+        style: FontStyle,
+    },
 }
 
 impl FaceKey {
     /// The pixel size this face is drawn at, carried by both arms.
     pub fn size(self) -> u32 {
         match self {
-            FaceKey::Prose { size, .. } | FaceKey::Code { size } => size,
+            FaceKey::Prose { size, .. } | FaceKey::Code { size } | FaceKey::Ui { size, .. } => size,
         }
     }
 }
@@ -720,6 +766,16 @@ struct SizedFaces {
     /// The code family's regular face at this size, or `None` when no distinct
     /// code family is installed (code then falls back to `regular`).
     code: Option<Face>,
+    /// The interface family's proportional faces at this size (for chrome text; see
+    /// [`FaceKey::Ui`]). `ui_regular` is always present (it falls back to the prose
+    /// family when no UI family is installed); `ui_medium` and `ui_bold` are `None`
+    /// when no such weight file is installed, and then that weight uses `ui_regular`.
+    /// `ui_metrics` are the interface face's own vertical metrics, so a UI baseline
+    /// centers on the sans ink box rather than the monospace one.
+    ui_regular: Face,
+    ui_medium: Option<Face>,
+    ui_bold: Option<Face>,
+    ui_metrics: Metrics,
     /// The fallback chain at this size ([`FontConfig::fallback`]), in priority
     /// order, holding only the faces whose files exist. Consulted by
     /// [`Fonts::glyph_face`] for a scalar the keyed face cannot draw; empty when
@@ -738,6 +794,9 @@ impl SizedFaces {
             .chain(self.italic.as_ref())
             .chain(self.bold_italic.as_ref())
             .chain(self.code.as_ref())
+            .chain(std::iter::once(&self.ui_regular))
+            .chain(self.ui_medium.as_ref())
+            .chain(self.ui_bold.as_ref())
             .chain(self.fallback.iter())
     }
 }
@@ -774,6 +833,8 @@ impl Fonts {
     pub fn with_config(config: &FontConfig, sizes: &[u32], line_height_scale: f32) -> Result<Self> {
         let family = config.default_family()?;
         let code_path = config.code_regular_path(family);
+        let ui_family = config.default_ui_family(family);
+        let ui_medium_path = config.default_ui_medium();
         let emoji = EmojiFont::open().map(Rc::new);
         let mut sized: Vec<SizedFaces> = Vec::new();
         for &size in sizes {
@@ -811,6 +872,12 @@ impl Fonts {
                 .iter()
                 .filter_map(|p| open_variant(p, size, None))
                 .collect();
+            // The interface face draws proportional chrome text, so it carries no
+            // emoji font (chrome is text) and keeps its own vertical metrics. When
+            // no distinct UI family is installed, `ui_family` is the prose family, so
+            // `ui_regular` simply mirrors `regular`.
+            let ui_regular = open_face(&ui_family.regular, size, None)?;
+            let ui_metrics = ui_regular.metrics();
             sized.push(SizedFaces {
                 size,
                 regular,
@@ -818,6 +885,10 @@ impl Fonts {
                 italic: open_variant(&family.italic, size, emoji.as_ref()),
                 bold_italic: open_variant(&family.bold_italic, size, emoji.as_ref()),
                 code: code_path.and_then(|p| open_variant(p, size, emoji.as_ref())),
+                ui_regular,
+                ui_medium: ui_medium_path.and_then(|p| open_variant(p, size, None)),
+                ui_bold: open_variant(&ui_family.bold, size, None),
+                ui_metrics,
                 fallback,
                 metrics,
             });
@@ -845,7 +916,8 @@ impl Fonts {
     pub fn face(&self, size: u32, style: FontStyle) -> &Face {
         let entry = self.entry(size);
         match style {
-            FontStyle::Regular => &entry.regular,
+            // The prose family ships no medium weight, so it reads as regular.
+            FontStyle::Regular | FontStyle::Medium => &entry.regular,
             FontStyle::Bold => entry.bold.as_ref().unwrap_or(&entry.regular),
             FontStyle::Italic => entry.italic.as_ref().unwrap_or(&entry.regular),
             FontStyle::BoldItalic => entry.bold_italic.as_ref().unwrap_or(&entry.regular),
@@ -861,6 +933,28 @@ impl Fonts {
         entry.code.as_ref().unwrap_or(&entry.regular)
     }
 
+    /// The interface face for `size` and weight: the proportional UI family's
+    /// medium or bold when asked and available, else its regular (italic styles
+    /// resolve to their upright weight, since UI text never slants). A missing
+    /// medium or bold falls back to `ui_regular`, as does an unopened `size`. Never
+    /// panics.
+    pub fn ui_face(&self, size: u32, style: FontStyle) -> &Face {
+        let entry = self.entry(size);
+        match style {
+            FontStyle::Medium => entry.ui_medium.as_ref().unwrap_or(&entry.ui_regular),
+            FontStyle::Bold | FontStyle::BoldItalic => {
+                entry.ui_bold.as_ref().unwrap_or(&entry.ui_regular)
+            }
+            FontStyle::Regular | FontStyle::Italic => &entry.ui_regular,
+        }
+    }
+
+    /// The interface family's vertical metrics for `size` (its own ascent/descent),
+    /// so a UI baseline centers on the sans ink box, not the monospace one.
+    pub fn ui_metrics(&self, size: u32) -> Metrics {
+        self.entry(size).ui_metrics
+    }
+
     /// Resolve a [`FaceKey`] to its face, the inverse of the key a run records.
     /// Routes to [`Self::face`] or [`Self::code_face`], so it inherits their
     /// fallbacks and never panics.
@@ -868,6 +962,7 @@ impl Fonts {
         match key {
             FaceKey::Prose { size, style } => self.face(size, style),
             FaceKey::Code { size } => self.code_face(size),
+            FaceKey::Ui { size, style } => self.ui_face(size, style),
         }
     }
 
@@ -1156,6 +1251,56 @@ mod tests {
             assert!(
                 fonts.code_face(size).advance('m') > 0.0,
                 "code face at {size}px advances"
+            );
+        }
+    }
+
+    #[test]
+    fn ui_faces_resolve_and_route_without_panicking() {
+        let fonts = Fonts::new(&[16, 32]).expect("a default font");
+        for &size in &[16, 32, 99] {
+            // The interface face resolves for every style at opened and unopened
+            // sizes (italic styles fall to their upright weight; a missing bold
+            // falls to regular), always advancing, never panicking.
+            for style in [
+                FontStyle::Regular,
+                FontStyle::Medium,
+                FontStyle::Bold,
+                FontStyle::Italic,
+                FontStyle::BoldItalic,
+            ] {
+                assert!(
+                    fonts.ui_face(size, style).advance('n') > 0.0,
+                    "ui face {style:?} at {size}px advances"
+                );
+            }
+            // A `FaceKey::Ui` routes through `face_for` to the same face `ui_face`
+            // returns, so a display-list run and a direct lookup agree.
+            let key = FaceKey::Ui {
+                size,
+                style: FontStyle::Bold,
+            };
+            assert!(std::ptr::eq(
+                fonts.face_for(key),
+                fonts.ui_face(size, FontStyle::Bold)
+            ));
+            // Its vertical metrics are a sane, positive box (used for the tab-bar
+            // baseline). Bold is never lighter than regular (equal only when the
+            // installed family ships no distinct bold).
+            let m = fonts.ui_metrics(size);
+            assert!(m.ascent > 0 && m.descent > 0 && m.line_height >= m.ascent + m.descent);
+            let ink = |style| {
+                fonts
+                    .ui_face(size, style)
+                    .rasterize('B')
+                    .coverage
+                    .iter()
+                    .map(|&c| c as u64)
+                    .sum::<u64>()
+            };
+            assert!(
+                ink(FontStyle::Bold) >= ink(FontStyle::Regular),
+                "ui bold is never lighter than ui regular"
             );
         }
     }

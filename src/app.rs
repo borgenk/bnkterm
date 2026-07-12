@@ -215,6 +215,10 @@ struct State {
     /// The fixed cell box the whole grid is laid out on. Window-authoritative (it
     /// owns the fonts and scale); the core holds a copy, shipped over on a resize.
     metrics: CellMetrics,
+    /// The cell box for the (smaller) tab-bar label font, recomputed with `metrics`
+    /// on every scale/zoom change and handed to the tabs layer on a resize. Equal to
+    /// `metrics` when the label scale is 100%.
+    label_metrics: CellMetrics,
     /// Key auto-repeat: Wayland delivers no repeat events, so the client synthesises
     /// them from the compositor's `repeat_info`. `repeat_key`/`repeat_at` track the
     /// held key and when it next fires; `repeat_interval` is `None` when repeat is
@@ -334,8 +338,11 @@ impl State {
         // Open at unity scale; the compositor's real scale arrives after bring-up
         // and reopens the fonts (see `apply_scale`).
         let font_size = config_font_px(SCALE_120_UNITY);
-        let fonts = Fonts::new(&[font_size])?;
+        let tab_bar_config = TabBarConfig::default();
+        let label_size = label_font_px(font_size, tab_bar_config.label_scale_pct);
+        let fonts = Fonts::new(&font_sizes(font_size, label_size))?;
         let metrics = CellMetrics::from_fonts(&fonts, font_size);
+        let label_metrics = CellMetrics::from_ui(&fonts, label_size);
         let (cols, rows) = (DEFAULT_COLS, DEFAULT_ROWS);
         let width = (cols as i32 * metrics.w + 2 * WINDOW_PADDING).max(1) as u32;
         let height = (rows as i32 * metrics.h + 2 * WINDOW_PADDING).max(1) as u32;
@@ -348,9 +355,10 @@ impl State {
             conn,
             fonts,
             xkb: Xkb::new()?,
-            tabs: Tabs::new(core, TabBarConfig::default()),
+            tabs: Tabs::new(core, tab_bar_config.clone()),
             poll_set: pty::PollSet::new(),
             metrics,
+            label_metrics,
             // Sensible defaults until the compositor sends repeat_info.
             repeat_delay: Duration::from_millis(400),
             repeat_interval: Some(Duration::from_millis(33)),
@@ -364,7 +372,7 @@ impl State {
             grid_origin_y: WINDOW_PADDING,
             bar_y: WINDOW_PADDING,
             bar_h: 0,
-            tab_bar_config: TabBarConfig::default(),
+            tab_bar_config,
             scale: Scaling::new((width, height)),
             registry: 0,
             compositor: None,
@@ -663,7 +671,7 @@ impl State {
     fn resize_to(&mut self, w: u32, h: u32) {
         // Reserve the padding on all sides, so the grid fits inside the margins.
         let pad = self.device_pad();
-        let cfg = self.tab_bar_config;
+        let cfg = &self.tab_bar_config;
         let (bar_h, gap) = if self.tabs.shows_bar() {
             // The configured logical height, DPI-scaled, floored at one text row so
             // the label can never clip on a small height or a large font, plus the
@@ -702,9 +710,18 @@ impl State {
         // Ship the fresh grid size and geometry to the core: it resizes the grid and
         // the PTY winsize (best-effort, so this cannot fail from here — see `apply`),
         // and keeps the geometry copies `fill_frame_list` lays out with.
-        let _ = self
-            .tabs
-            .resize_all(cols, rows, w, h, self.metrics, pad, origin_y, bar_y, bar_h);
+        let _ = self.tabs.resize_all(
+            cols,
+            rows,
+            w,
+            h,
+            self.metrics,
+            self.label_metrics,
+            pad,
+            origin_y,
+            bar_y,
+            bar_h,
+        );
     }
 
     /// Adopt a new compositor scale (in 120ths): reopen the fonts at the size it
@@ -735,8 +752,10 @@ impl State {
         }
         // On a font-open failure, keep the working fonts (no panic, no blank
         // window); the next scale event may recover.
-        if let Ok(fonts) = Fonts::new(&[size]) {
+        let label_size = label_font_px(size, self.tab_bar_config.label_scale_pct);
+        if let Ok(fonts) = Fonts::new(&font_sizes(size, label_size)) {
             self.metrics = CellMetrics::from_fonts(&fonts, size);
+            self.label_metrics = CellMetrics::from_ui(&fonts, label_size);
             self.fonts = fonts;
         }
     }
@@ -1645,6 +1664,25 @@ fn config_font_px(scale_120: u32) -> u32 {
         .filter(|p| p.is_finite() && *p > 0.0)
         .unwrap_or(FONT_POINTS);
     points_to_px(points, scale_120)
+}
+
+/// The tab-label font size in device pixels: the body `size` scaled by the config
+/// percentage, floored so a small font or a low percentage cannot shrink the label
+/// to nothing, and never larger than the body font.
+fn label_font_px(size: u32, scale_pct: u16) -> u32 {
+    const LABEL_FLOOR_PX: u32 = 8;
+    (size * scale_pct as u32 / 100).clamp(LABEL_FLOOR_PX.min(size), size)
+}
+
+/// The distinct font sizes to open for a body/label pair: one entry when the label
+/// lands on the body size (100% scale, or a floor that meets it), two otherwise, so
+/// `Fonts` never rasterizes the same size twice.
+fn font_sizes(body: u32, label: u32) -> Vec<u32> {
+    if label == body {
+        vec![body]
+    } else {
+        vec![body, label]
+    }
 }
 
 /// The glyph coverage gamma (see [`TEXT_GAMMA`]), overridable with

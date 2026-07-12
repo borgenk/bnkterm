@@ -98,6 +98,23 @@ impl CellMetrics {
         }
     }
 
+    /// The vertical box for the proportional interface face at `size`: its own
+    /// ascent/descent/line-height, so chrome text (the tab bar) baselines on the
+    /// sans ink box. `w` carries a nominal glyph advance for callers that want one,
+    /// but proportional UI text is placed by each glyph's real advance, not this
+    /// pitch, so it is not a cell width.
+    pub fn from_ui(fonts: &Fonts, size: u32) -> Self {
+        let m = fonts.ui_metrics(size);
+        let advance = fonts.ui_face(size, FontStyle::Regular).advance('n');
+        CellMetrics {
+            size,
+            w: (advance.round() as i32).max(1),
+            h: m.line_height.max(1),
+            ascent: m.ascent,
+            descent: m.descent,
+        }
+    }
+
     /// The largest `(cols, rows)` grid that fits a `width` x `height` pixel
     /// surface, at least 1x1. The app uses this to size the grid on a resize.
     pub fn columns_rows(self, width: i32, height: i32) -> (usize, usize) {
@@ -803,6 +820,41 @@ impl Painter<'_> {
     fn marks_empty(&self, row: usize, col: usize) -> bool {
         self.marks(row, col).is_none_or(|m| m.is_empty())
     }
+}
+
+/// Append one proportional text run (chrome/UI text) at `x` on `baseline` in
+/// `face`, drawing the owned string from the pool so a steady repaint allocates
+/// nothing. Unlike [`push_cell_text`] the glyphs advance by the font's own metrics
+/// rather than a fixed cell pitch, so this is for a UI-sans label, never grid text;
+/// `run_w` is the run's already-measured pixel width, used only for the damage
+/// bounds. An empty run pushes nothing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_text_run(
+    out: &mut DisplayList,
+    strings: &mut Vec<String>,
+    text: &str,
+    x: i32,
+    run_w: i32,
+    baseline: i32,
+    face: FaceKey,
+    color: u32,
+    bg: u32,
+    metrics: CellMetrics,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let mut owned = take_string_with_capacity(strings, text.len());
+    owned.push_str(text);
+    out.push(DrawCmd::Text {
+        bounds: text_bounds(x, baseline, run_w, metrics),
+        x,
+        baseline,
+        face,
+        color,
+        bg,
+        text: owned,
+    });
 }
 
 /// Append styled cell text at a fixed-pitch origin, recycling every command's

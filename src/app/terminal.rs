@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use super::message::{PointerEvent, ToTerminal, ToWindow};
 use crate::color::Theme;
+use crate::config::TabBarConfig;
 use crate::error::Result;
 use crate::gather::{GatherEnd, Gatherer};
 use crate::grid::{CursorStyle, Screen};
@@ -124,6 +125,11 @@ pub(super) struct TerminalCore {
     /// labels the tab when no program has set a title; `None` before the first
     /// read (or on a kernel without `/proc`).
     cwd: Option<std::path::PathBuf>,
+    /// The foreground program's name (`comm`), re-read alongside `cwd`. When it
+    /// matches the tab bar's configured list, the label is prefixed with `cwd` even
+    /// though a title is set, so a program that names its own tab (e.g. `claude`)
+    /// still reveals its directory. `None` before the first read.
+    foreground: Option<String>,
 }
 
 impl TerminalCore {
@@ -170,6 +176,7 @@ impl TerminalCore {
             outbox: Vec::new(),
             last_title: String::new(),
             cwd: None,
+            foreground: None,
         }
     }
 
@@ -250,8 +257,19 @@ impl TerminalCore {
     /// Owned because the directory string is derived, not stored ready to lend.
     /// This mirrors the sibling `wezterm.lua`, whose tab label prefers a program's
     /// own title and otherwise shows the `~`-abbreviated cwd.
-    pub(super) fn tab_label(&self) -> String {
+    ///
+    /// One exception keeps directory context for programs that name their own tab:
+    /// when a title is set *and* the foreground program is in
+    /// [`TabBarConfig::path_prefix_programs`], the label is `"<dir> - <title>"`,
+    /// where `<dir>` is the cwd's final component. `claude`, for instance, sets the
+    /// session name as the title; the prefix restores which directory it runs in.
+    /// The directory leads so the end-truncating [`tab_bar::fit_end`](crate::tab_bar)
+    /// clips the volatile title first.
+    pub(super) fn tab_label(&self, cfg: &TabBarConfig) -> String {
         if !self.last_title.is_empty() {
+            if let Some(dir) = self.prefix_dir(cfg) {
+                return format!("{dir} - {}", self.last_title);
+            }
             return self.last_title.clone();
         }
         match &self.cwd {
@@ -260,17 +278,32 @@ impl TerminalCore {
         }
     }
 
-    /// Re-read the working directory from the child and report whether the tab's
-    /// *displayed* label changed, so the manager rebuilds the bar only when it
-    /// must. Returns `false` while a program has set its own title, since the
-    /// directory is not shown then.
-    pub(super) fn refresh_cwd(&mut self) -> bool {
-        let next = self.pty.as_ref().and_then(Pty::cwd);
-        if next == self.cwd {
+    /// The cwd's final component when the foreground program opts into the path
+    /// prefix, else `None`. A rootless cwd (`/`, with no final component) yields
+    /// `None`, so the label simply shows the bare title.
+    fn prefix_dir(&self, cfg: &TabBarConfig) -> Option<String> {
+        let program = self.foreground.as_deref()?;
+        if !cfg.path_prefix_programs.iter().any(|p| p == program) {
+            return None;
+        }
+        let name = self.cwd.as_ref()?.file_name()?;
+        Some(name.to_string_lossy().into_owned())
+    }
+
+    /// Re-read the working directory and foreground program from the child and
+    /// report whether either changed, so the manager rebuilds the bar only when the
+    /// label might move. Both feed the label (the cwd directly, the program through
+    /// [`TabBarConfig::path_prefix_programs`]), so a change in either can shift what
+    /// is shown; the manager applies the cheap rebuild without re-deriving here.
+    pub(super) fn refresh_process(&mut self) -> bool {
+        let cwd = self.pty.as_ref().and_then(Pty::cwd);
+        let foreground = self.pty.as_ref().and_then(Pty::foreground_program);
+        if cwd == self.cwd && foreground == self.foreground {
             return false;
         }
-        self.cwd = next;
-        self.last_title.is_empty()
+        self.cwd = cwd;
+        self.foreground = foreground;
+        true
     }
 
     /// Test-only direct feed through the same parser/output bookkeeping used by
@@ -904,18 +937,42 @@ mod tests {
 
     #[test]
     fn tab_label_prefers_a_program_title_then_the_cwd_then_shell() {
+        let cfg = TabBarConfig::default();
         let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
         // No title and no known cwd: the bare fallback.
-        assert_eq!(core.tab_label(), "shell");
+        assert_eq!(core.tab_label(&cfg), "shell");
         // A known cwd (as /proc reports it) shows in place of the fallback. A path
         // outside home stays absolute regardless of the ambient $HOME, so this
         // stays deterministic without touching the process environment (the
         // home-abbreviation itself is covered by `abbreviate_under` above).
         core.cwd = Some(std::path::PathBuf::from("/opt/service"));
-        assert_eq!(core.tab_label(), "/opt/service");
+        assert_eq!(core.tab_label(&cfg), "/opt/service");
         // A program-set window title wins over the directory.
         core.last_title = "vim README".to_string();
-        assert_eq!(core.tab_label(), "vim README");
+        assert_eq!(core.tab_label(&cfg), "vim README");
+    }
+
+    #[test]
+    fn a_configured_program_prefixes_the_title_with_its_directory() {
+        // The `claude` case: a program that names its own tab still reveals its
+        // directory, because it is in the default `path_prefix_programs` list. The
+        // prefix is the cwd's final component, and the title follows the separator.
+        let cfg = TabBarConfig::default(); // path_prefix_programs = ["claude"]
+        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        core.cwd = Some(std::path::PathBuf::from("/home/ada/projects/bnkterm"));
+        core.last_title = "fixing the parser".to_string();
+
+        // Foreground is the shell: no prefix, the bare title shows.
+        core.foreground = Some("zsh".to_string());
+        assert_eq!(core.tab_label(&cfg), "fixing the parser");
+
+        // Foreground is a listed program: the directory leads, then the title.
+        core.foreground = Some("claude".to_string());
+        assert_eq!(core.tab_label(&cfg), "bnkterm - fixing the parser");
+
+        // Without a title there is nothing to prefix; the cwd shows on its own.
+        core.last_title.clear();
+        assert_eq!(core.tab_label(&cfg), "/home/ada/projects/bnkterm");
     }
 
     const METRICS: CellMetrics = CellMetrics {

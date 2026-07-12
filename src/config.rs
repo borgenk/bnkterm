@@ -78,6 +78,51 @@ impl Default for FontConfig {
                     "/usr/share/fonts/TTF/Roboto-BoldItalic.ttf",
                 ),
             ],
+            // Interface faces: a proportional sans for chrome (the tab bar), first
+            // installed wins. A real UI sans reads cleaner and carries a heavier,
+            // clearly distinct Bold at small sizes than the monospace body family
+            // does, so the active tab's weight actually shows. These are the
+            // desktop's own UI-sans candidates (Ghostty's GTK tabs use whatever the
+            // system font is; on GNOME that is Adwaita Sans, a variable font this
+            // static-face loader cannot pull a Bold from, so the static Noto Sans /
+            // Roboto pairs lead). Only regular + bold are consulted; italics are
+            // listed for shape but unused. Absent all of these, UI text falls back
+            // to the prose family.
+            ui: vec![
+                FontFamily::new(
+                    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+                    "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+                    "/usr/share/fonts/noto/NotoSans-Italic.ttf",
+                    "/usr/share/fonts/noto/NotoSans-BoldItalic.ttf",
+                ),
+                FontFamily::new(
+                    "/usr/share/fonts/TTF/Roboto-Regular.ttf",
+                    "/usr/share/fonts/TTF/Roboto-Bold.ttf",
+                    "/usr/share/fonts/TTF/Roboto-Italic.ttf",
+                    "/usr/share/fonts/TTF/Roboto-BoldItalic.ttf",
+                ),
+                FontFamily::new(
+                    "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+                    "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
+                    "/usr/share/fonts/liberation/LiberationSans-Italic.ttf",
+                    "/usr/share/fonts/liberation/LiberationSans-BoldItalic.ttf",
+                ),
+                FontFamily::new(
+                    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+                    "/usr/share/fonts/TTF/DejaVuSans-Oblique.ttf",
+                    "/usr/share/fonts/TTF/DejaVuSans-BoldOblique.ttf",
+                ),
+            ],
+            // The medium-weight interface face for the tab-bar label: heavier than
+            // regular, lighter than bold. One file per candidate, matched in the same
+            // order as `ui` above so the weight tracks the chosen family. Only true
+            // medium files are listed (Liberation Sans and DejaVu Sans ship none); if
+            // none is installed the label stays at the UI regular weight.
+            ui_medium: vec![
+                "/usr/share/fonts/noto/NotoSans-Medium.ttf".into(),
+                "/usr/share/fonts/TTF/Roboto-Medium.ttf".into(),
+            ],
             // Code faces: a monospace deliberately distinct from the prose family
             // for anything drawn through the code arm. Code never renders bold or
             // italic, so only the regular face is listed.
@@ -136,7 +181,10 @@ pub struct TabColors {
 /// active block on dark teal, faint inactive tabs that share the bar (terminal)
 /// background, and a divider between two inactive tabs so equal-width blocks stay
 /// separable when they share that background.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// Not `Copy` (it owns [`path_prefix_programs`](Self::path_prefix_programs)); it is
+/// built once and threaded by reference, never copied on a hot path.
+#[derive(Clone, PartialEq, Debug)]
 pub struct TabBarConfig {
     /// Top or bottom of the window (default `Bottom`).
     pub position: TabBarPosition,
@@ -164,6 +212,18 @@ pub struct TabBarConfig {
     /// the active block), so equal-width tabs sharing the strip background do not
     /// blur together.
     pub divider: Rgb,
+    /// Tab-label font size as a percentage of the terminal font size, so labels
+    /// read as chrome rather than body text. Applied window-side to pick the label
+    /// point size and clamped to a sane floor there (see `app`). A value of `100`
+    /// keeps the label at the terminal size.
+    pub label_scale_pct: u16,
+    /// Programs (matched by the foreground process group's `comm`) whose tab label
+    /// is prefixed with the working directory. A program that sets its own title
+    /// (e.g. `claude`, whose title is the session name) otherwise hides which
+    /// directory it runs in; the prefix keeps that visible. The path stays pinned
+    /// because labels truncate from the end (see `tab_bar::fit_end`), so the volatile
+    /// title is what clips, not the directory.
+    pub path_prefix_programs: Vec<String>,
 }
 
 impl Default for TabBarConfig {
@@ -183,6 +243,8 @@ impl Default for TabBarConfig {
                 bg: Rgb::new(0x28, 0x2c, 0x34), // == the default terminal background
             },
             divider: Rgb::new(0x3f, 0x46, 0x53),
+            label_scale_pct: 85,
+            path_prefix_programs: vec!["claude".to_string()],
         }
     }
 }

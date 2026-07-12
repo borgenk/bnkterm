@@ -442,7 +442,7 @@ impl State {
         // builds it without allocating. `front` still holds the on-screen frame.
         {
             let (out, strings) = self.presentation.lists.begin();
-            self.tabs.fill_frame_list(out, strings);
+            self.tabs.fill_frame_list(out, strings, &self.fonts);
             // The leader-mode indicator draws over the grid and bar (last wins in
             // list order); it is nothing at all in Normal mode.
             crate::keymode::paint_overlay(
