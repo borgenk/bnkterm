@@ -144,9 +144,11 @@ impl Default for CursorRender {
 /// A linear text selection over the visible grid, in `(row, col)` cell
 /// coordinates. `anchor` is where the drag began and `head` where it is now,
 /// either order; a cell falls in the selection when it lies between them in reading
-/// order (whole rows in the middle, partial rows at the ends). The painter then
-/// trims each row's highlight to its content (see `Painter::selection_cols`), so
-/// trailing blanks never paint and the highlight matches what is copied.
+/// order (whole rows in the middle, partial rows at the ends). The painter paints
+/// the whole geometric span, blank cells included (see `Painter::selection_cols`),
+/// so dragging over the empty area below the prompt highlights it; the copy still
+/// trims each line's trailing blanks (see [`crate::grid::Screen::selection_text`]),
+/// so the paint is deliberately wider than what lands on the clipboard.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Selection {
     pub anchor: (usize, usize),
@@ -376,8 +378,8 @@ impl Painter<'_> {
     /// colours, so it coalesces with the leader with no special case here.
     fn background_row(&mut self, row: usize, cols: usize) {
         let m = self.metrics;
-        // The selected span is content-trimmed once per row, so a cell past the last
-        // glyph never takes the highlight (and the per-cell test below stays O(1)).
+        // The selected span is one inclusive column range per row, so the per-cell
+        // test below stays O(1) and the whole band coalesces into one fill.
         let sel = self.selection_cols(row);
         let selected = |col: usize| sel.is_some_and(|(a, b)| a <= col && col <= b);
         let mut col = 0;
@@ -760,38 +762,23 @@ impl Painter<'_> {
         self.resolve(self.cell(row, col), selected).1
     }
 
-    /// The inclusive column span of `row` the selection highlights, trimmed to the
-    /// row's content: past the last glyph in the selected range lie only trailing
-    /// blanks, which neither highlight nor copy. `None` when the row is outside the
-    /// selection or the selected span holds no content (a blank line, or a drag over
-    /// empty cells). This keeps the highlight identical to what [`Screen::selection_text`]
-    /// copies, and stops the "select any empty cell" behaviour wezterm/ghostty lack.
+    /// The inclusive column span of `row` the selection highlights: the whole
+    /// geometric span the drag covers, blank cells included. A linear selection
+    /// paints the first row from its start column to the row's right edge, every
+    /// whole middle row edge to edge, and the last row from the left edge to its end
+    /// column, so dragging across the empty area below the prompt highlights it, the
+    /// way xterm/wezterm/ghostty do. `None` only when `row` lies outside the
+    /// selection. The paint is deliberately wider than [`Screen::selection_text`]
+    /// copies: it shows the drag for feedback while the copy trims trailing blanks.
     fn selection_cols(&self, row: usize) -> Option<(usize, usize)> {
         let (start, end) = self.selection?.ordered();
         if row < start.0 || row > end.0 {
             return None;
         }
-        let cols = self.screen.dimensions().0;
+        let last_col = self.screen.dimensions().0.saturating_sub(1);
         let first = if row == start.0 { start.1 } else { 0 };
-        let geom_last = if row == end.0 {
-            end.1
-        } else {
-            cols.saturating_sub(1)
-        }
-        .min(cols.saturating_sub(1));
-        // Walk in from the right edge of the selected span to the last inked cell.
-        let last = (first..=geom_last)
-            .rev()
-            .find(|&col| self.cell_has_content(row, col))?;
+        let last = if row == end.0 { end.1 } else { last_col }.min(last_col);
         Some((first, last))
-    }
-
-    /// Whether a cell carries content for selection purposes: a wide glyph's spacer
-    /// (its leader owns the glyph that covers this cell), a non-space rune, or a
-    /// combining mark. A blank space is not content, so it trims like `selection_text`.
-    fn cell_has_content(&self, row: usize, col: usize) -> bool {
-        let cell = self.cell(row, col);
-        cell.is_wide_spacer() || cell.rune != ' ' || !self.marks_empty(row, col)
     }
 
     /// Resolve a cell's `(fg, bg)` to concrete colours: reverse swaps the two, dim
@@ -1374,9 +1361,10 @@ mod tests {
     }
 
     #[test]
-    fn selection_trims_trailing_blanks() {
-        // "abc" in a 6-wide row, selected edge to edge. Only the three inked cells
-        // highlight; the trailing blanks (cols 3..=5) do not, matching the copy.
+    fn selection_highlights_the_full_span_including_trailing_blanks() {
+        // "abc" in a 6-wide row, selected edge to edge. The highlight spans all six
+        // cells, the trailing blanks (cols 3..=5) included, matching wezterm/ghostty;
+        // the copy still trims them (see grid::selection_text), so paint is wider.
         let mut s = Screen::new(6, 1);
         feed(&mut s, b"abc");
         let list = build_display_list(
@@ -1403,16 +1391,17 @@ mod tests {
             Rect {
                 x: 0,
                 y: 0,
-                w: 3 * M.w,
+                w: 6 * M.w,
                 h: M.h
             }
         );
     }
 
     #[test]
-    fn selection_over_blank_cells_paints_nothing() {
-        // Dragging across an empty region highlights no cell (the "select any block
-        // cell" behaviour wezterm/ghostty lack): there is no selection band at all.
+    fn selection_over_blank_cells_paints_the_full_band() {
+        // Dragging across an empty region highlights the whole geometric span (the
+        // "select the empty space below the prompt" behaviour): one full-width band,
+        // even though the row holds no glyphs and would copy nothing.
         let s = Screen::new(6, 1);
         let list = build_display_list(
             &s,
@@ -1429,11 +1418,18 @@ mod tests {
                 head: (0, 5),
             }),
         );
-        assert!(
-            fills(&list)
-                .into_iter()
-                .all(|(_, c)| c != SELECTION_BG.to_u32()),
-            "no selection band over blank cells"
+        let band = fills(&list)
+            .into_iter()
+            .find(|(_, c)| *c == SELECTION_BG.to_u32())
+            .expect("a selection band over the blank cells");
+        assert_eq!(
+            band.0,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 6 * M.w,
+                h: M.h
+            }
         );
     }
 

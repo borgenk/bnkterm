@@ -560,18 +560,19 @@ impl TerminalCore {
         }
     }
 
-    /// End a left-drag: a real selection is offered to both the clipboard and the
-    /// primary selection (copy-on-select, matching the `copy-on-select = clipboard`
-    /// convention), so Ctrl+V and middle-click both paste it. A plain click leaves no
-    /// selection (nothing to offer); a word/line selection over only blank cells has
-    /// no text, so it too is dropped rather than owning an empty selection.
+    /// End a left-drag: a selection with text is offered to both the clipboard and
+    /// the primary selection (copy-on-select, matching the `copy-on-select =
+    /// clipboard` convention), so Ctrl+V and middle-click both paste it. A plain
+    /// click leaves no selection at all. A drag over only blank cells keeps its
+    /// highlight (so selecting the empty space below the prompt sticks, the way
+    /// wezterm/ghostty leave it until the next click or output clears it) but offers
+    /// nothing, since there is no text to copy.
     fn finish_selection(&mut self) {
         let Some(sel) = self.selection else {
             return;
         };
         let text = self.screen.selection_text(sel.anchor, sel.head);
         if text.is_empty() {
-            self.selection = None;
             return;
         }
         let bytes = text.into_bytes();
@@ -998,6 +999,29 @@ mod tests {
         assert!(core.selection.is_none(), "same-cell motion shows nothing");
         press(&mut core, MouseButton::Left, false, 2, 0);
         assert!(core.selection.is_none(), "and the release leaves nothing");
+    }
+
+    #[test]
+    fn a_drag_over_empty_space_sticks_but_copies_nothing() {
+        // Selecting the empty area below the prompt: the drag leaves a live selection
+        // (so the highlight sticks after release, matching wezterm/ghostty) yet offers
+        // nothing to the clipboard, since blank cells have no text to copy. Row 20 is
+        // below the demo's last content row (16), so it is all blank cells.
+        let mut core = pointer_core();
+        press(&mut core, MouseButton::Left, true, 5, 20);
+        drag_to(&mut core, 15, 20);
+        press(&mut core, MouseButton::Left, false, 15, 20);
+        assert!(
+            core.selection.is_some(),
+            "the empty-space selection stays highlighted"
+        );
+        assert!(
+            !core
+                .take_outbox()
+                .iter()
+                .any(|m| matches!(m, ToWindow::OfferPrimary(_) | ToWindow::OfferSelection(_))),
+            "but nothing is offered to copy"
+        );
     }
 
     #[test]
