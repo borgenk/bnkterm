@@ -1,5 +1,5 @@
-//! The terminal core: the half of the app behind the terminal/window seam.
-//! [`TerminalCore`] owns the PTY, the VT parser, and the grid, plus everything
+//! The per-tab terminal core behind the tabs/window seam. One [`TerminalCore`]
+//! exists for each live tab and owns its PTY, VT parser, and grid, plus everything
 //! that is a function of them: the text selection, the cursor blink phase, the
 //! theme, and the frame geometry it needs to lay the grid out. It never touches
 //! Wayland, xkb, or the GPU.
@@ -7,16 +7,15 @@
 //! ```text
 //!   ToTerminal ─▶ TerminalCore::apply ─┬─▶ PTY write   (input → child)
 //!                                      └─▶ grid mutate  (parser, selection, scroll)
-//!   PTY master ─▶ gather thread ─▶ pump_pty ─▶ parser ─▶ grid ─▶ outbox (Title / Closed)
+//!   PTY master ─▶ gather thread ─▶ pump ─▶ parser ─▶ grid ─▶ outbox (Title / Closed)
 //!   grid state ─▶ fill_frame_list ─▶ DisplayList (pulled by the window each frame)
 //! ```
 //!
-//! The window drives it on the main thread: it resolves compositor events into
-//! [`ToTerminal`] messages (which turn into PTY bytes and grid mutations here),
-//! pulls a [`DisplayList`] each frame, and drains the [`ToWindow`] outbox for the
-//! few actions only the window can take (set the title, own the clipboard, shut
-//! down). The child's output is drained off-thread by [`crate::gather`] (see
-//! off-thread); `pump_pty` consumes the published batches. Only
+//! [`super::tabs::Tabs`] drives each core on the main thread: it routes the
+//! window's [`ToTerminal`] messages to the active core (or resize to all cores),
+//! pulls only the active [`DisplayList`], and translates each per-core
+//! [`ToWindow`] fact. The child's output is drained off-thread by [`crate::gather`] (see
+//! off-thread); `pump` consumes the published batches. Only
 //! reads move off the main thread; the parser, grid, and every write stay here.
 
 use std::os::fd::RawFd;
@@ -24,25 +23,18 @@ use std::time::{Duration, Instant};
 
 use super::message::{PointerEvent, ToTerminal, ToWindow};
 use crate::color::Theme;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::gather::{GatherEnd, Gatherer};
 use crate::grid::{CursorStyle, Screen};
 use crate::input;
 use crate::mouse::{self, MouseButton, MouseKind};
-use crate::pty::Pty;
+use crate::pty::{Pty, ZombieChild};
 use crate::render::display::DisplayList;
 use crate::term_render::{self, CellMetrics, CursorRender, CursorShape, Selection};
 use crate::vt::Parser;
 
 /// The cursor blink half-period: how long each of the on/off phases lasts.
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
-
-/// One gather pump's fairness budget: stop draining published batches after this
-/// much wall time, or [`GATHER_BYTE_BUDGET`] bytes, whichever comes first, so a
-/// continuous producer cannot starve Wayland input. The loop then bypasses its
-/// next blocking wait while batches remain, taking another turn at once.
-const GATHER_TIME_BUDGET: Duration = Duration::from_millis(2);
-const GATHER_BYTE_BUDGET: usize = 1024 * 1024;
 
 /// Lines the scrollback view moves per wheel notch, and arrows sent per notch
 /// when the wheel falls back to arrow keys on the alt screen.
@@ -58,6 +50,14 @@ enum SelectMode {
     Line,
 }
 
+/// What one budgeted pass over a core's gather queue observed. The tab manager
+/// spends one global budget across these outcomes and owns per-tab teardown.
+pub(super) struct PumpOutcome {
+    pub(super) bytes: usize,
+    pub(super) more: bool,
+    pub(super) end: Option<GatherEnd>,
+}
+
 /// The terminal half of the app: the PTY, parser, and grid, plus the state that
 /// is a pure function of them. The window feeds it [`ToTerminal`] messages, pulls
 /// a [`DisplayList`], and drains the [`ToWindow`] outbox. It holds its own copies
@@ -69,7 +69,7 @@ pub(super) struct TerminalCore {
     /// The VT state machine driving `screen` from the child's output bytes.
     parser: Parser,
     /// The dedicated PTY reader: it drains the master on its own thread into a
-    /// bounded pool, and `pump_pty` consumes the published batches. `None` in demo
+    /// bounded pool, and `pump` consumes the published batches. `None` in demo
     /// mode and before the shell is spawned. Declared before `pty` so it stops and
     /// joins before the master fd closes.
     gatherer: Option<Gatherer>,
@@ -113,6 +113,7 @@ pub(super) struct TerminalCore {
     width: u32,
     height: u32,
     pad: i32,
+    origin_y: i32,
     /// Outbound messages for the window to act on after the next drain (a title
     /// change, a fresh selection to own, or the child exiting).
     outbox: Vec<ToWindow>,
@@ -161,6 +162,7 @@ impl TerminalCore {
             width,
             height,
             pad,
+            origin_y: pad,
             outbox: Vec::new(),
             last_title: String::new(),
         }
@@ -175,9 +177,26 @@ impl TerminalCore {
     pub(super) fn spawn_shell(&mut self) -> Result<(usize, usize)> {
         let (cols, rows) = self.screen.dimensions();
         let pty = Pty::spawn(cols, rows)?;
-        self.gatherer = Some(Gatherer::start(pty.fd())?);
+        let gatherer = match Gatherer::start(pty.fd()) {
+            Ok(gatherer) => gatherer,
+            Err(error) => {
+                // Retain the successfully spawned PTY in the core so an owner
+                // handling this startup error can still hang it up and reap it.
+                self.pty = Some(pty);
+                return Err(error);
+            }
+        };
+        self.gatherer = Some(gatherer);
         self.pty = Some(pty);
         Ok((cols, rows))
+    }
+
+    /// Stop and join the gather thread, close the PTY master, and hand the child
+    /// pid to the tabs layer for repeated nonblocking reaping. Demo and not-yet-
+    /// spawned cores have no child.
+    pub(super) fn into_child(mut self) -> Option<ZombieChild> {
+        drop(self.gatherer.take());
+        self.pty.take().map(Pty::into_zombie)
     }
 
     /// Whether this core is the static demo (no PTY, no shell).
@@ -190,6 +209,51 @@ impl TerminalCore {
     /// (and in demo mode).
     pub(super) fn poll_fd(&self) -> Option<RawFd> {
         self.gatherer.as_ref().map(Gatherer::ready_fd)
+    }
+
+    /// Whether this core still has published gather batches waiting to be parsed.
+    pub(super) fn has_pending(&self) -> bool {
+        self.gatherer.as_ref().is_some_and(Gatherer::has_pending)
+    }
+
+    /// The grid dimensions currently owned by this core.
+    pub(super) fn dimensions(&self) -> (usize, usize) {
+        self.screen.dimensions()
+    }
+
+    /// Window-owned geometry copied into the core, used by the tabs layer to
+    /// place its chrome in the same device-pixel coordinate space as the grid.
+    pub(super) fn bar_geometry(&self) -> (CellMetrics, i32, i32) {
+        (self.metrics, self.width as i32, self.pad)
+    }
+
+    #[cfg(test)]
+    pub(super) fn origin_y(&self) -> i32 {
+        self.origin_y
+    }
+
+    /// The title shown for this core, with the empty/default title mapped to the
+    /// application name just like outbound title messages.
+    pub(super) fn title(&self) -> &str {
+        if self.last_title.is_empty() {
+            "bnkterm"
+        } else {
+            &self.last_title
+        }
+    }
+
+    /// Test-only direct feed through the same parser/output bookkeeping used by
+    /// gather batches, for manager routing tests that do not need a real child.
+    #[cfg(test)]
+    pub(super) fn feed_test_bytes(&mut self, bytes: &[u8]) {
+        self.parser.advance_bytes(&mut self.screen, bytes);
+        self.after_output();
+    }
+
+    /// Test-only visible row text for cross-tab PTY routing assertions.
+    #[cfg(test)]
+    pub(super) fn row_string(&self, row: usize) -> String {
+        self.screen.row_string(row)
     }
 
     /// The frame background as a `0x00RRGGBB`, for the GPU clear (which must match
@@ -240,6 +304,7 @@ impl TerminalCore {
                 height,
                 metrics,
                 pad,
+                origin_y,
             } => {
                 // Adopt the window's fresh geometry, then resize the grid to it. In
                 // demo mode there is no child; rebuild the static grid. Otherwise
@@ -250,6 +315,7 @@ impl TerminalCore {
                 self.height = height;
                 self.metrics = metrics;
                 self.pad = pad;
+                self.origin_y = origin_y;
                 if self.demo {
                     self.screen = demo_screen(cols, rows);
                 } else {
@@ -513,17 +579,18 @@ impl TerminalCore {
         self.outbox.push(ToWindow::OfferSelection(bytes));
     }
 
-    /// Drain the child's output, published by the gather thread, through the parser
-    /// into the grid under a fairness budget: at most [`GATHER_TIME_BUDGET`] of wall
-    /// time or [`GATHER_BYTE_BUDGET`] bytes per call, so a flooding child cannot
-    /// starve Wayland input. Returns whether ready batches remain (the budget was
-    /// hit), so the event loop takes another turn at once instead of blocking. Query
-    /// responses are flushed after each batch; the child-exit `Closed` and any read
-    /// error surface only once the queue is fully drained, so no byte is lost ahead
-    /// of the end marker. A no-op in demo mode and before the shell is spawned.
-    pub(super) fn pump_pty(&mut self) -> Result<bool> {
+    /// Drain published child output through the parser until `max_bytes` or
+    /// `deadline` is reached. The tab manager shares those limits across every
+    /// core in a turn. Query responses are flushed after each batch, and the end
+    /// marker is reported only after the gather queue is empty, so teardown never
+    /// drops bytes that were already read. A no-op before a shell is spawned.
+    pub(super) fn pump(&mut self, max_bytes: usize, deadline: Instant) -> Result<PumpOutcome> {
         if self.gatherer.is_none() {
-            return Ok(false);
+            return Ok(PumpOutcome {
+                bytes: 0,
+                more: false,
+                end: None,
+            });
         }
         // Drain the wake eventfd once per pump; a publish that races this still
         // re-arms it (empty→nonempty), so the next poll returns and we catch it.
@@ -531,10 +598,9 @@ impl TerminalCore {
             g.clear_wakeup();
         }
 
-        let start = Instant::now();
         let mut consumed_bytes = 0usize;
         let mut consumed_any = false;
-        loop {
+        while consumed_bytes < max_bytes && Instant::now() < deadline {
             let Some(batch) = self.gatherer.as_ref().and_then(|g| g.next_batch()) else {
                 break;
             };
@@ -550,9 +616,6 @@ impl TerminalCore {
             // rather than after the whole queue: parsing 64 KiB is well under a
             // millisecond, so this bounds reply latency while keeping batching.
             self.flush_responses()?;
-            if consumed_bytes >= GATHER_BYTE_BUDGET || start.elapsed() >= GATHER_TIME_BUDGET {
-                break;
-            }
         }
         if consumed_any {
             self.after_output();
@@ -564,14 +627,11 @@ impl TerminalCore {
             Some(g) => (g.completion(), g.has_pending()),
             None => (None, false),
         };
-        match end {
-            Some(GatherEnd::Eof) => self.outbox.push(ToWindow::Closed),
-            Some(GatherEnd::ReadError(e)) => {
-                return Err(Error::msg(format!("pty gather read error: errno {e}")));
-            }
-            None => {}
-        }
-        Ok(more)
+        Ok(PumpOutcome {
+            bytes: consumed_bytes,
+            more,
+            end,
+        })
     }
 
     /// Write back any query replies (DA/DSR) the grid queued while parsing, through
@@ -635,7 +695,7 @@ impl TerminalCore {
                 theme: &self.theme,
                 metrics: self.metrics,
                 surface: (self.width as i32, self.height as i32),
-                origin: (self.pad, self.pad),
+                origin: (self.pad, self.origin_y),
                 cursor,
                 selection: self.selection,
             },

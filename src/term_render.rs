@@ -42,6 +42,7 @@ use crate::color::{Ground, Rgb, Theme};
 use crate::grid::{Attrs, Cell, Screen};
 use crate::platform::freetype::{FaceKey, FontStyle, Fonts};
 use crate::platform::geom::Rect;
+use crate::platform::grapheme;
 use crate::render::display::{DisplayList, DrawCmd};
 
 /// The glyph whose advance defines the monospace cell width. `M` is the classic
@@ -330,7 +331,12 @@ impl Painter<'_> {
     /// pool is dry. Every run and glyph text is drawn from here so the frame reuses
     /// the buffers the previous frame retired.
     fn take_string(&mut self) -> String {
-        self.strings.pop().unwrap_or_default()
+        take_string(self.strings)
+    }
+
+    /// Recycle a buffer already large enough for the coming run when possible.
+    fn take_string_with_capacity(&mut self, min_capacity: usize) -> String {
+        take_string_with_capacity(self.strings, min_capacity)
     }
 
     /// The left pixel of column `col`, from the content origin.
@@ -444,7 +450,7 @@ impl Painter<'_> {
         // A recycled buffer (from the pool) usually already has the capacity a run
         // needs; reserving covers a fresh one and any run longer than last frame's,
         // so an all-ASCII run (the common case) fills without reallocating.
-        let mut text = self.take_string();
+        let mut text = self.take_string_with_capacity(end - col);
         text.reserve(end - col);
         // Bytes and cell count up to and including the last cell with ink, so a
         // trailing blank never lands in the emitted text.
@@ -466,19 +472,28 @@ impl Painter<'_> {
         let x = self.cell_x(col);
         if inked_cells > 0 {
             text.truncate(inked_bytes);
-            self.list.push(DrawCmd::Cells {
-                bounds: text_bounds(x, baseline, inked_cells as i32 * m.w, m),
+            push_owned_cells(
+                self.list,
+                text,
                 x,
                 baseline,
-                cell_w: m.w,
-                face: FaceKey::Prose {
+                inked_cells,
+                m,
+                FaceKey::Prose {
                     size: m.size,
                     style,
                 },
-                color: fg.to_u32(),
-                bg: bg.to_u32(),
-                text,
-            });
+                fg.to_u32(),
+                bg.to_u32(),
+            );
+        } else {
+            // A blank run emits no command, so explicitly return its scratch
+            // buffer; otherwise it is dropped and reallocated next frame. Clear it
+            // first: the pool's invariant is that its buffers are empty (every
+            // buffer salvaged from a retired command enters via `into_text_buf`,
+            // which clears it), and the next taker appends without clearing.
+            text.clear();
+            self.strings.push(text);
         }
         self.push_decorations(first, x, (end - col) as i32 * m.w, baseline, fg);
     }
@@ -801,6 +816,145 @@ impl Painter<'_> {
     fn marks_empty(&self, row: usize, col: usize) -> bool {
         self.marks(row, col).is_none_or(|m| m.is_empty())
     }
+}
+
+/// Append styled cell text at a fixed-pitch origin, recycling every command's
+/// owned string from `strings`. Single-column clusters coalesce into `Cells`;
+/// wide or astral clusters break out as `Text` at their exact cell position so
+/// they can never desynchronise the fixed-pitch run that follows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn push_cell_text(
+    out: &mut DisplayList,
+    strings: &mut Vec<String>,
+    text: &str,
+    x: i32,
+    baseline: i32,
+    metrics: CellMetrics,
+    face: FaceKey,
+    color: u32,
+    bg: u32,
+) {
+    let mut pen_cells = 0usize;
+    let mut run_start = 0usize;
+    let mut run_cells = 0usize;
+    let mut run: Option<String> = None;
+
+    for (_, cluster) in grapheme::graphemes(text) {
+        let width = display_cluster_width(cluster).max(1);
+        let safe = width == 1 && cluster.chars().all(|c| (c as u32) <= 0xffff);
+        if safe {
+            if run_cells == 0 {
+                run_start = pen_cells;
+                run = Some(take_string_with_capacity(strings, text.len()));
+            }
+            run.as_mut().expect("run starts above").push_str(cluster);
+            run_cells += 1;
+        } else {
+            if run_cells > 0 {
+                push_owned_cells(
+                    out,
+                    run.take().expect("nonempty run has storage"),
+                    x + run_start as i32 * metrics.w,
+                    baseline,
+                    run_cells,
+                    metrics,
+                    face,
+                    color,
+                    bg,
+                );
+                run_cells = 0;
+            }
+            let mut glyph = take_string_with_capacity(strings, cluster.len());
+            glyph.push_str(cluster);
+            let glyph_x = x + pen_cells as i32 * metrics.w;
+            out.push(DrawCmd::Text {
+                bounds: text_bounds(glyph_x, baseline, width as i32 * metrics.w, metrics),
+                x: glyph_x,
+                baseline,
+                face,
+                color,
+                bg,
+                text: glyph,
+            });
+        }
+        pen_cells += width;
+    }
+    if run_cells > 0 {
+        push_owned_cells(
+            out,
+            run.expect("nonempty run has storage"),
+            x + run_start as i32 * metrics.w,
+            baseline,
+            run_cells,
+            metrics,
+            face,
+            color,
+            bg,
+        );
+    }
+}
+
+/// Display columns occupied by one already-segmented grapheme cluster. Combining
+/// sequences inherit their base width; emoji keycaps and flags are two cells.
+pub(crate) fn display_cluster_width(cluster: &str) -> usize {
+    let mut chars = cluster.chars();
+    let Some(first) = chars.next() else {
+        return 0;
+    };
+    if cluster.contains('\u{20e3}')
+        || cluster.contains('\u{fe0f}')
+        || (matches!(first, '\u{1f1e6}'..='\u{1f1ff}') && chars.next().is_some())
+    {
+        return 2;
+    }
+    cluster.chars().map(crate::width::width).max().unwrap_or(0) as usize
+}
+
+fn take_string(strings: &mut Vec<String>) -> String {
+    strings.pop().unwrap_or_default()
+}
+
+/// Pull a pooled buffer that already holds `min_capacity`, so filling the run
+/// never reallocates (a plain `pop` + `reserve` would realloc whenever the popped
+/// buffer was the wrong size, and that shows up as an allocation in the perf
+/// gate). Scanning from the back finds the most-recently-retired buffer first, so
+/// in steady state — where retired runs are all similar sizes — the first probe
+/// hits and this is O(1); the O(n) scan only bites when no buffer is big enough,
+/// which is exactly the case where reallocating would otherwise cost more.
+fn take_string_with_capacity(strings: &mut Vec<String>, min_capacity: usize) -> String {
+    if let Some(index) = strings
+        .iter()
+        .rposition(|string| string.capacity() >= min_capacity)
+    {
+        return strings.swap_remove(index);
+    }
+    let mut string = take_string(strings);
+    string.reserve(min_capacity);
+    string
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_owned_cells(
+    out: &mut DisplayList,
+    text: String,
+    x: i32,
+    baseline: i32,
+    cells: usize,
+    metrics: CellMetrics,
+    face: FaceKey,
+    color: u32,
+    bg: u32,
+) {
+    out.push(DrawCmd::Cells {
+        bounds: text_bounds(x, baseline, cells as i32 * metrics.w, metrics),
+        x,
+        baseline,
+        cell_w: metrics.w,
+        face,
+        color,
+        bg,
+        text,
+    });
 }
 
 /// The bearing padding around a run: a glyph's ink can spill

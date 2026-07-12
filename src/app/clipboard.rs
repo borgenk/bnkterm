@@ -304,7 +304,9 @@ impl State {
     /// writes it (see `TerminalCore::apply`). A no-op when the transport is empty.
     fn paste_from(&mut self, t: Transport) -> Result<()> {
         if let Some(text) = self.selection_text(t)? {
-            self.core.apply(ToTerminal::Paste(text.into_bytes()))?;
+            self.tabs
+                .active_mut()
+                .apply(ToTerminal::Paste(text.into_bytes()))?;
         }
         Ok(())
     }

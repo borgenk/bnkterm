@@ -28,6 +28,7 @@ pub mod grid;
 pub mod input;
 pub mod mouse;
 pub mod pty;
+mod tab_bar;
 pub mod term_render;
 pub mod vt;
 pub mod width;

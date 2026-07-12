@@ -25,6 +25,13 @@
 //! no `Result`, no panic. Every buffer the child needs (the argv pointers, the
 //! slave path) is therefore built in the parent *before* the fork, and the child
 //! branch calls nothing but raw syscalls and `_exit`.
+//!
+//! # Process environment
+//!
+//! `TERM` and `COLORTERM` are process-wide settings inherited by every spawned
+//! child. The app exports them once at startup, before a gather thread exists;
+//! [`Pty::spawn`] deliberately never mutates the environment because later calls
+//! happen while the process is multi-threaded.
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -53,15 +60,30 @@ pub struct Pty {
     pid: i32,
 }
 
+/// A child whose PTY master has been closed but whose process may not have exited
+/// yet. The app keeps these lightweight pid handles and retries nonblocking reaps
+/// between event-loop turns so a tab closed mid-session cannot remain a zombie.
+pub struct ZombieChild {
+    pid: i32,
+}
+
 impl Pty {
     /// Open a PTY, size it to `cols` x `rows`, and fork `$SHELL` (or `/bin/sh`) on
-    /// the slave. The master is left non-blocking so the event loop can drain it
-    /// without stalling. `TERM`/`COLORTERM` are exported so the child advertises
-    /// the right capabilities.
+    /// the slave. The master is non-blocking (so the event loop can drain it
+    /// without stalling) and close-on-exec (so it is never inherited by another
+    /// tab's shell). The caller sets process-wide terminal capability
+    /// variables once, before any gather threads start, so every child inherits
+    /// them without mutating the environment from a multi-threaded process.
     pub fn spawn(cols: usize, rows: usize) -> Result<Pty> {
-        // SAFETY: posix_openpt with O_RDWR|O_NOCTTY returns a fresh master fd or
-        // -1; we take ownership of a valid fd or map the error.
-        let master_raw = unsafe { posix_openpt(O_RDWR | O_NOCTTY) };
+        // O_CLOEXEC is set atomically at open so a *later* tab's fork/exec cannot
+        // leak this master into its shell. A leaked master keeps its slave's
+        // hangup from firing, so closing this tab would never reap its child (see
+        // the multi-tab teardown in `super::tabs`). Doing it here, not with a
+        // follow-up fcntl, closes the window where a concurrent fork could inherit
+        // the fd before the flag is set.
+        // SAFETY: posix_openpt with O_RDWR|O_NOCTTY|O_CLOEXEC returns a fresh master
+        // fd or -1; we take ownership of a valid fd or map the error.
+        let master_raw = unsafe { posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC) };
         if master_raw < 0 {
             return Err(errno_error("posix_openpt"));
         }
@@ -83,11 +105,6 @@ impl Pty {
         // output flags are left at the cooked default, so the pty still works if
         // this fails; it is not fatal.
         let _ = enable_iutf8(master.as_raw_fd());
-
-        // Exported before the fork so the child inherits them. The process is
-        // still single-purpose here; set_var is safe on this edition.
-        std::env::set_var("TERM", "xterm-256color");
-        std::env::set_var("COLORTERM", "truecolor");
 
         // Everything the child touches is built here, in the parent, where the
         // allocator is safe to use.
@@ -184,6 +201,31 @@ impl Pty {
         let r = unsafe { waitpid(self.pid, &mut status, WNOHANG) };
         (r == self.pid).then_some(status)
     }
+
+    /// Close the master (hanging up the child's terminal session) and retain only
+    /// the pid for later nonblocking reaping.
+    pub fn into_zombie(self) -> ZombieChild {
+        // `Pty` implements Drop, so its fields cannot be moved out directly. Keep
+        // the allocation inert, explicitly drop the master exactly once, and copy
+        // the plain pid into the lightweight handoff object.
+        let mut this = std::mem::ManuallyDrop::new(self);
+        let pid = this.pid;
+        // SAFETY: `ManuallyDrop` suppresses `Pty::drop`; `master` is initialized
+        // and is dropped exactly here. The only remaining field is the Copy pid.
+        unsafe { std::ptr::drop_in_place(&mut this.master) };
+        ZombieChild { pid }
+    }
+}
+
+impl ZombieChild {
+    /// Try `waitpid(WNOHANG)`. Returns true once the child has been claimed (or is
+    /// no longer waitable), at which point the caller should discard this handle.
+    pub fn try_reap(&self) -> bool {
+        let mut status: c_int = 0;
+        // SAFETY: status is a live local and WNOHANG makes the wait nonblocking.
+        let r = unsafe { waitpid(self.pid, &mut status, WNOHANG) };
+        r == self.pid || (r < 0 && errno() == ECHILD)
+    }
 }
 
 impl Drop for Pty {
@@ -194,52 +236,72 @@ impl Drop for Pty {
     }
 }
 
-/// Which fds became readable in a single wait: the Wayland socket (`wayland`) and
-/// optionally the PTY master (`pty`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Ready {
-    pub wayland: bool,
-    pub pty: bool,
+/// A reusable set of file descriptors waited on with `poll(2)`.
+///
+/// Callers clear and refill the set each loop turn. The backing vector keeps the
+/// capacity grown so far, so the steady-state idle wait does not allocate even as
+/// the registered descriptors change.
+pub struct PollSet {
+    fds: Vec<Pollfd>,
 }
 
-/// Block until the Wayland fd or the (optional) PTY fd is readable, or `timeout`
-/// elapses. Stack-allocated pollfds, so the idle wait never touches the heap.
-/// `timeout` of `None` blocks indefinitely.
-pub fn wait_readable(
-    wayland: RawFd,
-    pty: Option<RawFd>,
-    timeout: Option<Duration>,
-) -> Result<Ready> {
-    let mut fds = [
-        Pollfd {
-            fd: wayland,
+impl PollSet {
+    /// Make an empty poll set. Capacity grows only when [`Self::add`] takes the
+    /// set above its previous high-water mark.
+    pub fn new() -> Self {
+        Self { fds: Vec::new() }
+    }
+
+    /// Remove every registered descriptor while retaining the backing capacity.
+    pub fn clear(&mut self) {
+        self.fds.clear();
+    }
+
+    /// Register `fd` for readable, hangup, and error notification, returning the
+    /// stable slot used to inspect this wait's result with [`Self::readable`].
+    pub fn add(&mut self, fd: RawFd) -> usize {
+        let slot = self.fds.len();
+        self.fds.push(Pollfd {
+            fd,
             events: POLLIN,
             revents: 0,
-        },
-        Pollfd {
-            fd: pty.unwrap_or(-1),
-            events: POLLIN,
-            revents: 0,
-        },
-    ];
-    let nfds: c_ulong = if pty.is_some() { 2 } else { 1 };
-    let millis = match timeout {
-        None => -1,
-        Some(d) => d.as_millis().min(c_int::MAX as u128) as c_int,
-    };
-    loop {
-        // SAFETY: fds points at `nfds` valid pollfd entries for the call.
-        let r = unsafe { poll(fds.as_mut_ptr(), nfds, millis) };
-        if r < 0 {
-            if errno() == EINTR {
-                continue;
-            }
-            return Err(errno_error("poll"));
-        }
-        return Ok(Ready {
-            wayland: fds[0].revents & (POLLIN | POLLHUP | POLLERR) != 0,
-            pty: pty.is_some() && fds[1].revents & (POLLIN | POLLHUP | POLLERR) != 0,
         });
+        slot
+    }
+
+    /// Block until a registered descriptor is ready or `timeout` elapses.
+    /// `None` waits indefinitely.
+    pub fn wait(&mut self, timeout: Option<Duration>) -> Result<()> {
+        let millis = match timeout {
+            None => -1,
+            Some(d) => d.as_millis().min(c_int::MAX as u128) as c_int,
+        };
+        loop {
+            // SAFETY: `fds` owns `len` initialized `Pollfd` entries and remains
+            // exclusively borrowed for the duration of the call.
+            let r = unsafe { poll(self.fds.as_mut_ptr(), self.fds.len() as c_ulong, millis) };
+            if r < 0 {
+                if errno() == EINTR {
+                    continue;
+                }
+                return Err(errno_error("poll"));
+            }
+            return Ok(());
+        }
+    }
+
+    /// Whether `idx` was reported readable, hung up, or errored by the last wait.
+    /// An out-of-range slot is never ready.
+    pub fn readable(&self, idx: usize) -> bool {
+        self.fds
+            .get(idx)
+            .is_some_and(|fd| fd.revents & (POLLIN | POLLHUP | POLLERR) != 0)
+    }
+}
+
+impl Default for PollSet {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -272,6 +334,7 @@ fn poll_writable(fd: RawFd) -> Result<()> {
 const O_RDWR: c_int = 0o2;
 const O_NOCTTY: c_int = 0o400;
 const O_NONBLOCK: c_int = 0o4000;
+const O_CLOEXEC: c_int = 0o2000000;
 // fcntl(2) commands.
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
@@ -297,6 +360,7 @@ const POLLHUP: c_short = 0x010;
 const EINTR: c_int = 4;
 const EIO: c_int = 5;
 const EAGAIN: c_int = 11; // == EWOULDBLOCK on Linux
+const ECHILD: c_int = 10;
 
 /// `struct winsize` (`sys/ioctl.h`): the cell dimensions a `TIOCSWINSZ` carries.
 /// The pixel fields are left zero; programs that care read the cell counts.
@@ -349,6 +413,8 @@ extern "C" {
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
     fn poll(fds: *mut Pollfd, nfds: c_ulong, timeout: c_int) -> c_int;
+    #[cfg(test)]
+    fn pipe(pipefd: *mut c_int) -> c_int;
     fn tcgetattr(fd: c_int, termios: *mut Termios) -> c_int;
     fn tcsetattr(fd: c_int, actions: c_int, termios: *const Termios) -> c_int;
     fn _exit(code: c_int) -> !;
@@ -498,6 +564,8 @@ mod tests {
         // Drain until the echo arrives (cat echoes line-buffered by the tty).
         let mut got = Vec::new();
         let mut buf = [0u8; 4096];
+        let mut poll_set = PollSet::new();
+        poll_set.add(pty.fd());
         for _ in 0..200 {
             match pty.read(&mut buf).expect("read from the child") {
                 ReadOutcome::Data(n) => {
@@ -507,8 +575,7 @@ mod tests {
                     }
                 }
                 ReadOutcome::WouldBlock => {
-                    let _ =
-                        wait_readable(pty.fd(), Some(pty.fd()), Some(Duration::from_millis(50)));
+                    let _ = poll_set.wait(Some(Duration::from_millis(50)));
                 }
                 ReadOutcome::Eof => break,
             }
@@ -523,5 +590,98 @@ mod tests {
             return; // sandbox without fork/exec
         };
         pty.resize(120, 40).expect("TIOCSWINSZ on a live pty");
+    }
+
+    #[test]
+    fn into_zombie_eventually_reaps_after_hangup() {
+        std::env::set_var("SHELL", "/bin/cat");
+        let Ok(pty) = Pty::spawn(80, 24) else {
+            return; // sandbox without fork/exec
+        };
+        let child = pty.into_zombie();
+        let pid = child.pid;
+        let mut reaped = false;
+        for _ in 0..200 {
+            if child.try_reap() {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(reaped, "hung-up child did not become waitable");
+
+        let mut status = 0;
+        // SAFETY: `pid` belonged to this test and was reaped above; this verifies
+        // a second wait cannot claim it again.
+        assert_eq!(unsafe { waitpid(pid, &mut status, WNOHANG) }, -1);
+        assert_eq!(errno(), ECHILD);
+    }
+
+    fn test_pipe() -> (OwnedFd, OwnedFd) {
+        let mut fds = [-1; 2];
+        // SAFETY: `fds` has room for the two descriptors written by pipe(2). On
+        // success both are fresh and transferred immediately into `OwnedFd`s.
+        assert_eq!(unsafe { pipe(fds.as_mut_ptr()) }, 0);
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    fn write_byte(fd: RawFd) {
+        let byte = b'x';
+        // SAFETY: `fd` is the live write side of a test pipe and `byte` is a
+        // readable one-byte buffer.
+        assert_eq!(
+            unsafe { write(fd, &byte as *const u8 as *const c_void, 1) },
+            1
+        );
+    }
+
+    #[test]
+    fn poll_set_maps_readiness_by_slot() {
+        let (read_a, write_a) = test_pipe();
+        let (read_b, write_b) = test_pipe();
+        let mut set = PollSet::new();
+        let a = set.add(read_a.as_raw_fd());
+        let b = set.add(read_b.as_raw_fd());
+
+        write_byte(write_b.as_raw_fd());
+        set.wait(Some(Duration::from_millis(50)))
+            .expect("poll the test pipes");
+
+        assert!(!set.readable(a));
+        assert!(set.readable(b));
+
+        // Keep the write ends live until after poll so an idle read side is not
+        // reported as a hangup.
+        drop((write_a, write_b));
+    }
+
+    #[test]
+    fn poll_set_timeout_reports_nothing_readable() {
+        let (read, write) = test_pipe();
+        let mut set = PollSet::new();
+        let slot = set.add(read.as_raw_fd());
+
+        set.wait(Some(Duration::from_millis(1)))
+            .expect("poll timeout");
+
+        assert!(!set.readable(slot));
+        drop(write);
+    }
+
+    #[test]
+    fn poll_set_clear_reuses_capacity() {
+        let (read_a, write_a) = test_pipe();
+        let (read_b, write_b) = test_pipe();
+        let mut set = PollSet::new();
+        set.add(read_a.as_raw_fd());
+        set.add(read_b.as_raw_fd());
+        let capacity = set.fds.capacity();
+
+        set.clear();
+        assert_eq!(set.add(read_b.as_raw_fd()), 0);
+        assert_eq!(set.add(read_a.as_raw_fd()), 1);
+
+        assert_eq!(set.fds.capacity(), capacity);
+        drop((write_a, write_b));
     }
 }

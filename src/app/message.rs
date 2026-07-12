@@ -1,13 +1,11 @@
 //! The typed messages crossing the terminal/window seam.
 //!
-//! The window side owns Wayland, xkb, and the GPU; the terminal side owns the PTY,
-//! parser, and grid. The window resolves compositor events into [`ToTerminal`]
-//! messages, and the terminal turns them into PTY bytes, grid mutations, and frames
-//! (which come back the other way as `ToWindow`). Both run on one thread
-//! (`app::State`) and these are applied inline; the seam keeps the two concerns
-//! cleanly separable and independently testable. (Moving the whole core onto its
-//! own thread was measured and not adopted; only the PTY *read* was split off, onto
-//! the gather thread.)
+//! The window side owns Wayland, xkb, and the GPU; each terminal core owns one PTY,
+//! parser, and grid. [`super::tabs::Tabs`] sits between them: active-only input,
+//! focus, title, blink, and frames route to one core; resize and pumping fan out to
+//! all cores. `Title` and `Closed` are per-tab facts until `Tabs` translates them
+//! into window actions. Everything except PTY reads stays on `app::State`'s main
+//! thread; gather threads publish only byte batches.
 
 use crate::input::{Key, Mods};
 use crate::mouse::MouseButton;
@@ -60,6 +58,9 @@ pub enum ToTerminal {
         height: u32,
         metrics: CellMetrics,
         pad: i32,
+        /// Device-pixel y coordinate of the grid's first row. This is `pad` with
+        /// one tab and `pad + metrics.h` while the tab bar is visible.
+        origin_y: i32,
     },
     /// Keyboard focus gained or lost. The window observes it (Wayland); the terminal
     /// needs it because the cursor draws solid when focused, hollow when not.
@@ -70,16 +71,14 @@ pub enum ToTerminal {
     Paste(Vec<u8>),
 }
 
-/// Terminal → window: the actions only the window can take, produced as the
-/// terminal parses output or a copy is made. The window drains these after each
-/// PTY pump and turns each into a Wayland request. The vocabulary grows with the
-/// seam: the frame itself is still pulled directly in Stage 1 (the window calls
-/// [`fill_frame_list`](super::terminal::TerminalCore::fill_frame_list)), so it
-/// is not a message yet; Stage 2 adds `Frame` when the terminal becomes a separate
-/// producer.
+/// Terminal → tabs/window: per-core facts produced while parsing output or making
+/// a copy. `Tabs` translates title/close facts according to active-tab state, and
+/// the window turns the routed actions into Wayland requests. Frames remain pulled
+/// directly from the active core because all state except PTY reads shares the main
+/// thread; no frame message or channel is needed.
 pub enum ToWindow {
-    /// The child's window title changed (OSC 0/2), already mapped to the shown
-    /// string (the app name when empty). The window sets the toplevel title.
+    /// This child's title changed (OSC 0/2), already mapped to the shown string.
+    /// `Tabs` forwards it only when this is the active child.
     Title(String),
     /// A fresh selection's text to own on the clipboard (Ctrl+Shift+C). The window
     /// becomes the data-device selection owner serving these bytes.
@@ -91,6 +90,9 @@ pub enum ToWindow {
     /// A middle-click asked to paste the primary selection. The window owns the data
     /// device, so it does the receive and feeds the bytes back as a [`ToTerminal::Paste`].
     PastePrimary,
-    /// The child exited (PTY EOF). The window begins shutdown.
+    /// The window should shut down: every tab is gone. A core signals its own
+    /// child's exit to [`super::tabs::Tabs`] through the pump's stream-end, not
+    /// this message; `Tabs` removes that tab and synthesizes `Closed` only once
+    /// the last one is gone.
     Closed,
 }

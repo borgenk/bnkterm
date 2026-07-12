@@ -442,7 +442,7 @@ impl State {
         // builds it without allocating. `front` still holds the on-screen frame.
         {
             let (out, strings) = self.presentation.lists.begin();
-            self.core.fill_frame_list(out, strings);
+            self.tabs.fill_frame_list(out, strings);
         }
 
         // Nothing changed since the on-screen frame: nothing to present (idle).
@@ -476,7 +476,7 @@ impl State {
             self.declare_surface_scale();
         }
 
-        let background = color_f32(self.core.clear_color());
+        let background = color_f32(self.tabs.active().clear_color());
         // Batch the freshly built list into the reused frame data (vertices/batches
         // refilled in place, no allocation in steady state).
         gpu::build_frame_into(

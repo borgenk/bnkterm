@@ -3,16 +3,21 @@
 //! spawns the shell on a PTY, and runs the event loop that ties them together.
 //!
 //! ```text
-//!            ┌───────────── wl_keyboard ──▶ xkb ──▶ input::encode ──▶ PTY write
-//!   poll ───▶│
-//!            └── PTY master read ──▶ vt::Parser ──▶ grid::Screen ──▶ term_render ──▶ GPU
+//!   poll [Wayland, ready(0)..ready(n)]
+//!            │
+//!            ├─ wl_keyboard ─▶ xkb ─▶ Tabs ─▶ active TerminalCore ─▶ PTY write
+//!            └─ gather wakes ─────────▶ Tabs ─┬▶ core 0 parser/grid
+//!                                              ├▶ core 1 parser/grid
+//!                                              └▶ core n parser/grid
+//!   active grid + cached tab bar ─▶ display list ─▶ damage ─▶ GPU
 //! ```
 //!
-//! One [`State`] holds every protocol id and the render/PTY resources.
+//! One [`State`] holds every protocol id, the render resources, and [`Tabs`],
+//! which owns the per-tab PTY/core fan-out.
 //! [`State::run_until`] is the drain-render-wait loop: it services Wayland events
 //! and PTY output, paints when the grid changed (paced to the compositor's frame
-//! callback), then blocks in a single `poll` over the Wayland socket *and* the
-//! PTY master until either has more to say. Keyboard input is encoded by the
+//! callback), then blocks in a single `poll` over the Wayland socket and every
+//! tab's gather wake fd until any has more to say. Keyboard input is encoded by the
 //! tested [`crate::input`] table and written back to the child; a resize divides
 //! the new pixel size into cells, resizes the grid, and sends the child
 //! `TIOCSWINSZ`. The GPU-facing half lives in the [`present`] submodule.
@@ -23,6 +28,7 @@
 mod clipboard;
 mod message;
 mod present;
+mod tabs;
 mod terminal;
 
 use std::os::fd::AsRawFd;
@@ -31,6 +37,7 @@ use std::time::{Duration, Instant};
 use self::clipboard::SelectionState;
 use self::message::{PointerEvent, ToTerminal, ToWindow};
 use self::present::GpuPresentation;
+use self::tabs::Tabs;
 use self::terminal::TerminalCore;
 // The app orchestrates the platform/render layers (which carry their own error
 // type) and the terminal core (which uses the crate-level one). It speaks the
@@ -106,6 +113,10 @@ const SERVER_ID_BASE: u32 = 0xff00_0000;
 /// Open the window, spawn `$SHELL`, and run the terminal until the shell exits or
 /// the window is closed.
 pub fn run() -> crate::error::Result<()> {
+    // Export terminal capabilities once, before State construction and before any
+    // gather thread can exist. Every shell opened by the process inherits them.
+    std::env::set_var("TERM", "xterm-256color");
+    std::env::set_var("COLORTERM", "truecolor");
     let mut state = State::new(false)?;
     state.bring_up()?;
     Ok(())
@@ -192,10 +203,13 @@ struct State {
     conn: Connection,
     fonts: Fonts,
     xkb: Xkb,
-    /// The terminal half of the app behind the seam: the PTY, parser, grid,
-    /// selection, cursor blink, theme, and the frame geometry it lays out with. The
-    /// window feeds it messages, pulls a display list, and drains its outbox.
-    core: TerminalCore,
+    /// The tab manager behind the window seam. It owns the terminal core (and in
+    /// Phase 1, every core), routes input/timers, supplies the visible display list,
+    /// and drains terminal facts for the window to act on.
+    tabs: Tabs,
+    /// Reused `poll(2)` descriptor storage: Wayland first, followed by gatherer
+    /// wake fds. Clearing it retains capacity, so idle waits do not allocate.
+    poll_set: pty::PollSet,
     /// The fixed cell box the whole grid is laid out on. Window-authoritative (it
     /// owns the fonts and scale); the core holds a copy, shipped over on a resize.
     metrics: CellMetrics,
@@ -207,6 +221,9 @@ struct State {
     repeat_interval: Option<Duration>,
     repeat_key: Option<u32>,
     repeat_at: Option<Instant>,
+    /// Whether the Wayland keyboard currently focuses this window. Tab switches
+    /// use it to focus only the newly active core and disarm every hidden cursor.
+    window_focused: bool,
 
     /// Current surface size in *device* pixels (the buffer resolution the grid is
     /// laid out in). The logical size lives in `scale.logical`.
@@ -216,6 +233,9 @@ struct State {
     /// the window can clamp a pointer to the grid and skip a no-op resize without
     /// reaching into the core's screen.
     grid_dims: (usize, usize),
+    /// Device-pixel y coordinate of grid row zero. It moves down one cell while
+    /// the tab bar is visible.
+    grid_origin_y: i32,
     /// Compositor scale factor and the objects that report it.
     scale: Scaling,
 
@@ -243,6 +263,9 @@ struct State {
     pointer_x: f32,
     pointer_y: f32,
     axis_accum: f32,
+    /// A button press that began in the tab bar. Its matching release is swallowed
+    /// even if closing a tab made the bar disappear in between.
+    bar_button: Option<MouseButton>,
     /// Multi-click tracking for word/line selection: the wl time (ms) and cell of the
     /// last left press, and the running count (1 character, 2 word, 3 line, cycling).
     last_click_time: u32,
@@ -309,16 +332,19 @@ impl State {
             conn,
             fonts,
             xkb: Xkb::new()?,
-            core,
+            tabs: Tabs::new(core),
+            poll_set: pty::PollSet::new(),
             metrics,
             // Sensible defaults until the compositor sends repeat_info.
             repeat_delay: Duration::from_millis(400),
             repeat_interval: Some(Duration::from_millis(33)),
             repeat_key: None,
             repeat_at: None,
+            window_focused: false,
             width,
             height,
             grid_dims: (cols, rows),
+            grid_origin_y: WINDOW_PADDING,
             scale: Scaling::new((width, height)),
             registry: 0,
             compositor: None,
@@ -332,6 +358,7 @@ impl State {
             pointer_x: 0.0,
             pointer_y: 0.0,
             axis_accum: 0.0,
+            bar_button: None,
             last_click_time: 0,
             last_click_cell: (0, 0),
             click_count: 0,
@@ -474,8 +501,8 @@ impl State {
 
         // Now that the window has its granted size, spawn the shell on a PTY
         // sized to the grid. Demo mode skips this and shows its static screen.
-        if !self.core.is_demo() {
-            let (cols, rows) = self.core.spawn_shell()?;
+        if !self.tabs.active().is_demo() {
+            let (cols, rows) = self.tabs.active_mut().spawn_shell()?;
             eprintln!("bnkterm: shell on a {cols}x{rows} grid. Close the window to exit.");
         } else {
             eprintln!("bnkterm: phase-2 static demo. Close the window to exit.");
@@ -500,7 +527,8 @@ impl State {
     }
 
     /// Drain Wayland events and PTY output, service the timers, draw a frame if
-    /// one is due, then block in one `poll` over both fds until either is ready or
+    /// one is due, then block in one `poll` over Wayland and every tab wake fd until
+    /// any is ready or
     /// the soonest timer (cursor blink, key repeat) comes due. An idle, unfocused
     /// terminal with nothing held waits open-ended.
     fn run_until(&mut self, done: impl Fn(&State) -> bool) -> Result<()> {
@@ -513,18 +541,21 @@ impl State {
             // copied selection to own, the child exiting). `more_pty` is true when a
             // fairness-budgeted gather pump left batches queued, so the wait below
             // must not block.
-            let more_pty = self.core.pump_pty()?;
+            let more_pty = self.tabs.pump_all(self.window_focused)?;
+            // Opening/closing (including a child exiting during the pump) can
+            // make the bar appear or disappear without a compositor configure.
+            self.resize_to(self.width, self.height);
             self.drain_outbox()?;
             // Fire any blink toggle or key repeat that has come due.
             self.service_timers()?;
             // Pace to the compositor: only draw when no frame callback is
             // outstanding, so a burst collapses into a single repaint.
             if self.configured
-                && self.core.dirty
+                && self.tabs.needs_frame()
                 && self.frame_callback == 0
                 && self.render_frame()?
             {
-                self.core.dirty = false;
+                self.tabs.clear_dirty();
             }
             if done(self) {
                 return Ok(());
@@ -538,8 +569,13 @@ impl State {
             } else {
                 self.next_wake()
             };
-            let ready = pty::wait_readable(self.conn.fd(), self.core.poll_fd(), wait)?;
-            if ready.wayland {
+            self.poll_set.clear();
+            let wayland_slot = self.poll_set.add(self.conn.fd());
+            for fd in self.tabs.gather_fds() {
+                self.poll_set.add(fd);
+            }
+            self.poll_set.wait(wait)?;
+            if self.poll_set.readable(wayland_slot) {
                 // poll said the socket has data (or hung up); this recv returns
                 // immediately, its short timeout only a safety net.
                 if let Fill::Bytes(0) = self.conn.fill(Some(Duration::from_millis(50)))? {
@@ -554,7 +590,7 @@ impl State {
     /// blink is the core's (it builds the frame); key repeat is the window's (it
     /// holds the compositor's `repeat_info` and the held key).
     fn service_timers(&mut self) -> Result<()> {
-        self.core.tick_blink_if_due();
+        self.tabs.tick_blink_if_due();
         if self.repeat_at.is_some_and(|at| at <= Instant::now()) {
             self.fire_repeat()?;
         }
@@ -570,7 +606,7 @@ impl State {
             at.saturating_duration_since(now)
                 .max(Duration::from_millis(1))
         };
-        [self.core.blink_deadline(), self.repeat_at]
+        [self.tabs.blink_deadline(), self.repeat_at]
             .into_iter()
             .flatten()
             .map(due)
@@ -606,26 +642,31 @@ impl State {
     fn resize_to(&mut self, w: u32, h: u32) {
         // Reserve the padding on all sides, so the grid fits inside the margins.
         let pad = self.device_pad();
+        let bar_h = if self.tabs.shows_bar() {
+            self.metrics.h
+        } else {
+            0
+        };
         let usable_w = (w as i32 - 2 * pad).max(0);
-        let usable_h = (h as i32 - 2 * pad).max(0);
+        let usable_h = (h as i32 - 2 * pad - bar_h).max(0);
         let (cols, rows) = self.metrics.columns_rows(usable_w, usable_h);
-        if (w, h) == (self.width, self.height) && (cols, rows) == self.grid_dims {
+        let origin_y = pad + bar_h;
+        if (w, h) == (self.width, self.height)
+            && (cols, rows) == self.grid_dims
+            && origin_y == self.grid_origin_y
+        {
             return;
         }
         self.width = w;
         self.height = h;
         self.grid_dims = (cols, rows);
+        self.grid_origin_y = origin_y;
         // Ship the fresh grid size and geometry to the core: it resizes the grid and
         // the PTY winsize (best-effort, so this cannot fail from here — see `apply`),
         // and keeps the geometry copies `fill_frame_list` lays out with.
-        let _ = self.core.apply(ToTerminal::Resize {
-            cols,
-            rows,
-            width: w,
-            height: h,
-            metrics: self.metrics,
-            pad,
-        });
+        let _ = self
+            .tabs
+            .resize_all(cols, rows, w, h, self.metrics, pad, origin_y);
     }
 
     /// Adopt a new compositor scale (in 120ths): reopen the fonts at the size it
@@ -645,7 +686,7 @@ impl State {
         self.resize_to(dw, dh);
         // Force the next frame even if the grid dimensions happened to land the
         // same, so the resent scale state (and rescaled glyphs) reach the screen.
-        self.core.dirty = true;
+        self.tabs.mark_dirty();
     }
 
     /// Reopen the fonts at device-pixel `size` and recompute the cell metrics. On a
@@ -673,6 +714,12 @@ impl State {
     }
 
     fn handle(&mut self, msg: Message) -> Result<()> {
+        // Closing the last tab can happen while more Wayland messages are already
+        // queued. The process is leaving; ignore those messages so none can route
+        // input through an intentionally empty tab list.
+        if self.closed {
+            return Ok(());
+        }
         let mut r = Reader::new(&msg.body);
 
         if msg.object == protocol::WL_DISPLAY {
@@ -726,7 +773,7 @@ impl State {
                 self.resize_to(dw, dh);
             }
             self.configured = true;
-            self.core.dirty = true;
+            self.tabs.mark_dirty();
             return Ok(());
         }
 
@@ -892,11 +939,13 @@ impl State {
             }
             wl_keyboard::EV_ENTER => {
                 let _serial = r.u32()?;
-                self.core.apply(ToTerminal::Focus(true))?;
+                self.window_focused = true;
+                self.tabs.active_mut().apply(ToTerminal::Focus(true))?;
             }
             wl_keyboard::EV_LEAVE => {
                 let _serial = r.u32()?;
-                self.core.apply(ToTerminal::Focus(false))?;
+                self.window_focused = false;
+                self.tabs.active_mut().apply(ToTerminal::Focus(false))?;
                 self.stop_repeat(); // drop any held-key repeat (window-side timer)
             }
             wl_keyboard::EV_MODIFIERS => {
@@ -943,15 +992,46 @@ impl State {
     /// come from xkb's current state.
     fn on_key_press(&mut self, keycode: u32) -> Result<()> {
         let mods = self.current_mods();
-        // Ctrl+Shift+C/V copy and paste (the terminal convention, since bare
-        // Ctrl+C/V are the interrupt and a control byte the child needs).
+        // Ctrl+Shift+T/W open and close tabs; C/V retain the terminal copy/paste
+        // convention. Demo mode consumes tab chords without creating a PTY.
         if mods.contains(input::Mods::CTRL) && mods.contains(input::Mods::SHIFT) {
             if let Some(c) = self.xkb.key_char(keycode) {
                 match c.to_ascii_lowercase() {
+                    't' => {
+                        self.stop_repeat();
+                        if self.tabs.active().is_demo() {
+                            return Ok(());
+                        }
+                        let (cols, rows) = self.grid_dims;
+                        let pad = self.device_pad();
+                        let result = self.tabs.open(
+                            cols,
+                            rows,
+                            self.metrics,
+                            self.width,
+                            self.height,
+                            pad,
+                            self.window_focused,
+                        );
+                        if let Err(error) = result {
+                            eprintln!("bnkterm: could not open tab: {error}");
+                        }
+                        return Ok(());
+                    }
+                    'w' => {
+                        self.stop_repeat();
+                        if self.tabs.active().is_demo() {
+                            return Ok(());
+                        }
+                        if let Some(id) = self.tabs.active_id() {
+                            self.closed = self.tabs.close(id, self.window_focused);
+                        }
+                        return Ok(());
+                    }
                     'c' => {
                         // The core extracts the selection text and queues an
                         // `OfferSelection`; the loop's outbox drain owns the clipboard.
-                        self.core.copy_selection();
+                        self.tabs.active_mut().copy_selection();
                         return Ok(());
                     }
                     'v' => {
@@ -962,18 +1042,43 @@ impl State {
                 }
             }
         }
+        // Ctrl+PageUp/PageDown switches tabs. Shift remains reserved for the
+        // scrollback chords below, matching the established terminal convention.
+        if mods == input::Mods::CTRL {
+            match input::key_from_keycode(keycode) {
+                Some(input::Key::PageUp) => {
+                    self.stop_repeat();
+                    if !self.tabs.active().is_demo() {
+                        self.tabs.prev(self.window_focused);
+                    }
+                    return Ok(());
+                }
+                Some(input::Key::PageDown) => {
+                    self.stop_repeat();
+                    if !self.tabs.active().is_demo() {
+                        self.tabs.next(self.window_focused);
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         // Shift + Page/Home/End scrolls the scrollback view instead of reaching the
         // child (the alt screen has no history, so there it is a normal key). The
         // window resolves the keycode to a named key; the core does the scrolling.
         if let Some(named) = input::key_from_keycode(keycode) {
-            if self.core.handle_scroll_key(named, mods) {
+            if self.tabs.active_mut().handle_scroll_key(named, mods) {
                 return Ok(());
             }
         }
         // Send the key, and if it produced bytes and the keymap marks it
         // repeatable, arm auto-repeat on it.
         if let Some(key) = self.resolve_key(keycode) {
-            if self.core.apply(ToTerminal::Key { key, mods })? {
+            if self
+                .tabs
+                .active_mut()
+                .apply(ToTerminal::Key { key, mods })?
+            {
                 self.arm_repeat(keycode);
             }
         }
@@ -1011,11 +1116,12 @@ impl State {
             self.repeat_at = None;
             return Ok(());
         };
+        let mods = self.current_mods();
         let sent = match self.resolve_key(keycode) {
-            Some(key) => self.core.apply(ToTerminal::Key {
-                key,
-                mods: self.current_mods(),
-            })?,
+            Some(key) => self
+                .tabs
+                .active_mut()
+                .apply(ToTerminal::Key { key, mods })?,
             None => false,
         };
         if sent {
@@ -1046,13 +1152,39 @@ impl State {
         let scale = self.scale.factor_120 as f32 / 120.0;
         let pad = self.device_pad() as f32;
         let px = (self.pointer_x * scale - pad).max(0.0);
-        let py = (self.pointer_y * scale - pad).max(0.0);
+        let py = (self.pointer_y * scale - self.grid_origin_y as f32).max(0.0);
         let col = (px / self.metrics.w as f32) as usize;
         let row = (py / self.metrics.h as f32) as usize;
         (
             col.min(cols.saturating_sub(1)),
             row.min(rows.saturating_sub(1)),
         )
+    }
+
+    /// Whether the latest pointer position is inside the device-pixel tab strip.
+    fn pointer_in_tab_bar(&self) -> bool {
+        if !self.tabs.shows_bar() {
+            return false;
+        }
+        let scale = self.scale.factor_120 as f32 / 120.0;
+        let y = self.pointer_y * scale;
+        let top = self.device_pad() as f32;
+        y >= top && y < top + self.metrics.h as f32
+    }
+
+    /// Stable tab identity under the pointer while it is in the bar.
+    fn pointer_bar_tab(&self) -> Option<self::tabs::TabId> {
+        if !self.pointer_in_tab_bar() {
+            return None;
+        }
+        let scale = self.scale.factor_120 as f32 / 120.0;
+        let x = self.pointer_x * scale;
+        let pad = self.device_pad() as f32;
+        if x < pad {
+            return None;
+        }
+        let col = ((x - pad) / self.metrics.w as f32) as usize;
+        self.tabs.tab_at_bar_col(col)
     }
 
     /// Ask the compositor to show the I-beam ("text") pointer over our surface, the
@@ -1107,10 +1239,14 @@ impl State {
                 let _time = r.u32()?;
                 self.pointer_x = r.fixed()?;
                 self.pointer_y = r.fixed()?;
+                if self.pointer_in_tab_bar() {
+                    return Ok(());
+                }
                 let (col, row) = self.pointer_cell();
-                self.core.apply(ToTerminal::Pointer {
+                let mods = self.current_mods();
+                self.tabs.active_mut().apply(ToTerminal::Pointer {
                     event: PointerEvent::Motion { col, row },
-                    mods: self.current_mods(),
+                    mods,
                 })?;
             }
             wl_pointer::EV_BUTTON => {
@@ -1118,8 +1254,31 @@ impl State {
                 let time = r.u32()?;
                 let button = r.u32()?;
                 let pressed = r.u32()? == wl_pointer::BUTTON_STATE_PRESSED;
+                let mapped = pointer_button(button);
+                if !pressed && self.bar_button == mapped {
+                    self.bar_button = None;
+                    return Ok(());
+                }
+                if self.pointer_in_tab_bar() && pressed {
+                    self.bar_button = mapped;
+                    if let (Some(button), Some(id)) = (mapped, self.pointer_bar_tab()) {
+                        match button {
+                            MouseButton::Left => {
+                                self.tabs.select(id, self.window_focused);
+                            }
+                            MouseButton::Middle => {
+                                self.closed = self.tabs.close(id, self.window_focused);
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Ok(());
+                }
+                // A release whose press began in the grid must still finish that
+                // gesture (selection or child mouse reporting), even if the pointer
+                // has since crossed into the bar.
                 // Map the raw Wayland button to ours (window-side); ignore unmapped.
-                if let Some(button) = pointer_button(button) {
+                if let Some(button) = mapped {
                     let (col, row) = self.pointer_cell();
                     // A left press carries its click multiplicity (word/line select);
                     // any other event is a plain single.
@@ -1128,7 +1287,8 @@ impl State {
                     } else {
                         1
                     };
-                    self.core.apply(ToTerminal::Pointer {
+                    let mods = self.current_mods();
+                    self.tabs.active_mut().apply(ToTerminal::Pointer {
                         event: PointerEvent::Button {
                             button,
                             pressed,
@@ -1136,7 +1296,7 @@ impl State {
                             row,
                             count,
                         },
-                        mods: self.current_mods(),
+                        mods,
                     })?;
                 }
             }
@@ -1144,7 +1304,7 @@ impl State {
                 let _time = r.u32()?;
                 let axis = r.u32()?;
                 let value = r.fixed()?;
-                if axis == wl_pointer::AXIS_VERTICAL_SCROLL {
+                if axis == wl_pointer::AXIS_VERTICAL_SCROLL && !self.pointer_in_tab_bar() {
                     self.on_wheel(value)?;
                 }
             }
@@ -1169,14 +1329,15 @@ impl State {
         }
         self.axis_accum -= notches as f32 * step;
         let (col, row) = self.pointer_cell();
-        self.core.apply(ToTerminal::Pointer {
+        let mods = self.current_mods();
+        self.tabs.active_mut().apply(ToTerminal::Pointer {
             event: PointerEvent::Wheel {
                 down: notches > 0,
                 notches: notches.unsigned_abs(),
                 col,
                 row,
             },
-            mods: self.current_mods(),
+            mods,
         })?;
         Ok(())
     }
@@ -1266,11 +1427,11 @@ impl State {
             .request(self.toplevel, xdg_toplevel::SET_TITLE, &[Arg::Str(title)]);
     }
 
-    /// Act on the terminal core's outbound messages after a `pump_pty` (or a copy):
+    /// Act on the tabs layer's routed outbound messages after a pump (or a copy):
     /// each is a Wayland request the terminal cannot make itself. Window-side by
     /// necessity; Stage 2 turns this outbox into the terminal→window channel.
     fn drain_outbox(&mut self) -> Result<()> {
-        for msg in self.core.take_outbox() {
+        for msg in self.tabs.take_outbox() {
             match msg {
                 ToWindow::Title(title) => self.set_toplevel_title(&title),
                 ToWindow::OfferSelection(bytes) => self.set_clipboard(bytes),
