@@ -39,6 +39,7 @@ use self::message::{PointerEvent, ToTerminal, ToWindow};
 use self::present::GpuPresentation;
 use self::tabs::{Reorder, Tabs};
 use self::terminal::TerminalCore;
+use crate::config::{TabBarConfig, TabBarPosition};
 // The app orchestrates the platform/render layers (which carry their own error
 // type) and the terminal core (which uses the crate-level one). It speaks the
 // crate-level `Error`/`Result` throughout; a `?` on a platform call converts
@@ -238,9 +239,15 @@ struct State {
     /// the window can clamp a pointer to the grid and skip a no-op resize without
     /// reaching into the core's screen.
     grid_dims: (usize, usize),
-    /// Device-pixel y coordinate of grid row zero. It moves down one cell while
-    /// the tab bar is visible.
+    /// Device-pixel y coordinate of grid row zero. It moves down by the strip
+    /// height while a top-anchored tab bar is visible.
     grid_origin_y: i32,
+    /// The tab strip's device-pixel top and height (both `0`-height when hidden),
+    /// mirrored here so pointer hit testing and the resize math share one source.
+    bar_y: i32,
+    bar_h: i32,
+    /// Tab strip appearance and placement (top/bottom, height, widths, colors).
+    tab_bar_config: TabBarConfig,
     /// Compositor scale factor and the objects that report it.
     scale: Scaling,
 
@@ -259,6 +266,10 @@ struct State {
     /// The per-pointer shape device the manager hands out, `0` until the pointer
     /// exists (and forever if there is no manager).
     cursor_shape_device: u32,
+    /// The cursor shape currently applied (a `wp_cursor_shape_device_v1::SHAPE_*`),
+    /// or `0` when none is set yet. Tracked so motion only re-sends `set_shape` when
+    /// the pointer crosses between the grid (I-beam) and the tab strip (arrow).
+    pointer_shape: u32,
     /// The serial of the latest `wl_pointer.enter`, which `set_shape` must cite to
     /// change the cursor (`0` before the pointer has entered).
     pointer_enter_serial: u32,
@@ -337,7 +348,7 @@ impl State {
             conn,
             fonts,
             xkb: Xkb::new()?,
-            tabs: Tabs::new(core),
+            tabs: Tabs::new(core, TabBarConfig::default()),
             poll_set: pty::PollSet::new(),
             metrics,
             // Sensible defaults until the compositor sends repeat_info.
@@ -351,6 +362,9 @@ impl State {
             height,
             grid_dims: (cols, rows),
             grid_origin_y: WINDOW_PADDING,
+            bar_y: WINDOW_PADDING,
+            bar_h: 0,
+            tab_bar_config: TabBarConfig::default(),
             scale: Scaling::new((width, height)),
             registry: 0,
             compositor: None,
@@ -360,6 +374,7 @@ impl State {
             keyboard: 0,
             pointer: 0,
             cursor_shape_device: 0,
+            pointer_shape: 0,
             pointer_enter_serial: 0,
             pointer_x: 0.0,
             pointer_y: 0.0,
@@ -648,18 +663,33 @@ impl State {
     fn resize_to(&mut self, w: u32, h: u32) {
         // Reserve the padding on all sides, so the grid fits inside the margins.
         let pad = self.device_pad();
-        let bar_h = if self.tabs.shows_bar() {
-            self.metrics.h
+        let cfg = self.tab_bar_config;
+        let (bar_h, gap) = if self.tabs.shows_bar() {
+            // The configured logical height, DPI-scaled, floored at one text row so
+            // the label can never clip on a small height or a large font, plus the
+            // configured breathing room between the strip and the grid.
+            (
+                (self.to_device(cfg.height_px) as i32).max(self.metrics.h),
+                self.to_device(cfg.gap_px) as i32,
+            )
         } else {
-            0
+            (0, 0)
         };
         let usable_w = (w as i32 - 2 * pad).max(0);
-        let usable_h = (h as i32 - 2 * pad - bar_h).max(0);
+        let usable_h = (h as i32 - 2 * pad - bar_h - gap).max(0);
         let (cols, rows) = self.metrics.columns_rows(usable_w, usable_h);
-        let origin_y = pad + bar_h;
+        // The strip steals its height (and the gap) from the side it sits on: a top
+        // bar tucks under the padding and pushes the grid down past the gap; a bottom
+        // bar sits flush above the bottom padding, the gap reserved above it.
+        let (origin_y, bar_y) = match (bar_h, cfg.position) {
+            (0, _) => (pad, pad),
+            (_, TabBarPosition::Top) => (pad + bar_h + gap, pad),
+            (_, TabBarPosition::Bottom) => (pad, h as i32 - pad - bar_h),
+        };
         if (w, h) == (self.width, self.height)
             && (cols, rows) == self.grid_dims
             && origin_y == self.grid_origin_y
+            && (bar_y, bar_h) == (self.bar_y, self.bar_h)
         {
             return;
         }
@@ -667,12 +697,14 @@ impl State {
         self.height = h;
         self.grid_dims = (cols, rows);
         self.grid_origin_y = origin_y;
+        self.bar_y = bar_y;
+        self.bar_h = bar_h;
         // Ship the fresh grid size and geometry to the core: it resizes the grid and
         // the PTY winsize (best-effort, so this cannot fail from here — see `apply`),
         // and keeps the geometry copies `fill_frame_list` lays out with.
         let _ = self
             .tabs
-            .resize_all(cols, rows, w, h, self.metrics, pad, origin_y);
+            .resize_all(cols, rows, w, h, self.metrics, pad, origin_y, bar_y, bar_h);
     }
 
     /// Adopt a new compositor scale (in 120ths): reopen the fonts at the size it
@@ -1259,14 +1291,15 @@ impl State {
     }
 
     /// Whether the latest pointer position is inside the device-pixel tab strip.
+    /// The strip may sit at the top or the bottom, so this reads the resolved
+    /// rectangle rather than assuming a one-cell bar under the padding.
     fn pointer_in_tab_bar(&self) -> bool {
         if !self.tabs.shows_bar() {
             return false;
         }
         let scale = self.scale.factor_120 as f32 / 120.0;
         let y = self.pointer_y * scale;
-        let top = self.device_pad() as f32;
-        y >= top && y < top + self.metrics.h as f32
+        y >= self.bar_y as f32 && y < (self.bar_y + self.bar_h) as f32
     }
 
     /// Stable tab identity under the pointer while it is in the bar.
@@ -1284,20 +1317,29 @@ impl State {
         self.tabs.tab_at_bar_col(col)
     }
 
-    /// Ask the compositor to show the I-beam ("text") pointer over our surface, the
-    /// shape every terminal uses to signal selectable text. A no-op when the
-    /// compositor lacks `wp_cursor_shape_manager_v1` (no device, so the default arrow
-    /// stands) or before the pointer has entered (no serial to cite).
-    fn set_text_cursor(&mut self) {
+    /// Ask the compositor for the cursor shape that fits where the pointer is: the
+    /// plain arrow over the tab strip (it is chrome, a click target, not text) and
+    /// the I-beam ("text") over the grid, the shape every terminal uses to signal
+    /// selectable text. Only re-sent when the shape changes, so a stream of motion
+    /// events never spams `set_shape`. A no-op when the compositor lacks
+    /// `wp_cursor_shape_manager_v1` (no device, so its default arrow stands) or
+    /// before the pointer has entered (no serial to cite).
+    fn update_pointer_shape(&mut self) {
+        let shape = if self.pointer_in_tab_bar() {
+            wp_cursor_shape_device_v1::SHAPE_DEFAULT
+        } else {
+            wp_cursor_shape_device_v1::SHAPE_TEXT
+        };
+        if shape == self.pointer_shape {
+            return;
+        }
         if self.cursor_shape_device != 0 && self.pointer_enter_serial != 0 {
             self.conn.request(
                 self.cursor_shape_device,
                 wp_cursor_shape_device_v1::SET_SHAPE,
-                &[
-                    Arg::Uint(self.pointer_enter_serial),
-                    Arg::Uint(wp_cursor_shape_device_v1::SHAPE_TEXT),
-                ],
+                &[Arg::Uint(self.pointer_enter_serial), Arg::Uint(shape)],
             );
+            self.pointer_shape = shape;
         }
     }
 
@@ -1324,18 +1366,22 @@ impl State {
         match opcode {
             wl_pointer::EV_ENTER => {
                 // The enter serial is the one `set_shape` must cite; a fresh enter is
-                // also where the compositor resets the cursor, so this is when we (re)ask
-                // for the I-beam.
+                // also where the compositor resets the cursor, so forget the last
+                // shape and re-apply whichever fits the entry position.
                 self.pointer_enter_serial = r.u32()?;
                 let _surface = r.u32()?;
                 self.pointer_x = r.fixed()?;
                 self.pointer_y = r.fixed()?;
-                self.set_text_cursor();
+                self.pointer_shape = 0;
+                self.update_pointer_shape();
             }
             wl_pointer::EV_MOTION => {
                 let _time = r.u32()?;
                 self.pointer_x = r.fixed()?;
                 self.pointer_y = r.fixed()?;
+                // Swap between the arrow (over the strip) and the I-beam (over the
+                // grid) as the pointer crosses the boundary.
+                self.update_pointer_shape();
                 if self.pointer_in_tab_bar() {
                     return Ok(());
                 }

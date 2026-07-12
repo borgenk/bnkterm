@@ -9,6 +9,7 @@
 //! Font / Powerline glyphs) that no text family carries. A future on-disk config
 //! loader replaces these built-ins at startup.
 
+use crate::color::Rgb;
 use crate::platform::freetype::{FontConfig, FontFamily};
 use std::path::PathBuf;
 
@@ -101,6 +102,87 @@ impl Default for FontConfig {
                 "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf".into(),
                 "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf".into(),
             ],
+        }
+    }
+}
+
+/// Where the tab strip sits relative to the grid. The strip steals its height
+/// from the grid on the side it lives; `Bottom` is the wezterm/ghostty default
+/// this config mirrors (`tab_bar_at_bottom = true`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TabBarPosition {
+    Top,
+    #[default]
+    Bottom,
+}
+
+/// The foreground/background pair painting one tab state. Absolute colors (not
+/// theme references) so they match the wezterm reference exactly and stay a
+/// self-contained, `Copy` config value; a future theme-aware config can make
+/// individual channels follow the palette.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TabColors {
+    pub fg: Rgb,
+    pub bg: Rgb,
+}
+
+/// Tab-strip appearance and layout. These were the hardcoded constants the tab
+/// bar once carried inline; gathered here as the single source of truth the app
+/// threads through, exactly as [`FontConfig`] gathers the font choices. There is
+/// no on-disk config loader yet, so these are
+/// the compile-time defaults a future loader will overwrite at startup.
+///
+/// The values mirror the sibling `wezterm.lua` tab palette: a muted-turquoise
+/// active block on dark teal, faint inactive tabs that share the bar (terminal)
+/// background, and a divider between two inactive tabs so equal-width blocks stay
+/// separable when they share that background.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TabBarConfig {
+    /// Top or bottom of the window (default `Bottom`).
+    pub position: TabBarPosition,
+    /// Strip height in *logical* pixels. It is DPI-scaled at use and floored at
+    /// one text row, so a value below the row height simply yields a one-row bar
+    /// rather than clipping the label.
+    pub height_px: u32,
+    /// Breathing room between the strip and the grid, in *logical* pixels (the same
+    /// unit as [`height_px`], DPI-scaled at use). Reserved from the grid on the
+    /// side the strip lives, so the chrome never butts against the terminal text.
+    /// Only applied while the strip is visible.
+    pub gap_px: u32,
+    /// Per-tab width bounds in cells. Every tab renders at one equal width clamped
+    /// into `[min_width, max_width]`; the cap keeps two tabs from each stretching
+    /// to half the window (the wezterm left-aligned-blocks look), the floor keeps
+    /// them legible until the bar is too crowded to honor it.
+    pub min_width: usize,
+    pub max_width: usize,
+    /// The active (focused) tab's colors: a muted-turquoise block.
+    pub active: TabColors,
+    /// Every inactive tab's colors. `bg` doubles as the whole strip background, so
+    /// it should match the terminal background for a seamless bar.
+    pub inactive: TabColors,
+    /// The one-pixel rule drawn between two adjacent inactive tabs (never beside
+    /// the active block), so equal-width tabs sharing the strip background do not
+    /// blur together.
+    pub divider: Rgb,
+}
+
+impl Default for TabBarConfig {
+    fn default() -> Self {
+        Self {
+            position: TabBarPosition::Bottom,
+            height_px: 20,
+            gap_px: 6,
+            min_width: 10,
+            max_width: 24,
+            active: TabColors {
+                fg: Rgb::new(0x12, 0x30, 0x28), // dark teal, strong on the turquoise
+                bg: Rgb::new(0x8a, 0xbe, 0xb7), // muted turquoise
+            },
+            inactive: TabColors {
+                fg: Rgb::new(0x9a, 0xa3, 0xb0),
+                bg: Rgb::new(0x28, 0x2c, 0x34), // == the default terminal background
+            },
+            divider: Rgb::new(0x3f, 0x46, 0x53),
         }
     }
 }

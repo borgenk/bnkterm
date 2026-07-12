@@ -8,7 +8,7 @@
 //!
 //! ```text
 //!   Normal ──Ctrl+A──▶ Leader ──w──▶ Tabs ⟲  (↑/↓ switch, shift+↑/↓ reorder)
-//!     ▲                  │  t new         │
+//!     ▲                  │  c new         │
 //!     │                  │  x close       │
 //!     └── esc / other ───┴── esc / enter ─┘
 //!
@@ -113,7 +113,10 @@ pub(crate) fn advance(mode: KeyMode, key: Key, mods: Mods) -> (KeyMode, Disposit
             }
             match command_letter(key, mods) {
                 Some('w') => (KeyMode::Tabs, Disposition::Consumed(None)),
-                Some('t') => (KeyMode::Normal, Disposition::Consumed(Some(TabAction::New))),
+                // `c` is wezterm's new-tab leader key; `t` is kept as an alias.
+                Some('c') | Some('t') => {
+                    (KeyMode::Normal, Disposition::Consumed(Some(TabAction::New)))
+                }
                 Some('x') => (
                     KeyMode::Normal,
                     Disposition::Consumed(Some(TabAction::Close)),
@@ -155,17 +158,17 @@ pub(crate) fn advance(mode: KeyMode, key: Key, mods: Mods) -> (KeyMode, Disposit
     }
 }
 
-/// The overlay text per armed mode: line 0 is the accented title, the rest are key
-/// hints. Only single-width clusters (ASCII plus the arrows) so the fixed-pitch
+/// The overlay hint per armed mode: the keys the mode binds. Only single-width
+/// clusters (ASCII plus the arrows) so the fixed-pitch
 /// [`term_render::push_cell_text`] runs never break.
-const LEADER_LINES: &[&str] = &["LEADER", "w tabs   t new   x close   esc cancel"];
-const TABS_LINES: &[&str] = &["TABS", "↑↓ switch   shift+↑↓ reorder   esc done"];
+const LEADER_LINES: &[&str] = &["w tabs   c new   x close   esc cancel"];
+const TABS_LINES: &[&str] = &["↑↓ switch   shift+↑↓ reorder   esc done"];
 
-/// Append the mode indicator to `out`: a rounded accent border, a darkened panel,
-/// then the mode's lines centered on the surface. Nothing is drawn in `Normal`
-/// mode, so a passthrough frame is byte-identical to one built without the overlay.
-/// Strings are drawn from the shared `strings` pool like every other run, so a
-/// steady overlaid frame stays allocation-free.
+/// Append the mode indicator to `out`: a darkened rounded panel, then the mode's
+/// hint line centered on the surface. Nothing is drawn in `Normal` mode, so a
+/// passthrough frame is byte-identical to one built without the overlay. Strings are
+/// drawn from the shared `strings` pool like every other run, so a steady overlaid
+/// frame stays allocation-free.
 pub(crate) fn paint_overlay(
     mode: KeyMode,
     out: &mut DisplayList,
@@ -194,24 +197,10 @@ pub(crate) fn paint_overlay(
     let x0 = ((surface_w - panel_w) / 2).max(0);
     let y0 = ((surface_h - panel_h) / 2).max(0);
 
-    let border = theme.cursor; // the same accent as the caret: "a mode is armed".
     let panel_bg = theme.bg.mix(Rgb::new(0, 0, 0), 1, 2);
     let radius = (metrics.h / 3).max(2);
-    let thickness = (metrics.h / 8).max(2);
 
-    // The border is a larger rounded rect behind the panel; the panel is drawn
-    // over it, leaving a `thickness`-wide accent frame.
-    out.push(DrawCmd::RoundRect {
-        rect: Rect {
-            x: x0 - thickness,
-            y: y0 - thickness,
-            w: panel_w + 2 * thickness,
-            h: panel_h + 2 * thickness,
-        },
-        color: border.to_u32(),
-        radius: radius + thickness,
-        corners: RoundedCorners::Both,
-    });
+    // A darkened rounded panel, no accent frame: the hint text alone names the mode.
     out.push(DrawCmd::RoundRect {
         rect: Rect {
             x: x0,
@@ -224,16 +213,11 @@ pub(crate) fn paint_overlay(
         corners: RoundedCorners::Both,
     });
 
+    let face = FaceKey::Prose {
+        size: metrics.size,
+        style: FontStyle::Regular,
+    };
     for (index, line) in lines.iter().enumerate() {
-        let (color, style) = if index == 0 {
-            (border, FontStyle::Bold)
-        } else {
-            (theme.fg, FontStyle::Regular)
-        };
-        let face = FaceKey::Prose {
-            size: metrics.size,
-            style,
-        };
         // Center each line within the content box.
         let line_cols = cells_wide(line) as i32;
         let offset = (content_cols - line_cols) / 2 * metrics.w;
@@ -247,7 +231,7 @@ pub(crate) fn paint_overlay(
             baseline,
             metrics,
             face,
-            color.to_u32(),
+            theme.fg.to_u32(),
             panel_bg.to_u32(),
         );
     }
@@ -315,6 +299,11 @@ mod tests {
         assert_eq!(
             advance(KeyMode::Leader, Key::Char('W'), Mods::SHIFT),
             (KeyMode::Tabs, Disposition::Consumed(None))
+        );
+        // `c` (wezterm's binding) and its `t` alias both open a new tab and disarm.
+        assert_eq!(
+            advance(KeyMode::Leader, Key::Char('c'), Mods::NONE),
+            (KeyMode::Normal, Disposition::Consumed(Some(TabAction::New)))
         );
         assert_eq!(
             advance(KeyMode::Leader, Key::Char('t'), Mods::NONE),
@@ -396,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_is_centered_bordered_and_single_width() {
+    fn overlay_is_a_centered_borderless_panel_of_plain_single_width_text() {
         let mut out = Vec::new();
         let mut strings = Vec::new();
         let theme = Theme::default();
@@ -410,33 +399,31 @@ mod tests {
             600,
         );
 
-        // Border rect, then panel rect, then the title and hint runs.
+        // Exactly one rounded panel (no magenta accent frame), then the hint run(s).
         assert!(matches!(out[0], DrawCmd::RoundRect { .. }));
-        assert!(matches!(out[1], DrawCmd::RoundRect { .. }));
-        assert!(out.len() >= 4, "border, panel, and at least two text runs");
+        assert_eq!(
+            out.iter()
+                .filter(|cmd| matches!(cmd, DrawCmd::RoundRect { .. }))
+                .count(),
+            1,
+            "the accent border is gone"
+        );
+        assert!(out.len() >= 2, "panel and at least one text run");
 
-        // The border encloses the panel and both are centered on the surface.
-        let (border, panel) = match (&out[0], &out[1]) {
-            (DrawCmd::RoundRect { rect: b, .. }, DrawCmd::RoundRect { rect: p, .. }) => (*b, *p),
+        // The panel is centered on the surface.
+        let panel = match &out[0] {
+            DrawCmd::RoundRect { rect, .. } => *rect,
             _ => unreachable!(),
         };
-        assert!(border.x < panel.x && border.y < panel.y);
-        assert!(border.x + border.w > panel.x + panel.w);
         let panel_cx = panel.x + panel.w / 2;
         let panel_cy = panel.y + panel.h / 2;
         assert!((panel_cx - 400).abs() <= METRICS.w, "horizontally centered");
         assert!((panel_cy - 300).abs() <= METRICS.h, "vertically centered");
 
-        // The accent border color paints the title run.
-        let title_color = out.iter().find_map(|cmd| match cmd {
-            DrawCmd::Cells { color, .. } => Some(*color),
-            _ => None,
-        });
-        assert_eq!(title_color, Some(theme.cursor.to_u32()));
-
-        // Every text run is single-width (the fixed-pitch Cells contract).
+        // Every text run is the plain foreground color (no accent) and single-width.
         for cmd in &out {
-            if let DrawCmd::Cells { text, .. } = cmd {
+            if let DrawCmd::Cells { color, text, .. } = cmd {
+                assert_eq!(*color, theme.fg.to_u32(), "overlay text is plain fg");
                 assert!(grapheme::graphemes(text)
                     .all(|(_, cluster)| term_render::display_cluster_width(cluster) == 1));
             }

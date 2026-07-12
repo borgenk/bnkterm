@@ -22,11 +22,12 @@ use std::time::{Duration, Instant};
 
 use super::message::{ToTerminal, ToWindow};
 use super::terminal::{PumpOutcome, TerminalCore};
+use crate::config::TabBarConfig;
 use crate::error::Result;
 use crate::gather::GatherEnd;
 use crate::pty::ZombieChild;
 use crate::render::display::DisplayList;
-use crate::tab_bar::{self, Slot, TabLabel};
+use crate::tab_bar::{self, BarGeom, Slot, TabLabel};
 use crate::term_render::CellMetrics;
 
 /// One global gather budget per event-loop turn. Foreground output is parsed
@@ -65,13 +66,18 @@ pub(super) struct Tabs {
     bar_dirty: bool,
     /// Cell-space layout shared by painting and pointer hit testing.
     bar_slots: Vec<Slot>,
+    /// The strip's device-pixel geometry, set by the window each resize (`None`
+    /// until the first one, which always precedes a paint that shows the bar).
+    bar_geom: Option<BarGeom>,
+    /// Strip appearance and layout, the source of truth for `layout`/`fill_bar`.
+    cfg: TabBarConfig,
     /// Messages already translated from per-core facts into window actions.
     outbox: Vec<ToWindow>,
 }
 
 impl Tabs {
-    /// Wrap the initial terminal core as tab zero.
-    pub(super) fn new(core: TerminalCore) -> Self {
+    /// Wrap the initial terminal core as tab zero, under the given strip config.
+    pub(super) fn new(core: TerminalCore, cfg: TabBarConfig) -> Self {
         let mut tabs = Self {
             entries: Vec::new(),
             active: 0,
@@ -80,6 +86,8 @@ impl Tabs {
             reaping: Vec::new(),
             bar_dirty: false,
             bar_slots: Vec::new(),
+            bar_geom: None,
+            cfg,
             outbox: Vec::new(),
         };
         let id = tabs.allocate_id();
@@ -247,7 +255,8 @@ impl Tabs {
     }
 
     /// Apply the window's current geometry eagerly to every tab so background
-    /// output always wraps at the true width.
+    /// output always wraps at the true width, and adopt the strip rectangle the
+    /// window computed for this size and top/bottom placement.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn resize_all(
         &mut self,
@@ -258,6 +267,8 @@ impl Tabs {
         metrics: CellMetrics,
         pad: i32,
         origin_y: i32,
+        bar_y: i32,
+        bar_h: i32,
     ) -> Result<()> {
         for entry in &mut self.entries {
             entry.core.apply(ToTerminal::Resize {
@@ -271,6 +282,13 @@ impl Tabs {
             })?;
             debug_assert_eq!(entry.core.dimensions(), (cols, rows));
         }
+        self.bar_geom = Some(BarGeom {
+            metrics,
+            surface_width: width as i32,
+            pad,
+            y: bar_y,
+            h: bar_h,
+        });
         self.rebuild_bar();
         Ok(())
     }
@@ -300,6 +318,7 @@ impl Tabs {
         if let Some(end) = outcome.end {
             ended.push((self.entries[active].id, end));
         }
+        self.note_settle(active, outcome.bytes, outcome.more);
 
         // Background tabs share whatever the foreground left of the turn's budget.
         // Under a sustained foreground flood the active tab can consume it all, so
@@ -324,6 +343,7 @@ impl Tabs {
             } = self.entries[index].core.pump(remaining, deadline)?;
             remaining = remaining.saturating_sub(bytes);
             more |= tab_more;
+            self.note_settle(index, bytes, tab_more);
             if let Some(end) = end {
                 ended.push((self.entries[index].id, end));
             }
@@ -391,21 +411,13 @@ impl Tabs {
         self.bar_dirty = false;
     }
 
-    /// Compose the visible terminal's display list.
+    /// Compose the visible terminal's display list, then the tab strip over it.
     pub(super) fn fill_frame_list(&self, out: &mut DisplayList, strings: &mut Vec<String>) {
         self.active().fill_frame_list(out, strings);
         if self.shows_bar() {
-            let core = self.active();
-            let (metrics, width, pad) = core.bar_geometry();
-            tab_bar::fill_bar(
-                out,
-                strings,
-                &self.bar_slots,
-                metrics,
-                &core.theme,
-                width,
-                pad,
-            );
+            if let Some(bar) = &self.bar_geom {
+                tab_bar::fill_bar(out, strings, &self.bar_slots, bar, &self.cfg);
+            }
         }
     }
 
@@ -430,25 +442,44 @@ impl Tabs {
         self.outbox.push(ToWindow::Title(title));
     }
 
+    /// After a core drained a burst of output with nothing left pending, its shell
+    /// has likely printed a fresh prompt, so its working directory may have moved
+    /// (a bare `cd` reports nothing else). Re-read it, and when the shown label
+    /// actually changed and the bar is visible, rebuild and repaint it. The cwd is
+    /// refreshed even for a lone tab so it is current the moment a second opens; the
+    /// bar work is skipped while there is nothing to draw.
+    fn note_settle(&mut self, index: usize, bytes: usize, more: bool) {
+        if bytes == 0 || more {
+            return;
+        }
+        if self.entries[index].core.refresh_cwd() && self.shows_bar() {
+            self.bar_dirty = true;
+            self.rebuild_bar();
+        }
+    }
+
     fn rebuild_bar(&mut self) {
         if self.entries.is_empty() {
             self.bar_slots.clear();
             return;
         }
         let cols = self.active().dimensions().0;
-        let slots = {
-            let labels: Vec<_> = self
-                .entries
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| TabLabel {
-                    title: entry.core.title(),
-                    active: index == self.active,
-                })
-                .collect();
-            tab_bar::layout(cols, &labels)
-        };
-        self.bar_slots = slots;
+        // A tab's label (its cwd) is derived, not stored ready to lend, so gather
+        // the owned strings first and let the borrowed `TabLabel`s point into them.
+        let titles: Vec<String> = self
+            .entries
+            .iter()
+            .map(|entry| entry.core.tab_label())
+            .collect();
+        let labels: Vec<_> = titles
+            .iter()
+            .enumerate()
+            .map(|(index, title)| TabLabel {
+                title,
+                active: index == self.active,
+            })
+            .collect();
+        self.bar_slots = tab_bar::layout(cols, &labels, &self.cfg);
     }
 
     /// Translate each core's outbox according to foreground/background routing.
@@ -514,7 +545,7 @@ mod tests {
 
     fn demo_tabs(count: usize) -> Tabs {
         assert!(count > 0);
-        let mut tabs = Tabs::new(core(true, 80, 24));
+        let mut tabs = Tabs::new(core(true, 80, 24), TabBarConfig::default());
         for _ in 1..count {
             let id = tabs.allocate_id();
             tabs.entries.push(TabEntry {
@@ -617,7 +648,7 @@ mod tests {
     #[test]
     fn resize_updates_every_core() {
         let mut tabs = demo_tabs(3);
-        tabs.resize_all(100, 30, 800, 480, METRICS, 0, 16)
+        tabs.resize_all(100, 30, 800, 480, METRICS, 0, 16, 0, 16)
             .expect("resize every demo core");
         assert!(tabs
             .entries
@@ -630,9 +661,10 @@ mod tests {
     fn bar_hit_testing_maps_to_stable_ids() {
         let mut tabs = demo_tabs(2);
         let ids: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
-        tabs.resize_all(20, 10, 160, 176, METRICS, 0, 16)
+        tabs.resize_all(20, 10, 160, 176, METRICS, 0, 16, 0, 16)
             .expect("build bar layout");
 
+        // Two tabs in 20 cols land at the floor width of 10 each: 0..10, 10..20.
         assert_eq!(tabs.tab_at_bar_col(2), Some(ids[0]));
         assert_eq!(tabs.tab_at_bar_col(12), Some(ids[1]));
         assert!(tabs.select(ids[1], false));
@@ -652,8 +684,9 @@ mod tests {
             _ => None,
         });
 
+        // A top-anchored one-cell strip: grid origin drops one cell, strip at y 0.
         let mut two = demo_tabs(2);
-        two.resize_all(80, 23, 640, 384, METRICS, 0, METRICS.h)
+        two.resize_all(80, 23, 640, 384, METRICS, 0, METRICS.h, 0, METRICS.h)
             .expect("shift both grids below the bar");
         let mut two_list = Vec::new();
         let mut two_strings = Vec::new();
@@ -679,7 +712,7 @@ mod tests {
         // every slot's label lands as its own clean text at its own column.
         let mut two = demo_tabs(2);
         let ids: Vec<_> = two.entries.iter().map(|entry| entry.id).collect();
-        two.resize_all(80, 23, 640, 384, METRICS, 0, METRICS.h)
+        two.resize_all(80, 23, 640, 384, METRICS, 0, METRICS.h, 0, METRICS.h)
             .expect("build the bar");
         // The runtime path makes the newly opened tab active and tab zero inactive.
         assert!(two.select(ids[1], false));
@@ -698,11 +731,14 @@ mod tests {
             })
             .collect();
 
-        for (slot, expected) in [(0, "1:bnkterm"), (1, "2:bnkterm")] {
-            let x = two.bar_slots[slot].cells.start as i32 * METRICS.w;
+        // Each tab's label (the numberless directory fallback "shell" for these
+        // no-PTY demo cores) lands as its own clean run at its centered origin,
+        // never with the previous run's recycled spaces glued in front.
+        for slot in [0, 1] {
+            let x = two.bar_slots[slot].text_start as i32 * METRICS.w;
             assert!(
-                bar_cells.contains(&(x, expected)),
-                "slot {slot} should paint {expected:?} at x={x}, got {bar_cells:?}"
+                bar_cells.contains(&(x, "shell")),
+                "slot {slot} should paint a clean \"shell\" at x={x}, got {bar_cells:?}"
             );
         }
     }
@@ -715,7 +751,7 @@ mod tests {
             eprintln!("fork/exec unavailable; skipping multi-tab PTY test");
             return;
         }
-        let mut tabs = Tabs::new(first);
+        let mut tabs = Tabs::new(first, TabBarConfig::default());
         if tabs.open(40, 10, METRICS, 320, 160, 0, false).is_err() {
             eprintln!("second PTY unavailable; skipping multi-tab PTY test");
             return;

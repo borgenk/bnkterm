@@ -120,6 +120,10 @@ pub(super) struct TerminalCore {
     /// The child's last-seen window title, so a `Title` is emitted only when it
     /// changes (the sender dedupes, so Stage 2 never spams the channel).
     last_title: String,
+    /// The child's working directory, re-read when the tab's output settles. It
+    /// labels the tab when no program has set a title; `None` before the first
+    /// read (or on a kernel without `/proc`).
+    cwd: Option<std::path::PathBuf>,
 }
 
 impl TerminalCore {
@@ -165,6 +169,7 @@ impl TerminalCore {
             origin_y: pad,
             outbox: Vec::new(),
             last_title: String::new(),
+            cwd: None,
         }
     }
 
@@ -188,6 +193,9 @@ impl TerminalCore {
         };
         self.gatherer = Some(gatherer);
         self.pty = Some(pty);
+        // Seed the directory label so a fresh tab shows its cwd before the shell
+        // has printed a thing.
+        self.cwd = self.pty.as_ref().and_then(Pty::cwd);
         Ok((cols, rows))
     }
 
@@ -221,25 +229,48 @@ impl TerminalCore {
         self.screen.dimensions()
     }
 
-    /// Window-owned geometry copied into the core, used by the tabs layer to
-    /// place its chrome in the same device-pixel coordinate space as the grid.
-    pub(super) fn bar_geometry(&self) -> (CellMetrics, i32, i32) {
-        (self.metrics, self.width as i32, self.pad)
-    }
-
     #[cfg(test)]
     pub(super) fn origin_y(&self) -> i32 {
         self.origin_y
     }
 
     /// The title shown for this core, with the empty/default title mapped to the
-    /// application name just like outbound title messages.
+    /// application name just like outbound title messages. This is the *window*
+    /// title (the OS caption); the tab bar uses [`tab_label`](Self::tab_label).
     pub(super) fn title(&self) -> &str {
         if self.last_title.is_empty() {
             "bnkterm"
         } else {
             &self.last_title
         }
+    }
+
+    /// The label for this core's tab: the child-set window title when there is one,
+    /// otherwise its working directory (`~`-abbreviated), falling back to `shell`.
+    /// Owned because the directory string is derived, not stored ready to lend.
+    /// This mirrors the sibling `wezterm.lua`, whose tab label prefers a program's
+    /// own title and otherwise shows the `~`-abbreviated cwd.
+    pub(super) fn tab_label(&self) -> String {
+        if !self.last_title.is_empty() {
+            return self.last_title.clone();
+        }
+        match &self.cwd {
+            Some(path) => abbreviate_home(path),
+            None => "shell".to_string(),
+        }
+    }
+
+    /// Re-read the working directory from the child and report whether the tab's
+    /// *displayed* label changed, so the manager rebuilds the bar only when it
+    /// must. Returns `false` while a program has set its own title, since the
+    /// directory is not shown then.
+    pub(super) fn refresh_cwd(&mut self) -> bool {
+        let next = self.pty.as_ref().and_then(Pty::cwd);
+        if next == self.cwd {
+            return false;
+        }
+        self.cwd = next;
+        self.last_title.is_empty()
     }
 
     /// Test-only direct feed through the same parser/output bookkeeping used by
@@ -738,6 +769,26 @@ impl TerminalCore {
     }
 }
 
+/// Render an absolute path with the user's home directory collapsed to `~`
+/// (`~`, then `~/src`, ...), matching the sibling `wezterm.lua` cwd label. Falls
+/// back to the plain display when `$HOME` is unset or the path is elsewhere.
+fn abbreviate_home(path: &std::path::Path) -> String {
+    match std::env::var_os("HOME") {
+        Some(home) => abbreviate_under(path, std::path::Path::new(&home)),
+        None => path.display().to_string(),
+    }
+}
+
+/// The `$HOME`-free core of [`abbreviate_home`], taking the home directory
+/// explicitly so it is testable without touching the process environment.
+fn abbreviate_under(path: &std::path::Path, home: &std::path::Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 /// Map the grid's cursor style (from DECSCUSR) to how the renderer paints it.
 fn cursor_shape(style: CursorStyle) -> CursorShape {
     match style {
@@ -829,6 +880,51 @@ fn demo_screen(cols: usize, rows: usize) -> Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn home_is_collapsed_to_tilde_and_other_paths_are_left_alone() {
+        let home = Path::new("/home/ada");
+        assert_eq!(abbreviate_under(Path::new("/home/ada"), home), "~");
+        assert_eq!(
+            abbreviate_under(Path::new("/home/ada/projects/bnkterm"), home),
+            "~/projects/bnkterm"
+        );
+        // A path outside home keeps its absolute form; a home-prefixed *name* that
+        // is not a path component (…/adam) is not mistaken for it.
+        assert_eq!(
+            abbreviate_under(Path::new("/etc/hosts"), home),
+            "/etc/hosts"
+        );
+        assert_eq!(
+            abbreviate_under(Path::new("/home/adam/x"), home),
+            "/home/adam/x"
+        );
+    }
+
+    #[test]
+    fn tab_label_prefers_a_program_title_then_the_cwd_then_shell() {
+        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        // No title and no known cwd: the bare fallback.
+        assert_eq!(core.tab_label(), "shell");
+        // A known cwd (as /proc reports it) shows in place of the fallback. A path
+        // outside home stays absolute regardless of the ambient $HOME, so this
+        // stays deterministic without touching the process environment (the
+        // home-abbreviation itself is covered by `abbreviate_under` above).
+        core.cwd = Some(std::path::PathBuf::from("/opt/service"));
+        assert_eq!(core.tab_label(), "/opt/service");
+        // A program-set window title wins over the directory.
+        core.last_title = "vim README".to_string();
+        assert_eq!(core.tab_label(), "vim README");
+    }
+
+    const METRICS: CellMetrics = CellMetrics {
+        size: 16,
+        w: 8,
+        h: 16,
+        ascent: 12,
+        descent: 4,
+    };
 
     #[test]
     fn demo_screen_fills_a_grid_without_panicking() {

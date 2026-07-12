@@ -193,6 +193,15 @@ impl Pty {
         set_winsize(self.master.as_raw_fd(), cols, rows)
     }
 
+    /// The child's working directory, resolved from its `/proc/<pid>/cwd` symlink.
+    /// `None` if the child has exited or the link cannot be read (no `/proc`, a
+    /// permission edge). This is how a tab labels itself with its shell's directory
+    /// without depending on the shell emitting OSC 7; it is read only when a tab's
+    /// output settles, never on the byte path, so a plain `read_link` is fine.
+    pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        std::fs::read_link(format!("/proc/{}/cwd", self.pid)).ok()
+    }
+
     /// Reap the child if it has exited, returning its exit status, else `None`
     /// (still running). Non-blocking.
     pub fn reap(&self) -> Option<c_int> {

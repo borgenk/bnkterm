@@ -807,19 +807,24 @@ fn color_f32(color: u32) -> [f32; 4] {
 /// - `+1` — foreground lighter than background, the usual light-on-dark terminal
 ///   text: reproduces the tuned thinning that offsets linear-light compositing,
 ///   byte-for-byte with the old single-gamma behaviour.
-/// - `< 1` — dark text on a lighter background (a reverse-video paste highlight, a
-///   light theme): thickens the anti-aliased edges that linear-light compositing
-///   would otherwise wash out, reaching `-1` (`G^-1`, the inverse) at maximum
-///   contrast. `0` leaves coverage untouched.
+/// - `< 0` — dark text on any lighter background (a reverse-video paste highlight, a
+///   light theme, the active tab's dark label on its light block): thickens the
+///   anti-aliased edges that linear-light compositing would otherwise wash out, in
+///   direct proportion to the contrast, reaching `-1` (`G^-1`, the inverse) at
+///   maximum contrast. Dark-on-light is never thinned, however faint the contrast:
+///   an earlier `1 + 2d` ramp only crossed into thickening past half-contrast, so a
+///   dark label on a mid-light block (this tab bar's turquoise) came out thin.
 ///
-/// Only the sign-crossing near equal luminance matters; the magnitude is a soft
-/// weight, so a perceptual (gamma-space) luma is enough.
+/// Only the sign of `d` (which side is lighter) and a soft magnitude matter, so a
+/// perceptual (gamma-space) luma is enough.
 fn contrast_factor(fg: u32, bg: u32) -> f32 {
     let d = luma(fg) - luma(bg);
     if d >= 0.0 {
         1.0
     } else {
-        (1.0 + 2.0 * d).clamp(-1.0, 1.0)
+        // `d` is already in `[-1, 0)`; `max` is a defensive clamp to the range the
+        // shader's `pow` expects.
+        d.max(-1.0)
     }
 }
 
@@ -1297,6 +1302,11 @@ mod tests {
         // factor drops below 1, bottoming at -1 for maximum contrast (exponent G^-1).
         assert_eq!(contrast_factor(black, white), -1.0);
         assert!(contrast_factor(black, white) < contrast_factor(0x0060_6060, white));
+        // Dark text on a mid-light block (the tab bar's #123028 on #8abeb7) is
+        // thickened, not left near-untouched: dark-on-light thickens in proportion
+        // to contrast, so a moderately lighter background still gets real weight.
+        let tab = contrast_factor(0x0012_3028, 0x008a_beb7);
+        assert!(tab < -0.4, "moderate dark-on-light thickens, got {tab}");
         // Equal luminance takes the no-thinning branch rather than a discontinuity.
         assert_eq!(contrast_factor(0x0044_4444, 0x0044_4444), 1.0);
         // The driver never escapes the range the shader's pow expects.
