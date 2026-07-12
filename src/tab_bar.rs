@@ -82,7 +82,7 @@ pub(crate) fn fill_bar(
     surface_width: i32,
     pad: i32,
 ) {
-    let inactive_bg = mix(theme.bg, theme.fg, 1, 10);
+    let inactive_bg = theme.bg.mix(theme.fg, 1, 10);
     let inactive_fg = dim(theme.fg);
     out.push(DrawCmd::Fill {
         rect: Rect {
@@ -181,13 +181,6 @@ fn text_width(text: &str) -> usize {
 fn dim(color: Rgb) -> Rgb {
     let channel = |value: u8| ((u16::from(value) * 2) / 3) as u8;
     Rgb::new(channel(color.r), channel(color.g), channel(color.b))
-}
-
-fn mix(a: Rgb, b: Rgb, b_parts: u16, total: u16) -> Rgb {
-    let channel = |av: u8, bv: u8| {
-        ((u16::from(av) * (total - b_parts) + u16::from(bv) * b_parts) / total) as u8
-    };
-    Rgb::new(channel(a.r, b.r), channel(a.g, b.g), channel(a.b, b.b))
 }
 
 #[cfg(test)]

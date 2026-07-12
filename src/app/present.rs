@@ -443,6 +443,17 @@ impl State {
         {
             let (out, strings) = self.presentation.lists.begin();
             self.tabs.fill_frame_list(out, strings);
+            // The leader-mode indicator draws over the grid and bar (last wins in
+            // list order); it is nothing at all in Normal mode.
+            crate::keymode::paint_overlay(
+                self.key_mode,
+                out,
+                strings,
+                self.metrics,
+                &self.tabs.active().theme,
+                sw,
+                sh,
+            );
         }
 
         // Nothing changed since the on-screen frame: nothing to present (idle).

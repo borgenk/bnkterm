@@ -37,6 +37,21 @@ impl Rgb {
     pub fn to_u32(self) -> u32 {
         (u32::from(self.r) << 16) | (u32::from(self.g) << 8) | u32::from(self.b)
     }
+
+    /// A per-channel linear blend: `other_parts / total` of `other` mixed over
+    /// `self`. Used by the chrome (tab bar, leader overlay) to derive dimmed and
+    /// raised shades from the theme without a second palette. `total` must be
+    /// nonzero and `other_parts <= total`.
+    pub fn mix(self, other: Rgb, other_parts: u16, total: u16) -> Rgb {
+        let channel = |a: u8, b: u8| {
+            ((u16::from(a) * (total - other_parts) + u16::from(b) * other_parts) / total) as u8
+        };
+        Rgb::new(
+            channel(self.r, other.r),
+            channel(self.g, other.g),
+            channel(self.b, other.b),
+        )
+    }
 }
 
 /// A color as an escape sequence names it. Small (`Copy`, one tag byte plus at

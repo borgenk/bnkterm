@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use self::clipboard::SelectionState;
 use self::message::{PointerEvent, ToTerminal, ToWindow};
 use self::present::GpuPresentation;
-use self::tabs::Tabs;
+use self::tabs::{Reorder, Tabs};
 use self::terminal::TerminalCore;
 // The app orchestrates the platform/render layers (which carry their own error
 // type) and the terminal core (which uses the crate-level one). It speaks the
@@ -45,6 +45,7 @@ use self::terminal::TerminalCore;
 // through the `From` bridge in `crate::error`, so there is one error type here.
 use crate::error::{Error, Result};
 use crate::input;
+use crate::keymode::{self, Disposition, KeyMode, TabAction};
 use crate::mouse::MouseButton;
 use crate::platform::conn::{Connection, Fill};
 use crate::platform::ffi;
@@ -224,6 +225,10 @@ struct State {
     /// Whether the Wayland keyboard currently focuses this window. Tab switches
     /// use it to focus only the newly active core and disarm every hidden cursor.
     window_focused: bool,
+    /// The armed leader key-table, wezterm-style. `Normal` (the default) sends
+    /// every key to the child; the others intercept keys for tab control and drive
+    /// the centered overlay. See [`crate::keymode`].
+    key_mode: KeyMode,
 
     /// Current surface size in *device* pixels (the buffer resolution the grid is
     /// laid out in). The logical size lives in `scale.logical`.
@@ -341,6 +346,7 @@ impl State {
             repeat_key: None,
             repeat_at: None,
             window_focused: false,
+            key_mode: KeyMode::Normal,
             width,
             height,
             grid_dims: (cols, rows),
@@ -992,6 +998,52 @@ impl State {
     /// come from xkb's current state.
     fn on_key_press(&mut self, keycode: u32) -> Result<()> {
         let mods = self.current_mods();
+
+        // The modal leader tables (wezterm-style) get first look at every resolved
+        // key. In Normal mode only Ctrl+A is a mode key, so everything else reports
+        // `Passthrough` and drops to the chords and the child below unchanged; once
+        // a mode is armed the machine owns the keystroke until it returns to Normal.
+        if let Some(key) = self.resolve_key(keycode) {
+            let (next, disposition) = keymode::advance(self.key_mode, key, mods);
+            self.set_key_mode(next);
+            match disposition {
+                Disposition::Consumed(action) => {
+                    self.stop_repeat();
+                    if let Some(action) = action {
+                        self.apply_tab_action(action)?;
+                    }
+                    return Ok(());
+                }
+                Disposition::SendLiteral(literal, literal_mods) => {
+                    // The Ctrl+A Ctrl+A escape hatch: type a real Ctrl+A.
+                    self.stop_repeat();
+                    self.tabs.active_mut().apply(ToTerminal::Key {
+                        key: literal,
+                        mods: literal_mods,
+                    })?;
+                    return Ok(());
+                }
+                Disposition::Passthrough => {}
+            }
+        }
+
+        // Ctrl+Tab / Ctrl+Shift+Tab cycle to the next / previous tab, a common
+        // accelerator alongside the leader table. Intercepted here because the
+        // child would otherwise receive a literal tab / back-tab.
+        if mods.contains(input::Mods::CTRL) && !mods.contains(input::Mods::ALT) {
+            if let Some(input::Key::Tab) = input::key_from_keycode(keycode) {
+                self.stop_repeat();
+                if !self.tabs.active().is_demo() {
+                    if mods.contains(input::Mods::SHIFT) {
+                        self.tabs.prev(self.window_focused);
+                    } else {
+                        self.tabs.next(self.window_focused);
+                    }
+                }
+                return Ok(());
+            }
+        }
+
         // Ctrl+Shift+T/W open and close tabs; C/V retain the terminal copy/paste
         // convention. Demo mode consumes tab chords without creating a PTY.
         if mods.contains(input::Mods::CTRL) && mods.contains(input::Mods::SHIFT) {
@@ -999,33 +1051,12 @@ impl State {
                 match c.to_ascii_lowercase() {
                     't' => {
                         self.stop_repeat();
-                        if self.tabs.active().is_demo() {
-                            return Ok(());
-                        }
-                        let (cols, rows) = self.grid_dims;
-                        let pad = self.device_pad();
-                        let result = self.tabs.open(
-                            cols,
-                            rows,
-                            self.metrics,
-                            self.width,
-                            self.height,
-                            pad,
-                            self.window_focused,
-                        );
-                        if let Err(error) = result {
-                            eprintln!("bnkterm: could not open tab: {error}");
-                        }
+                        self.open_tab();
                         return Ok(());
                     }
                     'w' => {
                         self.stop_repeat();
-                        if self.tabs.active().is_demo() {
-                            return Ok(());
-                        }
-                        if let Some(id) = self.tabs.active_id() {
-                            self.closed = self.tabs.close(id, self.window_focused);
-                        }
+                        self.close_active_tab();
                         return Ok(());
                     }
                     'c' => {
@@ -1083,6 +1114,72 @@ impl State {
             }
         }
         Ok(())
+    }
+
+    /// Switch the armed leader mode, repainting so the overlay appears, updates, or
+    /// clears. A mode change touches neither the grid nor the bar, so it marks the
+    /// active core dirty itself; the damage diff then repaints only the overlay
+    /// region (the grid portion of the two frames is identical).
+    fn set_key_mode(&mut self, mode: KeyMode) {
+        if self.key_mode != mode {
+            self.key_mode = mode;
+            self.tabs.mark_dirty();
+        }
+    }
+
+    /// Run a leader-resolved tab action against the manager. Tab creation is inert
+    /// in the no-PTY demo (as with the Ctrl+Shift chords); switching and reordering
+    /// are naturally no-ops there, since the demo has a single tab.
+    fn apply_tab_action(&mut self, action: TabAction) -> Result<()> {
+        match action {
+            TabAction::New => self.open_tab(),
+            TabAction::Close => self.close_active_tab(),
+            TabAction::Prev => {
+                self.tabs.prev(self.window_focused);
+            }
+            TabAction::Next => {
+                self.tabs.next(self.window_focused);
+            }
+            TabAction::MovePrev => {
+                self.tabs.move_active(Reorder::Prev);
+            }
+            TabAction::MoveNext => {
+                self.tabs.move_active(Reorder::Next);
+            }
+        }
+        Ok(())
+    }
+
+    /// Open a fresh shell tab at the current geometry, reporting a spawn failure to
+    /// stderr without disturbing the existing tabs. Inert in the no-PTY demo.
+    fn open_tab(&mut self) {
+        if self.tabs.active().is_demo() {
+            return;
+        }
+        let (cols, rows) = self.grid_dims;
+        let pad = self.device_pad();
+        if let Err(error) = self.tabs.open(
+            cols,
+            rows,
+            self.metrics,
+            self.width,
+            self.height,
+            pad,
+            self.window_focused,
+        ) {
+            eprintln!("bnkterm: could not open tab: {error}");
+        }
+    }
+
+    /// Close the visible tab, flagging window shutdown when it was the last one.
+    /// Inert in the no-PTY demo.
+    fn close_active_tab(&mut self) {
+        if self.tabs.active().is_demo() {
+            return;
+        }
+        if let Some(id) = self.tabs.active_id() {
+            self.closed = self.tabs.close(id, self.window_focused);
+        }
     }
 
     /// The window half of a key press: resolve `keycode` to an [`input::Key`] via
