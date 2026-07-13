@@ -1349,6 +1349,10 @@ mod tests {
             eprintln!("fork/exec unavailable; skipping the live tty-mode test");
             return;
         }
+        // Focused, so the cursor it replaces is a *filled* block: exactly one fill, which
+        // is what makes the count below arithmetic rather than a guess (an unfocused
+        // cursor is a hollow block, which is four).
+        core.focused = true;
         let fills = |core: &TerminalCore| {
             let (mut list, mut strings) = (DisplayList::new(), Vec::new());
             core.fill_frame_list(&mut list, &mut strings);
@@ -1370,10 +1374,11 @@ mod tests {
             core.dirty,
             "a silent prompt emits no output, so nothing but this would repaint it"
         );
+        // The one block fill becomes a cleared cell plus the padlock's four rectangles.
         assert_eq!(
             fills(&core),
             cooked + 4,
-            "the padlock's four rectangles reach the frame"
+            "the padlock reaches the frame the window pulls"
         );
 
         // And what it does once it has the password: give the echo back.
@@ -1387,41 +1392,30 @@ mod tests {
 
     #[test]
     fn the_lock_reaches_the_frame_and_repaints_when_the_mode_turns() {
-        // End to end through the real core: flip the cached mode the way a settle
-        // would, and confirm the display list the window pulls actually carries a lock
-        // and that the frame was marked for repaint (a silent prompt produces no
-        // output of its own, so nothing else would trigger one).
-        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
-        core.dirty = false;
-
-        core.tty_mode = TtyMode::PasswordPrompt;
-        core.dirty = true; // what `refresh_tty_mode` sets on a change
-
-        let mut list = DisplayList::new();
-        let mut strings = Vec::new();
-        core.fill_frame_list(&mut list, &mut strings);
-        assert!(core.dirty, "a mode change has to repaint");
-
-        // The padlock body is a fill inside the cursor's cell; a plain block cursor
-        // emits exactly one fill there, so a lock is distinguishable by count alone.
-        let cooked = {
-            let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
-            core.tty_mode = TtyMode::Cooked;
-            let mut l = DisplayList::new();
-            let mut s = Vec::new();
-            core.fill_frame_list(&mut l, &mut s);
-            l.iter()
+        // The same journey as the live-tty test above, but without a child, so it still
+        // guards the wiring where fork/exec is unavailable: flip the cached mode the way
+        // a settle would, and confirm the display list the window pulls carries a lock.
+        let fills = |core: &TerminalCore| {
+            let (mut list, mut strings) = (DisplayList::new(), Vec::new());
+            core.fill_frame_list(&mut list, &mut strings);
+            list.iter()
                 .filter(|c| matches!(c, crate::render::display::DrawCmd::Fill { .. }))
                 .count()
         };
-        let locked = list
-            .iter()
-            .filter(|c| matches!(c, crate::render::display::DrawCmd::Fill { .. }))
-            .count();
+        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        // Focused, so the block it replaces is one fill rather than a hollow block's four.
+        core.focused = true;
+        let cooked = fills(&core);
+
+        core.dirty = false;
+        core.tty_mode = TtyMode::PasswordPrompt;
+        core.dirty = true; // what `refresh_tty_mode` sets on a change
+
+        assert!(core.dirty, "a mode change has to repaint");
         assert_eq!(
-            locked,
+            fills(&core),
             cooked + 4,
-            "the lock adds its four rectangles to the frame"
+            "the block becomes a cleared cell plus the padlock's four rectangles"
         );
     }
 
