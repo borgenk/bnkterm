@@ -119,6 +119,20 @@ pub fn run() -> crate::error::Result<()> {
     // gather thread can exist. Every shell opened by the process inherits them.
     std::env::set_var("TERM", "xterm-256color");
     std::env::set_var("COLORTERM", "truecolor");
+    // Who we are. Nothing consumes this yet — the CLIs that sniff `TERM_PROGRAM` all
+    // match it against a hardcoded list of terminals they know, and we are on nobody's
+    // list — but it is what a terminal is supposed to say, and it is how anything ever
+    // *could* recognise us.
+    std::env::set_var("TERM_PROGRAM", "bnkterm");
+    std::env::set_var("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+    // And the capability that list is standing in for. The `supports-hyperlinks`
+    // family (Node's, and so most JS CLIs) has no capability query for OSC 8: it
+    // decides by *name*, from a fixed allowlist of iTerm/WezTerm/vscode/ghostty/VTE,
+    // and everyone else is told no forever. `FORCE_HYPERLINK` is the one door out, so
+    // we assert what is now simply true — bnkterm renders OSC 8 (see
+    // `grid::Screen::set_hyperlink`) — rather than impersonating a terminal on the
+    // list to get the same answer.
+    std::env::set_var("FORCE_HYPERLINK", "1");
     let mut state = State::new(false)?;
     state.bring_up()?;
     Ok(())
