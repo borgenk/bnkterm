@@ -20,6 +20,7 @@ use crate::platform::geom::Rect;
 use crate::platform::grapheme;
 use crate::render::boxdraw;
 use crate::render::display::DrawCmd;
+use crate::render::display::Fade;
 use crate::render::display::RoundedCorners;
 
 /// Vertex modes, matching shaders/quad.frag. (Mode 3, the decoded-image path,
@@ -29,20 +30,41 @@ pub const MODE_GLYPH: u32 = 1;
 pub const MODE_EMOJI: u32 = 2;
 pub const MODE_ROUND: u32 = 4;
 
+/// How hard to correct the two opposite ways linear-light compositing misweights
+/// anti-aliased text. Two dials, not one, because they pull in opposite directions:
+/// see [`coverage_exponent`], which turns them into a run's exponent, and
+/// [`crate::app::TEXT_GAMMA`], which holds the shipping values.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextGamma {
+    /// Thins light-on-dark text. `> 1` thins, `1.0` is no correction.
+    pub light_on_dark: f32,
+    /// Thickens dark-on-light text, in proportion to the run's contrast. `> 1`
+    /// thickens (it is raised to a negative power), `1.0` is no correction.
+    pub dark_on_light: f32,
+}
+
 /// A glyph run's paint, threaded through the glyph emitters as one value: the
-/// foreground `color` and the coverage-gamma `factor` derived once from its
-/// contrast with the run background (see [`contrast_factor`]).
+/// foreground `color`, the coverage `exponent` derived once from its contrast with
+/// the run background (see [`coverage_exponent`]), and the optional ink ramp that
+/// dissolves its tail (see [`Fade`]).
+///
+/// `exponent` is derived from the run's *own* colour against its background, and the
+/// fade deliberately leaves that colour alone: were the fade a colour mix toward the
+/// background instead, it would collapse the very contrast this exponent reads, and a
+/// label's stroke weight would drift along its own tail.
 #[derive(Clone, Copy)]
 struct Paint {
     color: u32,
-    factor: f32,
+    exponent: f32,
+    fade: Option<Fade>,
 }
 
 impl Paint {
-    fn new(color: u32, bg: u32) -> Self {
+    fn new(color: u32, bg: u32, fade: Option<Fade>, gamma: TextGamma) -> Self {
         Paint {
             color,
-            factor: contrast_factor(color, bg),
+            exponent: coverage_exponent(color, bg, gamma),
+            fade,
         }
     }
 }
@@ -329,6 +351,7 @@ pub fn build_frame_into(
     fonts: &Fonts,
     list: &[DrawCmd],
     cache: &mut GlyphCache,
+    gamma: TextGamma,
     out: &mut FrameData,
 ) {
     loop {
@@ -340,6 +363,7 @@ pub fn build_frame_into(
             let mut b = Batcher {
                 fonts,
                 cache: &mut *cache,
+                gamma,
                 vertices: &mut out.vertices,
                 batches: &mut out.batches,
             };
@@ -364,15 +388,21 @@ pub fn build_frame_into(
 
 /// Build a fresh frame, allocating its vertex and batch vectors. The one-shot path
 /// for tests; the render loop calls [`build_frame_into`] with a reused [`FrameData`].
-pub fn build_frame(fonts: &Fonts, list: &[DrawCmd], cache: &mut GlyphCache) -> FrameData {
+pub fn build_frame(
+    fonts: &Fonts,
+    list: &[DrawCmd],
+    cache: &mut GlyphCache,
+    gamma: TextGamma,
+) -> FrameData {
     let mut out = FrameData::default();
-    build_frame_into(fonts, list, cache, &mut out);
+    build_frame_into(fonts, list, cache, gamma, &mut out);
     out
 }
 
 struct Batcher<'a> {
     fonts: &'a Fonts,
     cache: &'a mut GlyphCache,
+    gamma: TextGamma,
     vertices: &'a mut Vec<Vertex>,
     batches: &'a mut Vec<Batch>,
 }
@@ -395,9 +425,16 @@ impl Batcher<'_> {
                 face,
                 color,
                 bg,
+                fade,
                 text,
                 ..
-            } => self.text(*face, *x, *baseline, text, Paint::new(*color, *bg)),
+            } => self.text(
+                *face,
+                *x,
+                *baseline,
+                text,
+                Paint::new(*color, *bg, *fade, self.gamma),
+            ),
             DrawCmd::Cells {
                 x,
                 baseline,
@@ -407,7 +444,14 @@ impl Batcher<'_> {
                 bg,
                 text,
                 ..
-            } => self.cells(*face, *x, *baseline, *cell_w, text, Paint::new(*color, *bg)),
+            } => self.cells(
+                *face,
+                *x,
+                *baseline,
+                *cell_w,
+                text,
+                Paint::new(*color, *bg, None, self.gamma),
+            ),
         }
     }
 
@@ -537,7 +581,7 @@ impl Batcher<'_> {
         // the baseline offset that seats it, both from the same metrics the grid
         // laid out on (read once, not per cluster).
         let m = self.fonts.metrics(face_key.size());
-        let (cell_h, ascent) = (m.line_height.max(1), m.ascent);
+        let (cell_h, baseline_offset) = (m.line_height.max(1), m.baseline);
         let face = self.fonts.face_for(face_key);
         for (i, (_, cluster)) in grapheme::graphemes(text).enumerate() {
             let pen = (x + i as i32 * cell_w) as f32;
@@ -546,7 +590,7 @@ impl Batcher<'_> {
             // They are single-width BMP scalars, so they only ever arrive as a
             // lone-char cluster on this fixed-pitch path, never through `text`.
             if let Some(ch) = box_glyph(cluster) {
-                let packed = self.packed_box(face_key, ch, cell_w, cell_h, ascent);
+                let packed = self.packed_box(face_key, ch, cell_w, cell_h, baseline_offset);
                 self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, paint);
                 continue;
             }
@@ -622,19 +666,20 @@ impl Batcher<'_> {
 
     /// The cached placement for a procedurally-drawn box/block glyph, sized to the
     /// `w`-by-`h` cell. Its coverage comes from [`boxdraw::coverage`] instead of a
-    /// FreeType raster, and it is anchored at `left = 0, top = ascent` so the
-    /// bitmap fills the cell box `[pen, pen + w) x [baseline - ascent, + h)`
-    /// exactly, tiling with its neighbours. Cached in the same `scalar_slots` map
-    /// as a font glyph: the `(face_key, ch)` key stays unique because a given char
-    /// is always a box glyph or never one, and the cell size is fixed by the size
-    /// the key carries.
+    /// FreeType raster, and it is anchored at `left = 0, top = baseline_offset` (the
+    /// metrics' baseline, i.e. the distance from the cell's top edge down to the
+    /// baseline) so the bitmap fills the cell box `[pen, pen + w) x [baseline -
+    /// baseline_offset, + h)` exactly, tiling with its neighbours. Cached in the same
+    /// `scalar_slots` map as a font glyph: the `(face_key, ch)` key stays unique
+    /// because a given char is always a box glyph or never one, and the cell size is
+    /// fixed by the size the key carries.
     fn packed_box(
         &mut self,
         face_key: FaceKey,
         ch: char,
         w: i32,
         h: i32,
-        ascent: i32,
+        baseline_offset: i32,
     ) -> PackedGlyph {
         let primary = self.fonts.face_for(face_key);
         if let Some(&packed) = self.cache.scalar_slots.get(&(face_key, ch)) {
@@ -649,7 +694,7 @@ impl Batcher<'_> {
                 .glyphs
                 .pack(w.max(0) as u32, h.max(0) as u32, &cov),
             left: 0,
-            top: ascent,
+            top: baseline_offset,
             advance: w as f32,
         };
         self.cache.scalar_slots.insert((face_key, ch), packed);
@@ -724,19 +769,26 @@ impl Batcher<'_> {
             w: slot.w as i32,
             h: slot.h as i32,
         };
-        // A coverage glyph (mode 1) carries its per-run contrast factor in extra.x,
-        // steering the shader's coverage gamma; emoji (mode 2) ignore it.
-        let extra = if mode == MODE_GLYPH {
-            [paint.factor, 0.0, 0.0, 0.0]
+        // A coverage glyph (mode 1) carries its per-run coverage exponent in extra.x;
+        // emoji (mode 2) are pre-rendered colour and ignore it. Both carry the ink
+        // ramp in extra.yz, so an emoji in a fading tail dissolves with the text
+        // around it rather than standing solid where the letters have gone. An empty
+        // span (`to <= from`, the 0.0 default) is the shader's "no fade".
+        let exponent = if mode == MODE_GLYPH {
+            paint.exponent
         } else {
-            [0.0; 4]
+            0.0
+        };
+        let (from, to) = match paint.fade {
+            Some(fade) => (fade.from as f32, fade.to as f32),
+            None => (0.0, 0.0),
         };
         self.quad(
             rect,
             mode,
             paint.color,
             [slot.x as f32, slot.y as f32],
-            extra,
+            [exponent, from, to, 0.0],
         );
     }
 }
@@ -800,31 +852,40 @@ fn color_f32(color: u32) -> [f32; 4] {
     ]
 }
 
-/// The per-run coverage-gamma exponent driver in `[-1, 1]`, from the run's
-/// foreground and background colours. The fragment shader raises glyph coverage to
-/// `G^factor` (`G` the base [`crate::app`] gamma):
+/// The power the fragment shader raises a run's glyph coverage to, from the run's
+/// foreground and background colours. Above 1 thins the anti-aliased edges, below 1
+/// thickens them, and exactly 1 leaves the raster alone.
 ///
-/// - `+1` — foreground lighter than background, the usual light-on-dark terminal
-///   text: reproduces the tuned thinning that offsets linear-light compositing,
-///   byte-for-byte with the old single-gamma behaviour.
-/// - `< 0` — dark text on any lighter background (a reverse-video paste highlight, a
-///   light theme, the active tab's dark label on its light block): thickens the
-///   anti-aliased edges that linear-light compositing would otherwise wash out, in
-///   direct proportion to the contrast, reaching `-1` (`G^-1`, the inverse) at
-///   maximum contrast. Dark-on-light is never thinned, however faint the contrast:
-///   an earlier `1 + 2d` ramp only crossed into thickening past half-contrast, so a
-///   dark label on a mid-light block (this tab bar's turquoise) came out thin.
+/// Linear-light compositing (the colour attachment is an sRGB view, so blending is
+/// gamma-correct) misweights anti-aliased text in *opposite* directions depending on
+/// which side is lighter, so the two cases get their own dial (see
+/// [`crate::app::TEXT_GAMMA`]):
+///
+/// - **Light on dark**, the usual terminal text: rendered heavier than the
+///   gamma-space stacks most terminals use, so thin it by
+///   [`TextGamma::light_on_dark`] flat. The magnitude of the contrast does not enter:
+///   the overweighting is there at any contrast.
+/// - **Dark on light** (a reverse-video paste highlight, a light theme, the active
+///   tab's dark label on its light block): washed out instead, so thicken it by
+///   raising [`TextGamma::dark_on_light`] to a negative power, reaching its inverse
+///   at maximum contrast. This one *does* scale with contrast, because the washout
+///   does. Dark-on-light is never thinned, however faint the contrast: an earlier
+///   `1 + 2d` ramp only crossed into thickening past half-contrast, so a dark label
+///   on a mid-light block (this tab bar's turquoise) came out thin.
+///
+/// Computing this per run rather than per pixel keeps the policy in Rust, where it is
+/// testable, and leaves the shader one `pow` instead of two.
 ///
 /// Only the sign of `d` (which side is lighter) and a soft magnitude matter, so a
 /// perceptual (gamma-space) luma is enough.
-fn contrast_factor(fg: u32, bg: u32) -> f32 {
+fn coverage_exponent(fg: u32, bg: u32, gamma: TextGamma) -> f32 {
     let d = luma(fg) - luma(bg);
     if d >= 0.0 {
-        1.0
+        gamma.light_on_dark
     } else {
-        // `d` is already in `[-1, 0)`; `max` is a defensive clamp to the range the
-        // shader's `pow` expects.
-        d.max(-1.0)
+        // `d` is already in `[-1, 0)`; `max` is a defensive clamp, so the exponent
+        // can never fall below the dial's inverse however the colours are chosen.
+        gamma.dark_on_light.powf(d.max(-1.0))
     }
 }
 
@@ -841,6 +902,13 @@ fn luma(color: u32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both dials at 2.0 in tests, so an assertion reads as a plain power and a
+    /// change to the shipping values in `app` cannot quietly move these numbers.
+    const GAMMA: TextGamma = TextGamma {
+        light_on_dark: 2.0,
+        dark_on_light: 2.0,
+    };
 
     #[test]
     fn atlas_packs_onto_shelves_and_tracks_dirty() {
@@ -884,7 +952,7 @@ mod tests {
             },
             color: 0x00ff_0000,
         }];
-        let f = build_frame(&fonts, &list, &mut cache);
+        let f = build_frame(&fonts, &list, &mut cache, GAMMA);
         assert_eq!(f.vertices.len(), 6);
         assert_eq!(f.batches.len(), 1);
         assert_eq!(f.batches[0], Batch { start: 0, count: 6 });
@@ -913,16 +981,17 @@ mod tests {
             },
             color: 0x00ff_ffff,
             bg: 0,
+            fade: None,
             text: "abcabc".to_string(),
         }];
-        let f1 = build_frame(&fonts, &list, &mut cache);
+        let f1 = build_frame(&fonts, &list, &mut cache, GAMMA);
         assert!(f1.glyph_upload.is_some(), "first frame uploads new glyphs");
         assert!(
             !f1.vertices.is_empty(),
             "glyph quads were emitted ({} vertices)",
             f1.vertices.len()
         );
-        let f2 = build_frame(&fonts, &list, &mut cache);
+        let f2 = build_frame(&fonts, &list, &mut cache, GAMMA);
         assert!(f2.glyph_upload.is_none(), "steady state uploads nothing");
         assert_eq!(f1.vertices, f2.vertices, "same list, same geometry");
     }
@@ -956,10 +1025,11 @@ mod tests {
                 },
                 color: 0x00ff_ffff,
                 bg: 0,
+                fade: None,
                 text: "hi".to_string(),
             },
         ];
-        let f = build_frame(&fonts, &list, &mut cache);
+        let f = build_frame(&fonts, &list, &mut cache, GAMMA);
         assert_eq!(
             f.batches.len(),
             1,
@@ -985,7 +1055,7 @@ mod tests {
             radius: 4,
             corners: RoundedCorners::Top,
         }];
-        let f = build_frame(&fonts, &list, &mut cache);
+        let f = build_frame(&fonts, &list, &mut cache, GAMMA);
         assert_eq!(f.vertices.len(), 6);
         let v = &f.vertices[0];
         assert_eq!(v.mode, MODE_ROUND);
@@ -1009,7 +1079,7 @@ mod tests {
             radius: 0,
             corners: RoundedCorners::Both,
         }];
-        let f = build_frame(&fonts, &list, &mut cache);
+        let f = build_frame(&fonts, &list, &mut cache, GAMMA);
         assert!(f.vertices.iter().all(|v| v.mode == MODE_SOLID));
     }
 
@@ -1038,7 +1108,7 @@ mod tests {
             bg: 0,
             text: "MMMM".to_string(),
         }];
-        let f = build_frame(&fonts, &list, &mut cache);
+        let f = build_frame(&fonts, &list, &mut cache, GAMMA);
         // 'M' is an inked glyph, so each of the four cells emits one 6-vertex quad.
         assert_eq!(f.vertices.len(), 24, "four inked cells, one quad each");
         let top_left = |cell: usize| f.vertices[cell * 6].pos;
@@ -1077,7 +1147,7 @@ mod tests {
             bg: 0,
             text: "M M".to_string(),
         }];
-        let f = build_frame(&fonts, &list, &mut cache);
+        let f = build_frame(&fonts, &list, &mut cache, GAMMA);
         assert_eq!(f.vertices.len(), 12, "two inked cells (the space is blank)");
         // The two 'M' quads are two cell pitches apart (columns 0 and 2).
         assert_eq!(
@@ -1091,11 +1161,13 @@ mod tests {
         // `▛` (U+259B) is a quadrant block many monospace fonts lack, so through
         // the font it would be `.notdef` tofu. It must instead be rasterized by
         // `render::boxdraw` into a quad that covers the whole cell box exactly, so
-        // it tiles: top-left at (pen, baseline - ascent), size (cell_w, cell_h).
+        // it tiles: top-left at (pen, baseline - m.baseline), size (cell_w, cell_h).
+        // Seating it on the ascent instead would float the quad above its cell by
+        // the font's line gap, leaving a seam between stacked block rows.
         let fonts = Fonts::new(&[16]).expect("default font");
         let mut cache = GlyphCache::new();
         let m = fonts.metrics(16);
-        let (ascent, cell_h) = (m.ascent, m.line_height.max(1));
+        let (baseline_offset, cell_h) = (m.baseline, m.line_height.max(1));
         let cell_w = 11;
         let (x, baseline) = (7, 16);
         let list = vec![DrawCmd::Cells {
@@ -1113,7 +1185,7 @@ mod tests {
             bg: 0,
             text: "▛".to_string(),
         }];
-        let f = build_frame(&fonts, &list, &mut cache);
+        let f = build_frame(&fonts, &list, &mut cache, GAMMA);
         assert_eq!(
             f.vertices.len(),
             6,
@@ -1126,12 +1198,15 @@ mod tests {
         // The quad is the cell box: top-left corner and bottom-right corner.
         assert_eq!(
             f.vertices[0].pos,
-            [x as f32, (baseline - ascent) as f32],
+            [x as f32, (baseline - baseline_offset) as f32],
             "top-left seats the glyph at the cell origin"
         );
         assert_eq!(
             f.vertices[4].pos,
-            [(x + cell_w) as f32, (baseline - ascent + cell_h) as f32],
+            [
+                (x + cell_w) as f32,
+                (baseline - baseline_offset + cell_h) as f32
+            ],
             "bottom-right fills the whole cell, so the glyph tiles"
         );
     }
@@ -1155,9 +1230,10 @@ mod tests {
             },
             color: 0x00ff_ffff,
             bg: 0,
+            fade: None,
             text: "😀".to_string(),
         }];
-        let f = build_frame(&fonts, &list, &mut cache);
+        let f = build_frame(&fonts, &list, &mut cache, GAMMA);
         // With an emoji font installed the cluster takes MODE_EMOJI; without
         // one it renders as per-character glyphs. Either way it must not
         // crash, and with color output there must be an emoji upload.
@@ -1198,6 +1274,7 @@ mod tests {
                 text: warn.clone(),
             }],
             &mut cache,
+            GAMMA,
         );
         let mut cache2 = GlyphCache::new();
         let text = build_frame(
@@ -1214,9 +1291,11 @@ mod tests {
                 face: key,
                 color: 0x00ff_ffff,
                 bg: 0,
+                fade: None,
                 text: warn,
             }],
             &mut cache2,
+            GAMMA,
         );
 
         // The width of the (single) emoji quad, if the cluster took the color
@@ -1271,6 +1350,7 @@ mod tests {
                 text: "\u{26A0}".to_string(),
             }],
             &mut cache,
+            GAMMA,
         );
         if f.vertices.iter().any(|v| v.mode == MODE_EMOJI) {
             let (top, bottom) = (f.vertices[0].pos[1], f.vertices[4].pos[1]);
@@ -1289,30 +1369,150 @@ mod tests {
         }
     }
 
+    /// Build one `Text` run and return its glyph quads' `extra` vectors.
+    fn run_extras(
+        fonts: &Fonts,
+        text: &str,
+        color: u32,
+        bg: u32,
+        fade: Option<Fade>,
+    ) -> Vec<[f32; 4]> {
+        let list = vec![DrawCmd::Text {
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                w: 200,
+                h: 20,
+            },
+            x: 0,
+            baseline: 16,
+            face: FaceKey::Prose {
+                size: 16,
+                style: crate::platform::freetype::FontStyle::Regular,
+            },
+            color,
+            bg,
+            fade,
+            text: text.to_string(),
+        }];
+        let mut cache = GlyphCache::new();
+        build_frame(fonts, &list, &mut cache, GAMMA)
+            .vertices
+            .iter()
+            .filter(|v| v.mode == MODE_GLYPH)
+            .map(|v| v.extra)
+            .collect()
+    }
+
     #[test]
-    fn contrast_factor_preserves_light_on_dark_and_thickens_dark_on_light() {
+    fn a_faded_run_carries_its_ink_ramp_without_disturbing_its_contrast() {
+        let fonts = Fonts::new(&[16]).expect("default font");
+        // The tab bar's dark-on-light case: the label's own colours, plus a ramp.
+        let (fg, bg) = (0x0012_3028, 0x008a_beb7);
+        let fade = Fade { from: 40, to: 72 };
+        let faded = run_extras(&fonts, "hello", fg, bg, Some(fade));
+        let solid = run_extras(&fonts, "hello", fg, bg, None);
+        assert!(!faded.is_empty(), "the run emitted glyphs");
+        assert_eq!(faded.len(), solid.len());
+
+        // Every glyph in the run carries the same span, so the ramp is continuous
+        // across glyph boundaries rather than quantised to them.
+        assert!(
+            faded
+                .iter()
+                .all(|e| e[1] == fade.from as f32 && e[2] == fade.to as f32),
+            "the fade span reaches every glyph quad"
+        );
+        // An unfaded run leaves an empty span, which the shader reads as "no fade".
+        assert!(
+            solid.iter().all(|e| e[2] <= e[1]),
+            "no fade means an empty span, not a hard cut at zero"
+        );
+        // The load-bearing invariant: fading changes the ink, never the contrast the
+        // coverage exponent is derived from. Were the fade a colour mix toward the
+        // background (as it once was), this exponent would drift toward 1.0 exactly as
+        // the tail faded, and the tail would carry ~2x the anti-aliased ink of the
+        // head: a smudge on a light tab rather than a dissolve.
+        let want = coverage_exponent(fg, bg, GAMMA);
+        assert!(
+            faded.iter().chain(&solid).all(|e| e[0] == want),
+            "the run's coverage exponent is untouched by the fade"
+        );
+    }
+
+    #[test]
+    fn coverage_exponent_thins_light_on_dark_and_thickens_dark_on_light() {
         let white = 0x00ff_ffff;
         let black = 0x0000_0000;
-        // Light text on a dark background is the tuned default: factor 1 reproduces
-        // the old single-gamma thinning exactly (exponent G^1 = G).
-        assert_eq!(contrast_factor(white, black), 1.0);
-        // A mid-grey background is still darker than white text: unchanged.
-        assert_eq!(contrast_factor(white, 0x0080_8080), 1.0);
-        // Dark text on white (a reverse-video paste highlight) is thickened: the
-        // factor drops below 1, bottoming at -1 for maximum contrast (exponent G^-1).
-        assert_eq!(contrast_factor(black, white), -1.0);
-        assert!(contrast_factor(black, white) < contrast_factor(0x0060_6060, white));
+        // Light on dark is thinned by the light_on_dark dial, flat: linear-light
+        // compositing overweights it at *any* contrast, so the correction does not
+        // soften as the contrast falls.
+        assert_eq!(coverage_exponent(white, black, GAMMA), 2.0);
+        assert_eq!(coverage_exponent(white, 0x0080_8080, GAMMA), 2.0);
+        // Dark on white (a reverse-video paste highlight) is thickened instead: the
+        // exponent drops below 1, bottoming at the dial's inverse at full contrast.
+        assert_eq!(coverage_exponent(black, white, GAMMA), 0.5);
+        assert!(
+            coverage_exponent(black, white, GAMMA) < coverage_exponent(0x0060_6060, white, GAMMA)
+        );
         // Dark text on a mid-light block (the tab bar's #123028 on #8abeb7) is
         // thickened, not left near-untouched: dark-on-light thickens in proportion
         // to contrast, so a moderately lighter background still gets real weight.
-        let tab = contrast_factor(0x0012_3028, 0x008a_beb7);
-        assert!(tab < -0.4, "moderate dark-on-light thickens, got {tab}");
-        // Equal luminance takes the no-thinning branch rather than a discontinuity.
-        assert_eq!(contrast_factor(0x0044_4444, 0x0044_4444), 1.0);
-        // The driver never escapes the range the shader's pow expects.
+        let tab = coverage_exponent(0x0012_3028, 0x008a_beb7, GAMMA);
+        assert!(tab < 0.76, "moderate dark-on-light thickens, got {tab}");
+        // Equal luminance takes the thinning branch rather than a discontinuity.
+        assert_eq!(coverage_exponent(0x0044_4444, 0x0044_4444, GAMMA), 2.0);
+        // A run is thinned at most to the dial and thickened at most to its inverse,
+        // so the shader's pow never sees an exponent that could erase or blot text.
         for &(fg, bg) in &[(white, black), (black, white), (0x0012_3456, 0x00fe_dcba)] {
-            let f = contrast_factor(fg, bg);
-            assert!((-1.0..=1.0).contains(&f), "factor {f} in range");
+            let e = coverage_exponent(fg, bg, GAMMA);
+            assert!((0.5..=2.0).contains(&e), "exponent {e} in range");
         }
+    }
+
+    #[test]
+    fn each_gamma_dial_moves_only_its_own_contrast_direction() {
+        // The bug the split exists to prevent. With one dial governing both
+        // corrections, softening it slid *both* toward the no-correction exponent of
+        // 1.0 at once, which means opposite visual directions: light-on-dark got
+        // bolder while dark-on-light got thinner. So lowering "the gamma" to embolden
+        // the grid silently thinned the active tab's dark label. Each dial must now
+        // move its own direction and leave the other alone.
+        let grid = (0x00d8_dee9, 0x0028_2c34); // light on dark
+        let label = (0x0012_3028, 0x008a_beb7); // the active tab's dark label
+        let base = GAMMA;
+
+        // Softening the light-on-dark dial emboldens light-on-dark text (a lower
+        // exponent keeps more coverage) and leaves dark-on-light text alone.
+        let softer_light = TextGamma {
+            light_on_dark: 1.5,
+            ..base
+        };
+        assert!(
+            coverage_exponent(grid.0, grid.1, softer_light)
+                < coverage_exponent(grid.0, grid.1, base),
+            "the light-on-dark dial emboldens light-on-dark text"
+        );
+        assert_eq!(
+            coverage_exponent(label.0, label.1, softer_light),
+            coverage_exponent(label.0, label.1, base),
+            "and must not touch the dark-on-light label"
+        );
+
+        // Symmetrically, the dark-on-light dial moves only dark-on-light text.
+        let softer_dark = TextGamma {
+            dark_on_light: 1.5,
+            ..base
+        };
+        assert!(
+            coverage_exponent(label.0, label.1, softer_dark)
+                > coverage_exponent(label.0, label.1, base),
+            "softening the dark-on-light dial thins the dark-on-light label"
+        );
+        assert_eq!(
+            coverage_exponent(grid.0, grid.1, softer_dark),
+            coverage_exponent(grid.0, grid.1, base),
+            "and must not touch light-on-dark grid text"
+        );
     }
 }

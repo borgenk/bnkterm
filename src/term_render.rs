@@ -26,6 +26,20 @@
 //! face rounded to a whole pixel; the grid decides *which* column a rune lands in
 //! (via `width::width`), so measurement and placement can never disagree.
 //!
+//! # Where the text sits in the cell
+//!
+//! The vertical half of the same story, and the one that is easy to get wrong: a
+//! row's glyphs are seated on `cell_y(row) + metrics.baseline`, where `baseline` is
+//! the distance from the cell's *top edge* down to the baseline — never the ascent.
+//! The two differ by the font's line gap (Consolas asks for 2-3px of it at terminal
+//! sizes), and spending that gap under the text instead of over it rides every glyph
+//! up against the cell's ceiling: capitals crowd the top edge, descenders float clear
+//! of the bottom, and the block cursor no longer reads as a box drawn around the
+//! character. [`crate::platform::freetype::Metrics`] derives the number and explains
+//! why it lands where it does; here it is simply the one seat every row uses, and the
+//! one a box-drawing glyph is packed against in [`crate::render::gpu`], so the two
+//! agree pixel for pixel.
+//!
 //! # What a frame is made of
 //!
 //! Per painted row, in stacking order (the list order the damage diff and the GPU
@@ -50,7 +64,7 @@ use crate::grid::{Attrs, Cell, Screen};
 use crate::platform::freetype::{FaceKey, FontStyle, Fonts};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
-use crate::render::display::{DisplayList, DrawCmd};
+use crate::render::display::{DisplayList, DrawCmd, Fade};
 
 /// The glyph whose advance defines the monospace cell width. `M` is the classic
 /// full-width reference; on a genuine monospace face every glyph shares it.
@@ -79,9 +93,16 @@ pub struct CellMetrics {
     pub w: i32,
     /// Cell height: the baseline-to-baseline line height.
     pub h: i32,
-    /// Pixels from the top of a cell down to the baseline.
+    /// Pixels from the top of a cell down to the baseline: where the text sits in
+    /// the cell. This is *not* the ascent (see [`Metrics`]) — the font's line gap
+    /// lies between the two, and mistaking one for the other rides the text up
+    /// against the cell's top edge.
+    pub baseline: i32,
+    /// The face's ascent: ink above the baseline. A reference for decorations
+    /// (a strike is a fraction of it), never the cell's top.
     pub ascent: i32,
-    /// Pixels from the baseline to the bottom of a cell.
+    /// The face's descent: ink below the baseline, which the baseline seats on the
+    /// cell's bottom edge.
     pub descent: i32,
 }
 
@@ -100,6 +121,7 @@ impl CellMetrics {
             size,
             w: (advance.round() as i32).max(1),
             h: m.line_height.max(1),
+            baseline: m.baseline,
             ascent: m.ascent,
             descent: m.descent,
         }
@@ -117,6 +139,7 @@ impl CellMetrics {
             size,
             w: (advance.round() as i32).max(1),
             h: m.line_height.max(1),
+            baseline: m.baseline,
             ascent: m.ascent,
             descent: m.descent,
         }
@@ -371,9 +394,9 @@ impl Painter<'_> {
         self.origin.1 + row as i32 * self.metrics.h
     }
 
-    /// The baseline y for `row`: the row's top plus the face ascent.
+    /// The baseline y for `row`: the row's top plus the cell's baseline offset.
     fn baseline(&self, row: usize) -> i32 {
-        self.cell_y(row) + self.metrics.ascent
+        self.cell_y(row) + self.metrics.baseline
     }
 
     /// The base background: one fill of the theme background covering the whole
@@ -588,6 +611,7 @@ impl Painter<'_> {
                 },
                 color: fg.to_u32(),
                 bg: bg.to_u32(),
+                fade: None,
                 text,
             });
         }
@@ -721,6 +745,7 @@ impl Painter<'_> {
             },
             color: ink.to_u32(),
             bg: self.theme.cursor.to_u32(),
+            fade: None,
             text,
         });
     }
@@ -892,7 +917,9 @@ impl Painter<'_> {
 /// nothing. Unlike [`push_cell_text`] the glyphs advance by the font's own metrics
 /// rather than a fixed cell pitch, so this is for a UI-sans label, never grid text;
 /// `run_w` is the run's already-measured pixel width, used only for the damage
-/// bounds. An empty run pushes nothing.
+/// bounds. `fade` ramps the run's ink away over a span of `x` (see [`Fade`]), for a
+/// truncated label that dissolves rather than ending on an ellipsis. An empty run
+/// pushes nothing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn push_text_run(
     out: &mut DisplayList,
@@ -904,6 +931,7 @@ pub(crate) fn push_text_run(
     face: FaceKey,
     color: u32,
     bg: u32,
+    fade: Option<Fade>,
     metrics: CellMetrics,
 ) {
     if text.is_empty() {
@@ -918,6 +946,7 @@ pub(crate) fn push_text_run(
         face,
         color,
         bg,
+        fade,
         text: owned,
     });
 }
@@ -978,6 +1007,7 @@ pub(crate) fn push_cell_text(
                 face,
                 color,
                 bg,
+                fade: None,
                 text: glyph,
             });
         }
@@ -1061,17 +1091,19 @@ fn push_owned_cells(
     });
 }
 
-/// The bearing padding around a run: a glyph's ink can spill
-/// past its advance box (an italic tail, a box-drawing overhang), so the damage
-/// and clip rectangle is padded to never shear a glyph's edge.
+/// The run's cell box, padded for bearing: a glyph's ink can spill past its cell
+/// (an italic tail, a box-drawing overhang, an accent riding above the ascent), so
+/// the damage and clip rectangle is grown to never shear a glyph's edge. The box is
+/// measured from the cell, not from ascent-to-descent: a box-drawing glyph fills its
+/// cell exactly, and clipping to the ink box would shave its top edge.
 fn text_bounds(x: i32, baseline: i32, run_w: i32, m: CellMetrics) -> Rect {
     let pad_x = (m.size as i32 / 2).max(2);
     let pad_y = (m.size as i32 / 4).max(1);
     Rect {
         x: x - pad_x,
-        y: baseline - m.ascent - pad_y,
+        y: baseline - m.baseline - pad_y,
         w: run_w.max(0) + 2 * pad_x,
-        h: m.ascent + m.descent + 2 * pad_y,
+        h: m.h + 2 * pad_y,
     }
 }
 
@@ -1110,13 +1142,17 @@ mod tests {
     use super::*;
     use crate::color::Color;
 
-    /// Synthetic metrics: a 10x20 cell so column/row math reads off by eye.
+    /// Synthetic metrics: a 10x20 cell so column/row math reads off by eye, with a
+    /// 2px line gap (ascent 14 + descent 4 < h 20), like every real font ships. The
+    /// gap sits above the ascent, so the baseline is 16, *not* the ascent: any test
+    /// that seats text by `M.ascent` is asserting the bug this metric exists to catch.
     const M: CellMetrics = CellMetrics {
         size: 16,
         w: 10,
         h: 20,
-        ascent: 15,
-        descent: 5,
+        baseline: 16,
+        ascent: 14,
+        descent: 4,
     };
 
     fn feed(s: &mut Screen, bytes: &[u8]) {
@@ -1213,8 +1249,8 @@ mod tests {
         let runs = cells_runs(&list_of(&s));
         assert_eq!(
             runs,
-            vec![(0, M.ascent, "hello".to_string())],
-            "the whole line batches into one run at column 0, baseline = ascent"
+            vec![(0, M.baseline, "hello".to_string())],
+            "the whole line batches into one run at column 0, seated on the baseline"
         );
     }
 
@@ -1226,8 +1262,8 @@ mod tests {
         assert_eq!(
             runs,
             vec![
-                (0, M.ascent, "ab".to_string()),
-                (2 * M.w, M.ascent, "cd".to_string()),
+                (0, M.baseline, "ab".to_string()),
+                (2 * M.w, M.baseline, "cd".to_string()),
             ],
             "the run breaks where the colour changes; the second starts at its column"
         );
@@ -1240,7 +1276,7 @@ mod tests {
         let runs = cells_runs(&list_of(&s));
         // "hi" then eight blanks: the blanks are default cells, so only "hi" is a
         // run and there are no stray blank runs.
-        assert_eq!(runs, vec![(0, M.ascent, "hi".to_string())]);
+        assert_eq!(runs, vec![(0, M.baseline, "hi".to_string())]);
     }
 
     #[test]
@@ -1310,8 +1346,8 @@ mod tests {
         assert_eq!(
             cells_runs(&list),
             vec![
-                (0, M.ascent, "a".to_string()),
-                (3 * M.w, M.ascent, "b".to_string()),
+                (0, M.baseline, "a".to_string()),
+                (3 * M.w, M.baseline, "b".to_string()),
             ],
             "'b' lands at column 3, past the wide glyph's spacer"
         );
@@ -1324,7 +1360,7 @@ mod tests {
         let runs = cells_runs(&list_of(&s));
         assert_eq!(
             runs,
-            vec![(0, M.ascent, "e\u{0301}x".to_string())],
+            vec![(0, M.baseline, "e\u{0301}x".to_string())],
             "the mark stays glued to its base; both cells share one run"
         );
     }
@@ -1337,7 +1373,7 @@ mod tests {
         let t = Theme::default();
         let rule = fills(&list)
             .into_iter()
-            .find(|(r, _)| r.y > M.ascent) // below the baseline
+            .find(|(r, _)| r.y > M.baseline) // below the baseline
             .expect("an underline rule");
         assert_eq!(rule.0.x, 0);
         assert_eq!(rule.0.w, 2 * M.w, "the rule spans the whole run");
@@ -1408,7 +1444,7 @@ mod tests {
         // the run at (ox, oy + ascent), the cursor block at (ox, oy).
         assert_eq!(
             cells_runs(&list),
-            vec![(ox, oy + M.ascent, "X".to_string())],
+            vec![(ox, oy + M.baseline, "X".to_string())],
             "the run is shifted by the content origin"
         );
         let cursor_fill = fills(&list)
@@ -1463,7 +1499,7 @@ mod tests {
     fn rules(list: &DisplayList) -> Vec<Rect> {
         fills(list)
             .into_iter()
-            .filter(|(r, _)| r.y > M.ascent)
+            .filter(|(r, _)| r.y > M.baseline)
             .map(|(r, _)| r)
             .collect()
     }
@@ -1484,7 +1520,7 @@ mod tests {
             rules(&list),
             vec![Rect {
                 x: 2 * M.w,
-                y: M.ascent + (M.descent / 2).max(1),
+                y: M.baseline + (M.descent / 2).max(1),
                 w: 8 * M.w,
                 h: (M.size as i32 / 12).max(1),
             }],
@@ -1675,10 +1711,12 @@ mod tests {
         let (w, h) = (20 * M.w, 3 * M.h);
         let d = crate::render::display::damage(&before, &after, w, h);
         assert!(!d.is_empty(), "the edit is visible");
-        // Every damaged rectangle is confined to the middle row's band.
+        // Every damaged rectangle is confined to the middle row's cell band, give or
+        // take the bearing pad a run's bounds carries for overhanging ink.
+        let pad = (M.size as i32 / 4).max(1);
         for r in d {
             assert!(
-                r.y >= M.h - M.ascent && r.y + r.h <= 2 * M.h + M.descent,
+                r.y >= M.h - pad && r.y + r.h <= 2 * M.h + pad,
                 "damage {r:?} stays on the edited line"
             );
         }
@@ -1701,8 +1739,53 @@ mod tests {
             m.ascent + m.descent <= m.h,
             "ink height fits the line height: {m:?}"
         );
+        // The line gap rides above the text, so the descent lands on the cell floor
+        // and the baseline sits at or below the ascent. A cell whose baseline *is*
+        // the ascent has hoisted the text into the cell's ceiling.
+        assert_eq!(
+            m.baseline,
+            m.h - m.descent,
+            "the descent seats on the cell's bottom edge: {m:?}"
+        );
+        assert!(m.baseline >= m.ascent, "the gap sits above the text: {m:?}");
         // The grid-fit inverse divides the surface back into whole cells.
         assert_eq!(m.columns_rows(m.w * 80, m.h * 24), (80, 24));
+    }
+
+    #[test]
+    fn a_run_is_seated_on_the_baseline_and_bounded_by_its_cells() {
+        // The bug this pins: seating a run on the ascent (14) instead of the baseline
+        // (16) rides every glyph 2px up in its cell, so capitals crowd the cell's top
+        // edge while descenders float clear of its bottom. Row 1 catches an off-by-one
+        // that row 0 would hide, since its cell top is not the surface's.
+        let mut s = Screen::new(4, 2);
+        feed(&mut s, b"Ty\r\nTy");
+        let list = list_of(&s);
+        assert_eq!(
+            cells_runs(&list),
+            vec![
+                (0, M.baseline, "Ty".to_string()),
+                (0, M.h + M.baseline, "Ty".to_string()),
+            ],
+            "each run rides its own cell's baseline"
+        );
+        // A run's bounds is its cell band, padded: a box-drawing glyph fills its cell
+        // to the edge, so bounds measured from the ink box would shear its top row.
+        let pad_y = (M.size as i32 / 4).max(1);
+        let bounds: Vec<Rect> = list
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Cells { bounds, .. } => Some(*bounds),
+                _ => None,
+            })
+            .collect();
+        for (row, b) in bounds.iter().enumerate() {
+            let cell_top = row as i32 * M.h;
+            assert!(
+                b.y <= cell_top && b.y + b.h >= cell_top + M.h,
+                "row {row}: bounds {b:?} must cover the whole cell band, padded by {pad_y}"
+            );
+        }
     }
 
     #[test]

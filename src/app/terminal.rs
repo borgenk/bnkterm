@@ -1085,6 +1085,7 @@ mod tests {
         size: 16,
         w: 8,
         h: 16,
+        baseline: 12,
         ascent: 12,
         descent: 4,
     };
@@ -1112,6 +1113,7 @@ mod tests {
             size: 16,
             w: 8,
             h: 16,
+            baseline: 12,
             ascent: 12,
             descent: 4,
         };
@@ -1135,6 +1137,7 @@ mod tests {
             size: 16,
             w: 8,
             h: 16,
+            baseline: 12,
             ascent: 12,
             descent: 4,
         };
@@ -1189,6 +1192,7 @@ mod tests {
             size: 16,
             w: 8,
             h: 16,
+            baseline: 12,
             ascent: 12,
             descent: 4,
         };

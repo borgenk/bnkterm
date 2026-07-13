@@ -9,16 +9,26 @@
 //! (clamped into the config's `[min_width, max_width]`), left-aligned so a few
 //! tabs read as neat fixed blocks rather than stretching edge to edge, its label
 //! centered with the numeric index dropped. A label too long for its tab is cut
-//! from the *end* (the start stays put) and its trailing cells fade into the tab
-//! background instead of ending on an abrupt ellipsis. A one-pixel divider sits
-//! between two inactive tabs so equal blocks sharing the strip background stay
-//! separable.
+//! from the *end* (the start stays put) and its tail dissolves into the tab
+//! instead of ending on an abrupt ellipsis. A one-pixel divider sits between two
+//! inactive tabs so equal blocks sharing the strip background stay separable.
 //!
 //! ```text
 //!   pad │  tab 0   │  tab 1  │ tab 2 │            (strip background)          │
 //!       │ centered │ cente…  │       │  <- fade    <- slack past the last tab
 //!       └ divider between two inactive tabs; hidden beside the active block
 //! ```
+//!
+//! The dissolve is a ramp on the label's *ink* ([`Fade`], applied per pixel by the
+//! renderer), not a mix of its colour toward the tab background, and the difference
+//! is visible. A colour mix never arrives at the background, so it leaves a stain
+//! where the label was cut, and on a light tab (the active block) a dark stain is
+//! read as dirt rather than as a fade. Worse, the glyph anti-aliasing is weighted by
+//! each run's contrast with its background, so mixing a tail *toward* that
+//! background made it report a contrast it did not have: the faded glyphs kept
+//! roughly twice the anti-aliased ink of the solid ones and came out fat as well as
+//! muddy. Ramping ink leaves both the colour and the stroke weight alone and lands
+//! on exactly the tab background, whatever colour that is.
 
 use std::ops::Range;
 
@@ -26,7 +36,7 @@ use crate::config::{TabBarConfig, TabColors};
 use crate::platform::freetype::{FaceKey, FontStyle, Fonts};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
-use crate::render::display::{DisplayList, DrawCmd};
+use crate::render::display::{DisplayList, DrawCmd, Fade};
 use crate::term_render::{self, CellMetrics};
 
 /// One breathing-room column each side of a label, so text never butts against a
@@ -37,11 +47,15 @@ const SIDE_PAD: usize = 1;
 /// narrower tab spends every column on the label.
 const PAD_MIN_WIDTH: usize = 6;
 
-/// How many trailing grapheme clusters of a truncated label fade toward the tab
-/// background. The fade signals "there is more" in place of an ellipsis. Kept short
-/// and end-weighted (see the quadratic ramp in [`paint_label`]) so only the last
-/// glyph or so dissolves, rather than a long soft gradient across the whole tail.
-const FADE_CLUSTERS: usize = 2;
+/// How much of a truncated label's tail dissolves into the tab, in label cells. The
+/// fade signals "there is more" in place of an ellipsis, so it is kept short: about
+/// the last two glyphs go, not a long soft gradient across the whole tail.
+///
+/// A width, not a cluster count, because the ramp is per-pixel (the backend applies
+/// it in the fragment shader; see [`Fade`]) and so has no reason to quantize to
+/// glyph boundaries. Scaling with the cell width keeps it proportional to the label
+/// size rather than pinned to one font's idea of a pixel.
+const FADE_SPAN: f32 = 2.0;
 
 /// The device-pixel rectangle the strip occupies, plus the cell metrics and left
 /// inset its contents lay out against. Computed window-side (it depends on the
@@ -264,14 +278,16 @@ pub(crate) fn hit_test(slots: &[Slot], col: usize) -> Option<usize> {
 
 /// Fit `title` into `content_px` device pixels of the proportional interface face,
 /// center it (or, when it overflows, keep it flush-left and fade its tail), and emit
-/// the run(s). `content_left` is the block content's device x from the strip origin.
+/// the run. `content_left` is the block content's device x from the strip origin.
 ///
-/// A label that fits is one [`DrawCmd::Text`] run. A label that overflows is the
-/// solid prefix as one run plus one run per faded trailing cluster ([`FADE_CLUSTERS`]
-/// of them), each re-colored a quadratic step deeper toward the background so the
-/// last glyph all but dissolves in place of an ellipsis. Fitting measures glyph
-/// advances but allocates nothing beyond the pooled run strings, so a steady repaint
-/// stays allocation-free.
+/// Either way this is *one* [`DrawCmd::Text`]; an overflowing label differs only by
+/// carrying a [`Fade`], which ramps the run's ink to nothing across its last
+/// [`FADE_SPAN`] so the tail dissolves in place of an ellipsis. The label keeps its
+/// own foreground throughout, which is what keeps the dissolve honest: the ink lands
+/// on exactly the tab background (no stain on a light block), and the coverage gamma
+/// still reads the label's true contrast, so the tail's strokes weigh the same as
+/// the head's. Fitting measures glyph advances but allocates nothing beyond the one
+/// pooled run string, so a steady repaint stays allocation-free.
 #[allow(clippy::too_many_arguments)]
 fn paint_label(
     out: &mut DisplayList,
@@ -293,21 +309,16 @@ fn paint_label(
     // goes in (even overflowing a tiny tab), so a block never paints empty.
     let mut fitted_bytes = 0usize;
     let mut fitted_w = 0.0f32;
-    let mut count = 0usize;
     let mut truncated = false;
     for (offset, cluster) in grapheme::graphemes(title) {
         let advance = cluster_advance(fonts, face, cluster);
-        if count > 0 && fitted_w + advance > budget {
+        if fitted_bytes > 0 && fitted_w + advance > budget {
             truncated = true;
             break;
         }
         fitted_w += advance;
         fitted_bytes = offset + cluster.len();
-        count += 1;
     }
-    let fitted = &title[..fitted_bytes];
-    let fg = colors.fg.to_u32();
-    let bg = colors.bg.to_u32();
     // Center a label that fits; a truncated one has filled the span, so it sits flush
     // to the content's left edge.
     let start_x = if truncated {
@@ -315,75 +326,39 @@ fn paint_label(
     } else {
         content_left + ((budget - fitted_w) / 2.0).round() as i32
     };
-    if !truncated {
-        term_render::push_text_run(
-            out,
-            strings,
-            fitted,
-            start_x,
-            fitted_w.round() as i32,
-            baseline,
-            face,
-            fg,
-            bg,
-            lm,
-        );
-        return;
-    }
-
-    // The tail fades over the last `fade_n` clusters. Find where that tail begins
-    // (its byte offset and the x it starts at), so the solid prefix is one run.
-    let fade_n = FADE_CLUSTERS.min(count);
-    let prefix_clusters = count - fade_n;
-    let mut prefix_bytes = 0usize;
-    let mut prefix_w = 0.0f32;
-    for (index, (offset, cluster)) in grapheme::graphemes(fitted).enumerate() {
-        if index == prefix_clusters {
-            prefix_bytes = offset;
-            break;
+    let ink_w = fitted_w.round() as i32;
+    // The ramp ends on the last glyph's own right edge, not the block's: a title cut
+    // mid-cluster stops short of `content_px`, and a ramp reaching zero out in the
+    // empty gutter past it would leave the tail solid. Its start is clamped to the
+    // label's left edge, so a title too short to hold a full span dissolves across
+    // itself rather than beginning already half-gone.
+    let fade = truncated.then(|| {
+        let end = start_x + ink_w;
+        Fade {
+            from: (end - fade_span(lm)).max(start_x),
+            to: end,
         }
-        prefix_w += cluster_advance(fonts, face, cluster);
-    }
-    if prefix_clusters > 0 {
-        term_render::push_text_run(
-            out,
-            strings,
-            &fitted[..prefix_bytes],
-            start_x,
-            prefix_w.round() as i32,
-            baseline,
-            face,
-            fg,
-            bg,
-            lm,
-        );
-    }
-    // Each trailing cluster in its own run, a quadratic step deeper toward the
-    // background so the fade stays near full strength until the very end and then
-    // drops off fast: with two clusters the weights are 1/5 and 4/5 of the way to
-    // the background. `depth` counts from the end, so the last glyph is always the
-    // most faded even when only one cluster fades.
-    let denom = (FADE_CLUSTERS * FADE_CLUSTERS) as u16 + 1;
-    let mut x = prefix_w;
-    for (step, (offset, cluster)) in grapheme::graphemes(&fitted[prefix_bytes..]).enumerate() {
-        let advance = cluster_advance(fonts, face, cluster);
-        let depth = (FADE_CLUSTERS - (fade_n - 1 - step)) as u16;
-        let faded = colors.fg.mix(colors.bg, depth * depth, denom);
-        let start = prefix_bytes + offset;
-        term_render::push_text_run(
-            out,
-            strings,
-            &fitted[start..start + cluster.len()],
-            start_x + x.round() as i32,
-            advance.round() as i32,
-            baseline,
-            face,
-            faded.to_u32(),
-            bg,
-            lm,
-        );
-        x += advance;
-    }
+    });
+    term_render::push_text_run(
+        out,
+        strings,
+        &title[..fitted_bytes],
+        start_x,
+        ink_w,
+        baseline,
+        face,
+        colors.fg.to_u32(),
+        colors.bg.to_u32(),
+        fade,
+        lm,
+    );
+}
+
+/// The width of a truncated label's dissolving tail, in device pixels: [`FADE_SPAN`]
+/// label cells, floored at one pixel so the span is never empty (which the backend
+/// reads as "no fade", leaving a hard cut).
+fn fade_span(lm: CellMetrics) -> i32 {
+    ((FADE_SPAN * lm.w as f32).round() as i32).max(1)
 }
 
 /// The total advance of a grapheme cluster in `face`, summed over its characters
@@ -418,6 +393,7 @@ mod tests {
         size: 16,
         w: 8,
         h: 16,
+        baseline: 12,
         ascent: 12,
         descent: 4,
     };
@@ -585,8 +561,24 @@ mod tests {
         assert_eq!(runs[0].1, cfg.active.fg.to_u32());
     }
 
+    /// The `(x, bounds, fade)` of every emitted label run, in list order.
+    fn fades(out: &[DrawCmd]) -> Vec<(i32, Rect, Option<Fade>)> {
+        out.iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text {
+                    x,
+                    bounds,
+                    fade,
+                    face: FaceKey::Ui { .. },
+                    ..
+                } => Some((*x, *bounds, *fade)),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn a_long_title_truncates_from_the_end_with_a_faded_tail() {
+    fn a_long_title_truncates_from_the_end_and_its_tail_fades_to_nothing() {
         let cfg = TabBarConfig::default();
         let fonts = fonts();
         let title = "a-very-long-window-title-that-will-not-fit";
@@ -594,34 +586,78 @@ mod tests {
         let out = paint(&fonts, &slots, &cfg, 80, 0);
         let runs = text_runs(&out);
 
-        // A solid prefix plus one run per faded trailing cluster (FADE_CLUSTERS of
-        // them), so more than one run and the tail glyphs are singletons.
-        assert!(runs.len() >= 2, "prefix run plus per-cluster fade runs");
-        let painted: String = runs.iter().map(|(t, _, _)| t.as_str()).collect();
+        // One run, whatever the fade: the tail dissolves per pixel, so it needs no
+        // per-cluster runs to re-colour.
+        assert_eq!(runs.len(), 1, "a faded label is still one run");
+        let painted = &runs[0].0;
         assert!(
-            title.starts_with(&painted) && painted.len() < title.len(),
+            title.starts_with(painted) && painted.len() < title.len(),
             "the start is kept and the end dropped: {painted:?}"
         );
         assert!(!painted.contains('…'), "no ellipsis, a fade instead");
 
-        // The prefix keeps the full foreground; every trailing run is mixed toward
-        // the background, and the very last is the most faded (nearest the bg).
-        let fg = cfg.active.fg.to_u32();
-        let bg = cfg.active.bg.to_u32();
-        assert_eq!(runs[0].1, fg, "the prefix stays full strength");
-        assert!(
-            runs[1..].iter().all(|(_, c, _)| *c != fg),
-            "faded runs are re-colored toward the background"
+        // The label keeps its own foreground end to end. This is the load-bearing
+        // one: mixing the tail toward the background would both leave a stain on a
+        // light tab (the mix never arrives) and misreport the run's contrast to the
+        // coverage gamma, so the tail's strokes would weigh differently than the
+        // head's. The fade is ink, not colour.
+        assert_eq!(
+            runs[0].1,
+            cfg.active.fg.to_u32(),
+            "the whole run stays the label's foreground"
         );
-        let dist = |c: u32| {
-            let ch =
-                |s: u32, m: u32| ((c >> s) & 0xff).abs_diff((bg >> s) & 0xff) as i32 * m as i32;
-            ch(16, 1) + ch(8, 1) + ch(0, 1)
-        };
-        assert!(
-            dist(runs.last().unwrap().1) < dist(runs[1].1),
-            "the last glyph fades closest to the background"
+
+        let (x, _, fade) = fades(&out)[0];
+        let fade = fade.expect("a truncated label fades");
+        assert!(fade.to > fade.from, "a non-empty span, or the backend cuts");
+        assert!(fade.from > x, "a long label keeps a solid head");
+        assert_eq!(
+            fade.to - fade.from,
+            fade_span(CellMetrics::from_ui(&fonts, METRICS.size)),
+            "the tail dissolves over FADE_SPAN label cells"
         );
+    }
+
+    #[test]
+    fn a_fitting_label_does_not_fade() {
+        let cfg = TabBarConfig::default();
+        let fonts = fonts();
+        let out = paint(&fonts, &lay(80, &[label("hi", true)], &cfg), &cfg, 80, 0);
+        assert_eq!(fades(&out)[0].2, None, "an untruncated label is solid");
+    }
+
+    #[test]
+    fn the_ramp_stays_inside_the_label_however_narrow_the_tab() {
+        // The ramp must land on the label's own ink at both ends. If it began out in
+        // the left gutter the head would already be half-gone; if it reached zero out
+        // in the right gutter (a title cut mid-cluster stops short of the block edge)
+        // the tail would stay solid and the cut would be hard. Neither may happen at
+        // any tab width, down to a single cell, whatever the label font measures: a
+        // label too short to hold a full span dissolves across the whole of itself.
+        let fonts = fonts();
+        let span = fade_span(CellMetrics::from_ui(&fonts, METRICS.size));
+        for width in 1..=12usize {
+            let cfg = TabBarConfig {
+                min_width: width,
+                max_width: width,
+                ..TabBarConfig::default()
+            };
+            let slots = lay(width, &[label("a-title-far-too-long-to-fit", true)], &cfg);
+            let (x, bounds, fade) = fades(&paint(&fonts, &slots, &cfg, width, 0))[0];
+            let fade = fade.expect("the title truncates at every one of these widths");
+            assert!(fade.to > fade.from, "{width}: a non-empty span");
+            assert!(fade.from >= x, "{width}: the ramp starts inside the label");
+            assert!(
+                fade.to > x && fade.to <= bounds.x + bounds.w,
+                "{width}: the ramp reaches zero on the ink, not past it"
+            );
+            let expected = if fade.to - x <= span {
+                x
+            } else {
+                fade.to - span
+            };
+            assert_eq!(fade.from, expected, "{width}: clamped to the left edge");
+        }
     }
 
     #[test]
@@ -717,6 +753,7 @@ mod tests {
             size: METRICS.size,
             w: 8,
             h: 20,
+            baseline: 16,
             ascent: 12,
             descent: 4,
         };

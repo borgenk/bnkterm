@@ -872,19 +872,16 @@ impl Gpu {
                 (f.cmd_set_scissor)(img.cmd, 0, 1, &scissor);
                 let offset = 0u64;
                 (f.cmd_bind_vertex_buffers)(img.cmd, 0, 1, &img.vertices.buf, &offset);
-                // Viewport (vertex) then glyph mask gamma (fragment), packed at the
-                // offsets the shaders' shared push block names.
-                let push: [f32; 3] = [
-                    img.width as f32,
-                    img.height as f32,
-                    self.renderer.glyph_coverage_gamma,
-                ];
+                // The viewport, the only push constant: the vertex stage maps pixel
+                // coordinates to clip space with it. The coverage exponent that used
+                // to ride along here is now per run, in the vertex data (gpu.rs).
+                let push: [f32; 2] = [img.width as f32, img.height as f32];
                 (f.cmd_push_constants)(
                     img.cmd,
                     self.renderer.pipeline_layout,
                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                     0,
-                    12,
+                    8,
                     push.as_ptr().cast(),
                 );
                 // The atlas set (set 0) is the only descriptor set now; bind it

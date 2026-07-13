@@ -222,7 +222,7 @@ pub(crate) fn paint_overlay(
         let line_cols = cells_wide(line) as i32;
         let offset = (content_cols - line_cols) / 2 * metrics.w;
         let x = x0 + pad_x + offset;
-        let baseline = y0 + pad_y + index as i32 * metrics.h + metrics.ascent;
+        let baseline = y0 + pad_y + index as i32 * metrics.h + metrics.baseline;
         term_render::push_cell_text(
             out,
             strings,
@@ -253,6 +253,7 @@ mod tests {
         size: 16,
         w: 8,
         h: 16,
+        baseline: 12,
         ascent: 12,
         descent: 4,
     };

@@ -348,13 +348,65 @@ impl Glyph {
 /// Render-ready line metrics for a face at its current pixel size, rounded to
 /// whole pixels. Ascent and descent are both positive glyph metrics (pixels
 /// above and below the baseline); `line_height` is the baseline-to-baseline
-/// distance and may exceed ascent + descent, the surplus being leading that
-/// falls below the line (so text is top-aligned in a taller line box).
+/// distance and may exceed ascent + descent.
+///
+/// # Where the baseline sits in the line box
+///
+/// `baseline` is the one number a renderer needs: pixels from the *top of the
+/// line box* down to the baseline. It is not the ascent, and reaching for the
+/// ascent instead is the classic way to misalign text.
+///
+/// The surplus (`line_height - ascent - descent`) is the font's line gap, and
+/// where it goes decides where the ink sits in the cell:
+///
+/// ```text
+///   line box              ascent-anchored (wrong)      baseline = h - descent
+///   ┌───────────────┐     ┌───────────────┐            ┌───────────────┐
+///   │               │     │ ┬─┬ ┬  ┬      │ ← ink      │               │ ← gap
+///   │               │     │  │  └┬─┘      │            │ ┬─┬ ┬  ┬      │
+///   │               │     │  │   ┌┘  base │            │  │  └┬─┘      │
+///   │               │     ├──┴───┴────────┤ ← line     │  │   ┌┘  base │
+///   │               │     │               │   gap      ├──┴───┴────────┤
+///   └───────────────┘     └───────────────┘   dumped   └───────────────┘
+///                                             below
+/// ```
+///
+/// A font's line gap is *external leading*: space between one line's descent and
+/// the next line's ascent. In a terminal, adjacent rows share an edge, so all of
+/// it belongs above the ascent, seating the descent on the cell bottom. Do the
+/// naive thing (baseline = ascent) and the gap piles up under the text instead:
+/// a `T` hugs the cell top while a `y` floats well clear of the bottom, and every
+/// accented capital pokes out of the top of its cell. Consolas asks for a 17%-of-em
+/// gap, so this is a visible 2-3px, not a rounding curiosity. wezterm and Alacritty
+/// seat the baseline the same way.
+///
+/// Leading a *caller* adds on top of the font's own line height (see
+/// [`Fonts::with_config`]) is a different thing: that one is split evenly, so text
+/// stays centered in the taller line box rather than sinking to its floor.
 #[derive(Clone, Copy, Debug)]
 pub struct Metrics {
     pub ascent: i32,
     pub descent: i32,
     pub line_height: i32,
+    /// Pixels from the top of the line box down to the baseline.
+    pub baseline: i32,
+}
+
+impl Metrics {
+    /// The same metrics in a line box grown to at least `target` pixels, the extra
+    /// split evenly above and below so the text stays centered in it. A `target`
+    /// the line box already meets changes nothing.
+    fn grown_to(self, target: i32) -> Self {
+        let extra = target - self.line_height;
+        if extra <= 0 {
+            return self;
+        }
+        Metrics {
+            line_height: target,
+            baseline: self.baseline + extra / 2,
+            ..self
+        }
+    }
 }
 
 /// Owns the FreeType library, the face, and the font-file bytes the face
@@ -727,6 +779,9 @@ impl Face {
     /// the height it reports, so a font can hand back a baseline-to-baseline
     /// height a pixel below the rounded ascent + descent (Noto Sans does at some
     /// sizes). Taking the max keeps the line box honest for any font.
+    ///
+    /// The baseline seats the descent on the line box's bottom edge, which puts
+    /// the font's line gap above the ascent where it belongs; see [`Metrics`].
     pub fn metrics(&self) -> Metrics {
         let (ascent, descent) = self.line_metrics();
         let ascent = ascent.ceil() as i32;
@@ -736,6 +791,7 @@ impl Face {
             ascent,
             descent,
             line_height,
+            baseline: line_height - descent,
         }
     }
 }
@@ -842,12 +898,13 @@ impl Fonts {
                 continue;
             }
             let regular = open_face(&family.regular, size, emoji.as_ref())?;
-            let mut metrics = regular.metrics();
             // Grow the line box to the requested multiple of the size, keeping
             // the font's own line height as the floor so lines never overlap.
-            // Ascent and descent stay the glyph metrics; the extra sits below.
+            // Ascent and descent stay the glyph metrics; the extra is leading the
+            // caller asked for, so it splits evenly and the baseline moves down
+            // half of it (see `Metrics`).
             let target = (line_height_scale * size as f32).round() as i32;
-            metrics.line_height = metrics.line_height.max(target);
+            let metrics = regular.metrics().grown_to(target);
             // Fallback faces draw only scalars the primary lacks and never route
             // emoji clusters themselves, so they carry no emoji font.
             //
@@ -1065,6 +1122,71 @@ mod tests {
 
     fn open() -> Face {
         Face::open_default(16).expect("a default font should be available")
+    }
+
+    #[test]
+    fn the_baseline_seats_the_descent_on_the_line_box_floor() {
+        for size in [12u32, 13, 16, 20, 26] {
+            let face = Face::open_default(size).expect("a default font");
+            let m = face.metrics();
+            assert_eq!(
+                m.baseline,
+                m.line_height - m.descent,
+                "the font's line gap belongs above the ascent, not under the text"
+            );
+            assert!(
+                m.baseline >= m.ascent,
+                "size {size}: the baseline never sits above the ascent"
+            );
+        }
+    }
+
+    #[test]
+    fn ascii_ink_lands_inside_its_line_box_at_every_size() {
+        // What the rule buys, and the regression that would take it away. Seated on
+        // the baseline, the printable ASCII a terminal actually draws fits its line
+        // box top and bottom, at every size, on all four candidate monospace faces.
+        // Seat it on the ascent instead (the old rule) and the tall thin glyphs go
+        // negative: Consolas' `|` reaches 13px over the baseline at 16px against an
+        // ascent of 12, so it bleeds a pixel into the row above.
+        //
+        // Ink *balance* is deliberately not asserted: how much air a face leaves over
+        // its capitals is the face's business (Noto Sans Mono reserves 10px more than
+        // Consolas does), and pinning it here would test the font, not the rule.
+        for size in 10u32..=40 {
+            let face = Face::open_default(size).expect("a default font");
+            let m = face.metrics();
+            for ch in '!'..='~' {
+                let g = face.rasterize(ch);
+                if g.rows == 0 {
+                    continue;
+                }
+                let (top, bottom) = (m.baseline - g.top, m.baseline - g.top + g.rows as i32);
+                assert!(
+                    top >= 0 && bottom <= m.line_height,
+                    "size {size}: '{ch}' ink spans {top}..{bottom}, outside the 0..{} line box",
+                    m.line_height
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn caller_leading_splits_evenly_around_the_text() {
+        let face = Face::open_default(16).expect("a default font");
+        let m = face.metrics();
+        let taller = m.grown_to(m.line_height + 4);
+        assert_eq!(taller.line_height, m.line_height + 4);
+        assert_eq!(
+            taller.baseline,
+            m.baseline + 2,
+            "leading a caller asks for is split above and below, not stacked on one side"
+        );
+        assert_eq!(
+            m.grown_to(m.line_height - 1).line_height,
+            m.line_height,
+            "the font's own line height is the floor"
+        );
     }
 
     #[test]

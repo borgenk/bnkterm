@@ -25,7 +25,7 @@
 //! This module is a pure function of `(char, cell_w, cell_h)` and nothing else:
 //! it returns a top-down `cell_w * cell_h` R8 coverage buffer, the same shape a
 //! FreeType raster hands the atlas. The GPU batcher packs it into the coverage
-//! atlas and places it at `left = 0, top = ascent` so it fills the cell box
+//! atlas and places it at `left = 0, top = baseline` so it fills the cell box
 //! exactly. Keying the raster on the cell size (which the [`crate::render::gpu`]
 //! batcher derives from the same metrics the grid lays out on) is what makes the
 //! glyph land pixel-for-pixel on its cell. No GPU, PTY, or font is needed to test

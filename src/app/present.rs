@@ -127,6 +127,10 @@ pub(super) struct GpuPresentation {
     pub(super) images: Vec<vulkan::GpuImage>,
     pub(super) modifiers: Vec<u64>,
     pub(super) glyphs: gpu::GlyphCache,
+    /// The coverage-gamma dials, resolved from the environment once at startup: the
+    /// batcher turns them into each run's exponent, so they are read here rather than
+    /// per frame.
+    pub(super) text_gamma: gpu::TextGamma,
     pub(super) syncobj_manager: Option<u32>,
     pub(super) explicit_sync: Option<ExplicitSync>,
     pub(super) buffers: [u32; 2],
@@ -155,6 +159,7 @@ impl GpuPresentation {
             images: Vec::new(),
             modifiers: Vec::new(),
             glyphs: gpu::GlyphCache::new(),
+            text_gamma: crate::app::config_text_gamma(),
             syncobj_manager: None,
             explicit_sync: None,
             buffers: [0, 0],
@@ -189,7 +194,7 @@ impl State {
         if compositor_mods.is_empty() {
             return Err(Error::msg("compositor does not accept XRGB8888 dmabufs"));
         }
-        let gpu = vulkan::Gpu::new(main_device, crate::app::config_text_gamma())?;
+        let gpu = vulkan::Gpu::new(main_device)?;
         let mods = gpu.image_modifiers(&compositor_mods);
         if mods.is_empty() {
             return Err(Error::msg(
@@ -494,6 +499,7 @@ impl State {
             &self.fonts,
             self.presentation.lists.back(),
             &mut self.presentation.glyphs,
+            self.presentation.text_gamma,
             &mut self.presentation.frame_scratch,
         );
         // Render, returning the render-done fence under explicit sync (`None` on
@@ -697,7 +703,7 @@ impl State {
             return Ok(());
         }
         let main_device = fb.main_device;
-        let gpu = match vulkan::Gpu::new(main_device, crate::app::config_text_gamma()) {
+        let gpu = match vulkan::Gpu::new(main_device) {
             Ok(gpu) => gpu,
             Err(e) => {
                 println!("gpu-probe: vulkan unavailable: {e}");

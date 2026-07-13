@@ -61,6 +61,7 @@ use crate::platform::protocol::{
 use crate::platform::wire::{Arg, Message, Reader};
 use crate::platform::xkb::Xkb;
 use crate::pty;
+use crate::render::gpu::TextGamma;
 use crate::term_render::CellMetrics;
 
 /// The default font size in points. Converted to device pixels at the display's
@@ -76,12 +77,28 @@ const FONT_SIZE_RANGE: std::ops::RangeInclusive<u32> = 6..=72;
 /// scale is unknown until the compositor reports it, so the window opens at unity.
 const SCALE_120_UNITY: u32 = 120;
 
-/// The default glyph mask gamma: the power the fragment shader raises coverage to.
-/// Linear-light compositing renders light-on-dark text heavier than the gamma-space
-/// stacks most GPU terminals use, so a value > 1 thins the anti-aliased edges back
-/// to a matching weight. 2.0 is the default; `BNKTERM_TEXT_GAMMA`
-/// tunes it (1.0 disables the correction, the old heavier look).
-const TEXT_GAMMA: f32 = 2.0;
+/// The default glyph coverage gammas: how hard to correct the two *opposite*
+/// artifacts linear-light compositing inflicts on anti-aliased text. They are
+/// separate dials because they correct opposite errors, and nothing says the two
+/// need the same magnitude; folding them into one number is a trap, because it
+/// makes "lighter correction" mean *bolder* in one direction and *thinner* in the
+/// other. Both reach `1.0` for "no correction at all".
+///
+/// - `light_on_dark` thins **light-on-dark** text (the usual terminal case), which
+///   linear-light compositing renders heavier than the gamma-space stacks most
+///   terminals use. `> 1` thins; `BNKTERM_TEXT_GAMMA` tunes it.
+/// - `dark_on_light` thickens **dark-on-light** text (a reverse-video highlight, a
+///   light theme, the active tab's dark label on its light block), which the same
+///   compositing washes out instead. Its strength scales with the run's contrast, so
+///   it is a `> 1` base raised to a negative power;
+///   `BNKTERM_TEXT_GAMMA_DARK_ON_LIGHT` tunes it.
+///
+/// These are the shipping values, before any environment override; the perf gate
+/// uses them directly so its numbers never depend on the environment.
+pub(crate) const TEXT_GAMMA: TextGamma = TextGamma {
+    light_on_dark: 1.5,
+    dark_on_light: 2.0,
+};
 
 /// The grid the window opens at, before the compositor sends a size. Classic
 /// 80x24; the surface then resizes to whatever the compositor grants.
@@ -1751,16 +1768,22 @@ fn font_sizes(body: u32, label: u32) -> Vec<u32> {
     }
 }
 
-/// The glyph coverage gamma (see [`TEXT_GAMMA`]), overridable with
-/// `BNKTERM_TEXT_GAMMA` and clamped to a sane range so a bad value cannot make
-/// text vanish.
-fn config_text_gamma() -> f32 {
-    std::env::var("BNKTERM_TEXT_GAMMA")
-        .ok()
-        .and_then(|v| v.trim().parse::<f32>().ok())
-        .filter(|g| g.is_finite() && *g > 0.0)
-        .unwrap_or(TEXT_GAMMA)
-        .clamp(0.5, 4.0)
+/// The glyph coverage gammas (see [`TEXT_GAMMA`]), each overridable by its own
+/// environment variable and clamped to a sane range so a bad value cannot make text
+/// vanish.
+fn config_text_gamma() -> TextGamma {
+    fn dial(var: &str, default: f32) -> f32 {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|g| g.is_finite() && *g > 0.0)
+            .unwrap_or(default)
+            .clamp(0.5, 4.0)
+    }
+    TextGamma {
+        light_on_dark: dial("BNKTERM_TEXT_GAMMA", TEXT_GAMMA.light_on_dark),
+        dark_on_light: dial("BNKTERM_TEXT_GAMMA_DARK_ON_LIGHT", TEXT_GAMMA.dark_on_light),
+    }
 }
 
 /// Launch a Ctrl+clicked hyperlink in whatever the desktop has set as its handler.

@@ -96,7 +96,7 @@ impl Gpu {
     /// compositor's dmabuf feedback): load the loader, create an instance, pick
     /// the physical device matching that DRM identity, and create a one-queue
     /// logical device with the dmabuf presentation extensions.
-    pub fn new(main_device: u64, glyph_coverage_gamma: f32) -> Result<Self> {
+    pub fn new(main_device: u64) -> Result<Self> {
         let lib = DynLib::open(c"libvulkan.so.1")?;
         let gipa_ptr = lib
             .sym(c"vkGetInstanceProcAddr")
@@ -174,7 +174,7 @@ impl Gpu {
             "vkCreateCommandPool",
         )?;
 
-        let renderer = match create_renderer(&fns, device.raw, glyph_coverage_gamma) {
+        let renderer = match create_renderer(&fns, device.raw) {
             Ok(r) => r,
             Err(e) => {
                 // SAFETY: pool is live and nothing was ever submitted.

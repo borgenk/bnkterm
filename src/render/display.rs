@@ -45,6 +45,29 @@ pub enum RoundedCorners {
     Both,
 }
 
+/// The horizontal span over which a [`DrawCmd::Text`] run's ink ramps away to
+/// nothing, in screen pixels: full ink at [`from`](Self::from) and to the left of
+/// it, none at [`to`](Self::to) and beyond. The tab bar's only use of it is a
+/// truncated label, whose tail dissolves in place of an ellipsis.
+///
+/// The fade is *ink*, not colour, and that distinction is the whole point. Mixing
+/// the foreground toward the background instead would leave two bruises. It never
+/// reaches the background, so a dark label on a light tab keeps a visible stain
+/// where it was cut; and the glyph's anti-aliasing is weighted by its contrast
+/// with the background (see [`crate::render::gpu::build_frame`]), so a run whose
+/// colour has been mixed *toward* that background reports a contrast it does not
+/// have and drifts to a different stroke weight than the rest of its own label.
+/// Scaling coverage leaves both the colour and the weight alone and lands on
+/// exactly zero, on any background.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Fade {
+    /// Where the ramp starts; the run is at full ink here and everywhere left of it.
+    pub from: i32,
+    /// Where the ramp reaches zero ink. Must be `> from`; an empty or inverted span
+    /// is treated by the backend as "no fade".
+    pub to: i32,
+}
+
 /// One drawing primitive in screen (post-scroll) pixels. The set is deliberately
 /// small and low level so a future GPU backend can execute the same list; the
 /// painter decomposes higher-level chrome (an image's selection border, a button)
@@ -75,6 +98,10 @@ pub enum DrawCmd {
         /// the glyph anti-aliasing for its contrast direction (dark-on-light text is
         /// thickened, light-on-dark thinned; see [`crate::render::gpu`]).
         bg: u32,
+        /// Ramp this run's ink away over a span of `x`, or `None` to draw it solid.
+        /// Only chrome fades (a truncated tab label); grid text never does, which is
+        /// why [`Cells`](DrawCmd::Cells) carries no such field.
+        fade: Option<Fade>,
         text: String,
     },
     /// A run of monospace cells drawn at a fixed pitch: the `i`th grapheme

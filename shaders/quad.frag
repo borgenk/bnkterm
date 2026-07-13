@@ -15,11 +15,9 @@ layout(set = 0, binding = 1) uniform sampler2D emoji_atlas;
 
 layout(location = 0) out vec4 out_color;
 
-// Shared with the vertex stage (which reads viewport). The fragment stage reads
-// only the glyph mask gamma; both members sit at the offsets the CPU packs.
+// Shared with the vertex stage, which is the only stage that reads it.
 layout(push_constant) uniform Push {
     vec2 viewport;
-    float glyph_coverage_gamma;
 } push;
 
 // sRGB to linear. Vertex colours and the emoji atlas carry sRGB-encoded bytes
@@ -31,6 +29,22 @@ vec3 srgb_to_linear(vec3 c) {
     vec3 lo = c / 12.92;
     vec3 hs = pow((c + 0.055) / 1.055, vec3(2.4));
     return mix(lo, hs, hi);
+}
+
+// A text run may ramp its ink away across a span of screen x (v_extra.yz, from
+// full ink to none; see display.rs Fade) so a truncated tab label dissolves in
+// place of an ellipsis. Scaling alpha, rather than mixing the colour toward the
+// background, is what lets the tail reach *exactly* the background on any tab
+// colour, and it leaves v_extra.x (the contrast the coverage gamma is weighted
+// against) intact, so a label's stroke weight does not drift along its own tail.
+//
+// smoothstep leaves the ramp flat at both ends, so the fade neither begins on a
+// visible seam nor stops short of zero. An empty span (z <= y) means "no fade".
+float ink_ramp() {
+    if (v_extra.z <= v_extra.y) {
+        return 1.0;
+    }
+    return 1.0 - smoothstep(v_extra.y, v_extra.z, gl_FragCoord.x);
 }
 
 // Replicates render.rs corner_coverage: full coverage everywhere except
@@ -59,21 +73,17 @@ void main() {
     if (v_mode == 0u) {
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a);
     } else if (v_mode == 1u) {
-        // Mask gamma thins the anti-aliased edges: linear-light compositing is
-        // physically correct but renders light-on-dark text heavier than the
-        // gamma-space stacks beside it, so raising coverage to a power > 1 lowers
-        // partial-coverage alpha back to a matching weight. v_extra.x steers that
-        // power per run by contrast direction (gpu.rs contrast_factor): the exponent
-        // is G^factor, so factor 1 keeps the tuned light-on-dark thinning, while dark
-        // text on a light background (factor < 1, down to G^-1) is thickened back
-        // from the washout the same compositing gives it. Solid pixels (coverage 1)
-        // are unchanged, so colour fills keep full strength.
-        float exponent = pow(push.glyph_coverage_gamma, v_extra.x);
-        float cov = pow(texelFetch(glyph_atlas, ivec2(v_uv), 0).r, exponent);
-        out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
+        // v_extra.x is the run's coverage exponent, computed once per run on the CPU
+        // (gpu.rs coverage_exponent) rather than per pixel here: linear-light
+        // compositing renders light-on-dark text too heavy and dark-on-light text too
+        // washed out, so a power > 1 thins the anti-aliased edges and a power < 1
+        // thickens them. Solid pixels (coverage 1) are unchanged either way, so
+        // colour fills keep full strength.
+        float cov = pow(texelFetch(glyph_atlas, ivec2(v_uv), 0).r, v_extra.x);
+        out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov * ink_ramp());
     } else if (v_mode == 2u) {
         vec4 e = texelFetch(emoji_atlas, ivec2(v_uv), 0);
-        out_color = vec4(srgb_to_linear(e.rgb), e.a);
+        out_color = vec4(srgb_to_linear(e.rgb), e.a * ink_ramp());
     } else {
         float cov = round_coverage(v_uv, v_extra.xy, v_extra.z, uint(v_extra.w));
         out_color = vec4(srgb_to_linear(v_color.rgb), v_color.a * cov);
