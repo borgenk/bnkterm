@@ -26,6 +26,7 @@ use crate::config::TabBarConfig;
 use crate::error::Result;
 use crate::gather::GatherEnd;
 use crate::platform::freetype::Fonts;
+use crate::platform::geom::Scale;
 use crate::pty::ZombieChild;
 use crate::render::display::DisplayList;
 use crate::tab_bar::{self, BarGeom, Slot, TabLabel};
@@ -271,6 +272,7 @@ impl Tabs {
         origin_y: i32,
         bar_y: i32,
         bar_h: i32,
+        scale: Scale,
     ) -> Result<()> {
         for entry in &mut self.entries {
             entry.core.apply(ToTerminal::Resize {
@@ -281,6 +283,7 @@ impl Tabs {
                 metrics,
                 pad,
                 origin_y,
+                scale,
             })?;
             debug_assert_eq!(entry.core.dimensions(), (cols, rows));
         }
@@ -386,6 +389,30 @@ impl Tabs {
         self.entries
             .get(self.active)
             .and_then(|entry| entry.core.blink_deadline())
+    }
+
+    /// Carry the visible tab's scrollbar forward a frame. A hidden tab's bar is frozen
+    /// wherever it was: nothing is showing it, and it will be ticked (or hidden, if its
+    /// history has gone) on the frame that brings it back.
+    pub(super) fn tick_scrollbar(&mut self) {
+        if let Some(entry) = self.entries.get_mut(self.active) {
+            entry.core.tick_scrollbar();
+        }
+    }
+
+    /// The visible scrollbar's next fade deadline.
+    pub(super) fn scrollbar_retry_at(&self) -> Option<Instant> {
+        self.entries
+            .get(self.active)
+            .and_then(|entry| entry.core.scrollbar_retry_at())
+    }
+
+    /// Whether the visible scrollbar is mid-fade, so the next compositor frame should
+    /// carry it on.
+    pub(super) fn scrollbar_animating(&self) -> bool {
+        self.entries
+            .get(self.active)
+            .is_some_and(|entry| entry.core.scrollbar_animating())
     }
 
     /// Whether the visible terminal has a hyperlink under the pointer, so the window
@@ -674,8 +701,20 @@ mod tests {
     #[test]
     fn resize_updates_every_core() {
         let mut tabs = demo_tabs(3);
-        tabs.resize_all(100, 30, 800, 480, METRICS, METRICS, 0, 16, 0, 16)
-            .expect("resize every demo core");
+        tabs.resize_all(
+            100,
+            30,
+            800,
+            480,
+            METRICS,
+            METRICS,
+            0,
+            16,
+            0,
+            16,
+            Scale::ONE,
+        )
+        .expect("resize every demo core");
         assert!(tabs
             .entries
             .iter()
@@ -687,7 +726,7 @@ mod tests {
     fn bar_hit_testing_maps_to_stable_ids() {
         let mut tabs = demo_tabs(2);
         let ids: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
-        tabs.resize_all(20, 10, 160, 176, METRICS, METRICS, 0, 16, 0, 16)
+        tabs.resize_all(20, 10, 160, 176, METRICS, METRICS, 0, 16, 0, 16, Scale::ONE)
             .expect("build bar layout");
 
         // Two tabs in 20 cols land at the floor width of 10 each: 0..10, 10..20.
@@ -714,7 +753,17 @@ mod tests {
         // A top-anchored one-cell strip: grid origin drops one cell, strip at y 0.
         let mut two = demo_tabs(2);
         two.resize_all(
-            80, 23, 640, 384, METRICS, METRICS, 0, METRICS.h, 0, METRICS.h,
+            80,
+            23,
+            640,
+            384,
+            METRICS,
+            METRICS,
+            0,
+            METRICS.h,
+            0,
+            METRICS.h,
+            Scale::ONE,
         )
         .expect("shift both grids below the bar");
         let mut two_list = Vec::new();
@@ -749,7 +798,17 @@ mod tests {
         let mut two = demo_tabs(2);
         let ids: Vec<_> = two.entries.iter().map(|entry| entry.id).collect();
         two.resize_all(
-            80, 23, 640, 384, METRICS, METRICS, 0, METRICS.h, 0, METRICS.h,
+            80,
+            23,
+            640,
+            384,
+            METRICS,
+            METRICS,
+            0,
+            METRICS.h,
+            0,
+            METRICS.h,
+            Scale::ONE,
         )
         .expect("build the bar");
         // The runtime path makes the newly opened tab active and tab zero inactive.

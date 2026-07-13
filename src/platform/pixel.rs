@@ -20,6 +20,26 @@ pub(crate) fn premultiplied_over(src: u32, dst: u32) -> u32 {
     (ch(24) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
+/// `ink` laid over the opaque surface `behind` at coverage `a` in 0..=1, as an
+/// opaque `0x00RRGGBB`.
+///
+/// The display list draws only opaque fills (see [`crate::render::gpu`], which reads
+/// a command's colour as `0x00RRGGBB` and hands the GPU an alpha of 1), so chrome that
+/// wants to read as translucent cannot ask the backend to blend it. It blends itself
+/// instead, against the surface it is known to sit on, and a fade is that coverage
+/// falling to zero.
+pub(crate) fn tint(behind: u32, ink: u32, a: f32) -> u32 {
+    let a = a.clamp(0.0, 1.0);
+    let ch = |shift: u32| {
+        let (b, i) = (
+            ((behind >> shift) & 0xff) as f32,
+            ((ink >> shift) & 0xff) as f32,
+        );
+        ((b + (i - b) * a).round() as u32).min(0xff) << shift
+    };
+    ch(16) | ch(8) | ch(0)
+}
+
 /// Straight-alpha `0xAARRGGBB` from a premultiplied pixel, for the blitter,
 /// which blends straight colors by coverage. Fully transparent maps to zero.
 pub(crate) fn straight_from_premultiplied(px: u32) -> u32 {
@@ -228,6 +248,19 @@ mod tests {
         assert_eq!(out >> 24, 0xff, "alpha saturates over an opaque ground");
         assert_eq!((out >> 16) & 0xff, 0x80, "red comes from the source");
         assert_eq!(out & 0xff, 0x7f, "blue is the ground's remainder");
+    }
+
+    #[test]
+    fn tint_fades_between_the_surface_and_the_ink() {
+        let (bg, ink) = (0x0000_0000, 0x00ff_ffff);
+        assert_eq!(tint(bg, ink, 0.0), bg, "no coverage leaves the surface");
+        assert_eq!(tint(bg, ink, 1.0), ink, "full coverage is the ink");
+        assert_eq!(tint(bg, ink, 0.5), 0x0080_8080);
+        // Out-of-range coverage clamps rather than wrapping a channel.
+        assert_eq!(tint(bg, ink, -1.0), bg);
+        assert_eq!(tint(bg, ink, 2.0), ink);
+        // Per channel, and never leaking into the (unused) alpha byte.
+        assert_eq!(tint(0x0020_4060, 0x0060_4020, 0.5), 0x0040_4040);
     }
 
     #[test]

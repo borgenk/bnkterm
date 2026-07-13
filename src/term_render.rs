@@ -62,9 +62,11 @@
 use crate::color::{Ground, Rgb, Theme};
 use crate::grid::{AbsRow, Attrs, Cell, RowEpoch, Screen};
 use crate::platform::freetype::{FaceKey, FontStyle, Fonts};
-use crate::platform::geom::Rect;
+use crate::platform::geom::{Rect, Scale};
 use crate::platform::grapheme;
-use crate::render::display::{DisplayList, DrawCmd, Fade};
+use crate::platform::pixel;
+use crate::platform::scroll::{self, Scrollbar};
+use crate::render::display::{DisplayList, DrawCmd, Fade, RoundedCorners};
 
 /// The glyph whose advance defines the monospace cell width. `M` is the classic
 /// full-width reference; on a genuine monospace face every glyph shares it.
@@ -77,11 +79,36 @@ const SELECTION_BG: Rgb = Rgb::new(0x41, 0x57, 0x76);
 /// The width of a bar (`DECSCUSR 5/6`) cursor, in pixels.
 const BAR_CURSOR_WIDTH: i32 = 2;
 
-/// The scroll-position indicator drawn on the right edge while viewing history:
-/// its width in pixels and its colour (a soft steel grey, dim so it never fights
-/// the text).
-const SCROLL_INDICATOR_WIDTH: i32 = 4;
-const SCROLL_INDICATOR_COLOR: u32 = 0x0055_6070;
+/// The overlay scrollbar down the grid's right edge, in *logical* pixels (they pass
+/// through [`Scale::px`], so they come out the same physical size at any DPI).
+///
+/// The bar rests as a thin indicator and grows to [`SCROLL_WIDE`] when the pointer
+/// enters its zone: [`SCROLL_NEAR`] of slack to the left of the lane, so it meets the
+/// pointer before the pointer has to aim. The thumb is right-aligned in the lane and
+/// grows leftward, staying anchored to the window edge, which is where a maximized
+/// window's pointer lands.
+///
+/// The window padding is thinner than the bar and there is no text margin for the
+/// slider to hide in, so the expanded slider laps over the last column. That is the price
+/// of an *overlay*: reserving a gutter would cost a column and reflow the child on every
+/// appearance. The bar is only that wide while the pointer is on it, and only visible at
+/// all while there is history to scroll.
+const SCROLL_THIN: i32 = 4;
+const SCROLL_WIDE: i32 = 10;
+const SCROLL_NEAR: i32 = 24;
+/// Gap between the lane and the window's right edge.
+const SCROLL_INSET: i32 = 3;
+/// Shortest the thumb gets, so even a 100k-line scrollback leaves something to grab.
+const SCROLL_MIN_THUMB: i32 = 30;
+
+/// The bar's ink, and the coverages it is tinted onto the theme background at: the
+/// resting thumb, the thumb once the pointer has lifted it, and the trough behind it.
+/// The fade is these falling to zero (the display list has no alpha; see
+/// [`crate::platform::pixel::tint`]).
+const SCROLL_INK: u32 = 0x00cf_d8e3;
+const SCROLL_THUMB_COVER: f32 = 0.20;
+const SCROLL_THUMB_HOVER_COVER: f32 = 0.36;
+const SCROLL_TROUGH_COVER: f32 = 0.05;
 
 /// Fixed monospace cell metrics in whole pixels: the pitch the entire grid is
 /// laid out on. `size` is the pixel size the faces were opened at, carried so the
@@ -248,6 +275,86 @@ pub struct FrameInputs<'a> {
     /// The hyperlink under the pointer, which paints underlined. The app finds it
     /// (the grid holds the text); the painter only draws it.
     pub hover: Option<CellSpan>,
+    /// The display scale, so the scrollbar's logical pixel constants land at the right
+    /// device size. [`Scale::ONE`] in a test or a headless build.
+    pub scale: Scale,
+    /// The overlay scrollbar, as lit and as wide as its last tick left it. The bar
+    /// carries no geometry: the painter derives that from the grid and the screen's
+    /// [`Screen::scroll_extent`] each frame.
+    pub scrollbar: &'a Scrollbar,
+}
+
+/// The three rectangles the overlay scrollbar owns down the right edge of the grid: the
+/// lane its thumb travels, the band a press grabs it in, and the zone whose pointer
+/// wakes it into a full slider. Shared by the painter and the window's pointer
+/// hit-testing, so the bar is grabbable exactly where it is drawn.
+///
+/// ```text
+///                     window's right edge ─┐
+///     │        zone            │  grab  │  │
+///     │                        │ track  │  │
+///     ├────────────────────────┼────────┤  │
+///     │  ....................  │  ███   │  │  ← thumb, right-aligned in the track
+/// ```
+pub struct ScrollLane {
+    /// The thumb's lane: the full height of the grid, inset from the window's right edge.
+    pub track: Rect,
+    /// Where a press takes the bar: the lane plus the inset out to the window's edge, so
+    /// a click at the very edge of a maximized window still lands on it.
+    pub grab: Rect,
+    /// Where the pointer expands the bar: the lane plus a margin of slack to its left.
+    pub zone: Rect,
+}
+
+/// The column the scrollbar hangs off: the grid's visible rows, running out to the
+/// *surface's* right edge rather than the grid's. The window padding is thinner than the
+/// bar, and a pointer flung at the edge of a maximized window has to land on it.
+///
+/// Both the painter and the window's hit-test call this, so the bar cannot be drawn
+/// anywhere other than where it is grabbable.
+pub fn scroll_column(
+    surface: (i32, i32),
+    origin: (i32, i32),
+    metrics: CellMetrics,
+    rows: usize,
+) -> Rect {
+    Rect {
+        x: origin.0,
+        y: origin.1,
+        w: (surface.0 - origin.0).max(0),
+        h: rows as i32 * metrics.h,
+    }
+}
+
+/// Split the right edge of the grid column `view` into the scrollbar's lane, its grab
+/// band, and its proximity zone.
+pub fn scroll_lane(view: Rect, scale: Scale) -> ScrollLane {
+    let wide = scale.px(SCROLL_WIDE);
+    let inset = scale.px(SCROLL_INSET);
+    let right = view.x + view.w;
+    let track = Rect {
+        x: right - inset - wide,
+        y: view.y,
+        w: wide,
+        h: view.h,
+    };
+    let from = |x: i32| Rect {
+        x,
+        y: view.y,
+        w: (right - x).max(0),
+        h: view.h,
+    };
+    ScrollLane {
+        track,
+        grab: from(track.x),
+        zone: from(track.x - scale.px(SCROLL_NEAR)),
+    }
+}
+
+/// The shortest thumb the bar will draw, in device pixels. The window's drag hit-test
+/// needs the same floor the painter used, or a grab would miss the thumb it can see.
+pub fn scroll_min_thumb(scale: Scale) -> i32 {
+    scale.px(SCROLL_MIN_THUMB)
 }
 
 /// Build the frame's display list into `out` (cleared first), drawing every run's
@@ -268,6 +375,8 @@ pub fn build_display_list_into(
         origin: inputs.origin,
         selection: inputs.selection,
         hover: inputs.hover,
+        scale: inputs.scale,
+        scrollbar: inputs.scrollbar,
         list: out,
         strings,
     };
@@ -278,7 +387,7 @@ pub fn build_display_list_into(
         painter.foreground_row(row, cols);
     }
     painter.cursor(inputs.cursor, cols, rows);
-    painter.scroll_indicator(inputs.surface, rows);
+    painter.push_scrollbar(inputs.surface, rows);
 }
 
 /// Build a fresh display list, allocating its vector and run strings. The one-shot
@@ -370,6 +479,10 @@ struct Painter<'a> {
     selection: Option<Selection>,
     /// The hovered hyperlink's cells, underlined by [`Self::push_hover_rule`].
     hover: Option<CellSpan>,
+    /// The display scale, so the scrollbar's logical constants land at the right size.
+    scale: Scale,
+    /// The overlay scrollbar's fade/expand state, drawn by [`Self::scrollbar`].
+    scrollbar: &'a Scrollbar,
     /// The list being appended to, owned by the caller's [`DisplayListPool`] and
     /// reused across frames.
     list: &'a mut DisplayList,
@@ -693,36 +806,52 @@ impl Painter<'_> {
         }
     }
 
-    /// A right-edge indicator of where the view sits in the scrollback, drawn only
-    /// while scrolled up. Its height and position are proportional to the window's
-    /// slice of the whole history-plus-screen, like a scrollbar thumb, so a glance
-    /// says how far back you are.
-    fn scroll_indicator(&mut self, surface: (i32, i32), rows: usize) {
-        if !self.screen.is_scrolled() {
+    /// The overlay scrollbar down the grid's right edge: a faint trough (only once the
+    /// pointer has grown the bar into a slider) and the thumb, both tinted onto the theme
+    /// background by how lit the bar is. A bar out of sight, or a screen with no history
+    /// behind it (which includes every alt screen), draws nothing.
+    fn push_scrollbar(&mut self, surface: (i32, i32), rows: usize) {
+        let lit = self.scrollbar.lit();
+        if lit <= 0.0 {
             return;
         }
-        let (sw, sh) = surface;
-        let total = self.screen.scrollback_len() + rows; // all lines, history + screen
-        if total == 0 || sh <= 0 || sw <= 0 {
+        let view = scroll_column(surface, self.origin, self.metrics, rows);
+        let track = scroll_lane(view, self.scale).track;
+        let (content, viewport) = self.screen.scroll_extent();
+        let Some(full) = scroll::thumb(
+            track,
+            viewport,
+            content,
+            self.screen.scroll_position(),
+            scroll_min_thumb(self.scale),
+        ) else {
             return;
+        };
+        let behind = self.theme.bg.to_u32();
+        let grown = self.scrollbar.wide();
+        // The bar grows out of the window edge: the thumb keeps its right edge and widens
+        // leftward, and the trough appears under it as it goes.
+        if grown > 0.0 {
+            self.list.push(DrawCmd::Fill {
+                rect: track,
+                color: pixel::tint(behind, SCROLL_INK, SCROLL_TROUGH_COVER * grown * lit),
+            });
         }
-        // The first visible line's index into that whole, and the window height.
-        let top = self
-            .screen
-            .scrollback_len()
-            .saturating_sub(self.screen.view_offset());
-        let y = (top as i64 * sh as i64 / total as i64) as i32;
-        // A minimum thumb height so it stays grabbable/visible on a deep history.
-        let min_thumb = (sh / 20).max(8);
-        let h = ((rows as i64 * sh as i64 / total as i64) as i32).max(min_thumb);
-        self.list.push(DrawCmd::Fill {
-            rect: Rect {
-                x: sw - SCROLL_INDICATOR_WIDTH,
-                y: y.min(sh - h).max(0),
-                w: SCROLL_INDICATOR_WIDTH,
-                h,
-            },
-            color: SCROLL_INDICATOR_COLOR,
+        let (thin, wide) = (self.scale.px(SCROLL_THIN), self.scale.px(SCROLL_WIDE));
+        let w = thin + ((wide - thin) as f32 * grown).round() as i32;
+        let rect = Rect {
+            x: full.x + full.w - w,
+            w,
+            ..full
+        };
+        // The thumb lifts under the pointer, so a bar that is merely reporting a scroll
+        // reads quieter than one asking to be grabbed.
+        let cover = SCROLL_THUMB_COVER + (SCROLL_THUMB_HOVER_COVER - SCROLL_THUMB_COVER) * grown;
+        self.list.push(DrawCmd::RoundRect {
+            rect,
+            color: pixel::tint(behind, SCROLL_INK, cover * lit),
+            radius: w / 2,
+            corners: RoundedCorners::Both,
         });
     }
 
@@ -1161,6 +1290,8 @@ fn dim(c: Rgb) -> Rgb {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::color::Color;
 
@@ -1182,10 +1313,14 @@ mod tests {
         p.advance_bytes(s, bytes);
     }
 
+    /// A bar at rest, for the frames that are not about the scrollbar: it is out of
+    /// sight, so it adds nothing to the list they assert over.
+    static HIDDEN_BAR: Scrollbar = Scrollbar::hidden();
+
     /// The frame inputs for `s`: default theme, a surface exactly the grid's size, no
-    /// origin inset, no selection, no hovered link, and the cursor hidden (so a test
-    /// about content is not perturbed by it). A case varies one field with struct
-    /// update syntax: `FrameInputs { selection, ..inputs(&s, &t) }`.
+    /// origin inset, no selection, no hovered link, the cursor hidden and the scrollbar
+    /// out of sight (so a test about content is not perturbed by either). A case varies
+    /// one field with struct update syntax: `FrameInputs { selection, ..inputs(&s, &t) }`.
     fn inputs<'a>(s: &'a Screen, theme: &'a Theme) -> FrameInputs<'a> {
         FrameInputs {
             screen: s,
@@ -1199,7 +1334,38 @@ mod tests {
             },
             selection: None,
             hover: None,
+            scale: Scale::ONE,
+            scrollbar: &HIDDEN_BAR,
         }
+    }
+
+    /// A bar a scroll has lit, ticked past its fade-in so it draws at full strength but
+    /// has not been grown by a pointer (`wide` is still 0: a thin indicator, no trough).
+    fn lit_bar() -> Scrollbar {
+        let start = Instant::now();
+        let mut bar = Scrollbar::default();
+        bar.flash(start);
+        for f in 1..=8 {
+            bar.tick(start + Duration::from_millis(f * 16));
+        }
+        assert_eq!((bar.lit(), bar.wide()), (1.0, 0.0), "lit, still thin");
+        bar
+    }
+
+    /// The frame `s` paints with `bar` down its edge.
+    fn list_with_bar(s: &Screen, bar: &Scrollbar) -> DisplayList {
+        build_display_list(&FrameInputs {
+            scrollbar: bar,
+            ..inputs(s, &Theme::default())
+        })
+    }
+
+    /// The scrollbar's thumb: the only rounded rectangle this painter ever draws.
+    fn thumb_of(list: &[DrawCmd]) -> Option<Rect> {
+        list.iter().find_map(|c| match c {
+            DrawCmd::RoundRect { rect, .. } => Some(*rect),
+            _ => None,
+        })
     }
 
     /// Build a list for a screen with the default theme, no selection, cursor
@@ -1905,17 +2071,95 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_scroll_indicator_shows_only_while_scrolled() {
+    /// A 6x2 screen with four lines fed through it, so two rows sit in history and the
+    /// view can scroll: content 4 lines, viewport 2, max scroll 2.
+    fn scrollable_screen() -> Screen {
         let mut s = Screen::new(6, 2);
         feed(&mut s, b"one\r\ntwo\r\nthree\r\nfour");
-        let indicator = |s: &Screen| {
-            list_of(s).iter().any(
-                |c| matches!(c, DrawCmd::Fill { color, .. } if *color == SCROLL_INDICATOR_COLOR),
-            )
-        };
-        assert!(!indicator(&s), "no indicator when pinned to the bottom");
-        s.scroll_view_up(1);
-        assert!(indicator(&s), "an indicator appears while viewing history");
+        assert_eq!(
+            s.scroll_extent(),
+            (4, 2),
+            "two lines of history behind two rows"
+        );
+        s
+    }
+
+    #[test]
+    fn a_bar_out_of_sight_draws_nothing_even_while_scrolled() {
+        let mut s = scrollable_screen();
+        s.scroll_view_up(2);
+        // The bar is state, not a function of the scroll position: until something lights
+        // it, viewing history draws no chrome at all.
+        assert_eq!(thumb_of(&list_of(&s)), None);
+    }
+
+    #[test]
+    fn a_lit_bar_draws_a_thumb_in_its_lane() {
+        let s = scrollable_screen();
+        let list = list_with_bar(&s, &lit_bar());
+        let thumb = thumb_of(&list).expect("a lit, scrollable screen draws a thumb");
+        // It is drawn where a press would grab it, which is the whole contract between
+        // the painter and the window's hit-test.
+        let view = scroll_column(
+            (s.dimensions().0 as i32 * M.w, s.dimensions().1 as i32 * M.h),
+            (0, 0),
+            M,
+            s.dimensions().1,
+        );
+        let lane = scroll_lane(view, Scale::ONE);
+        assert!(
+            thumb.x >= lane.grab.x && thumb.x + thumb.w <= lane.grab.x + lane.grab.w,
+            "thumb {thumb:?} sits inside the grab band {:?}",
+            lane.grab
+        );
+        // Thin at rest: no pointer has grown it, so it has not reached the full slider.
+        assert_eq!(thumb.w, Scale::ONE.px(SCROLL_THIN));
+    }
+
+    #[test]
+    fn no_bar_when_there_is_no_history_to_scroll() {
+        let mut s = Screen::new(6, 2);
+        feed(&mut s, b"one\r\ntwo"); // fills the screen, nothing retired into history
+        assert_eq!(s.scroll_extent(), (2, 2), "content fits the viewport");
+        assert_eq!(
+            thumb_of(&list_with_bar(&s, &lit_bar())),
+            None,
+            "a lit bar still draws nothing when there is nothing to scroll"
+        );
+    }
+
+    #[test]
+    fn the_alt_screen_never_shows_a_bar() {
+        let mut s = scrollable_screen();
+        feed(&mut s, b"\x1b[?1049h"); // switch to the alt screen
+        assert!(s.is_alt());
+        assert_eq!(
+            s.scroll_extent(),
+            (2, 2),
+            "the alt screen keeps no history, so it reports as unscrollable"
+        );
+        assert_eq!(thumb_of(&list_with_bar(&s, &lit_bar())), None);
+    }
+
+    #[test]
+    fn the_thumb_travels_the_track_from_the_oldest_line_to_the_live_bottom() {
+        let mut s = scrollable_screen();
+        let bar = lit_bar();
+        let view = scroll_column(
+            (s.dimensions().0 as i32 * M.w, s.dimensions().1 as i32 * M.h),
+            (0, 0),
+            M,
+            s.dimensions().1,
+        );
+        let track = scroll_lane(view, Scale::ONE).track;
+
+        // Pinned to the live bottom (view_offset 0): the thumb's bottom meets the track's.
+        let bottom = thumb_of(&list_with_bar(&s, &bar)).expect("scrollable");
+        assert_eq!(bottom.y + bottom.h, track.y + track.h);
+
+        // Scrolled all the way back: its top meets the track's top.
+        s.scroll_view_to_top();
+        let top = thumb_of(&list_with_bar(&s, &bar)).expect("scrollable");
+        assert_eq!(top.y, track.y);
     }
 }

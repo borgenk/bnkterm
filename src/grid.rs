@@ -1231,10 +1231,53 @@ impl Screen {
         self.view_offset() > 0
     }
 
-    /// How many lines of scrollback the primary screen holds (for a scroll-position
-    /// indicator).
+    /// How many lines of scrollback the primary screen holds.
     pub fn scrollback_len(&self) -> usize {
         self.primary.scrollback.len()
+    }
+
+    /// Lines of history the *view* can scroll through: the primary's scrollback, or none
+    /// at all on the alt screen, which does not show it (the history is still there
+    /// behind it, which is why this is not [`Self::scrollback_len`]).
+    ///
+    /// Every scrollbar question is answered from here, so "the alt screen does not
+    /// scroll" is stated once and the extent, the position, and a thumb drop cannot
+    /// disagree about it.
+    fn scrollable_history(&self) -> i32 {
+        if self.on_alt {
+            0
+        } else {
+            self.scrollback_len() as i32
+        }
+    }
+
+    /// What the scrollbar needs to size its thumb, in lines: how much content there is to
+    /// scroll through (the history plus the screen), and how much of it is on screen.
+    ///
+    /// On the alt screen the content is exactly the viewport, so it reports as
+    /// unscrollable — which is what hides the bar there, with no special case in the
+    /// painter or the pointer.
+    pub fn scroll_extent(&self) -> (i32, i32) {
+        let rows = self.dimensions().1 as i32;
+        (self.scrollable_history() + rows, rows)
+    }
+
+    /// How far down the whole history-plus-screen the view sits, in lines: 0 at the
+    /// oldest line kept, the full history at the live bottom.
+    ///
+    /// This is [`Self::view_offset`] read the other way round. The offset counts lines
+    /// *up* from the live bottom, because that is the direction the user scrolls back; a
+    /// thumb travels *down* a track, so the scrollbar wants the complement.
+    pub fn scroll_position(&self) -> i32 {
+        self.scrollable_history() - self.view_offset() as i32
+    }
+
+    /// Put the view where a scrollbar thumb dropped it: `position` lines down the whole
+    /// history-plus-screen, the inverse of [`Self::scroll_position`]. Clamped, so a drag
+    /// flung past either end of the track rests at the oldest line or the live bottom.
+    pub fn scroll_view_to(&mut self, position: i32) {
+        let history = self.scrollable_history();
+        self.view_offset = (history - position).clamp(0, history) as usize;
     }
 
     /// Scroll the view up into history by `n` lines, clamped to the top. A no-op on
@@ -3091,6 +3134,75 @@ mod tests {
         // "aa" scrolled off, "bb"/"cc" are the two visible rows.
         assert_eq!(s.row_string(0).trim_end(), "bb");
         assert_eq!(s.row_string(1).trim_end(), "cc");
+    }
+
+    #[test]
+    fn the_scrollbar_reads_the_view_as_a_scroll_down_from_the_oldest_line() {
+        // Three lines retired into history behind a 2-row screen: 5 lines of content, a
+        // 2-line viewport, so the view can scroll 3.
+        let mut s = Screen::new(4, 2);
+        for line in ["aa", "bb", "cc", "dd", "ee"] {
+            print_str(&mut s, line);
+            s.line_feed();
+            s.carriage_return();
+        }
+        assert_eq!(s.scrollback_len(), 4);
+        assert_eq!(
+            s.scroll_extent(),
+            (6, 2),
+            "content is history plus the screen"
+        );
+
+        // At the live bottom the offset is 0, but the *position* is the whole history:
+        // the thumb sits at the end of its travel, not the start.
+        assert_eq!(s.view_offset(), 0);
+        assert_eq!(s.scroll_position(), 4);
+
+        // Scrolling back walks the position down toward the oldest line.
+        s.scroll_view_up(3);
+        assert_eq!((s.view_offset(), s.scroll_position()), (3, 1));
+        s.scroll_view_to_top();
+        assert_eq!(s.scroll_position(), 0, "the oldest line kept");
+    }
+
+    #[test]
+    fn a_thumb_drop_puts_the_view_where_it_landed() {
+        let mut s = Screen::new(4, 2);
+        for line in ["aa", "bb", "cc", "dd", "ee"] {
+            print_str(&mut s, line);
+            s.line_feed();
+            s.carriage_return();
+        }
+        // `scroll_view_to` is the inverse of `scroll_position`: every position round-trips.
+        for position in 0..=s.scrollback_len() as i32 {
+            s.scroll_view_to(position);
+            assert_eq!(s.scroll_position(), position);
+        }
+        // A drag flung past either end of the track rests at the top or the live bottom
+        // rather than running off the content.
+        s.scroll_view_to(-100);
+        assert_eq!(
+            s.view_offset(),
+            s.scrollback_len(),
+            "clamped to the oldest line"
+        );
+        s.scroll_view_to(9_999);
+        assert_eq!(s.view_offset(), 0, "clamped to the live bottom");
+    }
+
+    #[test]
+    fn the_alt_screen_reports_nothing_to_scroll() {
+        let mut s = Screen::new(5, 2);
+        feed(&mut s, b"a\r\nb\r\nc\r\nd");
+        assert!(s.scrollback_len() > 0, "the primary screen has history");
+        feed(&mut s, b"\x1b[?1049h"); // enter the alt screen
+                                      // The history is still behind it, but the alt screen does not show it, so it
+                                      // reports content == viewport: unscrollable, which is what hides the bar.
+        assert_eq!(s.scroll_extent(), (2, 2));
+        assert_eq!(s.scroll_position(), 0);
+        // And a thumb cannot drag a view that does not scroll.
+        s.scroll_view_to(2);
+        assert_eq!(s.view_offset(), 0);
     }
 
     #[test]

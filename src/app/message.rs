@@ -9,6 +9,7 @@
 
 use crate::input::{Key, Mods};
 use crate::mouse::MouseButton;
+use crate::platform::geom::Scale;
 use crate::term_render::CellMetrics;
 
 /// A pointer event, already mapped to a grid cell by the window (it holds the scale,
@@ -65,6 +66,9 @@ pub enum ToTerminal {
         /// Device-pixel y coordinate of the grid's first row. This is `pad` with
         /// one tab and `pad + metrics.h` while the tab bar is visible.
         origin_y: i32,
+        /// The display scale, so the core can size the chrome it owns (the scrollbar)
+        /// in the same device pixels the rest of this geometry is in.
+        scale: Scale,
     },
     /// Keyboard focus gained or lost. The window observes it (Wayland); the terminal
     /// needs it because the cursor draws solid when focused, hollow when not.

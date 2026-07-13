@@ -30,6 +30,8 @@ use crate::grid::{AbsRow, CursorStyle, LinkProbe, RowEpoch, Screen};
 use crate::input;
 use crate::mouse::{self, MouseButton, MouseKind};
 use crate::platform::browser;
+use crate::platform::geom::{Rect, Scale};
+use crate::platform::scroll::{self, Scrollbar};
 use crate::pty::{Pty, ZombieChild};
 use crate::render::display::DisplayList;
 use crate::term_render::{self, CellMetrics, CellSpan, CursorRender, CursorShape, Selection};
@@ -140,13 +142,18 @@ pub(super) struct TerminalCore {
     /// pace repaints, and sets it on a geometry change it drives.
     pub(super) dirty: bool,
     /// Frame geometry, all window-computed and shipped over on a resize: the fixed
-    /// cell box, the device surface size the grid lays out in, and the device
-    /// padding inset on every side.
+    /// cell box, the device surface size the grid lays out in, the device padding inset
+    /// on every side, and the display scale the chrome is sized in.
     metrics: CellMetrics,
     width: u32,
     height: u32,
     pad: i32,
     origin_y: i32,
+    scale: Scale,
+    /// This tab's overlay scrollbar: it fades in on a scroll and out after it, and grows
+    /// into a grabbable slider under the pointer. Per-tab because the scrollback it
+    /// describes is: each tab scrolls its own history, and only the visible one animates.
+    scrollbar: Scrollbar,
     /// Outbound messages for the window to act on after the next drain (a title
     /// change, a fresh selection to own, or the child exiting).
     outbox: Vec<ToWindow>,
@@ -206,6 +213,8 @@ impl TerminalCore {
             height,
             pad,
             origin_y: pad,
+            scale: Scale::ONE,
+            scrollbar: Scrollbar::default(),
             outbox: Vec::new(),
             last_title: String::new(),
             cwd: None,
@@ -402,6 +411,7 @@ impl TerminalCore {
                 metrics,
                 pad,
                 origin_y,
+                scale,
             } => {
                 // Adopt the window's fresh geometry, then resize the grid to it. In
                 // demo mode there is no child; rebuild the static grid. Otherwise
@@ -413,6 +423,7 @@ impl TerminalCore {
                 self.metrics = metrics;
                 self.pad = pad;
                 self.origin_y = origin_y;
+                self.scale = scale;
                 if self.demo {
                     // The grid is replaced wholesale, so no row id minted against the
                     // old one survives it.
@@ -556,6 +567,7 @@ impl TerminalCore {
                     } else {
                         self.screen.scroll_view_up(lines);
                     }
+                    self.flash_scrollbar();
                     // The text moved but the pointer did not: whatever it now rests on
                     // is a different link, or none.
                     self.refresh_hover();
@@ -682,6 +694,8 @@ impl TerminalCore {
             input::Key::End => self.screen.scroll_view_to_bottom(),
             _ => return false,
         }
+        // A keyboard scroll is a scroll: show the bar moving, the way the wheel does.
+        self.flash_scrollbar();
         self.refresh_hover();
         self.dirty = true;
         true
@@ -942,8 +956,149 @@ impl TerminalCore {
                 cursor,
                 selection: self.selection,
                 hover: self.hover,
+                scale: self.scale,
+                scrollbar: &self.scrollbar,
             },
         );
+    }
+
+    /// The column the scrollbar hangs off: the grid's rows, out to the window's right
+    /// edge. The painter derives the same rectangle from the same geometry, so the bar is
+    /// grabbable exactly where it is drawn.
+    fn scroll_column(&self) -> Rect {
+        term_render::scroll_column(
+            (self.width as i32, self.height as i32),
+            (self.pad, self.origin_y),
+            self.metrics,
+            self.screen.dimensions().1,
+        )
+    }
+
+    /// The thumb as it is drawn right now, or `None` when there is nothing to scroll.
+    fn scroll_thumb(&self) -> Option<Rect> {
+        let (content, viewport) = self.screen.scroll_extent();
+        let track = term_render::scroll_lane(self.scroll_column(), self.scale).track;
+        scroll::thumb(
+            track,
+            viewport,
+            content,
+            self.screen.scroll_position(),
+            term_render::scroll_min_thumb(self.scale),
+        )
+    }
+
+    /// Whether this tab has history to scroll at all, which is the only case the bar is
+    /// drawn or takes the pointer. False on the alt screen, which keeps no history.
+    pub(super) fn scrollable(&self) -> bool {
+        let (content, viewport) = self.screen.scroll_extent();
+        scroll::scrollable(content, viewport)
+    }
+
+    /// Whether a device-pixel point is on the scrollbar, meaning a press there takes its
+    /// thumb rather than starting a selection in the grid beneath it.
+    pub(super) fn on_scrollbar(&self, x: f32, y: f32) -> bool {
+        self.scrollable()
+            && term_render::scroll_lane(self.scroll_column(), self.scale)
+                .grab
+                .contains(x, y)
+    }
+
+    /// Follow the pointer with the bar: inside its proximity zone it grows into a slider,
+    /// outside it shrinks back. A live drag owns the bar and ignores this.
+    pub(super) fn track_scrollbar(&mut self, at: Option<(f32, f32)>) {
+        if self.scrollbar.grab().is_some() {
+            return;
+        }
+        let near = self.scrollable()
+            && at.is_some_and(|(x, y)| {
+                term_render::scroll_lane(self.scroll_column(), self.scale)
+                    .zone
+                    .contains(x, y)
+            });
+        if self.scrollbar.set_near(near) {
+            self.dirty = true;
+        }
+    }
+
+    /// A press in the scrollbar's lane: take the thumb under the pointer, or, when the
+    /// press landed on the empty track, warp the thumb to it first and take it there
+    /// (GNOME's behavior: a click jumps to that spot, and holding turns it into a scrub).
+    /// Returns whether the press was the scrollbar's.
+    pub(super) fn press_scrollbar(&mut self, x: f32, y: f32) -> bool {
+        if !self.on_scrollbar(x, y) {
+            return false;
+        }
+        let Some(thumb) = self.scroll_thumb() else {
+            return false;
+        };
+        // On the thumb, the grab keeps its offset so it does not jump under the finger;
+        // on the bare track, the thumb lands centred on the pointer.
+        let grab = if y >= thumb.y as f32 && y < (thumb.y + thumb.h) as f32 {
+            y as i32 - thumb.y
+        } else {
+            thumb.h / 2
+        };
+        self.scrollbar.press(grab);
+        self.drag_scrollbar(y);
+        true
+    }
+
+    /// Track a scrollbar drag: put the thumb's top where the pointer holds it and scroll
+    /// the view to match. The scroll lands on a whole line, which is the only place a
+    /// terminal view can rest.
+    pub(super) fn drag_scrollbar(&mut self, y: f32) {
+        let (Some(grab), Some(thumb)) = (self.scrollbar.grab(), self.scroll_thumb()) else {
+            return;
+        };
+        let (content, viewport) = self.screen.scroll_extent();
+        let track = term_render::scroll_lane(self.scroll_column(), self.scale).track;
+        let at = self.screen.scroll_position();
+        let to = scroll::scroll_at_thumb(track, thumb.h, viewport, content, y as i32 - grab);
+        if to == at {
+            return;
+        }
+        self.screen.scroll_view_to(to);
+        // The text moved under a parked pointer, so whatever it now rests on is a
+        // different link, or none.
+        self.refresh_hover();
+        self.dirty = true;
+    }
+
+    /// The drag ended: let go of the thumb and let the bar fade unless the pointer stayed
+    /// on it.
+    pub(super) fn release_scrollbar(&mut self) {
+        self.scrollbar.release();
+        self.dirty = true;
+    }
+
+    /// Light the bar, so every scroll (a wheel notch, a Shift+PageUp, a thumb drag) is
+    /// confirmed by it sliding into view and then fading back out.
+    fn flash_scrollbar(&mut self) {
+        self.scrollbar.flash(Instant::now());
+    }
+
+    /// Carry the bar forward a frame. A tab with nothing to scroll has nothing to point
+    /// at, so its bar drops out of sight at once rather than fading from a history it no
+    /// longer describes (switching to the alt screen is exactly this).
+    pub(super) fn tick_scrollbar(&mut self) {
+        if self.scrollable() {
+            if self.scrollbar.tick(Instant::now()) {
+                self.dirty = true;
+            }
+        } else {
+            self.scrollbar.hide();
+        }
+    }
+
+    /// When the loop should next tick the bar: a step of a fade, or the moment a lit
+    /// bar's hold lapses and it starts fading. `None` when it is settled.
+    pub(super) fn scrollbar_retry_at(&self) -> Option<Instant> {
+        self.scrollbar.retry_at()
+    }
+
+    /// Whether the bar is mid-fade, so the next compositor frame should carry it on.
+    pub(super) fn scrollbar_animating(&self) -> bool {
+        self.scrollbar.animating()
     }
 
     /// Whether the pointer is resting on a hyperlink. The window reads it to offer the
@@ -1197,6 +1352,7 @@ mod tests {
             ascent: 12,
             descent: 4,
         };
+        let bar = Scrollbar::hidden();
         let list = term_render::build_display_list(&term_render::FrameInputs {
             screen: &s,
             theme: &Theme::default(),
@@ -1206,6 +1362,8 @@ mod tests {
             cursor: CursorRender::default(),
             selection: None,
             hover: None,
+            scale: Scale::ONE,
+            scrollbar: &bar,
         });
         assert!(list.len() > 1, "more than just the background fill");
     }
@@ -1616,6 +1774,7 @@ mod tests {
             metrics: METRICS,
             pad: 0,
             origin_y: 0,
+            scale: Scale::ONE,
         })
         .unwrap();
         assert!(core.selection.is_none());
@@ -1781,6 +1940,161 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, ToWindow::PastePrimary)),
             "middle-click requests a primary paste"
+        );
+    }
+
+    /// A live core with `lines` of output behind an 80x24 screen, so it has history to
+    /// scroll. Its geometry is the one [`TerminalCore::new`] starts at: an 8x16 cell, no
+    /// padding, unity scale, so the lane lands at a hand-checkable place (see
+    /// [`lane_x`]).
+    fn scrollable_core(lines: usize) -> TerminalCore {
+        let mut core = TerminalCore::new(false, 80, 24, METRICS, 80 * 8, 24 * 16, 0);
+        let mut parser = Parser::new();
+        for i in 0..lines {
+            parser.advance_bytes(&mut core.screen, format!("line {i}\r\n").as_bytes());
+        }
+        core
+    }
+
+    /// A device x inside the scrollbar's grab band of a [`scrollable_core`]: the lane is
+    /// 10px wide, inset 3px from the surface's right edge (640), so it spans 627..637 and
+    /// the band runs out to 640.
+    const fn lane_x() -> f32 {
+        630.0
+    }
+
+    /// The full height of that core's track, which is the grid's: 24 rows of 16px.
+    const TRACK_H: f32 = 24.0 * 16.0;
+
+    #[test]
+    fn a_screen_with_history_behind_it_is_scrollable() {
+        let core = scrollable_core(100);
+        let (content, viewport) = core.screen.scroll_extent();
+        assert_eq!(viewport, 24, "the viewport is the screen");
+        assert!(content > viewport, "and there is history behind it");
+        assert!(core.scrollable());
+        // A fresh screen has nothing behind it and so offers no bar.
+        assert!(!scrollable_core(0).scrollable());
+    }
+
+    #[test]
+    fn the_bar_takes_a_press_in_its_lane_but_not_one_in_the_text() {
+        let core = scrollable_core(100);
+        assert!(core.on_scrollbar(lane_x(), 100.0), "the lane is grabbable");
+        assert!(
+            !core.on_scrollbar(300.0, 100.0),
+            "a press out in the text is the grid's, not the bar's"
+        );
+        assert!(
+            !core.on_scrollbar(lane_x(), TRACK_H + 20.0),
+            "and below the grid there is no lane at all"
+        );
+    }
+
+    #[test]
+    fn the_alt_screen_offers_no_bar_to_grab() {
+        let mut core = scrollable_core(100);
+        let mut parser = Parser::new();
+        parser.advance_bytes(&mut core.screen, b"\x1b[?1049h");
+        assert!(core.screen.is_alt());
+        assert!(!core.scrollable(), "the alt screen keeps no history");
+        assert!(
+            !core.on_scrollbar(lane_x(), 100.0),
+            "so a press in the lane falls through to the program"
+        );
+    }
+
+    #[test]
+    fn dragging_the_thumb_up_the_track_walks_the_view_into_history() {
+        let mut core = scrollable_core(100);
+        let history = core.screen.scrollback_len();
+        assert_eq!(core.screen.view_offset(), 0, "starts at the live bottom");
+
+        // Press on the thumb (which rests against the bottom of the track, since the view
+        // is at the live bottom) and drag it to the very top.
+        assert!(core.press_scrollbar(lane_x(), TRACK_H - 4.0));
+        core.drag_scrollbar(0.0);
+        assert_eq!(
+            core.screen.view_offset(),
+            history,
+            "the thumb at the top of the track shows the oldest line kept"
+        );
+
+        // And back down again: the view returns to the live output.
+        core.drag_scrollbar(TRACK_H);
+        assert_eq!(core.screen.view_offset(), 0);
+        core.release_scrollbar();
+    }
+
+    #[test]
+    fn a_click_on_the_bare_track_jumps_the_view_to_it() {
+        // GNOME's behavior, not Windows': a click on the empty track goes to that spot
+        // rather than paging toward it. The thumb lands centred on the pointer, so a click
+        // at the very top of the track shows the oldest line.
+        let mut core = scrollable_core(100);
+        let history = core.screen.scrollback_len();
+        assert!(core.press_scrollbar(lane_x(), 0.0));
+        assert_eq!(core.screen.view_offset(), history);
+    }
+
+    #[test]
+    fn a_press_outside_the_lane_is_not_the_scrollbars() {
+        let mut core = scrollable_core(100);
+        assert!(
+            !core.press_scrollbar(300.0, 100.0),
+            "a press in the text leaves the bar alone, so a selection can begin"
+        );
+        assert_eq!(core.screen.view_offset(), 0, "and the view has not moved");
+    }
+
+    #[test]
+    fn every_scroll_lights_the_bar() {
+        let mut core = scrollable_core(100);
+        assert_eq!(
+            core.scrollbar_retry_at(),
+            None,
+            "a bar nothing has woken is settled and costs the loop nothing"
+        );
+
+        // The wheel.
+        core.apply(ToTerminal::Pointer {
+            event: PointerEvent::Wheel {
+                down: false,
+                notches: 1,
+                col: 0,
+                row: 0,
+            },
+            mods: input::Mods::NONE,
+        })
+        .unwrap();
+        assert!(core.screen.is_scrolled(), "the wheel scrolled the view");
+        assert!(
+            core.scrollbar_retry_at().is_some(),
+            "and lit the bar, which now wants the loop back to fade it"
+        );
+
+        // And the keyboard, which scrolls by the same view and must say so the same way.
+        let mut core = scrollable_core(100);
+        assert!(core.handle_scroll_key(input::Key::PageUp, input::Mods::SHIFT));
+        assert!(core.scrollbar_retry_at().is_some());
+    }
+
+    #[test]
+    fn a_bar_with_nothing_left_to_scroll_hides_itself() {
+        // Switching to the alt screen takes the history away under a lit bar. The tick is
+        // what notices, so the bar cannot linger describing a scrollback that is not
+        // showing.
+        let mut core = scrollable_core(100);
+        core.flash_scrollbar();
+        assert!(core.scrollbar_retry_at().is_some());
+
+        let mut parser = Parser::new();
+        parser.advance_bytes(&mut core.screen, b"\x1b[?1049h");
+        core.tick_scrollbar();
+        assert_eq!(
+            core.scrollbar_retry_at(),
+            None,
+            "the bar dropped out of sight rather than fading from a history it no longer describes"
         );
     }
 }

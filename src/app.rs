@@ -51,6 +51,7 @@ use crate::mouse::MouseButton;
 use crate::platform::conn::{Connection, Fill};
 use crate::platform::ffi;
 use crate::platform::freetype::Fonts;
+use crate::platform::geom::{logical_to_device, Scale};
 use crate::platform::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_device_manager, wl_data_offer, wl_display,
     wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_surface,
@@ -317,6 +318,11 @@ struct State {
     /// A button press that began in the tab bar. Its matching release is swallowed
     /// even if closing a tab made the bar disappear in between.
     bar_button: Option<MouseButton>,
+    /// Whether a left press took the visible tab's scrollbar thumb and is scrubbing it.
+    /// The drag owns the pointer wherever it wanders (off the lane, off the grid), and
+    /// swallows its own release, so it can neither start a selection nor leave the thumb
+    /// stuck to the pointer. Where inside the thumb it grabbed lives on the bar itself.
+    drag_scroll: bool,
     /// Multi-click tracking for word/line selection: the wl time (ms) and cell of the
     /// last left press, and the running count (1 character, 2 word, 3 line, cycling).
     last_click_time: u32,
@@ -419,6 +425,7 @@ impl State {
             pointer_y: 0.0,
             axis_accum: 0.0,
             bar_button: None,
+            drag_scroll: false,
             last_click_time: 0,
             last_click_cell: (0, 0),
             click_count: 0,
@@ -646,27 +653,34 @@ impl State {
         }
     }
 
-    /// Fire the cursor blink and key repeat if their deadlines have passed. The
-    /// blink is the core's (it builds the frame); key repeat is the window's (it
-    /// holds the compositor's `repeat_info` and the held key).
+    /// Fire the cursor blink, the scrollbar's fade, and key repeat if their deadlines
+    /// have passed. The blink and the fade are the core's (it builds the frame); key
+    /// repeat is the window's (it holds the compositor's `repeat_info` and the held key).
     fn service_timers(&mut self) -> Result<()> {
         self.tabs.tick_blink_if_due();
+        self.tabs.tick_scrollbar();
         if self.repeat_at.is_some_and(|at| at <= Instant::now()) {
             self.fire_repeat()?;
         }
         Ok(())
     }
 
-    /// How long to block for input: the soonest of the pending cursor-blink and
-    /// key-repeat deadlines, or `None` (block indefinitely) when neither is armed.
-    /// The blink deadline is the core's; the key-repeat deadline is the window's.
+    /// How long to block for input: the soonest of the pending cursor-blink, scrollbar
+    /// fade, and key-repeat deadlines, or `None` (block indefinitely) when none is armed.
+    /// The blink and fade deadlines are the core's; the key-repeat deadline is the
+    /// window's.
     fn next_wake(&self) -> Option<Duration> {
         let now = Instant::now();
         let due = |at: Instant| {
             at.saturating_duration_since(now)
                 .max(Duration::from_millis(1))
         };
-        [self.tabs.blink_deadline(), self.repeat_at]
+        // While a frame callback is outstanding the compositor is driving the fade, so
+        // the loop does not also need to wake for it (see the callback handler).
+        let scrollbar = (self.frame_callback == 0)
+            .then(|| self.tabs.scrollbar_retry_at())
+            .flatten();
+        [self.tabs.blink_deadline(), self.repeat_at, scrollbar]
             .into_iter()
             .flatten()
             .map(due)
@@ -677,6 +691,19 @@ impl State {
     /// rounded to nearest. Device pixels are what the buffer and grid are sized in.
     fn to_device(&self, logical: u32) -> u32 {
         logical_to_device(logical, self.scale.factor_120)
+    }
+
+    /// The current display scale, as the painter and the chrome hit-tests take it.
+    fn ui_scale(&self) -> Scale {
+        Scale::from_120(self.scale.factor_120)
+    }
+
+    /// The pointer in device pixels. Wayland delivers it in logical (surface-local)
+    /// ones, but the grid and the chrome hanging off it are laid out in device pixels,
+    /// so every hit-test against them has to scale up first.
+    fn pointer_device(&self) -> (f32, f32) {
+        let scale = self.scale.factor_120 as f32 / 120.0;
+        (self.pointer_x * scale, self.pointer_y * scale)
     }
 
     /// The logical window size scaled to the device buffer size, clamped so a bogus
@@ -752,6 +779,7 @@ impl State {
             origin_y,
             bar_y,
             bar_h,
+            self.ui_scale(),
         );
     }
 
@@ -846,6 +874,13 @@ impl State {
             && msg.opcode == wl_callback::EV_DONE
         {
             self.frame_callback = 0;
+            // Keep a fade going: a scrollbar mid-transition wants the frame the
+            // compositor has just offered. A step whose quantised colours did not move
+            // presents nothing and arms no new callback, which is what `retry_at` and the
+            // wake deadline are for; this is the fast path while it is visibly changing.
+            if self.tabs.scrollbar_animating() {
+                self.tabs.mark_dirty();
+            }
             return Ok(());
         }
 
@@ -1404,7 +1439,11 @@ impl State {
     /// Ctrl+click still works, because the click brings focus (and the modifiers with
     /// it) before the button press is delivered.
     fn update_pointer_shape(&mut self) {
-        let shape = if self.pointer_in_tab_bar() {
+        let (px, py) = self.pointer_device();
+        // A scrollbar is a control, not text, so over its grab band (and for as long as
+        // its thumb is held) the I-beam gives way to the arrow.
+        let on_bar = self.drag_scroll || self.tabs.active().on_scrollbar(px, py);
+        let shape = if self.pointer_in_tab_bar() || on_bar {
             wp_cursor_shape_device_v1::SHAPE_DEFAULT
         } else if self.xkb.ctrl_active() && self.tabs.hovering_link() {
             wp_cursor_shape_device_v1::SHAPE_POINTER
@@ -1428,6 +1467,9 @@ impl State {
     /// surface or crossed into the tab strip. It drops the hovered hyperlink, so an
     /// underline never outlives the pointer that summoned it.
     fn pointer_left_grid(&mut self) -> Result<()> {
+        // The scrollbar goes with it: a bar left expanded under a pointer that is no
+        // longer there would never shrink back.
+        self.tabs.active_mut().track_scrollbar(None);
         let mods = self.current_mods();
         self.tabs.active_mut().apply(ToTerminal::Pointer {
             event: PointerEvent::Left,
@@ -1478,9 +1520,17 @@ impl State {
                 let _time = r.u32()?;
                 self.pointer_x = r.fixed()?;
                 self.pointer_y = r.fixed()?;
-                if self.pointer_in_tab_bar() {
+                let (px, py) = self.pointer_device();
+                if self.drag_scroll {
+                    // A thumb the pointer is holding follows it anywhere, including out
+                    // of the lane and off the grid. Nothing else sees the move.
+                    self.tabs.active_mut().drag_scrollbar(py);
+                } else if self.pointer_in_tab_bar() {
                     self.pointer_left_grid()?;
                 } else {
+                    // The bar only lights and grows here; the grid still gets the move,
+                    // because the bar is an overlay and a live text drag runs under it.
+                    self.tabs.active_mut().track_scrollbar(Some((px, py)));
                     let (col, row) = self.pointer_cell();
                     let mods = self.current_mods();
                     self.tabs.active_mut().apply(ToTerminal::Pointer {
@@ -1503,6 +1553,17 @@ impl State {
                     self.bar_button = None;
                     return Ok(());
                 }
+                // The release that ends a thumb drag is the scrollbar's, wherever the
+                // pointer has wandered to by now: it must not reach the grid as the end
+                // of a selection that never began.
+                if !pressed && self.drag_scroll && mapped == Some(MouseButton::Left) {
+                    self.drag_scroll = false;
+                    self.tabs.active_mut().release_scrollbar();
+                    let at = self.pointer_device();
+                    self.tabs.active_mut().track_scrollbar(Some(at));
+                    self.update_pointer_shape();
+                    return Ok(());
+                }
                 if self.pointer_in_tab_bar() && pressed {
                     self.bar_button = mapped;
                     if let (Some(button), Some(id)) = (mapped, self.pointer_bar_tab()) {
@@ -1517,6 +1578,16 @@ impl State {
                         }
                     }
                     return Ok(());
+                }
+                // A left press in the lane takes the thumb before the grid beneath it
+                // sees it: the gesture is a scrub, not a selection. Only a scrollable tab
+                // has a lane, so this can never shadow a click on the alt screen.
+                if pressed && mapped == Some(MouseButton::Left) {
+                    let (px, py) = self.pointer_device();
+                    if self.tabs.active_mut().press_scrollbar(px, py) {
+                        self.drag_scroll = true;
+                        return Ok(());
+                    }
                 }
                 // A release whose press began in the grid must still finish that
                 // gesture (selection or child mouse reporting), even if the pointer
@@ -1708,13 +1779,6 @@ impl State {
     }
 }
 
-/// Round a logical (surface-local) length to device pixels at scale `factor_120`
-/// (120ths; 120 = 1.0). The `+ 60` is round-to-nearest (half of 120). `u64` math
-/// so a large window times a large scale cannot overflow before the divide.
-fn logical_to_device(logical: u32, factor_120: u32) -> u32 {
-    (((logical as u64) * (factor_120 as u64) + 60) / 120) as u32
-}
-
 /// Convert a point size to device pixels at compositor scale `scale_120` (120ths;
 /// 120 = 1.0), clamped to [`FONT_SIZE_RANGE`]. The `96/72` factor is the reference
 /// 96 DPI over 72 points per inch, the same basis the sibling terminals use, so a
@@ -1831,17 +1895,6 @@ mod tests {
         assert_eq!(points_to_px(f32::NAN, 120), lo); // NaN -> range start, no panic
         assert_eq!(points_to_px(-5.0, 120), lo); // negative -> range start
         assert_eq!(points_to_px(0.0, 120), lo);
-    }
-
-    #[test]
-    fn logical_to_device_rounds_to_nearest() {
-        assert_eq!(logical_to_device(100, 120), 100); // 1.0x is identity
-        assert_eq!(logical_to_device(100, 240), 200); // 2.0x
-        assert_eq!(logical_to_device(100, 180), 150); // 1.5x
-        assert_eq!(logical_to_device(100, 150), 125); // 1.25x
-        assert_eq!(logical_to_device(101, 150), 126); // 126.25 -> 126 (nearest)
-                                                      // No overflow at the extremes (u64 math, then narrowed).
-        assert_eq!(logical_to_device(16384, 240), 32768);
     }
 
     #[test]
