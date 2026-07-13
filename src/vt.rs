@@ -224,7 +224,7 @@ impl Parser {
             }
             0x1b => {
                 if self.state == State::OscString {
-                    p.osc_dispatch(&self.osc);
+                    self.finish_osc(p);
                 }
                 self.clear();
                 self.state = State::Escape;
@@ -426,7 +426,7 @@ impl Parser {
         match byte {
             0x07 => {
                 // BEL terminator (xterm convention).
-                p.osc_dispatch(&self.osc);
+                self.finish_osc(p);
                 self.state = State::Ground;
             }
             0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f => {} // ignore other controls
@@ -435,6 +435,23 @@ impl Parser {
                     self.osc.push(byte);
                 }
             }
+        }
+    }
+
+    /// Hand the collected OSC string to the performer, unless it hit the cap.
+    ///
+    /// A buffer sitting at exactly [`OSC_MAX`] is one we stopped filling, so we cannot
+    /// know whether more was coming — and a truncated OSC is not a short OSC, it is a
+    /// *different* one. The payload may be a hyperlink target (OSC 8), where half a URL
+    /// still parses as a perfectly good URL pointing somewhere the child never named.
+    /// So we drop it whole. The length *is* the overflow flag, which is why the parser
+    /// carries no extra state for this: a `bool` field here cost `parse_escape` 7% (it
+    /// reshaped `Parser` for the hot `advance` loop), and the price of deriving it
+    /// instead is that a legitimate OSC of exactly 4096 bytes is dropped too — a title
+    /// or URL that long is already past what we would honour.
+    fn finish_osc<P: Perform>(&mut self, p: &mut P) {
+        if self.osc.len() < OSC_MAX {
+            p.osc_dispatch(&self.osc);
         }
     }
 
@@ -676,6 +693,28 @@ mod tests {
                 byte: b'0',
             }]
         );
+    }
+
+    #[test]
+    fn an_osc_too_long_for_the_buffer_is_dropped_whole() {
+        // Truncating an OSC 8 payload at OSC_MAX would leave a prefix that still parses
+        // as a perfectly good URL — a *different* URL from the one the child named, and
+        // one we would then happily hand to xdg-open. A sequence we could not receive
+        // whole was not received.
+        let mut bytes = b"\x1b]8;;https://example.com/".to_vec();
+        bytes.resize(bytes.len() + OSC_MAX, b'a');
+        bytes.extend_from_slice(b"\x1b\\");
+        let actions = run(&bytes);
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Osc(_))),
+            "an overlong OSC dispatches nothing, {actions:?}"
+        );
+
+        // One byte under the cap still arrives, so the guard is a cap and not a wall.
+        let mut ok = b"\x1b]0;".to_vec();
+        ok.resize(OSC_MAX, b'a');
+        ok.extend_from_slice(b"\x07");
+        assert!(run(&ok).iter().any(|a| matches!(a, Action::Osc(_))));
     }
 
     #[test]
