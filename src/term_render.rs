@@ -958,13 +958,24 @@ impl Painter<'_> {
     ///    `------'      body:    a round-rect, with the keyhole knocked out of it.
     /// ```
     ///
-    /// Drawn rather than typeset on purpose. The obvious implementation is to render
-    /// U+1F512, which is what wezterm does and why it has a standing trickle of "the
-    /// lock shows as a blank box" reports: a terminal font is chosen for its Latin and
-    /// box-drawing glyphs and frequently has no padlock, so the one cursor that exists
-    /// to say "a secret is being typed" degrades to tofu on the machines least likely to
-    /// notice. Rounded rectangles cannot miss, and they take the cursor colour, which a
-    /// colour-emoji glyph would fight.
+    /// Drawn rather than typeset, and that is a real fork in the road: **neither wezterm
+    /// nor ghostty draws this.** Both typeset **U+F023**, the padlock in the Nerd Fonts
+    /// private-use area, which is why their locks are pixel-identical. The difference
+    /// between them is only where the font comes from, and it decides everything:
+    ///
+    /// - wezterm resolves it through the *user's* fallback chain, so it tofus whenever
+    ///   that chain has no padlock — a standing trickle of "the lock shows as a blank box"
+    ///   reports (wezterm #4976, #5507, #3902). The one cursor whose entire job is to say
+    ///   "a secret is being typed" degrades to an empty box, on the machines least likely
+    ///   to notice.
+    /// - ghostty dodges that by *shipping* a symbols-only Nerd Font as a built-in
+    ///   fallback, so the glyph is always there.
+    ///
+    /// Both of those are closed to us. bnkterm ships no fonts (and is not about to start
+    /// vendoring one for a single glyph), and it will not stake a security indicator on
+    /// whatever the user's fallback chain happens to hold. So the third door: draw it.
+    /// Rounded rectangles cannot go missing, they scale to the cell instead of to whatever
+    /// size the glyph happens to be, and they take the cursor colour cleanly.
     ///
     /// Three things this geometry has to get right, the first two learned the hard way:
     ///
