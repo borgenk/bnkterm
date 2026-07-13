@@ -1004,6 +1004,10 @@ impl State {
                 self.window_focused = false;
                 self.tabs.active_mut().apply(ToTerminal::Focus(false))?;
                 self.stop_repeat(); // drop any held-key repeat (window-side timer)
+                                    // Losing focus resets the modifier state (see `Xkb::clear_modifiers`);
+                                    // if Ctrl was down, the hand cursor it earned goes with it.
+                self.xkb.clear_modifiers();
+                self.update_pointer_shape();
             }
             wl_keyboard::EV_MODIFIERS => {
                 let _serial = r.u32()?;
@@ -1011,6 +1015,13 @@ impl State {
                 let latched = r.u32()?;
                 let locked = r.u32()?;
                 let group = r.u32()?;
+                // Deliberately not gated on `window_focused`. This is the one keyboard
+                // event the protocol lets a compositor send to an *unfocused* surface,
+                // "to tie modifier information to pointer focus instead" — so a window
+                // can know Ctrl is down and offer a Ctrl+click affordance before it is
+                // focused. Compositors that do this send it with no `enter` before it;
+                // those that do not simply never reach here while unfocused, and the
+                // hand waits for focus. Either way, honouring it is correct.
                 self.xkb.update_modifiers(depressed, latched, locked, group);
                 // Ctrl is what turns a hovered link into a clickable one, so taking it
                 // or letting it go changes the cursor with the pointer standing still.
@@ -1352,6 +1363,15 @@ impl State {
     /// under the pointer, because the hand is a promise that clicking does something:
     /// the underline says "this is a link", the hand says "and now a click follows
     /// it". That is why the modifiers event re-runs this with the pointer parked.
+    ///
+    /// Whether that promise can be kept while the window is *unfocused* is the
+    /// compositor's call, not ours: modifier state reaches an unfocused surface only
+    /// if the compositor ties it to pointer focus (see the `EV_MODIFIERS` arm). Where
+    /// it does, the hand appears over an unfocused window exactly as over a focused
+    /// one. Where it does not, `ctrl_active` is false and the pointer keeps the I-beam
+    /// until the window takes focus — the underline still marks the link, and the
+    /// Ctrl+click still works, because the click brings focus (and the modifiers with
+    /// it) before the button press is delivered.
     fn update_pointer_shape(&mut self) {
         let shape = if self.pointer_in_tab_bar() {
             wp_cursor_shape_device_v1::SHAPE_DEFAULT

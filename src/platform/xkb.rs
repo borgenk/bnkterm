@@ -202,6 +202,21 @@ impl Xkb {
         }
     }
 
+    /// Drop every modifier and layout group, which is what `wl_keyboard.leave`
+    /// means: the protocol says the event "resets all values to their defaults",
+    /// because once the surface is unfocused its releases are delivered elsewhere
+    /// and we would never see the key come up. Skipping this leaves a modifier held
+    /// down forever — Ctrl held while switching windows would still read as held on
+    /// return, and the next plain click would be taken for a Ctrl+click.
+    ///
+    /// Safe against a compositor that ties modifiers to *pointer* focus and so keeps
+    /// sending `wl_keyboard.modifiers` to us while we are unfocused: that event is
+    /// allowed to arrive with no `enter` before it, and it lands after this reset and
+    /// simply re-establishes the truth.
+    pub fn clear_modifiers(&self) {
+        self.update_modifiers(0, 0, 0, 0);
+    }
+
     /// Whether Shift is currently active, so navigation keys extend a selection.
     pub fn shift_active(&self) -> bool {
         self.mod_active(XKB_MOD_NAME_SHIFT)
@@ -406,5 +421,54 @@ mod tests {
         assert!(!xkb.shift_active());
         assert!(!xkb.ctrl_active());
         assert!(!xkb.alt_active());
+    }
+
+    /// The smallest keymap that can answer "is Ctrl held": one key bound to
+    /// `Control_L` and mapped into the real `Control` modifier. Written out here
+    /// rather than read from the system's xkb data so the test depends on nothing
+    /// outside the process.
+    const MINIMAL_KEYMAP: &str = r#"
+xkb_keymap {
+  xkb_keycodes "min" { minimum = 8; maximum = 255; <LCTL> = 37; };
+  xkb_types "min" {
+    type "ONE_LEVEL" { modifiers = none; map[none] = Level1; level_name[Level1] = "Any"; };
+  };
+  xkb_compatibility "min" {
+    interpret Control_L { action = SetMods(modifiers = Control); };
+  };
+  xkb_symbols "min" {
+    key <LCTL> { type = "ONE_LEVEL", [ Control_L ] };
+    modifier_map Control { <LCTL> };
+  };
+};
+"#;
+
+    #[test]
+    fn losing_focus_clears_a_held_modifier() {
+        // `wl_keyboard.leave` "resets all values to their defaults". It has to: once
+        // the surface is unfocused, the *release* of a held key is delivered to
+        // somebody else, so a Ctrl we do not drop here stays down for the life of the
+        // window — and the next plain left-click would be read as a Ctrl+click and
+        // follow a hyperlink the user never asked for.
+        let mut xkb = Xkb::new().expect("xkb context");
+        xkb.load_keymap(MINIMAL_KEYMAP.as_bytes(), XKB_KEYMAP_FORMAT_TEXT_V1)
+            .expect("the minimal keymap compiles");
+
+        // `Control` is real modifier index 2 in every keymap, so its mask is 1 << 2 —
+        // the same bits a compositor puts in wl_keyboard.modifiers.
+        xkb.update_modifiers(1 << 2, 0, 0, 0);
+        assert!(xkb.ctrl_active(), "the depressed mask makes Ctrl active");
+
+        xkb.clear_modifiers();
+        assert!(!xkb.ctrl_active(), "and leaving the surface drops it");
+
+        // And a modifiers event arriving with no `enter` before it (a compositor that
+        // ties modifier state to pointer focus) still lands: that is what lets an
+        // unfocused window offer the hand cursor over a Ctrl-clickable link.
+        xkb.update_modifiers(1 << 2, 0, 0, 0);
+        assert!(
+            xkb.ctrl_active(),
+            "an unfocused modifiers event is honoured"
+        );
     }
 }
