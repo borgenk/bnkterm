@@ -998,10 +998,14 @@ impl Painter<'_> {
         if cell_w < 7 || m.h < 9 {
             return None;
         }
-        // The lock's box: as wide as the cell allows (a pixel of margin each side), half
-        // again as tall as it is wide, and centred in the cell's height.
-        let lw = cell_w - 2;
-        let lh = (lw * 3 / 2).min(m.h - 2);
+        // The lock's box. Width is the scarce dimension (a cell is about twice as tall as
+        // it is wide), so the lock takes all of it that it can: the margin is a proportion
+        // of the cell, which rounds to nothing on the small cells that cannot spare it and
+        // opens up on the large ones that can. Height then follows from the width, capped
+        // by the cell, which is what lets a lock be *tall* -- the only way left to be big
+        // once the width is spent.
+        let lw = cell_w - 2 * (cell_w / 16);
+        let lh = (lw * 7 / 4).min(m.h - 2);
         let ox = x + (w - lw) / 2;
         let oy = y + (m.h - lh) / 2;
 
@@ -1900,27 +1904,27 @@ mod tests {
 
     /// The padlock the `M` metrics (a 10x20 cell) must produce, in push order. Derived by
     /// hand from the ratios in `Painter::padlock`, so changing the geometry has to be a
-    /// deliberate act: an 8x12 lock box (as wide as the cell allows, half again as tall),
-    /// inset a pixel from each cell edge and centred, so it starts at (1, 4). The shackle
-    /// is 5 wide and sinks half-way into the 8-tall body; the hole inside it is a 1px wall
-    /// thinner all round. A 10px cell is too small for a keyhole.
+    /// deliberate act: a 10x17 lock box (the cell's full width -- 10px is too narrow to
+    /// spare a margin -- then all the height that width earns), centred, so it starts at
+    /// (0, 1). The shackle is 6 wide and sinks half-way into the 11-tall body; the hole
+    /// inside it is a 1px wall thinner all round. A 10px cell is too narrow for a keyhole.
     const SHACKLE: Rect = Rect {
         x: 2,
-        y: 4,
-        w: 5,
-        h: 8,
+        y: 1,
+        w: 6,
+        h: 11,
     };
     const HOLE: Rect = Rect {
         x: 3,
-        y: 5,
-        w: 3,
-        h: 7,
+        y: 2,
+        w: 4,
+        h: 10,
     };
     const BODY: Rect = Rect {
-        x: 1,
-        y: 8,
-        w: 8,
-        h: 8,
+        x: 0,
+        y: 7,
+        w: 10,
+        h: 11,
     };
 
     #[test]
@@ -1973,6 +1977,11 @@ mod tests {
                 "focused={focused}: no inverted glyph over the lock"
             );
         }
+    }
+
+    /// The padlock's full height: from the top of the shackle to the bottom of the body.
+    fn lock_h(shackle: Rect, body: Rect) -> i32 {
+        body.y + body.h - shackle.y
     }
 
     #[test]
@@ -2030,9 +2039,29 @@ mod tests {
                     drawn.len()
                 );
                 let (shackle, hole, body) = (drawn[1], drawn[2], drawn[3]);
+                // The body is the widest part, so it is what decides whether the lock is
+                // centred. Left and right margins agree to within the odd pixel a centred
+                // odd width leaves over.
+                let (left, right) = (body.x, w - (body.x + body.w));
                 assert!(
-                    body.x > 0 && body.x + body.w < w,
-                    "the body is flush with a {w}x{h} cell edge and will not read: {body:?}"
+                    (left - right).abs() <= 1,
+                    "the padlock sits off-centre in a {w}x{h} cell: {left} left, {right} right"
+                );
+                // It should be *big*. The whole point of drawing it is that it reads at a
+                // glance, and the first version was a legible padlock that nobody could see
+                // because it rattled around inside its cell. So the sizing policy is pinned
+                // rather than left to drift: take the cell's full usable width, then all the
+                // height that width earns, up to the cell. (Height cannot be pushed further
+                // on its own -- a lock that is tall for its width stops looking like a lock.)
+                assert_eq!(
+                    body.w,
+                    w - 2 * (w / 16),
+                    "the padlock does not use the full width of a {w}x{h} cell"
+                );
+                assert_eq!(
+                    lock_h(shackle, body),
+                    (body.w * 7 / 4).min(h - 2),
+                    "the padlock does not use the height its width earns in a {w}x{h} cell"
                 );
                 assert!(
                     hole.x > shackle.x
