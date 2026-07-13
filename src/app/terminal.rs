@@ -1353,17 +1353,23 @@ mod tests {
         // is what makes the count below arithmetic rather than a guess (an unfocused
         // cursor is a hollow block, which is four).
         core.focused = true;
-        let fills = |core: &TerminalCore| {
+        // The padlock's two solid parts (the arch and the body) are the only round-rects
+        // the frame draws in the cursor colour: its hollow and keyhole take the cell's
+        // background, and no other cursor shape is round. So this counts padlocks.
+        let padlock_parts = |core: &TerminalCore| {
             let (mut list, mut strings) = (DisplayList::new(), Vec::new());
             core.fill_frame_list(&mut list, &mut strings);
+            let ink = core.theme.cursor.to_u32();
             list.iter()
-                .filter(|c| matches!(c, crate::render::display::DrawCmd::Fill { .. }))
+                .filter(|c| {
+                    matches!(c, crate::render::display::DrawCmd::RoundRect { color, .. } if *color == ink)
+                })
                 .count()
         };
 
         core.refresh_tty_mode();
         assert_eq!(core.tty_mode, TtyMode::Cooked, "a fresh tty echoes");
-        let cooked = fills(&core);
+        assert_eq!(padlock_parts(&core), 0, "an echoing tty draws no lock");
 
         // What sudo does: stop echoing, print an ordinary line of text, say nothing.
         core.pty.as_ref().expect("a live pty").set_echo(false);
@@ -1374,11 +1380,10 @@ mod tests {
             core.dirty,
             "a silent prompt emits no output, so nothing but this would repaint it"
         );
-        // The one block fill becomes a cleared cell plus the padlock's four rectangles.
         assert_eq!(
-            fills(&core),
-            cooked + 4,
-            "the padlock reaches the frame the window pulls"
+            padlock_parts(&core),
+            2,
+            "the padlock's arch and body reach the frame the window pulls"
         );
 
         // And what it does once it has the password: give the echo back.
@@ -1387,7 +1392,7 @@ mod tests {
         core.refresh_tty_mode();
         assert_eq!(core.tty_mode, TtyMode::Cooked);
         assert!(core.dirty, "letting go of the lock repaints too");
-        assert_eq!(fills(&core), cooked, "the padlock is gone");
+        assert_eq!(padlock_parts(&core), 0, "the padlock is gone");
     }
 
     #[test]
@@ -1395,17 +1400,22 @@ mod tests {
         // The same journey as the live-tty test above, but without a child, so it still
         // guards the wiring where fork/exec is unavailable: flip the cached mode the way
         // a settle would, and confirm the display list the window pulls carries a lock.
-        let fills = |core: &TerminalCore| {
+        // The padlock's two solid parts (the arch and the body) are the only round-rects
+        // the frame draws in the cursor colour: its hollow and keyhole take the cell's
+        // background, and no other cursor shape is round. So this counts padlocks.
+        let padlock_parts = |core: &TerminalCore| {
             let (mut list, mut strings) = (DisplayList::new(), Vec::new());
             core.fill_frame_list(&mut list, &mut strings);
+            let ink = core.theme.cursor.to_u32();
             list.iter()
-                .filter(|c| matches!(c, crate::render::display::DrawCmd::Fill { .. }))
+                .filter(|c| {
+                    matches!(c, crate::render::display::DrawCmd::RoundRect { color, .. } if *color == ink)
+                })
                 .count()
         };
         let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
-        // Focused, so the block it replaces is one fill rather than a hollow block's four.
         core.focused = true;
-        let cooked = fills(&core);
+        assert_eq!(padlock_parts(&core), 0, "a cooked tty draws no lock");
 
         core.dirty = false;
         core.tty_mode = TtyMode::PasswordPrompt;
@@ -1413,9 +1423,9 @@ mod tests {
 
         assert!(core.dirty, "a mode change has to repaint");
         assert_eq!(
-            fills(&core),
-            cooked + 4,
-            "the block becomes a cleared cell plus the padlock's four rectangles"
+            padlock_parts(&core),
+            2,
+            "the block cursor becomes a padlock: an arch and a body"
         );
     }
 
