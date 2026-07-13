@@ -60,7 +60,7 @@
 //! serve a span that is usually empty. A 13% frame regression established it.
 
 use crate::color::{Ground, Rgb, Theme};
-use crate::grid::{Attrs, Cell, Screen};
+use crate::grid::{AbsRow, Attrs, Cell, RowEpoch, Screen};
 use crate::platform::freetype::{FaceKey, FontStyle, Fonts};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
@@ -188,23 +188,30 @@ impl Default for CursorRender {
     }
 }
 
-/// A linear text selection over the visible grid, in `(row, col)` cell
-/// coordinates. `anchor` is where the drag began and `head` where it is now,
-/// either order; a cell falls in the selection when it lies between them in reading
-/// order (whole rows in the middle, partial rows at the ends). The painter paints
-/// the whole geometric span, blank cells included (see `Painter::selection_cols`),
-/// so dragging over the empty area below the prompt highlights it; the copy still
-/// trims each line's trailing blanks (see [`crate::grid::Screen::selection_text`]),
-/// so the paint is deliberately wider than what lands on the clipboard.
+/// A linear text selection, in absolute `(row, col)` cells. `anchor` is where the drag
+/// began and `head` where it is now, either order; a cell falls in the selection when it
+/// lies between them in reading order (whole rows in the middle, partial rows at the
+/// ends). The painter paints the whole geometric span, blank cells included (see
+/// `Painter::selection_cols`), so dragging over the empty area below the prompt
+/// highlights it; the copy still trims each line's trailing blanks (see
+/// [`crate::grid::Screen::selection_text`]), so the paint is deliberately wider than what
+/// lands on the clipboard.
+///
+/// [`AbsRow`] and not a display row, so that a printing child cannot drag the selection
+/// off the text it was made over: output scrolls the grid, the rows keep their ids, and
+/// the highlight stays on the words the user picked. `epoch` is the identity regime the
+/// ids were minted in — see [`RowEpoch`] for what ends one, and
+/// `TerminalCore::prune_selection` for who checks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Selection {
-    pub anchor: (usize, usize),
-    pub head: (usize, usize),
+    pub anchor: (AbsRow, usize),
+    pub head: (AbsRow, usize),
+    pub epoch: RowEpoch,
 }
 
 impl Selection {
     /// `(start, end)` in reading order, so `start <= end` row-major.
-    fn ordered(self) -> ((usize, usize), (usize, usize)) {
+    pub fn ordered(self) -> ((AbsRow, usize), (AbsRow, usize)) {
         if self.anchor <= self.head {
             (self.anchor, self.head)
         } else {
@@ -700,7 +707,10 @@ impl Painter<'_> {
             return;
         }
         // The first visible line's index into that whole, and the window height.
-        let top = self.screen.scrollback_len() - self.screen.view_offset();
+        let top = self
+            .screen
+            .scrollback_len()
+            .saturating_sub(self.screen.view_offset());
         let y = (top as i64 * sh as i64 / total as i64) as i32;
         // A minimum thumb height so it stays grabbable/visible on a deep history.
         let min_thumb = (sh / 20).max(8);
@@ -858,9 +868,21 @@ impl Painter<'_> {
     /// empty area below the prompt highlights it, the way xterm/wezterm/ghostty do.
     /// The paint is deliberately wider than [`Screen::selection_text`] copies: it
     /// shows the drag for feedback while the copy trims trailing blanks.
+    ///
+    /// The selection is held in absolute rows, so it is resolved against the display
+    /// here, at paint time. That is also where the clipping comes from for free: a
+    /// selection whose top has scrolled above the window simply has no display row
+    /// inside it until the part you can see, so the visible part still highlights.
     fn selection_cols(&self, row: usize) -> Option<(usize, usize)> {
         let (start, end) = self.selection?.ordered();
-        self.span_cols(CellSpan { start, end }, row)
+        let abs = self.screen.abs_row(row);
+        if abs < start.0 || abs > end.0 {
+            return None;
+        }
+        let last_col = self.screen.dimensions().0.saturating_sub(1);
+        let first = if abs == start.0 { start.1 } else { 0 };
+        let last = if abs == end.0 { end.1 } else { last_col }.min(last_col);
+        Some((first, last))
     }
 
     /// The underline under the hovered hyperlink where it crosses `row`, drawn as one
@@ -1184,6 +1206,16 @@ mod tests {
     /// hidden (so the tests that are about content are not perturbed by it).
     fn list_of(s: &Screen) -> DisplayList {
         build_display_list(&inputs(s, &Theme::default()))
+    }
+
+    /// A selection over the display cells `a`..`b`, resolved to absolute rows the way a
+    /// pointer drag resolves one.
+    fn sel(s: &Screen, a: (usize, usize), b: (usize, usize)) -> Selection {
+        Selection {
+            anchor: (s.abs_row(a.0), a.1),
+            head: (s.abs_row(b.0), b.1),
+            epoch: s.row_epoch(),
+        }
     }
 
     /// [`list_of`] with a selection over it.
@@ -1604,13 +1636,7 @@ mod tests {
     fn selection_paints_the_selected_cells() {
         let mut s = Screen::new(6, 1);
         feed(&mut s, b"abcdef");
-        let list = list_selecting(
-            &s,
-            Selection {
-                anchor: (0, 1),
-                head: (0, 3),
-            },
-        );
+        let list = list_selecting(&s, sel(&s, (0, 1), (0, 3)));
         // Columns 1..=3 get the selection background as one band.
         let band = fills(&list)
             .into_iter()
@@ -1634,13 +1660,7 @@ mod tests {
         // the copy still trims them (see grid::selection_text), so paint is wider.
         let mut s = Screen::new(6, 1);
         feed(&mut s, b"abc");
-        let list = list_selecting(
-            &s,
-            Selection {
-                anchor: (0, 0),
-                head: (0, 5),
-            },
-        );
+        let list = list_selecting(&s, sel(&s, (0, 0), (0, 5)));
         let band = fills(&list)
             .into_iter()
             .find(|(_, c)| *c == SELECTION_BG.to_u32())
@@ -1662,13 +1682,7 @@ mod tests {
         // "select the empty space below the prompt" behaviour): one full-width band,
         // even though the row holds no glyphs and would copy nothing.
         let s = Screen::new(6, 1);
-        let list = list_selecting(
-            &s,
-            Selection {
-                anchor: (0, 0),
-                head: (0, 5),
-            },
-        );
+        let list = list_selecting(&s, sel(&s, (0, 0), (0, 5)));
         let band = fills(&list)
             .into_iter()
             .find(|(_, c)| *c == SELECTION_BG.to_u32())
@@ -1682,6 +1696,60 @@ mod tests {
                 h: M.h
             }
         );
+    }
+
+    #[test]
+    fn a_selection_scrolled_off_the_top_still_paints_the_part_that_shows() {
+        // The selection is held in absolute rows and resolved against the display at
+        // paint time, so clipping is not a special case: rows above the window simply
+        // have no display row inside the span, and the visible tail still highlights.
+        let mut s = Screen::new(4, 2);
+        feed(&mut s, b"aa\r\nbb"); // both rows live
+        let selection = sel(&s, (0, 0), (1, 3)); // both rows selected
+        feed(&mut s, b"\r\ncc"); // "aa" scrolls into history, out of the window
+
+        let bands: Vec<Rect> = fills(&list_selecting(&s, selection))
+            .into_iter()
+            .filter(|(_, c)| *c == SELECTION_BG.to_u32())
+            .map(|(r, _)| r)
+            .collect();
+        assert_eq!(
+            bands.len(),
+            1,
+            "one band, for the one visible row: {bands:?}"
+        );
+        assert_eq!(
+            bands[0],
+            Rect {
+                x: 0,
+                y: 0,
+                w: 4 * M.w,
+                h: M.h
+            },
+            "the surviving row of the selection, now at the top of the window"
+        );
+    }
+
+    #[test]
+    fn a_selection_follows_its_rows_as_output_scrolls_the_grid() {
+        // The painted band tracks the content: the same selection, after one row scrolls
+        // into history, highlights the row where that text now is.
+        let mut s = Screen::new(4, 3);
+        feed(&mut s, b"aa\r\nbb\r\ncc");
+        let selection = sel(&s, (1, 0), (1, 3)); // the middle row, "bb"
+        let before = fills(&list_selecting(&s, selection))
+            .into_iter()
+            .find(|(_, c)| *c == SELECTION_BG.to_u32())
+            .expect("a band");
+        assert_eq!(before.0.y, M.h, "row 1 to start with");
+
+        feed(&mut s, b"\r\ndd"); // everything shifts up one row
+
+        let after = fills(&list_selecting(&s, selection))
+            .into_iter()
+            .find(|(_, c)| *c == SELECTION_BG.to_u32())
+            .expect("still a band");
+        assert_eq!(after.0.y, 0, "and the highlight moved up with the text");
     }
 
     #[test]

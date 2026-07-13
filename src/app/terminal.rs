@@ -26,7 +26,7 @@ use crate::color::Theme;
 use crate::config::TabBarConfig;
 use crate::error::Result;
 use crate::gather::{GatherEnd, Gatherer};
-use crate::grid::{CursorStyle, LinkProbe, Screen};
+use crate::grid::{AbsRow, CursorStyle, LinkProbe, RowEpoch, Screen};
 use crate::input;
 use crate::mouse::{self, MouseButton, MouseKind};
 use crate::platform::browser;
@@ -50,6 +50,26 @@ enum SelectMode {
     Char,
     Word,
     Line,
+}
+
+/// A left-drag in progress: everything the pointer needs to keep extending it.
+///
+/// One value rather than three fields, because they are only meaningful together. In
+/// particular the `epoch`: a character drag deliberately paints *no* selection until it
+/// leaves the cell it started in (so a plain click never flashes), yet it is already
+/// pinned to an anchor. If the grid renumbers its rows in that window — a resize, an
+/// alt-screen switch, a `clear`, a region scroll — the anchor names nothing, and the drag
+/// has to be cancelled rather than resumed against whatever row inherited the id. Kept
+/// beside the anchor it qualifies, there is no way to check one and forget the other.
+#[derive(Clone, Copy)]
+struct Drag {
+    /// The granularity the drag extends by, from the press's click count.
+    mode: SelectMode,
+    /// The clicked unit's inclusive cell range (a character, word, or line), the pivot a
+    /// drag extends around so the anchored unit always stays selected.
+    anchor: ((AbsRow, usize), (AbsRow, usize)),
+    /// The identity regime the anchor's rows were minted in.
+    epoch: RowEpoch,
 }
 
 /// What one budgeted pass over a core's gather queue observed. The tab manager
@@ -95,16 +115,13 @@ pub(super) struct TerminalCore {
     /// The button held for drag reporting under mouse mode (`None` when none is
     /// down).
     mouse_held: Option<MouseButton>,
-    /// The active text selection (a left-drag), or `None`. In display coords.
+    /// The active text selection (a left-drag), or `None`. In absolute rows, so child
+    /// output scrolling the grid does not drag it off the text it was made over; see
+    /// [`Self::prune_selection`] for the (short) list of things that do end it.
     selection: Option<Selection>,
-    /// Whether a selection drag is in progress (the button is down).
-    selecting: bool,
-    /// The granularity the active drag extends by, set from the click count on press
-    /// (one click a character, two a word, three a line).
-    select_mode: SelectMode,
-    /// The clicked unit's inclusive cell range (a character, word, or line), the
-    /// pivot a drag extends around so the anchored unit always stays selected.
-    select_anchor: ((usize, usize), (usize, usize)),
+    /// The left-drag in progress (the button is down), or `None`. Absolute, like the
+    /// selection it pivots: output during a drag must not move the anchor.
+    drag: Option<Drag>,
     /// The hyperlink under the pointer: its cells paint underlined and Ctrl+click
     /// follows it. `None` whenever there is nothing to follow — no URL under the
     /// pointer, a drag in progress (the gesture is a selection), a program grabbing
@@ -179,9 +196,7 @@ impl TerminalCore {
             blink_at: None,
             mouse_held: None,
             selection: None,
-            selecting: false,
-            select_mode: SelectMode::Char,
-            select_anchor: ((0, 0), (0, 0)),
+            drag: None,
             hover: None,
             hover_cell: None,
             probe: LinkProbe::default(),
@@ -399,13 +414,22 @@ impl TerminalCore {
                 self.pad = pad;
                 self.origin_y = origin_y;
                 if self.demo {
+                    // The grid is replaced wholesale, so no row id minted against the
+                    // old one survives it.
                     self.screen = demo_screen(cols, rows);
+                    self.selection = None;
+                    self.drag = None;
                 } else {
+                    // A resize re-indexes rows and ends their epoch, which is what the
+                    // prune below reads to drop a selection that no longer means
+                    // anything. It is checked here and not only after output because a
+                    // resize need not be followed by any.
                     self.screen.resize(cols, rows);
                     if let Some(pty) = &self.pty {
                         let _ = pty.resize(cols, rows);
                     }
                 }
+                self.prune_selection();
                 self.dirty = true;
                 Ok(false)
             }
@@ -485,7 +509,7 @@ impl TerminalCore {
                     if pressed {
                         self.begin_selection(row, col, count);
                     } else {
-                        self.selecting = false;
+                        self.drag = None;
                         self.finish_selection();
                     }
                     self.dirty = true;
@@ -497,7 +521,7 @@ impl TerminalCore {
                 }
             }
             PointerEvent::Motion { col, row } => {
-                if self.selecting {
+                if self.drag.is_some() {
                     self.extend_selection(row, col);
                 } else if reporting {
                     // Report motion to a program that asked for it (drag under ?1002,
@@ -507,7 +531,7 @@ impl TerminalCore {
                 }
                 // A hover is live only when the gesture is not already spoken for: a
                 // drag is a selection, and a grabbed mouse belongs to the program.
-                self.track_hover(row, col, !reporting && !self.selecting);
+                self.track_hover(row, col, !reporting && self.drag.is_none());
             }
             PointerEvent::Left => self.track_hover(0, 0, false),
             PointerEvent::Wheel {
@@ -684,18 +708,23 @@ impl TerminalCore {
     /// leaves the cell, see [`Self::extend_selection`]), so a single click never
     /// flashes the cell under it; a word/line click is a real selection at once.
     fn begin_selection(&mut self, row: usize, col: usize, count: usize) {
+        let abs = self.screen.abs_row(row);
         let (mode, anchor) = match count {
-            2 => (SelectMode::Word, self.screen.word_at(row, col)),
-            n if n >= 3 => (SelectMode::Line, self.screen.line_at(row)),
-            _ => (SelectMode::Char, ((row, col), (row, col))),
+            2 => (SelectMode::Word, self.screen.word_at(abs, col)),
+            n if n >= 3 => (SelectMode::Line, self.screen.line_at(abs)),
+            _ => (SelectMode::Char, ((abs, col), (abs, col))),
         };
-        self.select_mode = mode;
-        self.select_anchor = anchor;
+        let epoch = self.screen.row_epoch();
+        self.drag = Some(Drag {
+            mode,
+            anchor,
+            epoch,
+        });
         self.selection = (mode != SelectMode::Char).then_some(Selection {
             anchor: anchor.0,
             head: anchor.1,
+            epoch,
         });
-        self.selecting = true;
     }
 
     /// Extend the in-progress drag to display `(row, col)`, snapped to its
@@ -703,16 +732,21 @@ impl TerminalCore {
     /// pointer, so a word/line drag never splits a word or line. A character drag
     /// that has not yet left the anchor cell stays empty, so it reads as a click.
     fn extend_selection(&mut self, row: usize, col: usize) {
-        let unit = match self.select_mode {
-            SelectMode::Char => ((row, col), (row, col)),
-            SelectMode::Word => self.screen.word_at(row, col),
-            SelectMode::Line => self.screen.line_at(row),
+        let Some(drag) = self.drag else {
+            return;
         };
-        let start = self.select_anchor.0.min(unit.0);
-        let end = self.select_anchor.1.max(unit.1);
-        let sel = (self.select_mode != SelectMode::Char || start != end).then_some(Selection {
+        let abs = self.screen.abs_row(row);
+        let unit = match drag.mode {
+            SelectMode::Char => ((abs, col), (abs, col)),
+            SelectMode::Word => self.screen.word_at(abs, col),
+            SelectMode::Line => self.screen.line_at(abs),
+        };
+        let start = drag.anchor.0.min(unit.0);
+        let end = drag.anchor.1.max(unit.1);
+        let sel = (drag.mode != SelectMode::Char || start != end).then_some(Selection {
             anchor: start,
             head: end,
+            epoch: drag.epoch,
         });
         if self.selection != sel {
             self.selection = sel;
@@ -807,18 +841,64 @@ impl TerminalCore {
         Ok(())
     }
 
-    /// The bookkeeping every burst of child output triggers: snap the view to the
-    /// live bottom (xterm behavior), drop a selection now over stale cells, re-probe
-    /// the link under a parked pointer (the text under it just moved), show the cursor
-    /// solid, mark dirty, and refresh the title if the child changed it.
+    /// The bookkeeping every burst of child output triggers: drop the selection if the
+    /// output invalidated it, re-probe the link under a parked pointer (the text under it
+    /// just moved), show the cursor solid, mark dirty, and refresh the title if the child
+    /// changed it.
+    ///
+    /// Output deliberately moves neither the view nor the selection. A scrolled-back view
+    /// stays anchored to its content while the child prints
+    /// ([`Screen::follow_history`](crate::grid::Screen::follow_history)), and the
+    /// selection is held in absolute rows so the text under it keeps its identity as the
+    /// grid scrolls beneath it. Only the user returns the view to the live bottom (by
+    /// typing, pasting, or pressing End), and only a genuine loss of row identity ends a
+    /// selection (see [`Self::prune_selection`]).
     fn after_output(&mut self) {
-        self.screen.scroll_view_to_bottom();
-        self.selection = None;
-        self.selecting = false;
+        self.prune_selection();
         self.refresh_hover();
         self.bump_cursor();
         self.dirty = true;
         self.refresh_title();
+    }
+
+    /// Drop the selection, and any drag pinned to it, when the rows they name have
+    /// stopped meaning what they meant.
+    ///
+    /// Two ways that happens, and only two. The grid can end the identity regime those
+    /// rows were minted in — a reset, a resize, an alt-screen switch, a full-display
+    /// erase, or a scroll that renumbered the stream (see
+    /// [`RowEpoch`](crate::grid::RowEpoch)). Or the ring can simply outrun them: once the
+    /// *last* row of a selection has aged off the front of history, the whole thing is
+    /// behind the oldest line the terminal still holds, and there is nothing left to copy.
+    /// A selection that has merely scrolled out of *sight* is not pruned — it is still
+    /// there, and scrolling back reveals it, as in xterm.
+    ///
+    /// The drag is checked separately from the selection, and must be: a character drag
+    /// that has not yet left the cell it started in has an anchor but no selection to
+    /// speak for it, and resuming it against a renumbered grid would drag out a span from
+    /// a row the user never touched.
+    ///
+    /// Everything else — a printing child, a scroll, a program overwriting the cells
+    /// underneath — leaves both alone. A selection is a region, not a snapshot: it copies
+    /// whatever those cells hold when you ask for them.
+    fn prune_selection(&mut self) {
+        let epoch = self.screen.row_epoch();
+        let live_rows = |cell: (AbsRow, usize)| self.screen.row_exists(cell.0);
+
+        if self
+            .drag
+            .is_some_and(|d| d.epoch != epoch || !live_rows(d.anchor.1))
+        {
+            self.drag = None;
+        }
+        let stale = self
+            .selection
+            .is_some_and(|sel| sel.epoch != epoch || !live_rows(sel.ordered().1));
+        if stale {
+            self.selection = None;
+            self.drag = None;
+            self.dirty = true;
+        }
     }
 
     /// Queue a `Title` for the window when the child's title changed since the last
@@ -1292,7 +1372,7 @@ mod tests {
             Some("https://example.com/a")
         );
         assert!(core.selection.is_none(), "the click began no selection");
-        assert!(!core.selecting, "and no drag is in progress");
+        assert!(core.drag.is_none(), "and no drag is in progress");
     }
 
     #[test]
@@ -1320,7 +1400,7 @@ mod tests {
         // click keeps its ordinary meaning rather than being swallowed.
         let mut core = core_showing("see https://example.com/a here");
         click_mods(&mut core, true, 1, 0, input::Mods::CTRL);
-        assert!(core.selecting, "a selection drag began");
+        assert!(core.drag.is_some(), "a selection drag began");
         assert!(opened_url(&mut core).is_none());
     }
 
@@ -1428,7 +1508,8 @@ mod tests {
         // A triple-click selects the whole logical line (row 0's title), trailing
         // blanks trimmed.
         let mut core = pointer_core();
-        let expected = core.screen.selection_text((0, 0), (0, 79));
+        let row = core.screen.abs_row(0);
+        let expected = core.screen.selection_text((row, 0), (row, 79));
         click(&mut core, MouseButton::Left, true, 5, 0, 3);
         click(&mut core, MouseButton::Left, false, 5, 0, 1);
         let offered = primary_offer(&mut core);
@@ -1437,6 +1518,149 @@ mod tests {
             offered.as_deref().is_some_and(|t| t.starts_with("bnkterm")),
             "the line begins with the title"
         );
+    }
+
+    /// The text `core` would copy right now, or `None` with nothing selected.
+    fn copied(core: &mut TerminalCore) -> Option<String> {
+        core.copy_selection();
+        core.take_outbox().into_iter().find_map(|m| match m {
+            ToWindow::OfferSelection(bytes) => String::from_utf8(bytes).ok(),
+            _ => None,
+        })
+    }
+
+    /// Double-click the word at display `(row, col)` and leave it selected.
+    fn select_word(core: &mut TerminalCore, col: usize, row: usize) {
+        click(core, MouseButton::Left, true, col, row, 2);
+        click(core, MouseButton::Left, false, col, row, 1);
+        core.take_outbox();
+    }
+
+    #[test]
+    fn a_selection_survives_the_child_printing_under_it() {
+        // The other half of the reported bug: selecting text while a program prints used
+        // to be impossible, because every burst of output dropped the selection. It now
+        // holds, and keeps copying the words it was made over even after they have
+        // scrolled off the top of the screen.
+        let mut core = core_showing("hello world");
+        select_word(&mut core, 6, 0);
+        assert_eq!(copied(&mut core).as_deref(), Some("world"));
+
+        // A screenful and a half of output: "hello world" scrolls into history.
+        core.feed_test_bytes(b"\r\n");
+        for i in 0..30 {
+            core.feed_test_bytes(format!("line {i}\r\n").as_bytes());
+        }
+
+        assert!(core.selection.is_some(), "output did not evaporate it");
+        assert_eq!(
+            copied(&mut core).as_deref(),
+            Some("world"),
+            "and it still names the line it was made over"
+        );
+    }
+
+    #[test]
+    fn a_drag_in_progress_stays_anchored_while_the_child_prints() {
+        // The anchor a drag pivots around is absolute too. Here the child scrolls the
+        // grid by three rows *between* the press and the drag, so the anchored line moves
+        // from display row 5 to display row 2 while the pointer follows it down there. A
+        // display-row anchor would still be pinned at row 5 and would drag out three rows
+        // of the wrong text; an absolute one is still on the line the user grabbed.
+        let mut core = core_showing("\x1b[6;1Halpha beta"); // display row 5
+        click(&mut core, MouseButton::Left, true, 0, 5, 1); // press on "alpha"
+
+        core.feed_test_bytes(b"\x1b[24;1H\r\n\r\n\r\n"); // three rows into history
+
+        drag_to(&mut core, 9, 2); // the same line, now three rows higher
+        click(&mut core, MouseButton::Left, false, 9, 2, 1);
+        assert_eq!(copied(&mut core).as_deref(), Some("alpha beta"));
+    }
+
+    #[test]
+    fn the_alt_screen_takes_the_selection_with_it() {
+        // Rows on the alt screen are a different buffer with no history: an id minted on
+        // the primary names nothing there, so the switch ends the epoch and the prune
+        // drops the selection rather than highlighting whatever now sits at that row.
+        let mut core = core_showing("hello world");
+        select_word(&mut core, 6, 0);
+        assert!(core.selection.is_some());
+
+        core.feed_test_bytes(b"\x1b[?1049h");
+
+        assert!(core.selection.is_none(), "the selection did not follow");
+    }
+
+    #[test]
+    fn a_full_screen_erase_takes_the_selection_with_it() {
+        // `clear` (ED 2 + ED 3): the text the user picked is gone, so the highlight goes
+        // with it rather than sitting over the blank cells that replaced it.
+        let mut core = core_showing("hello world");
+        select_word(&mut core, 6, 0);
+        core.feed_test_bytes(b"\x1b[2J\x1b[3J");
+        assert!(core.selection.is_none());
+    }
+
+    #[test]
+    fn a_resize_takes_the_selection_with_it() {
+        // Rows re-index on a resize and we do not re-wrap, so an id minted before it can
+        // name a different line (or none). A resize sends no output, so this is the path
+        // that proves the prune does not depend on the child saying something.
+        let mut core = core_showing("hello world");
+        select_word(&mut core, 6, 0);
+        core.apply(ToTerminal::Resize {
+            cols: 40,
+            rows: 12,
+            width: 40 * 8,
+            height: 12 * 16,
+            metrics: METRICS,
+            pad: 0,
+            origin_y: 0,
+        })
+        .unwrap();
+        assert!(core.selection.is_none());
+    }
+
+    #[test]
+    fn a_selection_is_dropped_once_the_ring_outruns_it() {
+        // Absolute ids are stable, but not immortal: history is finite, and once the last
+        // of a selection's rows has aged off the front of the ring there is nothing left
+        // to copy. (A selection that has merely scrolled out of *sight* is kept — see
+        // `a_selection_survives_the_child_printing_under_it`.)
+        let mut core = core_showing("hello world");
+        select_word(&mut core, 6, 0);
+        assert!(core.selection.is_some());
+
+        // More line feeds than the ring is deep, in one burst: row 0 is evicted.
+        core.feed_test_bytes(&b"\r\n".repeat(11_000));
+
+        assert!(
+            core.selection.is_none(),
+            "the row it named has aged out of history"
+        );
+    }
+
+    #[test]
+    fn a_pending_character_drag_is_cancelled_when_its_anchor_dies() {
+        // A single click pins an anchor but paints no selection until the drag leaves the
+        // cell (so a plain click never flashes). That leaves a window in which the drag
+        // holds row ids that nothing else speaks for: if the grid renumbers in it, the
+        // drag has to die too, or the next motion resumes from an anchor that now names a
+        // row the user never touched and drags out a span of it.
+        let mut core = core_showing("alpha beta");
+        click(&mut core, MouseButton::Left, true, 0, 0, 1); // press: anchor, no selection
+        assert!(core.selection.is_none());
+        assert!(core.drag.is_some());
+
+        core.feed_test_bytes(b"\x1b[?1049h"); // alt screen: every id minted is void
+
+        drag_to(&mut core, 5, 3);
+        click(&mut core, MouseButton::Left, false, 5, 3, 1);
+        assert!(
+            core.selection.is_none(),
+            "the drag did not resume from a dead anchor"
+        );
+        assert_eq!(copied(&mut core), None, "and nothing was offered to copy");
     }
 
     #[test]
@@ -1490,6 +1714,59 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, ToWindow::OfferPrimary(_) | ToWindow::OfferSelection(_))),
             "but nothing is offered to copy"
+        );
+    }
+
+    /// The text the view is showing at display `row`, which is what the user's eye is
+    /// on. (`row_string` reads the *live* screen, so it is the wrong probe here.)
+    fn view_row_text(core: &TerminalCore, row: usize) -> String {
+        let (cols, _) = core.screen.dimensions();
+        let text: String = (0..cols)
+            .map(|c| core.screen.view_cell(row, c).rune)
+            .collect();
+        text.trim_end().to_string()
+    }
+
+    #[test]
+    fn child_output_leaves_a_scrolled_view_where_the_user_put_it() {
+        // The reported bug, at the layer it lived on: `after_output` pinned the view to
+        // the live bottom on every read from the PTY, so a chatty child (a spinner, a
+        // build) snatched the view back ten times a second and scrolling back while it
+        // printed was impossible. Output moves the content, so the offset moves with it.
+        let mut core = pointer_core();
+        for i in 0..40 {
+            core.feed_test_bytes(format!("line {i}\r\n").as_bytes());
+        }
+        core.screen.scroll_view_up(5);
+        assert!(core.screen.is_scrolled());
+        let under_the_eye = view_row_text(&core, 0);
+
+        for i in 40..50 {
+            core.feed_test_bytes(format!("line {i}\r\n").as_bytes());
+        }
+
+        assert_eq!(
+            core.screen.view_offset(),
+            15,
+            "the offset followed the output"
+        );
+        assert_eq!(
+            view_row_text(&core, 0),
+            under_the_eye,
+            "the text held still"
+        );
+
+        // The one thing that still snaps to the bottom: the user. A keystroke must
+        // never land blind in the middle of history.
+        core.apply(ToTerminal::Key {
+            key: input::Key::Char('x'),
+            mods: input::Mods::NONE,
+        })
+        .unwrap();
+        assert_eq!(
+            core.screen.view_offset(),
+            0,
+            "typing returns to the live bottom"
         );
     }
 

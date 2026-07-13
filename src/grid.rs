@@ -50,6 +50,114 @@ const DEFAULT_SCROLLBACK: usize = 10_000;
 /// Columns between default tab stops.
 const TAB_WIDTH: usize = 8;
 
+/// The index of a line in the unbounded stream of everything the child has printed:
+/// history first (oldest at 0), then the live screen. Unlike a display row it does not
+/// move when the screen scrolls — output pushes a row up out of the live screen and
+/// into history, and the id rides along with the content.
+///
+/// That is the whole point of it. A selection stored in display coordinates has to be
+/// thrown away on every scroll (display row 4 is a different line afterwards), which is
+/// why child output used to drop it; a selection stored in `AbsRow` survives, because
+/// the row it names is still the row the user picked.
+///
+/// Ids are only meaningful within one [`RowEpoch`]: see there for the operations that
+/// renumber the grid, and [`Screen::display_row`] for resolving one back to a row on
+/// screen (`None` once it has scrolled out of the visible band or aged out of history).
+///
+/// ```text
+///   evicted=2        │ the stream (ids never reused, never shifted)
+///   ─────────────────┼──────────────────────────────────────────────
+///   AbsRow(0)   gone │ pushed out of the front of the ring
+///   AbsRow(1)   gone │
+///   AbsRow(2)        │ ┐ history (scrollback)
+///   AbsRow(3)        │ ┘
+///   AbsRow(4)        │ ┐ live screen (rows)
+///   AbsRow(5)        │ ┘
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct AbsRow(u64);
+
+impl AbsRow {
+    /// The line after this one. `None` only at the end of the id space, which a
+    /// terminal printing a line per nanosecond would reach in about six hundred years.
+    fn next(self) -> Option<Self> {
+        self.0.checked_add(1).map(AbsRow)
+    }
+
+    /// The line before this one, or `None` at the very start of the stream.
+    fn prev(self) -> Option<Self> {
+        self.0.checked_sub(1).map(AbsRow)
+    }
+}
+
+/// The identity regime [`AbsRow`] ids live in, bumped whenever they stop meaning what
+/// they meant. Two things do that, and only these two:
+///
+/// - **A row is discarded out of the middle of the grid** rather than retired into
+///   history: a scroll inside a `DECSTBM` region, a `DL`, or any scroll on the alt
+///   screen (which keeps no history at all). Every row below the hole shifts up, so the
+///   ids no longer name the same lines.
+/// - **The content is destroyed wholesale**: `RIS`, a resize (rows re-index and we do
+///   not re-wrap), an alt-screen switch, or an `ED` that erases the whole display.
+///
+/// Note what is *not* here: ordinary output. A row retiring into history keeps its id,
+/// and a row evicted off the front of a full ring only makes ids below `evicted`
+/// unresolvable — it shifts nothing. That asymmetry is what lets a selection (and the
+/// viewport) survive a printing child, which is the entire feature.
+///
+/// Anything holding row ids across output stores the epoch it minted them in and is
+/// dropped when the epoch moves on, rather than resolving them against a grid that has
+/// since been renumbered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct RowEpoch(u64);
+
+impl RowEpoch {
+    fn next(self) -> Self {
+        RowEpoch(self.0.wrapping_add(1))
+    }
+}
+
+/// What a scroll did to the rows it moved, which is all the rest of the terminal needs to
+/// know about it.
+///
+/// - `pushed`: rows that *retired into history* off the top of the screen. A scrolled-back
+///   viewport must follow them up ([`Screen::follow_history`]).
+/// - `renumbered`: the ids stopped naming the same lines, so the [`RowEpoch`] must end.
+///
+/// The two are independent, and the reason is worth stating once. Rows live in one stream,
+/// `scrollback ++ lines`, and an [`AbsRow`] is a position in it. A row retiring into
+/// history does not move within that stream — it goes from the front of `lines` to the
+/// back of `scrollback`, which is the very same slot — so a *full-screen* scroll keeps
+/// every id: it only appends a blank at the far end.
+///
+/// ```text
+///   stream:  [ h0 h1 | r0 r1 r2 ]        r0 retires, blank appends at the end
+///            [ h0 h1   r0 | r1 r2 __ ]   every surviving row kept its slot
+/// ```
+///
+/// Anything else that moves rows *inside* the stream renumbers it, and there are two such
+/// moves. A row can be torn out of the middle — a scroll inside a `DECSTBM` region, a
+/// `DL`, any scroll on the historyless alt screen, or any scroll *down* — and everything
+/// past the hole shifts. Or a top-anchored region can stop short of the last row, in which
+/// case the blank that fills in behind the scroll is inserted mid-stream and shifts every
+/// row *below the region*, even though nothing about those rows moved on screen:
+///
+/// ```text
+///   region 0..=1 of a 4-row screen, r0 retiring into history
+///   stream:  [ h0 | r0 r1 r2 r3 ]
+///            [ h0   r0 | r1 __ r2 r3 ]   ← the blank landed mid-stream:
+///                            ↑↑  r2 and r3 each shifted up an id, sitting still
+/// ```
+///
+/// That last case is the subtle one: it pushes to history *and* renumbers, so a program
+/// holding a status line below a scroll region would silently drag a selection onto the
+/// blank if only `pushed` were reported.
+#[derive(Clone, Copy, Default)]
+struct Scrolled {
+    pushed: usize,
+    renumbered: bool,
+}
+
 /// A cell's rendition attributes: the SGR styles plus the two layout bits that
 /// mark a wide character's halves and the one that records a soft-wrapped line.
 /// A bitfield newtype (no `bitflags` crate) so it is one `u16`, `Copy`, and
@@ -473,6 +581,11 @@ struct Buffer {
     /// History above the screen, oldest at the front, capped at `scrollback_limit`.
     scrollback: VecDeque<Row>,
     scrollback_limit: usize,
+    /// How many rows have left the front of the stream for good: evicted from a full
+    /// ring, or dropped when `ED 3` cleared the history. It is the offset that turns an
+    /// [`AbsRow`] into an index into `scrollback ++ lines`, and the reason an id is
+    /// never reused: the front of the stream only ever moves forward.
+    evicted: u64,
     cursor: Cursor,
     saved: Option<Saved>,
     /// DECSTBM scroll region, inclusive, within `0..rows`.
@@ -496,6 +609,7 @@ impl Buffer {
             lines,
             scrollback: VecDeque::with_capacity(scrollback_limit),
             scrollback_limit,
+            evicted: 0,
             cursor: Cursor::default(),
             saved: None,
             scroll_top: 0,
@@ -516,19 +630,48 @@ impl Buffer {
             .unwrap_or(Cell::BLANK)
     }
 
-    /// The row shown at display position `display_row` when the view is scrolled
-    /// `offset` lines up into scrollback. The scrollback and the live lines form
-    /// one virtual column of rows; the window of `rows` starts `offset` lines
-    /// above the live top. `offset` is assumed already clamped to `0..=scrollback
-    /// .len()`. Returns `None` past the end (a short final window).
-    fn view_row(&self, display_row: usize, offset: usize) -> Option<&Row> {
-        let base = self.scrollback.len().checked_sub(offset)?;
-        let idx = base + display_row;
+    /// The row at `idx` in this buffer's stream — history first (oldest at 0), then the
+    /// live screen — which is the one column of rows every other row lookup is a view
+    /// onto. `None` past the live bottom.
+    fn stream_row(&self, idx: usize) -> Option<&Row> {
         if idx < self.scrollback.len() {
             self.scrollback.get(idx)
         } else {
             self.lines.get(idx - self.scrollback.len())
         }
+    }
+
+    /// The stream index of `abs`, or `None` once it has been evicted off the front.
+    fn stream_index(&self, abs: AbsRow) -> Option<usize> {
+        usize::try_from(abs.0.checked_sub(self.evicted)?).ok()
+    }
+
+    /// The row `abs` names, or `None` if it has aged out of history or does not exist
+    /// yet (an id past the live bottom).
+    fn abs_row(&self, abs: AbsRow) -> Option<&Row> {
+        self.stream_row(self.stream_index(abs)?)
+    }
+
+    /// The id of the row at stream index `idx`.
+    fn abs_of(&self, idx: usize) -> AbsRow {
+        AbsRow(
+            self.evicted
+                .saturating_add(idx.try_into().unwrap_or(u64::MAX)),
+        )
+    }
+
+    /// One past the newest row's id: the live bottom of the stream.
+    fn abs_end(&self) -> AbsRow {
+        self.abs_of(self.scrollback.len() + self.rows)
+    }
+
+    /// The row shown at display position `display_row` when the view is scrolled
+    /// `offset` lines up into scrollback. The window of `rows` starts `offset` lines
+    /// above the live top. `offset` is assumed already clamped to `0..=scrollback
+    /// .len()`. Returns `None` past the end (a short final window).
+    fn view_row(&self, display_row: usize, offset: usize) -> Option<&Row> {
+        let base = self.scrollback.len().checked_sub(offset)?;
+        self.stream_row(base + display_row)
     }
 
     fn set_raw(&mut self, row: usize, col: usize, cell: Cell) {
@@ -609,6 +752,14 @@ impl Buffer {
     /// rows leaving the top are retained in scrollback; otherwise they are
     /// discarded. Either way the row storage is recycled, so a steady scroll
     /// allocates nothing once scrollback is full.
+    ///
+    /// Reports what left, as a [`Scrolled`]: rows that *retired into history* keep their
+    /// [`AbsRow`] and pull a scrolled-back viewport along with them
+    /// ([`Screen::follow_history`]); rows that were *discarded* are torn out of the
+    /// middle of the stream, shifting every id below them, which ends the
+    /// [`RowEpoch`]. The push count is a count of pushes, not of net growth: once the
+    /// ring is full every push also evicts, and that difference is what makes a view
+    /// parked at the top hold still while history slides out from under it.
     fn scroll_up_range(
         &mut self,
         top: usize,
@@ -616,18 +767,21 @@ impl Buffer {
         n: usize,
         blank: Cell,
         to_scrollback: bool,
-    ) {
+    ) -> Scrolled {
+        let mut out = Scrolled::default();
         if top > bottom || bottom >= self.rows {
-            return;
+            return out;
         }
         let n = n.min(bottom - top + 1);
         for _ in 0..n {
             let Some(leaving) = self.lines.remove(top) else {
-                return;
+                return out;
             };
             let mut recycled = if to_scrollback && top == 0 && self.scrollback_limit > 0 {
+                out.pushed += 1;
                 self.scrollback.push_back(leaving);
                 if self.scrollback.len() > self.scrollback_limit {
+                    self.evicted += 1;
                     self.scrollback
                         .pop_front()
                         .unwrap_or_else(|| Row::filled(self.cols, blank))
@@ -635,29 +789,48 @@ impl Buffer {
                     Row::filled(self.cols, blank)
                 }
             } else {
+                // Torn out of the middle of the stream: everything past the hole shifts.
+                out.renumbered = true;
                 leaving
             };
             recycled.reset(self.cols, blank);
             self.lines.insert(bottom, recycled);
         }
+        // A retiring row keeps its slot in the stream, but the blank replacing it is
+        // inserted at the region's bottom margin. Only when that is the last row of the
+        // screen does it land at the end of the stream and leave the ids alone; short of
+        // it, every row below the region shifts up one while sitting perfectly still.
+        if out.pushed > 0 && bottom + 1 < self.rows {
+            out.renumbered = true;
+        }
+        out
     }
 
     /// Scroll `[top, bottom]` down by `n`, feeding `blank` rows in at the top.
     /// Never touches scrollback (only content leaving the top of the full screen
     /// enters history).
-    fn scroll_down_range(&mut self, top: usize, bottom: usize, n: usize, blank: Cell) {
+    ///
+    /// Every row it moves is [`Scrolled::discarded`]: the content slides *down* while the
+    /// ids stay where they are, so the row that was `AbsRow(n)` now holds what used to be
+    /// above it, and the row pushed off the bottom of the region is gone. That shifts the
+    /// content out from under anything holding an id, which ends the [`RowEpoch`] — the
+    /// mirror image of a region scroll up.
+    fn scroll_down_range(&mut self, top: usize, bottom: usize, n: usize, blank: Cell) -> Scrolled {
+        let mut out = Scrolled::default();
         if top > bottom || bottom >= self.rows {
-            return;
+            return out;
         }
         let n = n.min(bottom - top + 1);
         for _ in 0..n {
             let Some(leaving) = self.lines.remove(bottom) else {
-                return;
+                return out;
             };
+            out.renumbered = true;
             let mut recycled = leaving;
             recycled.reset(self.cols, blank);
             self.lines.insert(top, recycled);
         }
+        out
     }
 
     /// Push a row off the top into scrollback, evicting the oldest if the ring is
@@ -670,7 +843,16 @@ impl Buffer {
         self.scrollback.push_back(row);
         while self.scrollback.len() > self.scrollback_limit {
             self.scrollback.pop_front();
+            self.evicted += 1;
         }
+    }
+
+    /// Drop the whole history (`ED 3`). The rows are gone from the front of the stream
+    /// like any eviction, so the *live* rows keep the ids they already had: an id names
+    /// a line, and nothing here moved a line.
+    fn clear_history(&mut self) {
+        self.evicted += u64::try_from(self.scrollback.len()).unwrap_or(u64::MAX);
+        self.scrollback.clear();
     }
 
     /// Resize the buffer to `new_cols` x `new_rows`. Columns truncate or pad every
@@ -884,6 +1066,9 @@ pub struct Screen {
     /// always land on the live screen; only what the renderer shows shifts. The
     /// alt screen has no scrollback, so it forces this to 0.
     view_offset: usize,
+    /// The regime the current [`AbsRow`] ids belong to. Anything that stores rows
+    /// across output compares against it and drops what it holds when it moves on.
+    epoch: RowEpoch,
     /// Mouse reporting the child asked for (`?1000`/`?1002`/`?1003`/`?1006`); the
     /// app reads it to decide whether a pointer event goes to the child or drives
     /// local selection/scroll.
@@ -926,11 +1111,22 @@ impl Screen {
             gl_is_g1: false,
             title: String::new(),
             view_offset: 0,
+            epoch: RowEpoch::default(),
             mouse: MouseMode::default(),
             cursor_style: CursorStyle::Block,
             cursor_blink: false,
             responses: Vec::new(),
             links: LinkTable::default(),
+        }
+    }
+
+    /// A screen whose history holds `limit` lines, so a test can watch the ring fill
+    /// and evict without pushing [`DEFAULT_SCROLLBACK`] lines through the parser.
+    #[cfg(test)]
+    fn with_scrollback(cols: usize, rows: usize, limit: usize) -> Self {
+        Screen {
+            primary: Buffer::new(cols, rows, limit),
+            ..Screen::new(cols, rows)
         }
     }
 
@@ -1044,9 +1240,100 @@ impl Screen {
         }
     }
 
-    /// Pin the view back to the live bottom (what output and fresh input do).
+    /// Pin the view back to the live bottom (what fresh input does).
     pub fn scroll_view_to_bottom(&mut self) {
         self.view_offset = 0;
+    }
+
+    /// Keep a scrolled-back view anchored to the content it is showing after `pushed`
+    /// rows left the screen for scrollback. The offset counts lines above the live
+    /// bottom, so every row entering history moves the text under the user's eye one
+    /// line further up; the offset has to grow with it or the view drifts. Output
+    /// therefore never yanks the view back to the bottom: only the user does, by
+    /// typing, pasting, or asking for the bottom.
+    ///
+    /// A view already at the live bottom stays there — `view_offset == 0` *is* what
+    /// "follow the tail" means. The clamp to `scrollback.len()` is the full-ring case:
+    /// history evicts from the front as fast as it grows, so a view parked at the very
+    /// top holds while the oldest lines slide out from under it (as xterm does).
+    fn follow_history(&mut self, pushed: usize) {
+        if pushed == 0 || self.view_offset == 0 {
+            return;
+        }
+        self.view_offset = (self.view_offset + pushed).min(self.primary.scrollback.len());
+    }
+
+    /// Settle the two things a scroll leaves behind: the viewport follows the rows that
+    /// retired into history, and a scroll that renumbered the stream ends the
+    /// [`RowEpoch`] (see [`Scrolled`] for both, and for why a scroll can do both at once).
+    ///
+    /// Every scroll goes through here, so those two rules are stated once.
+    fn after_scroll(&mut self, scrolled: Scrolled) {
+        self.follow_history(scrolled.pushed);
+        if scrolled.renumbered {
+            self.break_row_identity();
+        }
+    }
+
+    // ---- absolute rows ------------------------------------------------------
+
+    /// The regime the grid's [`AbsRow`] ids currently belong to. A holder of row ids
+    /// (the selection) keeps the epoch it minted them in and drops them when this
+    /// changes, rather than resolving stale ids against a renumbered grid.
+    pub fn row_epoch(&self) -> RowEpoch {
+        self.epoch
+    }
+
+    /// End the current identity regime: the rows the outstanding ids named are gone or
+    /// renumbered. See [`RowEpoch`] for the (short) list of things that do this.
+    fn break_row_identity(&mut self) {
+        self.epoch = self.epoch.next();
+    }
+
+    /// The id of the line currently shown at display `row`.
+    ///
+    /// Display row 0 sits `view_offset` lines above the live screen, so it is that far
+    /// back into history; add the rows already evicted off the front and the display row
+    /// itself, and the result names a line rather than a position.
+    pub fn abs_row(&self, row: usize) -> AbsRow {
+        let b = self.active();
+        let top = b.scrollback.len().saturating_sub(self.view_offset());
+        b.abs_of(top + row)
+    }
+
+    /// Where `abs` sits on screen right now, or `None` when it is not in the visible
+    /// band — scrolled off above or below it, or aged out of history entirely. The
+    /// painter uses the `None` to clip: a selection whose top has scrolled away still
+    /// paints the part you can see.
+    pub fn display_row(&self, abs: AbsRow) -> Option<usize> {
+        let b = self.active();
+        let top = b.scrollback.len().saturating_sub(self.view_offset());
+        let idx = b.stream_index(abs)?;
+        let row = idx.checked_sub(top)?;
+        (row < b.rows).then_some(row)
+    }
+
+    /// Whether `abs` still names a line that exists: not yet evicted off the front of
+    /// history, not past the live bottom. (A row can exist without being on screen.)
+    pub fn row_exists(&self, abs: AbsRow) -> bool {
+        let b = self.active();
+        abs >= b.abs_of(0) && abs < b.abs_end()
+    }
+
+    /// The cell at absolute `(row, col)`, blank when the row no longer exists. This is
+    /// the selection's view of the grid: it reads the content the user picked, whatever
+    /// the viewport has since done.
+    fn abs_cell(&self, row: AbsRow, col: usize) -> Cell {
+        self.active()
+            .abs_row(row)
+            .and_then(|r| r.cells.get(col))
+            .copied()
+            .unwrap_or(Cell::BLANK)
+    }
+
+    /// Combining marks at absolute `(row, col)`.
+    fn abs_marks(&self, row: AbsRow, col: usize) -> Option<&[char]> {
+        self.active().abs_row(row).and_then(|r| r.marks_at(col))
     }
 
     /// The cell shown at display `(row, col)` honouring the scroll offset: the live
@@ -1074,60 +1361,73 @@ impl Screen {
             .and_then(|r| r.marks_at(col))
     }
 
-    /// The text of a linear selection over the current view, `a`..`b` inclusive in
-    /// display `(row, col)` cells (either order). Rows join with `\n`, except a
-    /// soft-wrapped row joins with nothing (the two display rows are one logical
-    /// line, so a selection across a wrap copies as unbroken text). Trailing
-    /// blanks on a row are dropped, wide spacers skipped, combining marks kept.
-    pub fn selection_text(&self, a: (usize, usize), b: (usize, usize)) -> String {
+    /// The text of a linear selection, `a`..`b` inclusive in absolute `(row, col)`
+    /// cells (either order). Rows join with `\n`, except a soft-wrapped row joins with
+    /// nothing (the two rows are one logical line, so a selection across a wrap copies
+    /// as unbroken text). Trailing blanks on a row are dropped, wide spacers skipped,
+    /// combining marks kept.
+    ///
+    /// Absolute rows, so it copies the lines the user picked no matter where the
+    /// viewport has drifted to since — including lines that have scrolled out of sight
+    /// entirely. Rows that have aged out of history read blank.
+    pub fn selection_text(&self, a: (AbsRow, usize), b: (AbsRow, usize)) -> String {
         let (start, end) = if a <= b { (a, b) } else { (b, a) };
-        let (cols, rows) = self.dimensions();
-        let last_row = end.0.min(rows.saturating_sub(1));
+        let cols = self.dimensions().0;
+        let last_col = cols.saturating_sub(1);
+        let buf = self.active();
+        // Clip to the rows that still exist: the head of an old selection may have aged
+        // out of history, and its tail cannot run past the live bottom.
+        let start_row = start.0.max(buf.abs_of(0));
+        let Some(end_row) = buf.abs_end().prev().map(|last| end.0.min(last)) else {
+            return String::new();
+        };
         let mut out = String::new();
-        for row in start.0..=last_row {
+        let mut row = start_row;
+        while row <= end_row {
             let first = if row == start.0 { start.1 } else { 0 };
-            let last = if row == end.0 {
-                end.1
-            } else {
-                cols.saturating_sub(1)
-            };
+            let last = if row == end.0 { end.1 } else { last_col };
             let mut line = String::new();
-            for col in first..=last.min(cols.saturating_sub(1)) {
-                let cell = self.view_cell(row, col);
+            for col in first..=last.min(last_col) {
+                let cell = self.abs_cell(row, col);
                 if cell.is_wide_spacer() {
                     continue;
                 }
                 line.push(cell.rune);
-                if let Some(marks) = self.view_marks(row, col) {
+                if let Some(marks) = self.abs_marks(row, col) {
                     line.extend(marks);
                 }
             }
             out.push_str(line.trim_end_matches(' '));
-            if row != last_row {
+            if row != end_row {
                 // A soft wrap continues the same logical line: no newline.
-                let wrapped = self
-                    .view_cell(row, cols.saturating_sub(1))
-                    .attrs
-                    .contains(Attrs::WRAPPED);
-                if !wrapped {
+                if !self.wraps(row) {
                     out.push('\n');
                 }
             }
+            let Some(next) = row.next() else { break };
+            row = next;
         }
         out
+    }
+
+    /// Whether absolute `row` soft-wrapped into the next one, so the two are one
+    /// logical line.
+    fn wraps(&self, row: AbsRow) -> bool {
+        let last_col = self.dimensions().0.saturating_sub(1);
+        self.abs_cell(row, last_col).attrs.contains(Attrs::WRAPPED)
     }
 
     /// The inclusive cell range of the word at display `(row, col)`, for a
     /// double-click selection. A word is a maximal run of non-boundary runes (see
     /// [`is_word_boundary`]); a wide glyph's spacer continues its leader's word.
     /// Clicking a boundary cell (whitespace, a bracket) selects just that cell.
-    pub fn word_at(&self, row: usize, col: usize) -> ((usize, usize), (usize, usize)) {
+    pub fn word_at(&self, row: AbsRow, col: usize) -> ((AbsRow, usize), (AbsRow, usize)) {
         let cols = self.dimensions().0;
         if col >= cols {
             return ((row, col), (row, col));
         }
         let is_word = |c: usize| {
-            let cell = self.view_cell(row, c);
+            let cell = self.abs_cell(row, c);
             cell.is_wide_spacer() || !is_word_boundary(cell.rune)
         };
         if !is_word(col) {
@@ -1144,22 +1444,47 @@ impl Screen {
         ((row, start), (row, end))
     }
 
-    /// The inclusive cell range of the whole logical line at display `row`, for a
-    /// triple-click selection: it spans every display row a soft wrap joined (the
-    /// `WRAPPED` flag on a row's last cell continues it into the next), edge to edge.
-    pub fn line_at(&self, row: usize) -> ((usize, usize), (usize, usize)) {
-        let (cols, rows) = self.dimensions();
-        let last = cols.saturating_sub(1);
-        let wrapped = |r: usize| self.view_cell(r, last).attrs.contains(Attrs::WRAPPED);
+    /// The inclusive cell range of the whole logical line at absolute `row`, for a
+    /// triple-click selection: it spans every row a soft wrap joined (the `WRAPPED` flag
+    /// on a row's last cell continues it into the next), edge to edge.
+    ///
+    /// The walk runs over the stream, not the visible band, so triple-clicking the first
+    /// row on screen still takes the part of the line that wrapped in from above it.
+    pub fn line_at(&self, row: AbsRow) -> ((AbsRow, usize), (AbsRow, usize)) {
+        let cols = self.dimensions().0;
+        let last_col = cols.saturating_sub(1);
+        let b = self.active();
+        let (first_row, end_row) = (b.abs_of(0), b.abs_end());
         let mut start = row;
-        while start > 0 && wrapped(start - 1) {
-            start -= 1;
+        while let Some(above) = start.prev() {
+            if start <= first_row || !self.wraps(above) {
+                break;
+            }
+            start = above;
         }
         let mut end = row;
-        while end + 1 < rows && wrapped(end) {
-            end += 1;
+        while let Some(below) = end.next() {
+            if below >= end_row || !self.wraps(end) {
+                break;
+            }
+            end = below;
         }
-        ((start, 0), (end, last))
+        ((start, 0), (end, last_col))
+    }
+
+    /// The display rows the logical line at display `row` spans, clipped to the visible
+    /// band. A hyperlink is a *hover* concern — re-probed on every pointer motion, never
+    /// stored across output, and underlined row by row on screen — so unlike a selection
+    /// it works in display rows and stops at the edge of what is drawn, even where the
+    /// logical line runs on past it. The clamps are safe because `row` is on screen and
+    /// the line contains it: a bound that does not resolve is off the band on that side.
+    fn line_rows_on_screen(&self, row: usize) -> (usize, usize) {
+        let rows = self.dimensions().1;
+        let ((first, _), (last, _)) = self.line_at(self.abs_row(row));
+        (
+            self.display_row(first).unwrap_or(0),
+            self.display_row(last).unwrap_or(rows.saturating_sub(1)),
+        )
     }
 
     /// The hyperlink under display `(row, col)`: the inclusive cell range its text
@@ -1210,7 +1535,7 @@ impl Screen {
         }
         // Byte offset of the probed cell's rune, recorded as that rune is pushed.
         let mut at = None;
-        let ((first, _), (last, _)) = self.line_at(row);
+        let (first, last) = self.line_rows_on_screen(row);
         for r in first..=last {
             for c in 0..cols {
                 let cell = self.view_cell(r, c);
@@ -1260,7 +1585,7 @@ impl Screen {
     /// ```
     fn anchor_span(&self, row: usize, col: usize, id: LinkId) -> ((usize, usize), (usize, usize)) {
         let (cols, _) = self.dimensions();
-        let ((first, _), (last, _)) = self.line_at(row);
+        let (first, last) = self.line_rows_on_screen(row);
         // Walk the logical line as one flat sequence of cells, so crossing a soft wrap
         // needs no special case: cell `n` is at (first + n / cols, n % cols).
         let at = |n: usize| self.view_cell(first + n / cols, n % cols);
@@ -1578,12 +1903,14 @@ impl Screen {
         let blank = self.blank_cell();
         let b = self.active_mut();
         b.cursor.pending_wrap = false;
+        let mut scrolled = Scrolled::default();
         if b.cursor.row == b.scroll_bottom {
             let (top, bottom) = (b.scroll_top, b.scroll_bottom);
-            b.scroll_up_range(top, bottom, 1, blank, top == 0);
+            scrolled = b.scroll_up_range(top, bottom, 1, blank, top == 0);
         } else if b.cursor.row + 1 < b.rows {
             b.cursor.row += 1;
         }
+        self.after_scroll(scrolled);
     }
 
     /// RI: move up one row, scrolling the region down at the top margin.
@@ -1591,12 +1918,14 @@ impl Screen {
         let blank = self.blank_cell();
         let b = self.active_mut();
         b.cursor.pending_wrap = false;
+        let mut scrolled = Scrolled::default();
         if b.cursor.row == b.scroll_top {
             let (top, bottom) = (b.scroll_top, b.scroll_bottom);
-            b.scroll_down_range(top, bottom, 1, blank);
+            scrolled = b.scroll_down_range(top, bottom, 1, blank);
         } else if b.cursor.row > 0 {
             b.cursor.row -= 1;
         }
+        self.after_scroll(scrolled);
     }
 
     /// NEL: carriage return plus line feed.
@@ -1752,7 +2081,7 @@ impl Screen {
             2 | 3 => {
                 b.clear_all(blank);
                 if mode == 3 {
-                    b.scrollback.clear();
+                    b.clear_history();
                 }
             }
             _ => {
@@ -1763,6 +2092,15 @@ impl Screen {
             }
         }
         b.cursor.pending_wrap = false;
+        if mode == 2 || mode == 3 {
+            // The display the user was looking at (and may have selected) is gone.
+            self.break_row_identity();
+        }
+        if mode == 3 {
+            // The history the view was scrolled into no longer exists, and an offset
+            // pointing past the end of an empty ring is not a view of anything.
+            self.view_offset = 0;
+        }
     }
 
     /// ECH: erase `n` cells from the cursor, without shifting the rest.
@@ -1799,12 +2137,21 @@ impl Screen {
             return;
         }
         let (top, bottom) = (b.cursor.row, b.scroll_bottom);
-        b.scroll_down_range(top, bottom, n.max(1), blank);
+        let scrolled = b.scroll_down_range(top, bottom, n.max(1), blank);
         b.cursor.col = 0;
         b.cursor.pending_wrap = false;
+        self.after_scroll(scrolled);
     }
 
     /// DL: delete `n` lines at the cursor row, within the scroll region.
+    ///
+    /// The deleted rows are discarded, never retained, even with the cursor at row 0.
+    /// This is a deliberate pick in a genuine split: xterm and alacritty push them into
+    /// history (xterm's `DeleteLine` saves when `cur_row == 0`), ghostty does not. DL is
+    /// an editing command, not a scroll — the application is *removing* those lines, and
+    /// a shell redrawing a multi-line prompt at the top of the screen should not dribble
+    /// prompt fragments into the scrollback. If a real program is ever found to depend on
+    /// the xterm behavior, this is the line to change.
     pub fn delete_lines(&mut self, n: usize) {
         let blank = self.blank_cell();
         let b = self.active_mut();
@@ -1812,9 +2159,10 @@ impl Screen {
             return;
         }
         let (top, bottom) = (b.cursor.row, b.scroll_bottom);
-        b.scroll_up_range(top, bottom, n.max(1), blank, false);
+        let scrolled = b.scroll_up_range(top, bottom, n.max(1), blank, false);
         b.cursor.col = 0;
         b.cursor.pending_wrap = false;
+        self.after_scroll(scrolled);
     }
 
     // ---- scrolling ----------------------------------------------------------
@@ -1836,12 +2184,18 @@ impl Screen {
         self.move_to(0, 0);
     }
 
-    /// SU: scroll the region up `n` lines (content moves up; no scrollback).
+    /// SU: scroll the region up `n` lines (content moves up, blanks feed in at the
+    /// bottom). Rows leaving the *top of the screen* enter history, exactly as they do
+    /// for a line feed at the bottom margin: xterm retains them whenever the top margin
+    /// is 0 (`xtermScroll`'s `top_marg == 0`), and alacritty and ghostty agree. A region
+    /// with a top margin discards instead — those rows never touch the top of the
+    /// screen, so they were never history.
     pub fn scroll_up(&mut self, n: usize) {
         let blank = self.blank_cell();
         let b = self.active_mut();
         let (top, bottom) = (b.scroll_top, b.scroll_bottom);
-        b.scroll_up_range(top, bottom, n.max(1), blank, false);
+        let scrolled = b.scroll_up_range(top, bottom, n.max(1), blank, top == 0);
+        self.after_scroll(scrolled);
     }
 
     /// SD: scroll the region down `n` lines (content moves down).
@@ -1849,7 +2203,8 @@ impl Screen {
         let blank = self.blank_cell();
         let b = self.active_mut();
         let (top, bottom) = (b.scroll_top, b.scroll_bottom);
-        b.scroll_down_range(top, bottom, n.max(1), blank);
+        let scrolled = b.scroll_down_range(top, bottom, n.max(1), blank);
+        self.after_scroll(scrolled);
     }
 
     // ---- save / restore -----------------------------------------------------
@@ -2059,8 +2414,10 @@ impl Screen {
             return;
         }
         // Entering or leaving the alt screen shows a live view, never stale
-        // history; the alt screen has no scrollback to scroll anyway.
+        // history; the alt screen has no scrollback to scroll anyway. The rows now
+        // belong to a different buffer, so no id minted against the old one survives.
         self.view_offset = 0;
+        self.break_row_identity();
         if enable {
             let blank = self.blank_cell();
             self.alt.clear_all(blank);
@@ -2079,7 +2436,11 @@ impl Screen {
     /// RIS: hard reset to the power-on state, keeping the current dimensions.
     pub fn reset(&mut self) {
         let (cols, rows) = self.dimensions();
+        let epoch = self.epoch.next();
         *self = Screen::new(cols, rows);
+        // A fresh `Screen` starts at epoch zero, which would make ids minted before the
+        // reset look current again. Identity moves forward across a reset, never back.
+        self.epoch = epoch;
     }
 
     /// Resize both screens to `cols` x `rows` (clamped to at least 1x1). The app
@@ -2091,8 +2452,11 @@ impl Screen {
         let rows = rows.max(1);
         self.primary.resize(cols, rows);
         self.alt.resize(cols, rows);
-        // Scrollback was reindexed; a stale offset would point at the wrong rows.
+        // Scrollback was reindexed; a stale offset would point at the wrong rows, and a
+        // row id minted against the old geometry names a row that may not exist (and,
+        // since we do not re-wrap, may hold different text at a different column).
         self.view_offset = 0;
+        self.break_row_identity();
     }
 
     /// OSC 0/2: set the window title.
@@ -3295,6 +3659,190 @@ mod tests {
     }
 
     #[test]
+    fn output_holds_a_scrolled_view_in_place() {
+        // The regression test for "you cannot scroll back while the child is printing":
+        // a row entering history under a scrolled view must move the offset with it, or
+        // the text under the user's eye slides away.
+        let mut s = Screen::new(5, 2);
+        feed(&mut s, b"a\r\nb\r\nc\r\nd"); // "a","b" in history; "c","d" live
+        s.scroll_view_up(2); // the top of history: "a" over "b"
+        assert_eq!(s.view_cell(0, 0).rune, 'a');
+
+        feed(&mut s, b"\r\ne"); // "c" enters history while the view is scrolled
+
+        assert_eq!(
+            s.view_offset(),
+            3,
+            "the offset followed the content into history"
+        );
+        assert_eq!(s.view_cell(0, 0).rune, 'a', "the visible text did not move");
+        assert_eq!(s.view_cell(1, 0).rune, 'b');
+    }
+
+    #[test]
+    fn a_pinned_view_still_follows_the_tail() {
+        let mut s = Screen::new(5, 2);
+        feed(&mut s, b"a\r\nb\r\nc\r\nd");
+        assert_eq!(s.view_offset(), 0);
+        feed(&mut s, b"\r\ne");
+        assert_eq!(
+            s.view_offset(),
+            0,
+            "a view at the bottom stays at the bottom"
+        );
+        assert_eq!(
+            s.view_cell(0, 0).rune,
+            'd',
+            "and keeps showing the newest rows"
+        );
+        assert_eq!(s.view_cell(1, 0).rune, 'e');
+    }
+
+    #[test]
+    fn a_scrolled_view_holds_at_the_top_as_history_evicts() {
+        // Once the ring is full every push also evicts, so the offset saturates and the
+        // oldest line the user can see slides out from under them (as xterm does). The
+        // view must hold at the top, not jump.
+        let mut s = Screen::with_scrollback(5, 2, 3);
+        feed(&mut s, b"a\r\nb\r\nc\r\nd\r\ne"); // "a".."c" in history (full), "d","e" live
+        assert_eq!(s.scrollback_len(), 3);
+        s.scroll_view_to_top();
+        assert_eq!(s.view_offset(), 3);
+        assert_eq!(s.view_cell(0, 0).rune, 'a');
+
+        feed(&mut s, b"\r\nf"); // "d" pushes in, "a" evicts
+
+        assert_eq!(s.view_offset(), 3, "the offset saturates at the full ring");
+        assert_eq!(s.scrollback_len(), 3);
+        assert_eq!(
+            s.view_cell(0, 0).rune,
+            'b',
+            "the oldest line slid out of view"
+        );
+        assert_eq!(s.view_cell(1, 0).rune, 'c');
+    }
+
+    #[test]
+    fn a_scroll_region_does_not_feed_a_scrolled_view() {
+        // With a top margin below row 0 the rows leaving the region are discarded, not
+        // retained, so there is no new history for the view to follow.
+        let mut s = Screen::new(5, 3);
+        feed(&mut s, b"a\r\nb\r\nc\r\nd"); // "a" in history; "b","c","d" live
+        s.scroll_view_up(1);
+        assert_eq!(s.view_offset(), 1);
+
+        feed(&mut s, b"\x1b[2;3r"); // DECSTBM: region rows 2..3 (1-based)
+        feed(&mut s, b"\x1b[3;1Hx\r\ny"); // a line feed at the bottom margin
+
+        assert_eq!(s.scrollback_len(), 1, "a region scroll retains nothing");
+        assert_eq!(s.view_offset(), 1, "so the view has nothing to follow");
+        assert_eq!(s.view_cell(0, 0).rune, 'a');
+    }
+
+    #[test]
+    fn multi_row_scroll_moves_the_view_by_the_rows_that_entered_history() {
+        let mut s = Screen::new(5, 2);
+        feed(&mut s, b"a\r\nb\r\nc\r\nd"); // "a","b" history; "c","d" live
+        s.scroll_view_up(1);
+        feed(&mut s, b"\r\ne\r\nf\r\ng\r\nh\r\ni"); // five line feeds
+        assert_eq!(
+            s.view_offset(),
+            6,
+            "the offset tracks rows entering history, not line feeds"
+        );
+        assert_eq!(s.view_offset(), s.scrollback_len() - 1);
+        assert_eq!(s.view_cell(0, 0).rune, 'b', "the view held its content");
+    }
+
+    #[test]
+    fn su_retains_the_rows_that_leave_the_top_of_the_screen() {
+        // SU with no top margin scrolls content off the top of the screen, and those
+        // rows are history, not litter (xterm's `top_marg == 0`, and the same in
+        // alacritty and ghostty). bnkterm used to drop them.
+        let mut s = Screen::new(5, 3);
+        feed(&mut s, b"a\r\nb\r\nc"); // fills the screen, no history yet
+        assert_eq!(s.scrollback_len(), 0);
+
+        feed(&mut s, b"\x1b[2S"); // SU 2
+
+        assert_eq!(
+            s.scrollback_len(),
+            2,
+            "the rows that left the top were kept"
+        );
+        s.scroll_view_to_top();
+        assert_eq!(s.view_cell(0, 0).rune, 'a');
+        assert_eq!(s.view_cell(1, 0).rune, 'b');
+        assert_eq!(
+            s.view_cell(2, 0).rune,
+            'c',
+            "and the live screen scrolled up"
+        );
+    }
+
+    #[test]
+    fn su_inside_a_scroll_region_discards() {
+        // With a top margin the rows leaving the region never reach the top of the
+        // screen, so they were never history.
+        let mut s = Screen::new(5, 3);
+        feed(&mut s, b"a\r\nb\r\nc");
+        feed(&mut s, b"\x1b[2;3r"); // DECSTBM: region rows 2..3
+        feed(&mut s, b"\x1b[1S");
+        assert_eq!(s.scrollback_len(), 0, "a region scroll retains nothing");
+        assert_eq!(
+            s.row_string(0).trim_end(),
+            "a",
+            "and rows above it hold still"
+        );
+    }
+
+    #[test]
+    fn su_moves_a_scrolled_view_with_its_content() {
+        let mut s = Screen::new(5, 3);
+        feed(&mut s, b"a\r\nb\r\nc\r\nd"); // "a" in history; "b","c","d" live
+        s.scroll_view_up(1);
+        assert_eq!(s.view_cell(0, 0).rune, 'a');
+
+        feed(&mut s, b"\x1b[2S"); // "b","c" enter history under a scrolled view
+
+        assert_eq!(s.view_offset(), 3, "the offset followed the content");
+        assert_eq!(
+            s.view_cell(0, 0).rune,
+            'a',
+            "and the visible text held still"
+        );
+    }
+
+    #[test]
+    fn dl_at_the_top_of_the_screen_discards_rather_than_retains() {
+        // A deliberate divergence from xterm and alacritty, matching ghostty: DL is an
+        // editing command, so the lines the application removed stay removed. See
+        // [`Screen::delete_lines`].
+        let mut s = Screen::new(5, 3);
+        feed(&mut s, b"a\r\nb\r\nc");
+        feed(&mut s, b"\x1b[1;1H\x1b[1M"); // home, DL 1
+        assert_eq!(
+            s.scrollback_len(),
+            0,
+            "the deleted line is gone, not archived"
+        );
+        assert_eq!(s.row_string(0).trim_end(), "b");
+    }
+
+    #[test]
+    fn erasing_the_scrollback_returns_the_view_to_the_bottom() {
+        // ED 3 (what `clear` and `tput reset` emit) drops the history the view was
+        // showing. An offset left pointing into an empty ring is a view of nothing.
+        let mut s = Screen::new(5, 2);
+        feed(&mut s, b"a\r\nb\r\nc\r\nd");
+        s.scroll_view_up(2);
+        feed(&mut s, b"\x1b[3J");
+        assert_eq!(s.scrollback_len(), 0);
+        assert_eq!(s.view_offset(), 0, "the view cannot outlive the history");
+        assert!(!s.is_scrolled());
+    }
+
+    #[test]
     fn link_at_finds_a_url_and_spans_exactly_its_cells() {
         let mut s = Screen::new(40, 2);
         feed(&mut s, b"see https://example.com/a now");
@@ -3593,17 +4141,24 @@ mod tests {
         );
     }
 
+    /// The absolute cell under display `(row, col)`, which is what a pointer resolves to.
+    fn at(s: &Screen, row: usize, col: usize) -> (AbsRow, usize) {
+        (s.abs_row(row), col)
+    }
+
     #[test]
     fn selection_text_extracts_and_joins_rows() {
         let mut s = Screen::new(10, 3);
         feed(&mut s, b"hello\r\nworld\r\nfoo");
         // A single-row partial selection: cols 0..=4 of row 0.
-        assert_eq!(s.selection_text((0, 0), (0, 4)), "hello");
+        assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 0, 4)), "hello");
         // Across rows: end of row 0 through part of row 1, joined by a newline;
         // trailing blanks on the first row are trimmed.
-        assert_eq!(s.selection_text((0, 0), (1, 2)), "hello\nwor");
+        assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 1, 2)), "hello\nwor");
         // A mid-row start.
-        assert_eq!(s.selection_text((0, 2), (0, 4)), "llo");
+        assert_eq!(s.selection_text(at(&s, 0, 2), at(&s, 0, 4)), "llo");
+        // Either order: the endpoints sort into reading order.
+        assert_eq!(s.selection_text(at(&s, 1, 2), at(&s, 0, 0)), "hello\nwor");
     }
 
     #[test]
@@ -3613,7 +4168,7 @@ mod tests {
         let mut s = Screen::new(4, 3);
         feed(&mut s, b"abcdef"); // wraps: "abcd" | "ef"
         assert!(s.cell(0, 3).attrs.contains(Attrs::WRAPPED));
-        assert_eq!(s.selection_text((0, 0), (1, 1)), "abcdef");
+        assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 1, 1)), "abcdef");
     }
 
     #[test]
@@ -3621,31 +4176,234 @@ mod tests {
         let mut s = Screen::new(6, 2);
         feed(&mut s, b"one\r\ntwo\r\nthree\r\nfour");
         s.scroll_view_up(2); // top: "one" over "two"
-        assert_eq!(s.selection_text((0, 0), (0, 2)), "one");
+        assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 0, 2)), "one");
+    }
+
+    #[test]
+    fn a_selection_copies_its_rows_after_output_scrolls_them_away() {
+        // The absolute-row payoff: the same ids, resolved after the grid has scrolled
+        // under them, still name the lines the user picked — including once they have
+        // scrolled out of sight entirely.
+        let mut s = Screen::new(6, 2);
+        feed(&mut s, b"one\r\ntwo");
+        let (start, end) = (at(&s, 0, 0), at(&s, 0, 2)); // "one", on the live screen
+        assert_eq!(s.selection_text(start, end), "one");
+
+        feed(&mut s, b"\r\nthree\r\nfour\r\nfive"); // "one" is pushed deep into history
+
+        assert_eq!(s.display_row(start.0), None, "it is off screen now");
+        assert_eq!(
+            s.selection_text(start, end),
+            "one",
+            "but the ids still name the line it was made over"
+        );
+    }
+
+    #[test]
+    fn a_row_id_rides_along_with_its_content() {
+        // The invariant the whole model rests on: the id names a *line*, so as the line
+        // moves up the screen and into history, the id keeps resolving to it.
+        let mut s = Screen::new(6, 3);
+        feed(&mut s, b"one\r\ntwo\r\nthree");
+        let one = s.abs_row(0);
+        assert_eq!(s.display_row(one), Some(0));
+
+        feed(&mut s, b"\r\nfour"); // "one" is pushed into history
+        assert_eq!(s.scrollback_len(), 1);
+        assert_eq!(s.display_row(one), None, "off the top of the live band");
+        assert!(s.row_exists(one), "but still in history");
+        assert_eq!(
+            s.abs_cell(one, 0).rune,
+            'o',
+            "and it is still the same line"
+        );
+
+        s.scroll_view_up(1); // scroll it back into view
+        assert_eq!(
+            s.display_row(one),
+            Some(0),
+            "the same id, now on screen again"
+        );
+        assert_eq!(s.abs_row(0), one);
+    }
+
+    #[test]
+    fn ordinary_output_never_breaks_the_row_epoch() {
+        // Printing, wrapping, and scrolling into history are the whole steady state of a
+        // terminal. If any of them ended the epoch, a selection could not survive output
+        // and the feature would be a lie.
+        let mut s = Screen::new(4, 2);
+        let epoch = s.row_epoch();
+        feed(&mut s, b"abcdefgh\r\nmore\r\ntext\r\nstill going");
+        assert!(s.scrollback_len() > 0, "it really did scroll");
+        assert_eq!(s.row_epoch(), epoch, "and no id was invalidated");
+    }
+
+    #[test]
+    fn tearing_a_row_out_of_the_middle_ends_the_row_epoch() {
+        // A region scroll and a DL both delete a row from the middle of the stream: every
+        // row below shifts up, so the ids no longer name the same lines and anything
+        // holding one has to be told.
+        let mut s = Screen::new(5, 3);
+        feed(&mut s, b"a\r\nb\r\nc");
+
+        let epoch = s.row_epoch();
+        feed(&mut s, b"\x1b[2;3r\x1b[3;1H\r\n"); // DECSTBM, then a feed at the margin
+        assert_ne!(s.row_epoch(), epoch, "a region scroll discarded a row");
+
+        let epoch = s.row_epoch();
+        feed(&mut s, b"\x1b[r\x1b[1;1H\x1b[1M"); // full screen, home, DL
+        assert_ne!(s.row_epoch(), epoch, "and DL deleted one");
+    }
+
+    #[test]
+    fn a_top_region_that_stops_short_of_the_bottom_renumbers_the_rows_below_it() {
+        // The subtle one. The region starts at the top, so the row leaving it retires into
+        // history and keeps its id — but the blank filling in behind it lands at the
+        // region's bottom margin, which is *mid-stream*, so every row below the region
+        // shifts up an id while sitting perfectly still on screen. (A status line under a
+        // scroll region is exactly this shape.) Reporting only the push would leave a
+        // selection on that status line quietly pointing at the blank instead.
+        let mut s = Screen::new(8, 4);
+        feed(&mut s, b"a\r\nb\r\nc\r\nstatus");
+        feed(&mut s, b"\x1b[1;3r"); // DECSTBM rows 1..3: the top three, not the last
+        let status = s.abs_row(3);
+        assert_eq!(s.abs_cell(status, 0).rune, 's');
+
+        let epoch = s.row_epoch();
+        feed(&mut s, b"\x1b[3;1H\r\n"); // a line feed at the region's bottom margin
+
+        assert_eq!(
+            s.scrollback_len(),
+            1,
+            "the row off the top was still retained"
+        );
+        assert_eq!(
+            s.row_string(3).trim_end(),
+            "status",
+            "and the status line never moved"
+        );
+        assert_ne!(
+            s.abs_cell(status, 0).rune,
+            's',
+            "yet its old id now names the blank the scroll left behind"
+        );
+        assert_ne!(
+            s.row_epoch(),
+            epoch,
+            "so the ids below the region must be declared dead"
+        );
+    }
+
+    #[test]
+    fn a_full_screen_scroll_keeps_every_id() {
+        // The contrast that makes the case above legible: with the region running to the
+        // last row, the blank appends to the *end* of the stream and nothing is renumbered
+        // — which is why ordinary output can leave a selection alone.
+        let mut s = Screen::new(8, 4);
+        feed(&mut s, b"a\r\nb\r\nc\r\nlast");
+        let last = s.abs_row(3);
+        let epoch = s.row_epoch();
+
+        feed(&mut s, b"\r\nmore");
+
+        assert_eq!(s.scrollback_len(), 1);
+        assert_eq!(s.row_epoch(), epoch, "no id was invalidated");
+        assert_eq!(s.abs_cell(last, 0).rune, 'l', "and they all still hold");
+        assert_eq!(s.display_row(last), Some(2), "one row higher, same line");
+    }
+
+    #[test]
+    fn scrolling_the_content_down_ends_the_row_epoch() {
+        // The mirror of tearing a row out of the top: RI, SD and IL all slide the content
+        // *down* while the ids stay where they are, so the line that was AbsRow(n) is now
+        // at AbsRow(n+1). Nothing is pushed to history and nothing obviously "leaves", so
+        // it is easy to miss — but a selection held across one would drift a row, which is
+        // exactly the silent wrongness absolute rows exist to prevent.
+        let mut s = Screen::new(5, 3);
+
+        feed(&mut s, b"a\r\nb\r\nc");
+        let epoch = s.row_epoch();
+        feed(&mut s, b"\x1b[1;1H\x1b[1L"); // IL at the top: everything slides down
+        assert_eq!(s.row_string(1).trim_end(), "a", "the content moved down");
+        assert_ne!(
+            s.row_epoch(),
+            epoch,
+            "so the ids no longer name those lines"
+        );
+
+        let epoch = s.row_epoch();
+        feed(&mut s, b"\x1b[2T"); // SD
+        assert_ne!(s.row_epoch(), epoch);
+
+        let epoch = s.row_epoch();
+        feed(&mut s, b"\x1b[1;1H\x1bM"); // RI at the top margin
+        assert_ne!(s.row_epoch(), epoch);
+
+        // But an RI that merely moves the cursor up displaces nothing.
+        let epoch = s.row_epoch();
+        feed(&mut s, b"\x1b[3;1H\x1bM");
+        assert_eq!(s.row_epoch(), epoch, "no rows moved, no ids invalidated");
+    }
+
+    #[test]
+    fn the_alt_screen_and_a_reset_end_the_row_epoch() {
+        let mut s = Screen::new(5, 2);
+        feed(&mut s, b"a\r\nb");
+
+        let epoch = s.row_epoch();
+        feed(&mut s, b"\x1b[?1049h"); // a different buffer: ids mean nothing there
+        assert_ne!(s.row_epoch(), epoch);
+
+        // The alt screen keeps no history, so its scrolls discard rows and end the epoch
+        // too: nothing on it can be tracked across a scroll.
+        let epoch = s.row_epoch();
+        feed(&mut s, b"x\r\ny\r\nz");
+        assert_ne!(s.row_epoch(), epoch, "an alt-screen scroll discards");
+
+        let epoch = s.row_epoch();
+        feed(&mut s, b"\x1bc"); // RIS
+        assert_ne!(s.row_epoch(), epoch, "a reset never rewinds identity");
+    }
+
+    #[test]
+    fn erasing_the_history_keeps_the_live_rows_ids() {
+        // ED 3 drops history off the *front* of the stream, which is an eviction like any
+        // other: the live rows have not moved, so they keep the ids they had. (Getting
+        // this wrong would renumber them and quietly alias a stale id onto a live line.)
+        let mut s = Screen::new(5, 2);
+        feed(&mut s, b"a\r\nb\r\nc\r\nd"); // "a","b" history; "c","d" live
+        let c = s.abs_row(0);
+        let gone = s.primary.abs_of(0);
+        assert!(s.row_exists(gone));
+
+        feed(&mut s, b"\x1b[3J");
+
+        assert_eq!(s.scrollback_len(), 0);
+        assert!(!s.row_exists(gone), "the history rows are gone for good");
+        assert_eq!(s.display_row(c), Some(0), "the live rows kept their ids");
+        assert_eq!(s.abs_row(0), c);
     }
 
     #[test]
     fn word_at_spans_a_token_and_stops_at_boundaries() {
         let mut s = Screen::new(20, 1);
         feed(&mut s, b"cd /usr/bin (ok)");
+        let abs = s.abs_row(0);
         // A click anywhere in "cd" selects just "cd" (cols 0..=1); a space bounds it.
-        assert_eq!(s.word_at(0, 1), ((0, 0), (0, 1)));
+        assert_eq!(s.word_at(abs, 1), ((abs, 0), (abs, 1)));
         // The path is one word: '/' is not a boundary, so double-click grabs it whole.
-        assert_eq!(
-            s.selection_text(s.word_at(0, 5).0, s.word_at(0, 5).1),
-            "/usr/bin"
-        );
+        let path = s.word_at(abs, 5);
+        assert_eq!(s.selection_text(path.0, path.1), "/usr/bin");
         // A parenthesis bounds the token, and clicking the space between words
         // selects just that cell.
         assert_eq!(
-            s.word_at(0, 11),
-            ((0, 11), (0, 11)),
+            s.word_at(abs, 11),
+            ((abs, 11), (abs, 11)),
             "the space is its own cell"
         );
-        assert_eq!(
-            s.selection_text(s.word_at(0, 13).0, s.word_at(0, 13).1),
-            "ok"
-        );
+        let ok = s.word_at(abs, 13);
+        assert_eq!(s.selection_text(ok.0, ok.1), "ok");
     }
 
     #[test]
@@ -3654,9 +4412,30 @@ mod tests {
         // display row selects the whole logical line, edge to edge.
         let mut s = Screen::new(4, 3);
         feed(&mut s, b"abcdef");
-        assert_eq!(s.line_at(0), ((0, 0), (1, 3)));
-        assert_eq!(s.line_at(1), ((0, 0), (1, 3)));
-        assert_eq!(s.selection_text(s.line_at(1).0, s.line_at(1).1), "abcdef");
+        let (r0, r1) = (s.abs_row(0), s.abs_row(1));
+        assert_eq!(s.line_at(r0), ((r0, 0), (r1, 3)));
+        assert_eq!(s.line_at(r1), ((r0, 0), (r1, 3)));
+        let line = s.line_at(r1);
+        assert_eq!(s.selection_text(line.0, line.1), "abcdef");
+    }
+
+    #[test]
+    fn line_at_follows_a_wrap_that_starts_above_the_visible_band() {
+        // The walk runs over the stream, not the window: the head of this logical line
+        // has scrolled into history, and a triple-click on its tail must still take it
+        // whole. (In display rows the walk stopped at the top of the screen and copied
+        // half a line.)
+        let mut s = Screen::new(4, 2);
+        feed(&mut s, b"abcdefgh"); // "abcd" | "efgh", filling both rows
+        feed(&mut s, b"\r\nx"); // scrolls "abcd" into history
+        assert_eq!(s.scrollback_len(), 1);
+        let tail = s.abs_row(0); // "efgh", now the top visible row
+        let line = s.line_at(tail);
+        assert_eq!(
+            s.selection_text(line.0, line.1),
+            "abcdefgh",
+            "the line was taken whole, across the top of the screen"
+        );
     }
 
     #[test]
