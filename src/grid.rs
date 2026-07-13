@@ -40,7 +40,7 @@ use crate::mouse::{MouseMode, MouseProtocol};
 use crate::vt::Perform;
 use crate::width::width;
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 /// Default lines of scrollback the primary screen keeps. Overridable by config
@@ -157,9 +157,106 @@ impl fmt::Debug for Attrs {
     }
 }
 
+/// How many distinct hyperlinks one screen can hold at once. The id space is a
+/// `u16` with zero reserved for "no link", so this is all of it; running out is not
+/// fatal (see [`Screen::collect_links`]).
+const LINK_LIMIT: usize = u16::MAX as usize - 1;
+
+/// Which OSC 8 hyperlink a cell belongs to: an index into the screen's [`LinkTable`],
+/// or [`LinkId::NONE`] for the overwhelming majority of cells, which are in none.
+///
+/// The URL is interned rather than stored on the cell for two reasons. A `Cell` must
+/// stay small and `Copy` (the damage diff compares two screenfuls every painted
+/// frame), and a `u16` costs the grid *nothing*: `Cell` was already padding two bytes
+/// out to `char`'s alignment, so hyperlinks fit in the hole. And the same URL is
+/// printed over and over (`ls --hyperlink` repeats a directory's links on every run),
+/// so one copy shared by every cell that cites it is also simply less memory.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct LinkId(u16);
+
+impl LinkId {
+    /// The cell is not inside an OSC 8 hyperlink. Zero, so a blank cell — and any
+    /// `Default` cell — is linkless without anyone saying so.
+    pub const NONE: LinkId = LinkId(0);
+
+    /// Whether this cell is inside a hyperlink at all. The check the hover probe runs
+    /// first, before it considers scanning text.
+    pub fn is_set(self) -> bool {
+        self != LinkId::NONE
+    }
+}
+
+/// The URLs of the OSC 8 hyperlinks a screen is holding, each interned once and cited
+/// by [`LinkId`].
+///
+/// Ids are 1-based, so `urls[i]` is the URL of `LinkId(i + 1)` and zero is free to
+/// mean "no link". The URL is stored twice — once in `urls` to go id → URL in O(1)
+/// for the hover probe, once as the `index` key to go URL → id on intern so a link
+/// printed a thousand times is interned once. That duplication is bounded (the id
+/// space caps the table at [`LINK_LIMIT`] entries) and buys both directions their
+/// natural cost, which a single structure could not.
+#[derive(Default)]
+struct LinkTable {
+    urls: Vec<String>,
+    index: HashMap<String, LinkId>,
+}
+
+impl LinkTable {
+    /// The id for `url`, interning it if this is the first time we have seen it.
+    /// `None` when the id space is exhausted, which is the caller's cue to collect the
+    /// dead ids and try once more ([`Screen::intern_link`]).
+    fn intern(&mut self, url: &str) -> Option<LinkId> {
+        if let Some(&id) = self.index.get(url) {
+            return Some(id);
+        }
+        if self.urls.len() >= LINK_LIMIT {
+            return None;
+        }
+        // Ids are 1-based and the table is capped below `u16::MAX`, so this fits.
+        let id = LinkId(u16::try_from(self.urls.len() + 1).ok()?);
+        self.urls.push(url.to_string());
+        self.index.insert(url.to_string(), id);
+        Some(id)
+    }
+
+    /// The URL behind `id`, or `None` for [`LinkId::NONE`] and any id this table does
+    /// not hold.
+    fn url(&self, id: LinkId) -> Option<&str> {
+        let slot = usize::from(id.0).checked_sub(1)?;
+        self.urls.get(slot).map(String::as_str)
+    }
+
+    /// Drop every URL `live` does not mark and renumber the survivors, returning the
+    /// old-id → new-id map (indexed by the old id's raw value) that the caller must
+    /// then apply to every cell it kept. `live[i]` speaks for `LinkId(i)`, so slot
+    /// zero is [`LinkId::NONE`] and is never a URL.
+    fn compact(&mut self, live: &[bool]) -> Vec<LinkId> {
+        let mut remap = vec![LinkId::NONE; self.urls.len() + 1];
+        let old = std::mem::take(&mut self.urls);
+        self.index.clear();
+        // Counts only survivors, so it is bounded by the table we came in with and
+        // cannot pass `LINK_LIMIT`, let alone wrap.
+        let mut next: u16 = 0;
+        for (slot, url) in old.into_iter().enumerate() {
+            if live.get(slot + 1) != Some(&true) {
+                continue;
+            }
+            next += 1;
+            let id = LinkId(next);
+            if let Some(entry) = remap.get_mut(slot + 1) {
+                *entry = id;
+            }
+            self.index.insert(url.clone(), id);
+            self.urls.push(url);
+        }
+        remap
+    }
+}
+
 /// One grid cell: the base rune of its grapheme cluster, its foreground and
-/// background colors, and its rendition attributes. Small, `Copy`, and `Eq` so
-/// the per-frame damage diff can compare two screenfuls cheaply.
+/// background colors, its rendition attributes, and the hyperlink it belongs to.
+/// Small, `Copy`, and `Eq` so the per-frame damage diff can compare two screenfuls
+/// cheaply.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Cell {
     /// The base rune. Combining marks, when present, live in the `Row`'s side
@@ -168,6 +265,11 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub attrs: Attrs,
+    /// The OSC 8 hyperlink this cell is inside, [`LinkId::NONE`] for most cells.
+    /// Carried per cell rather than as a span so that every operation that moves or
+    /// overwrites a cell (insert, delete, scroll, erase) keeps the link right for
+    /// free, with no ranges to fix up.
+    pub link: LinkId,
 }
 
 impl Cell {
@@ -178,6 +280,7 @@ impl Cell {
         fg: Color::Default,
         bg: Color::Default,
         attrs: Attrs::empty(),
+        link: LinkId::NONE,
     };
 
     /// A cell carrying `rune` in the default colors, no attributes. Handy for
@@ -210,9 +313,15 @@ impl fmt::Debug for Cell {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Cell({:?}, fg={:?}, bg={:?}, {:?})",
+            "Cell({:?}, fg={:?}, bg={:?}, {:?}",
             self.rune, self.fg, self.bg, self.attrs
-        )
+        )?;
+        // Only when there is one, so the overwhelmingly common linkless cell reads
+        // exactly as it always has.
+        if self.link.is_set() {
+            write!(f, ", link={}", self.link.0)?;
+        }
+        f.write_str(")")
     }
 }
 
@@ -228,12 +337,40 @@ struct Cursor {
 }
 
 /// The current graphic rendition (SGR state): the colors and attributes printed
-/// cells receive. `Copy` so a save/restore (DECSC/DECRC) is a plain move.
+/// cells receive, plus the OSC 8 hyperlink they fall inside. `Copy` so a
+/// save/restore (DECSC/DECRC) is a plain move.
+///
+/// The link rides on the pen because that is exactly what it is: a mode the child
+/// turns on, prints under, and turns off, no different from bold. It is *not* an SGR
+/// attribute, though, so `SGR 0` (reset) must leave it alone — closing a hyperlink is
+/// `OSC 8 ; ; ST` and nothing else, and a program that resets colors mid-anchor (as
+/// any colored `ls` listing does) still expects the anchor to hold.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Pen {
     fg: Color,
     bg: Color,
     attrs: Attrs,
+    link: LinkId,
+}
+
+impl Pen {
+    /// SGR 0: default colors, no attributes, and the hyperlink left exactly as it was.
+    /// See the type's header for why the link survives a rendition reset — a colored
+    /// `ls --hyperlink` listing emits `SGR 0` between entries *inside* an open anchor,
+    /// so clearing the link here would break the most common OSC 8 producer there is.
+    fn reset_rendition(&mut self) {
+        // Destructured rather than `..Pen::default()` so that adding a field to `Pen`
+        // is a compile error here: whoever adds it has to say whether SGR 0 clears it.
+        let Pen {
+            fg,
+            bg,
+            attrs,
+            link: _,
+        } = Pen::default();
+        self.fg = fg;
+        self.bg = bg;
+        self.attrs = attrs;
+    }
 }
 
 impl Default for Pen {
@@ -242,6 +379,7 @@ impl Default for Pen {
             fg: Color::Default,
             bg: Color::Default,
             attrs: Attrs::empty(),
+            link: LinkId::NONE,
         }
     }
 }
@@ -459,6 +597,7 @@ impl Buffer {
                     fg: pen.fg,
                     bg: pen.bg,
                     attrs: pen.attrs,
+                    link: pen.link,
                 };
             }
         }
@@ -761,6 +900,11 @@ pub struct Screen {
     /// after each parse and writes them to the master fd. Kept tiny (queries are
     /// rare), reused across parses.
     responses: Vec<u8>,
+    /// The URLs of the OSC 8 hyperlinks on screen and in scrollback, which cells cite
+    /// by [`LinkId`]. Shared by both buffers: the alt screen has its own cells but not
+    /// its own link namespace, so an id means the same thing whichever buffer holds it
+    /// and switching buffers costs nothing.
+    links: LinkTable,
 }
 
 impl Screen {
@@ -786,6 +930,7 @@ impl Screen {
             cursor_style: CursorStyle::Block,
             cursor_blink: false,
             responses: Vec::new(),
+            links: LinkTable::default(),
         }
     }
 
@@ -1032,6 +1177,11 @@ impl Screen {
     /// Wide glyphs are handled at both ends: probing a spacer probes its leader (the
     /// right half of a character is the character), and a range ending on a leader is
     /// widened over its spacer, so the underline never stops half a glyph short.
+    ///
+    /// An OSC 8 anchor short-circuits all of that. When the cell carries a [`LinkId`],
+    /// the child has *told* us these cells are this link, so there is nothing to infer:
+    /// the extent is the run of cells sharing the id and the URL is the one it interned.
+    /// The text scan is only ever the fallback for output that was never marked up.
     pub fn link_at(
         &self,
         row: usize,
@@ -1052,6 +1202,12 @@ impl Screen {
         probe.text.clear();
         probe.runes.clear();
         probe.url.clear();
+
+        let id = self.view_cell(row, col).link;
+        if id.is_set() {
+            probe.url.push_str(self.links.url(id)?);
+            return Some(self.anchor_span(row, col, id));
+        }
         // Byte offset of the probed cell's rune, recorded as that rune is pushed.
         let mut at = None;
         let ((first, _), (last, _)) = self.line_at(row);
@@ -1082,6 +1238,45 @@ impl Screen {
             end.1 += 1;
         }
         Some((start, end))
+    }
+
+    /// The extent of the OSC 8 anchor `id` around `(row, col)`: the unbroken run of
+    /// cells carrying that same id, walked in reading order across the whole logical
+    /// line, so an anchor that soft-wraps at the margin underlines whole.
+    ///
+    /// The run — rather than "every cell with this id" — is what makes two anchors that
+    /// happen to share a URL (and so an id) stay two links: the plain cells between
+    /// them break the run. It is also why an ICH-opened gap splits an anchor, which is
+    /// the honest reading once the label is no longer contiguous.
+    ///
+    /// ```text
+    ///        col 0                     cols-1
+    ///   row  ┌───────────────────────────────┐
+    ///    r   │ $ ls  [docs····················│  ← id 7 starts, hits the margin
+    ///   r+1  │····/spec.md]  README.md       │  ← id 7 continues, then plain cells
+    ///        └───────────────────────────────┘
+    ///          the span runs start → end in reading order, exactly the geometry
+    ///          `push_hover_rule` already knows how to underline row by row.
+    /// ```
+    fn anchor_span(&self, row: usize, col: usize, id: LinkId) -> ((usize, usize), (usize, usize)) {
+        let (cols, _) = self.dimensions();
+        let ((first, _), (last, _)) = self.line_at(row);
+        // Walk the logical line as one flat sequence of cells, so crossing a soft wrap
+        // needs no special case: cell `n` is at (first + n / cols, n % cols).
+        let at = |n: usize| self.view_cell(first + n / cols, n % cols);
+        let cell_of = |n: usize| (first + n / cols, n % cols);
+        let total = (last - first + 1) * cols;
+        let here = (row - first) * cols + col;
+
+        let mut start = here;
+        while start > 0 && at(start - 1).link == id {
+            start -= 1;
+        }
+        let mut end = here;
+        while end + 1 < total && at(end + 1).link == id {
+            end += 1;
+        }
+        (cell_of(start), cell_of(end))
     }
 
     /// A visible row as text: base runes with their combining marks, wide spacers
@@ -1187,12 +1382,19 @@ impl Screen {
 
     /// The cell an erase or scroll fills with: a space in the current background
     /// (background-color erase, as xterm does), default foreground, no attrs.
+    ///
+    /// Deliberately *not* the pen's hyperlink, even while one is open: erased ground
+    /// is not inside the anchor. Blanks that an insert (ICH) opens in the middle of a
+    /// link are likewise outside it, which is what splits the run the hover probe
+    /// walks — exactly the behaviour you want, since the text either side of the gap
+    /// is no longer one label.
     fn blank_cell(&self) -> Cell {
         Cell {
             rune: ' ',
             fg: Color::Default,
             bg: self.pen.bg,
             attrs: Attrs::empty(),
+            link: LinkId::NONE,
         }
     }
 
@@ -1244,16 +1446,20 @@ impl Screen {
             } else {
                 pen.attrs
             },
+            link: pen.link,
         };
         {
             let b = self.active_mut();
             b.write_cell(row, col, leader);
             if cw == 2 {
+                // The spacer carries the link too, so the run the hover probe walks
+                // never breaks in the middle of a wide glyph.
                 let spacer = Cell {
                     rune: ' ',
                     fg: pen.fg,
                     bg: pen.bg,
                     attrs: pen.attrs | Attrs::WIDE_SPACER,
+                    link: pen.link,
                 };
                 b.write_cell(row, col + 1, spacer);
             }
@@ -1682,14 +1888,14 @@ impl Screen {
     /// (`38;2;r;g;b`) for both foreground (38) and background (48).
     pub fn sgr(&mut self, params: &[u16]) {
         if params.is_empty() {
-            self.pen = Pen::default();
+            self.pen.reset_rendition();
             return;
         }
         let mut i = 0;
         while i < params.len() {
             let p = params[i];
             match p {
-                0 => self.pen = Pen::default(),
+                0 => self.pen.reset_rendition(),
                 1 => self.pen.attrs.insert(Attrs::BOLD),
                 2 => self.pen.attrs.insert(Attrs::DIM),
                 3 => self.pen.attrs.insert(Attrs::ITALIC),
@@ -1892,6 +2098,107 @@ impl Screen {
     /// OSC 0/2: set the window title.
     pub fn set_title(&mut self, title: String) {
         self.title = title;
+    }
+
+    /// OSC 8: open or close a hyperlink on the pen. `pt` is everything after the `8;`,
+    /// which the spec shapes as `params ; URI`:
+    ///
+    /// ```text
+    ///   ESC ] 8 ; ; https://example.com  ESC \   the anchor opens
+    ///   text the user sees                       these cells carry the link
+    ///   ESC ] 8 ; ;                       ESC \   an empty URI closes it
+    /// ```
+    ///
+    /// `params` is a `key=value:key=value` list whose one defined key is `id=`, a hint
+    /// that two separate runs are one logical link. We ignore it: interning by URL
+    /// already gives identical URLs one identity, which is the only thing the hint was
+    /// for, and honouring an attacker-chosen id would let a child fuse two unrelated
+    /// runs into one hover target.
+    ///
+    /// The URI is vetted **here**, when the anchor opens, not at click time. That is
+    /// the rule [`crate::platform::browser::OPENABLE_SCHEMES`] states: a link we
+    /// decorate and then refuse to follow is worse than one we never decorated. So a
+    /// `javascript:` or `data:` anchor is not a link at all — it prints as plain text
+    /// and never underlines, rather than underlining and then doing nothing. Anything
+    /// we cannot make sense of (bad UTF-8, an unopenable scheme, an empty URI) closes
+    /// whatever anchor was open, which is also the safe reading of a malformed
+    /// sequence.
+    fn set_hyperlink(&mut self, pt: &[u8]) {
+        let mut fields = pt.splitn(2, |&b| b == b';');
+        let _params = fields.next();
+        let uri = fields.next().unwrap_or(&[]);
+        let opened = std::str::from_utf8(uri)
+            .ok()
+            .filter(|uri| crate::platform::browser::can_open(uri));
+        self.pen.link = match opened {
+            Some(uri) => self.intern_link(uri),
+            None => LinkId::NONE,
+        };
+    }
+
+    /// The id for `url`, collecting dead ids first if the table has filled up. Falling
+    /// all the way through to [`LinkId::NONE`] means 65534 *live* links are on screen
+    /// and in scrollback at once, at which point the newest simply is not clickable —
+    /// a degradation, never a failure, and the text still reads.
+    fn intern_link(&mut self, url: &str) -> LinkId {
+        if let Some(id) = self.links.intern(url) {
+            return id;
+        }
+        self.collect_links();
+        self.links.intern(url).unwrap_or(LinkId::NONE)
+    }
+
+    /// Reclaim the ids of hyperlinks no cell carries any more.
+    ///
+    /// Links die when the cells citing them do: scrollback evicts its oldest rows, the
+    /// alt screen is thrown away wholesale on exit, an erase blanks a line. Without
+    /// this, a session that prints an unbounded stream of *distinct* links (an
+    /// `ls --hyperlink` of a large tree, run again and again) would burn through the
+    /// `u16` id space and quietly stop linking anything until the terminal restarted.
+    ///
+    /// A textbook mark-and-sweep, run only when [`LinkTable::intern`] reports the table
+    /// full — so the walk over every cell is an *event*, once per 65534 distinct links,
+    /// and never a per-frame cost. The roots are every cell in both buffers (visible
+    /// and scrollback) plus the pen and both saved cursors, because an anchor can be
+    /// open with no text printed under it yet.
+    fn collect_links(&mut self) {
+        // `live[i]` speaks for `LinkId(i)`; slot 0 is `LinkId::NONE` and is never a URL.
+        let mut live = vec![false; self.links.urls.len() + 1];
+        let mark = |id: LinkId, live: &mut Vec<bool>| {
+            if let Some(slot) = live.get_mut(usize::from(id.0)) {
+                *slot = true;
+            }
+        };
+        for buf in [&self.primary, &self.alt] {
+            for row in buf.scrollback.iter().chain(buf.lines.iter()) {
+                for cell in &row.cells {
+                    mark(cell.link, &mut live);
+                }
+            }
+            if let Some(saved) = &buf.saved {
+                mark(saved.pen.link, &mut live);
+            }
+        }
+        mark(self.pen.link, &mut live);
+
+        let remap = self.links.compact(&live);
+        let renumber = |id: LinkId| {
+            remap
+                .get(usize::from(id.0))
+                .copied()
+                .unwrap_or(LinkId::NONE)
+        };
+        for buf in [&mut self.primary, &mut self.alt] {
+            for row in buf.scrollback.iter_mut().chain(buf.lines.iter_mut()) {
+                for cell in &mut row.cells {
+                    cell.link = renumber(cell.link);
+                }
+            }
+            if let Some(saved) = &mut buf.saved {
+                saved.pen.link = renumber(saved.pen.link);
+            }
+        }
+        self.pen.link = renumber(self.pen.link);
     }
 
     /// DECKPAM/DECKPNM keypad mode, read by the input encoder (phase 3).
@@ -2183,12 +2490,14 @@ impl Perform for Screen {
     }
 
     fn osc_dispatch(&mut self, data: &[u8]) {
-        // OSC Ps ; Pt — we handle 0 (icon + title) and 2 (title).
+        // OSC Ps ; Pt — we handle 0 (icon + title), 2 (title), and 8 (hyperlink).
         let mut parts = data.splitn(2, |&b| b == b';');
         let ps = parts.next().unwrap_or(&[]);
         let pt = parts.next().unwrap_or(&[]);
-        if ps == b"0" || ps == b"2" {
-            self.set_title(String::from_utf8_lossy(pt).into_owned());
+        match ps {
+            b"0" | b"2" => self.set_title(String::from_utf8_lossy(pt).into_owned()),
+            b"8" => self.set_hyperlink(pt),
+            _ => {}
         }
     }
 }
@@ -2200,9 +2509,12 @@ mod tests {
     #[test]
     fn cell_layout_is_pinned() {
         // A screenful plus scrollback is a lot of cells; growth is a decision,
-        // not an accident. char(4) + Color(4) + Color(4) + Attrs(2), aligned to
-        // char's 4 bytes, rounds to 16.
+        // not an accident. char(4) + Color(4) + Color(4) + Attrs(2) + LinkId(2),
+        // aligned to char's 4 bytes, is exactly 16 — the hyperlink id was fitted into
+        // the two bytes the cell was already padding away, so OSC 8 cost the grid
+        // nothing. Anything that pushes this to 20 has to justify a 25% bigger grid.
         assert_eq!(std::mem::size_of::<Attrs>(), 2);
+        assert_eq!(std::mem::size_of::<LinkId>(), 2);
         assert_eq!(std::mem::size_of::<Cell>(), 16);
         assert_eq!(std::mem::align_of::<Cell>(), 4);
     }
@@ -3052,6 +3364,233 @@ mod tests {
         feed(&mut s, b"https://example.com/a");
         let mut probe = LinkProbe::default();
         assert_eq!(s.link_at(0, 99, &mut probe), None);
+    }
+
+    // ---- OSC 8 hyperlinks ---------------------------------------------------
+    //
+    // The anchor form throughout: `ESC ] 8 ; <params> ; <URI> ESC \` opens, the cells
+    // printed after it belong to the link, and `ESC ] 8 ; ; ESC \` closes.
+
+    /// `ESC ] 8 ; ; <uri> ESC \` — an anchor around `label`, closed after it.
+    fn anchor(uri: &str, label: &str) -> Vec<u8> {
+        format!("\x1b]8;;{uri}\x1b\\{label}\x1b]8;;\x1b\\").into_bytes()
+    }
+
+    #[test]
+    fn an_anchor_makes_text_that_is_not_a_url_a_link() {
+        // The whole point of OSC 8: the label need not look like a URL. No text scan
+        // could ever find this one, which is exactly why the child marked it up.
+        let mut s = Screen::new(20, 2);
+        let mut bytes = anchor("https://example.com/a", "click me");
+        bytes.extend_from_slice(b" nope");
+        feed(&mut s, &bytes);
+
+        let mut probe = LinkProbe::default();
+        let hit = ((0, 0), (0, 7)); // "click me" is 8 cells
+        for col in 0..=7 {
+            assert_eq!(s.link_at(0, col, &mut probe), Some(hit), "col {col}");
+            assert_eq!(probe.url(), "https://example.com/a");
+        }
+        assert_eq!(
+            s.link_at(0, 8, &mut probe),
+            None,
+            "the space past the anchor"
+        );
+        assert_eq!(s.link_at(0, 10, &mut probe), None, "and the text after it");
+        assert_eq!(probe.url(), "", "a miss leaves no stale URL behind");
+    }
+
+    #[test]
+    fn an_anchor_outranks_the_text_underneath_it() {
+        // The label happens to be a URL, and a *different* one from the target. The
+        // child said where these cells go; the scanner does not get a vote.
+        let mut s = Screen::new(40, 2);
+        feed(
+            &mut s,
+            &anchor("https://real.example/x", "https://decoy.example"),
+        );
+        let mut probe = LinkProbe::default();
+        assert_eq!(s.link_at(0, 3, &mut probe), Some(((0, 0), (0, 20))));
+        assert_eq!(probe.url(), "https://real.example/x");
+    }
+
+    #[test]
+    fn an_anchor_we_would_refuse_to_open_is_not_a_link_at_all() {
+        // A child prints whatever it likes. A scheme outside `OPENABLE_SCHEMES` is
+        // rejected when the anchor *opens*, so the label stays ordinary text and never
+        // underlines. Decorating a link and then refusing to follow it is the bug this
+        // exists to prevent (see `browser::OPENABLE_SCHEMES`).
+        for uri in [
+            "javascript:alert(1)",
+            "data:text/html,<script>x</script>",
+            "ftp://host/x",
+            "-flag-that-xdg-open-would-eat",
+        ] {
+            let mut s = Screen::new(20, 2);
+            feed(&mut s, &anchor(uri, "click"));
+            let mut probe = LinkProbe::default();
+            assert_eq!(s.cell(0, 0).link, LinkId::NONE, "{uri}");
+            assert_eq!(s.link_at(0, 2, &mut probe), None, "{uri}");
+        }
+    }
+
+    #[test]
+    fn an_sgr_reset_does_not_close_an_anchor() {
+        // `ls --hyperlink` with colors sets a color inside the anchor and emits SGR 0
+        // after the name while *still* inside it. If a rendition reset closed the link,
+        // the most widespread OSC 8 producer there is would half-work. The link rides
+        // on the pen but is not an SGR attribute; only `OSC 8 ; ;` closes it.
+        let mut s = Screen::new(20, 2);
+        feed(
+            &mut s,
+            b"\x1b]8;;https://example.com/d\x1b\\\x1b[34mdir\x1b[0m/\x1b]8;;\x1b\\",
+        );
+        let mut probe = LinkProbe::default();
+        assert_eq!(
+            s.link_at(0, 3, &mut probe),
+            Some(((0, 0), (0, 3))),
+            "the `/` printed after the reset is still inside the anchor"
+        );
+        assert_eq!(probe.url(), "https://example.com/d");
+        assert_eq!(s.cell(0, 0).fg, Color::Ansi(4), "the color still applied");
+        assert_eq!(
+            s.cell(0, 3).fg,
+            Color::Default,
+            "and the reset still reset it"
+        );
+    }
+
+    #[test]
+    fn an_anchor_joins_across_a_soft_wrap() {
+        // Ten label cells on an eight-column grid: the anchor is one link across the
+        // margin, not two, exactly as a wrapped bare URL is.
+        let mut s = Screen::new(8, 3);
+        feed(&mut s, &anchor("https://example.com/w", "abcdefghij"));
+        let mut probe = LinkProbe::default();
+        let hit = ((0, 0), (1, 1));
+        assert_eq!(s.link_at(0, 4, &mut probe), Some(hit), "before the wrap");
+        assert_eq!(s.link_at(1, 1, &mut probe), Some(hit), "after it");
+        assert_eq!(probe.url(), "https://example.com/w");
+    }
+
+    #[test]
+    fn two_anchors_sharing_one_url_stay_two_links() {
+        // Interning by URL hands both runs the same id. The *run* is what bounds a
+        // link, so the plain cell between them still splits it into two hover targets.
+        let mut s = Screen::new(20, 2);
+        let mut bytes = anchor("https://e.com/a", "ab");
+        bytes.extend_from_slice(b" ");
+        bytes.extend(anchor("https://e.com/a", "cd"));
+        feed(&mut s, &bytes);
+
+        assert!(s.cell(0, 0).link.is_set());
+        assert_eq!(s.cell(0, 0).link, s.cell(0, 3).link, "interned once");
+        let mut probe = LinkProbe::default();
+        assert_eq!(
+            s.link_at(0, 0, &mut probe),
+            Some(((0, 0), (0, 1))),
+            "the first"
+        );
+        assert_eq!(
+            s.link_at(0, 4, &mut probe),
+            Some(((0, 3), (0, 4))),
+            "the second"
+        );
+        assert_eq!(s.link_at(0, 2, &mut probe), None, "the gap between them");
+    }
+
+    #[test]
+    fn an_anchor_covers_both_halves_of_a_wide_glyph() {
+        // The spacer carries the link too, so the run never breaks mid-character and
+        // probing the right half of a wide glyph finds the glyph's link.
+        let mut s = Screen::new(20, 2);
+        feed(&mut s, &anchor("https://e.com/w", "世a"));
+        assert!(s.cell(0, 0).is_wide_leader());
+        assert!(s.cell(0, 1).is_wide_spacer());
+        let mut probe = LinkProbe::default();
+        let hit = ((0, 0), (0, 2));
+        assert_eq!(s.link_at(0, 0, &mut probe), Some(hit), "the leader");
+        assert_eq!(s.link_at(0, 1, &mut probe), Some(hit), "the spacer");
+        assert_eq!(probe.url(), "https://e.com/w");
+    }
+
+    #[test]
+    fn erasing_a_cell_takes_it_out_of_its_anchor() {
+        // Erased ground is inside no link (`blank_cell` carries `LinkId::NONE`), so the
+        // run breaks there and the halves become separate links — the honest reading
+        // once the label is no longer contiguous.
+        let mut s = Screen::new(20, 2);
+        feed(&mut s, &anchor("https://e.com/a", "abcde"));
+        feed(&mut s, b"\x1b[1;3H\x1b[X"); // ECH one cell at col 2
+        assert_eq!(s.cell(0, 2).link, LinkId::NONE);
+
+        let mut probe = LinkProbe::default();
+        assert_eq!(
+            s.link_at(0, 0, &mut probe),
+            Some(((0, 0), (0, 1))),
+            "the left half"
+        );
+        assert_eq!(s.link_at(0, 2, &mut probe), None, "the erased cell");
+        assert_eq!(
+            s.link_at(0, 4, &mut probe),
+            Some(((0, 3), (0, 4))),
+            "the right half"
+        );
+    }
+
+    #[test]
+    fn the_id_param_is_ignored_and_an_empty_uri_closes() {
+        // `id=` is a hint that two runs are one link. We intern by URL, which already
+        // gives identical URLs one identity, so the hint buys nothing — and honouring a
+        // child-chosen id would let it fuse unrelated runs into one hover target.
+        let mut s = Screen::new(20, 2);
+        feed(
+            &mut s,
+            b"\x1b]8;id=xyz;https://e.com/a\x1b\\ab\x1b]8;;\x1b\\cd",
+        );
+        let mut probe = LinkProbe::default();
+        assert_eq!(s.link_at(0, 1, &mut probe), Some(((0, 0), (0, 1))));
+        assert_eq!(probe.url(), "https://e.com/a");
+        assert_eq!(s.link_at(0, 2, &mut probe), None, "the empty URI closed it");
+    }
+
+    #[test]
+    fn a_full_link_table_collects_dead_ids_and_keeps_linking() {
+        // Burn the whole u16 id space on anchors that then scroll out of history. The
+        // next one must still work: without the collector the table would stay full for
+        // the life of the process and OSC 8 would quietly stop linking anything.
+        let mut s = Screen::new(20, 2);
+        let mut bytes = Vec::new();
+        for i in 0..LINK_LIMIT {
+            bytes.extend(anchor(&format!("https://e.com/{i}"), "x"));
+            bytes.extend_from_slice(b"\r\n");
+        }
+        feed(&mut s, &bytes);
+        assert_eq!(s.links.urls.len(), LINK_LIMIT, "the id space is spent");
+
+        // Row 0 shows the last anchor printed; row 1 is where the cursor now sits.
+        let last = format!("https://e.com/{}", LINK_LIMIT - 1);
+        let mut probe = LinkProbe::default();
+        assert_eq!(s.link_at(0, 0, &mut probe), Some(((0, 0), (0, 0))));
+        assert_eq!(probe.url(), last);
+
+        // One more distinct URL: intern finds the table full, collects, and succeeds.
+        feed(&mut s, &anchor("https://e.com/fresh", "NEW"));
+        assert!(
+            s.links.urls.len() < LINK_LIMIT,
+            "the ids of the scrolled-out anchors came back"
+        );
+        assert_eq!(s.link_at(1, 1, &mut probe), Some(((1, 0), (1, 2))));
+        assert_eq!(probe.url(), "https://e.com/fresh");
+
+        // And the survivors were *renumbered*, not orphaned: a cell that outlived the
+        // collection still resolves to the URL it always had.
+        assert_eq!(s.link_at(0, 0, &mut probe), Some(((0, 0), (0, 0))));
+        assert_eq!(
+            probe.url(),
+            last,
+            "a survivor kept its URL across the collection"
+        );
     }
 
     #[test]
