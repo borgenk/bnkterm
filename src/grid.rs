@@ -1002,6 +1002,27 @@ pub enum CursorStyle {
     Bar,
 }
 
+/// How the cursor looks: its shape and whether it blinks. `DECSCUSR` sets both at
+/// once, so they travel together, and the derived [`Default`] is the one place that
+/// says what bnkterm's cursor looks like at power-on: a **steady** block.
+///
+/// That default is also what `DECSCUSR 0` restores, which is the whole reason this
+/// pair has a name. xterm documents `Ps = 0` as a *blinking* block, but no modern
+/// terminal reads it that way: it means "back to the terminal's own default", and
+/// TUIs emit it while restoring the terminal on exit. Taking xterm literally there
+/// means a program that politely puts the cursor back leaves it blinking forever.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct CursorAppearance {
+    style: CursorStyle,
+    blink: bool,
+}
+
+impl CursorAppearance {
+    const fn new(style: CursorStyle, blink: bool) -> Self {
+        CursorAppearance { style, blink }
+    }
+}
+
 /// The reusable working set of a hyperlink probe (see [`Screen::link_at`]): the
 /// logical line being scanned, the map back from its bytes to the cells they came
 /// from, and the URL the last hit found.
@@ -1073,13 +1094,11 @@ pub struct Screen {
     /// app reads it to decide whether a pointer event goes to the child or drives
     /// local selection/scroll.
     mouse: MouseMode,
-    /// The cursor shape and whether it blinks, from `DECSCUSR`. Defaults to a
-    /// steady block: xterm's default is a *blinking* block, but every modern
-    /// terminal opens steady (commonly via a `cursor-style-blink = false` setting),
-    /// so that is bnkterm's power-on default. A program can still request blink with
-    /// `DECSCUSR`.
-    cursor_style: CursorStyle,
-    cursor_blink: bool,
+    /// How the cursor is drawn, from `DECSCUSR`. Opens as a steady block and returns
+    /// there on `DECSCUSR 0`; see [`CursorAppearance`]. A program can still ask for a
+    /// blink explicitly (`DECSCUSR 1`/`3`/`5`). Where the cursor *is* lives in the
+    /// active buffer; this is only what it looks like.
+    cursor_appearance: CursorAppearance,
     /// Bytes to write back to the child in answer to a query (DA, DSR). The grid
     /// holds no PTY, so it queues its replies as data here; the app drains them
     /// after each parse and writes them to the master fd. Kept tiny (queries are
@@ -1113,8 +1132,7 @@ impl Screen {
             view_offset: 0,
             epoch: RowEpoch::default(),
             mouse: MouseMode::default(),
-            cursor_style: CursorStyle::Block,
-            cursor_blink: false,
+            cursor_appearance: CursorAppearance::default(),
             responses: Vec::new(),
             links: LinkTable::default(),
         }
@@ -1162,13 +1180,13 @@ impl Screen {
 
     /// The cursor shape the child selected via `DECSCUSR` (default block).
     pub fn cursor_style(&self) -> CursorStyle {
-        self.cursor_style
+        self.cursor_appearance.style
     }
 
     /// Whether the child asked the cursor to blink (default false; see
-    /// `cursor_blink`).
+    /// [`CursorAppearance`]).
     pub fn cursor_blinks(&self) -> bool {
-        self.cursor_blink
+        self.cursor_appearance.blink
     }
 
     /// Take the bytes queued to write back to the child (DA/DSR answers), leaving
@@ -2336,20 +2354,21 @@ impl Screen {
         self.mouse.protocol = if enable { protocol } else { MouseProtocol::Off };
     }
 
-    /// DECSCUSR: the `Ps` argument selects both the shape and whether it blinks
-    /// (odd/zero blink, even steady). An unknown `Ps` is ignored.
+    /// DECSCUSR: the `Ps` argument selects both the shape and whether it blinks (odd
+    /// blinks, even is steady). `Ps = 0` asks for the terminal's own default, so it
+    /// restores bnkterm's power-on look rather than xterm's documented blinking block
+    /// (see [`CursorAppearance`]). An unknown `Ps` is ignored.
     fn set_cursor_style(&mut self, ps: u16) {
-        let (style, blink) = match ps {
-            0 | 1 => (CursorStyle::Block, true),
-            2 => (CursorStyle::Block, false),
-            3 => (CursorStyle::Underline, true),
-            4 => (CursorStyle::Underline, false),
-            5 => (CursorStyle::Bar, true),
-            6 => (CursorStyle::Bar, false),
+        self.cursor_appearance = match ps {
+            0 => CursorAppearance::default(),
+            1 => CursorAppearance::new(CursorStyle::Block, true),
+            2 => CursorAppearance::new(CursorStyle::Block, false),
+            3 => CursorAppearance::new(CursorStyle::Underline, true),
+            4 => CursorAppearance::new(CursorStyle::Underline, false),
+            5 => CursorAppearance::new(CursorStyle::Bar, true),
+            6 => CursorAppearance::new(CursorStyle::Bar, false),
             _ => return,
         };
-        self.cursor_style = style;
-        self.cursor_blink = blink;
     }
 
     /// DA (Send Device Attributes): answer a program's "what are you?" probe.
@@ -4467,7 +4486,7 @@ mod tests {
     #[test]
     fn decscusr_sets_the_cursor_shape_and_blink() {
         let mut s = Screen::new(10, 2);
-        // Power-on default is a steady block (see `cursor_blink`).
+        // Power-on default is a steady block (see `CursorAppearance`).
         assert_eq!(s.cursor_style(), CursorStyle::Block);
         assert!(!s.cursor_blinks());
         feed(&mut s, b"\x1b[4 q"); // steady underline
@@ -4476,9 +4495,28 @@ mod tests {
         feed(&mut s, b"\x1b[5 q"); // blinking bar
         assert_eq!(s.cursor_style(), CursorStyle::Bar);
         assert!(s.cursor_blinks());
-        feed(&mut s, b"\x1b[0 q"); // DECSCUSR 0: a blinking block (its own default)
+        feed(&mut s, b"\x1b[1 q"); // blinking block, asked for explicitly
         assert_eq!(s.cursor_style(), CursorStyle::Block);
         assert!(s.cursor_blinks());
+        feed(&mut s, b"\x1b[7 q"); // out of range: ignored, the last style stands
+        assert_eq!(s.cursor_style(), CursorStyle::Block);
+        assert!(s.cursor_blinks());
+    }
+
+    /// `DECSCUSR 0` means "the terminal's default", not xterm's literal blinking
+    /// block. TUIs (codex, anything on crossterm's `SetCursorStyle::DefaultUserShape`)
+    /// emit it while restoring the terminal on exit, so reading it as a blink request
+    /// leaves a blinking cursor behind in the shell long after the program is gone.
+    #[test]
+    fn decscusr_zero_restores_the_power_on_cursor() {
+        let mut s = Screen::new(10, 2);
+        for style in [&b"\x1b[5 q"[..], b"\x1b[1 q", b"\x1b[3 q"] {
+            feed(&mut s, style);
+            assert!(s.cursor_blinks(), "the program asked for a blink");
+            feed(&mut s, b"\x1b[0 q");
+            assert_eq!(s.cursor_style(), CursorStyle::Block);
+            assert!(!s.cursor_blinks(), "DECSCUSR 0 restores the steady default");
+        }
     }
 
     #[test]
