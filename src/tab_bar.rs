@@ -396,6 +396,7 @@ mod tests {
         baseline: 12,
         ascent: 12,
         descent: 4,
+        lock_glyph: true,
     };
 
     fn label(title: &str, active: bool) -> TabLabel<'_> {
@@ -756,6 +757,7 @@ mod tests {
             baseline: 16,
             ascent: 12,
             descent: 4,
+            lock_glyph: true,
         };
         let geom = BarGeom {
             metrics: METRICS,

@@ -1050,6 +1050,24 @@ impl Fonts {
             .unwrap_or(primary)
     }
 
+    /// Whether *any* face reachable from `key` has a real glyph for `ch`: the keyed face
+    /// or, failing that, its fallback chain. The question [`glyph_face`](Self::glyph_face)
+    /// cannot answer, because it returns the keyed face on a total miss so the scalar
+    /// still draws its `.notdef` box.
+    ///
+    /// A caller that would rather draw *something else* than a tofu box has to ask first,
+    /// and the password cursor is exactly that caller: the padlock lives in the Nerd Fonts
+    /// private-use area, so on a machine without a symbols font it would render as an
+    /// empty rectangle — the one glyph whose whole job is to be understood at a glance.
+    pub fn covers(&self, key: FaceKey, ch: char) -> bool {
+        self.face_for(key).has_scalar(ch)
+            || self
+                .entry(key.size())
+                .fallback
+                .iter()
+                .any(|f| f.has_scalar(ch))
+    }
+
     /// The metrics for `size`, or the fallback's metrics if `size` was not opened.
     pub fn metrics(&self, size: u32) -> Metrics {
         self.entry(size).metrics

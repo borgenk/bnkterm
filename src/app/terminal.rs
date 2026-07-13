@@ -1356,20 +1356,21 @@ mod tests {
         // The padlock's two solid parts (the arch and the body) are the only round-rects
         // the frame draws in the cursor colour: its hollow and keyhole take the cell's
         // background, and no other cursor shape is round. So this counts padlocks.
-        let padlock_parts = |core: &TerminalCore| {
+        let locked = |core: &TerminalCore| {
             let (mut list, mut strings) = (DisplayList::new(), Vec::new());
             core.fill_frame_list(&mut list, &mut strings);
-            let ink = core.theme.cursor.to_u32();
-            list.iter()
-                .filter(|c| {
-                    matches!(c, crate::render::display::DrawCmd::RoundRect { color, .. } if *color == ink)
-                })
-                .count()
+            list.iter().any(|c| {
+                matches!(
+                    c,
+                    crate::render::display::DrawCmd::Text { text, .. }
+                        if text.contains(crate::term_render::LOCK_GLYPH)
+                )
+            })
         };
 
         core.refresh_tty_mode();
         assert_eq!(core.tty_mode, TtyMode::Cooked, "a fresh tty echoes");
-        assert_eq!(padlock_parts(&core), 0, "an echoing tty draws no lock");
+        assert!(!locked(&core), "an echoing tty draws no lock");
 
         // What sudo does: stop echoing, print an ordinary line of text, say nothing.
         core.pty.as_ref().expect("a live pty").set_echo(false);
@@ -1380,10 +1381,9 @@ mod tests {
             core.dirty,
             "a silent prompt emits no output, so nothing but this would repaint it"
         );
-        assert_eq!(
-            padlock_parts(&core),
-            2,
-            "the padlock's arch and body reach the frame the window pulls"
+        assert!(
+            locked(&core),
+            "the padlock reaches the frame the window pulls"
         );
 
         // And what it does once it has the password: give the echo back.
@@ -1392,7 +1392,7 @@ mod tests {
         core.refresh_tty_mode();
         assert_eq!(core.tty_mode, TtyMode::Cooked);
         assert!(core.dirty, "letting go of the lock repaints too");
-        assert_eq!(padlock_parts(&core), 0, "the padlock is gone");
+        assert!(!locked(&core), "the padlock is gone");
     }
 
     #[test]
@@ -1403,30 +1403,27 @@ mod tests {
         // The padlock's two solid parts (the arch and the body) are the only round-rects
         // the frame draws in the cursor colour: its hollow and keyhole take the cell's
         // background, and no other cursor shape is round. So this counts padlocks.
-        let padlock_parts = |core: &TerminalCore| {
+        let locked = |core: &TerminalCore| {
             let (mut list, mut strings) = (DisplayList::new(), Vec::new());
             core.fill_frame_list(&mut list, &mut strings);
-            let ink = core.theme.cursor.to_u32();
-            list.iter()
-                .filter(|c| {
-                    matches!(c, crate::render::display::DrawCmd::RoundRect { color, .. } if *color == ink)
-                })
-                .count()
+            list.iter().any(|c| {
+                matches!(
+                    c,
+                    crate::render::display::DrawCmd::Text { text, .. }
+                        if text.contains(crate::term_render::LOCK_GLYPH)
+                )
+            })
         };
         let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
         core.focused = true;
-        assert_eq!(padlock_parts(&core), 0, "a cooked tty draws no lock");
+        assert!(!locked(&core), "a cooked tty draws no lock");
 
         core.dirty = false;
         core.tty_mode = TtyMode::PasswordPrompt;
         core.dirty = true; // what `refresh_tty_mode` sets on a change
 
         assert!(core.dirty, "a mode change has to repaint");
-        assert_eq!(
-            padlock_parts(&core),
-            2,
-            "the block cursor becomes a padlock: an arch and a body"
-        );
+        assert!(locked(&core), "the block cursor becomes a padlock");
     }
 
     #[test]
@@ -1476,6 +1473,7 @@ mod tests {
         baseline: 12,
         ascent: 12,
         descent: 4,
+        lock_glyph: true,
     };
 
     #[test]
@@ -1504,6 +1502,7 @@ mod tests {
             baseline: 12,
             ascent: 12,
             descent: 4,
+            lock_glyph: true,
         };
         let bar = Scrollbar::hidden();
         let list = term_render::build_display_list(&term_render::FrameInputs {
@@ -1531,6 +1530,7 @@ mod tests {
             baseline: 12,
             ascent: 12,
             descent: 4,
+            lock_glyph: true,
         };
         TerminalCore::new(true, 80, 24, metrics, 80 * 8, 24 * 16, 0)
     }
@@ -1586,6 +1586,7 @@ mod tests {
             baseline: 12,
             ascent: 12,
             descent: 4,
+            lock_glyph: true,
         };
         let mut core = TerminalCore::new(false, 80, 24, metrics, 80 * 8, 24 * 16, 0);
         let mut parser = Parser::new();

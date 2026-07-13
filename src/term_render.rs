@@ -79,6 +79,18 @@ const SELECTION_BG: Rgb = Rgb::new(0x41, 0x57, 0x76);
 /// The width of a bar (`DECSCUSR 5/6`) cursor, in pixels.
 const BAR_CURSOR_WIDTH: i32 = 2;
 
+/// The padlock drawn in place of the cursor while the tty is taking a password: `nf-fa-lock`
+/// in the Nerd Fonts private-use area, the same codepoint wezterm and ghostty typeset, so
+/// bnkterm's lock is *their* lock rather than a lookalike.
+///
+/// Being private-use, it is only there if a symbols font is: the Nerd Fonts range is the one
+/// part of the fallback chain that a bare system genuinely may not have (`make deps` installs
+/// it). So nothing may assume it — [`CellMetrics::lock_glyph`] says whether this machine can
+/// draw it, and the cursor falls back to the shape the child asked for when it cannot. A
+/// password cursor that renders as an empty tofu box would be worse than no password cursor
+/// at all: it is unexplained rather than merely absent.
+pub const LOCK_GLYPH: char = '\u{f023}';
+
 /// The overlay scrollbar down the grid's right edge, in *logical* pixels (they pass
 /// through [`Scale::px`], so they come out the same physical size at any DPI).
 ///
@@ -131,6 +143,13 @@ pub struct CellMetrics {
     /// The face's descent: ink below the baseline, which the baseline seats on the
     /// cell's bottom edge.
     pub descent: i32,
+    /// Whether the font stack can draw [`LOCK_GLYPH`], the password padlock.
+    ///
+    /// Not a measurement, but it rides here because it is the same question as the rest of
+    /// this struct — *what can this font stack do in a cell* — asked of the same stack at
+    /// the same moment, and it is re-asked whenever a font change re-measures the rest. It
+    /// is read where the cursor is painted, which is exactly where the metrics already are.
+    pub lock_glyph: bool,
 }
 
 impl CellMetrics {
@@ -151,6 +170,13 @@ impl CellMetrics {
             baseline: m.baseline,
             ascent: m.ascent,
             descent: m.descent,
+            lock_glyph: fonts.covers(
+                FaceKey::Prose {
+                    size,
+                    style: FontStyle::Regular,
+                },
+                LOCK_GLYPH,
+            ),
         }
     }
 
@@ -169,6 +195,16 @@ impl CellMetrics {
             baseline: m.baseline,
             ascent: m.ascent,
             descent: m.descent,
+            // The chrome never draws a cursor, but the answer is the fallback chain's, not
+            // this face's, so it is the same answer either way. Measuring it rather than
+            // hardcoding `false` keeps the two constructors from disagreeing.
+            lock_glyph: fonts.covers(
+                FaceKey::Ui {
+                    size,
+                    style: FontStyle::Regular,
+                },
+                LOCK_GLYPH,
+            ),
         }
     }
 
@@ -196,23 +232,6 @@ pub enum CursorShape {
     /// A padlock: the tty is line-editing with echo off, so whatever is being typed
     /// here is a secret (a `sudo`/`ssh`/`passwd` prompt).
     Lock,
-}
-
-/// The four rounded rectangles a padlock is drawn from, in screen pixels. Geometry
-/// only, so the layout can be asserted without a GPU (and so the shape is decided in
-/// one place rather than smeared through the painter). See [`Painter::padlock`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Padlock {
-    /// The shackle's outer arch: a round-rect capped at the top, its legs sunk into
-    /// the body.
-    shackle: Rect,
-    /// The opening inside the arch, painted back to the cell's background.
-    hole: Rect,
-    /// The body, rounded on all four corners, drawn over the shackle's legs.
-    body: Rect,
-    /// The keyhole, knocked back out of the body. `None` on a cell too small for it to
-    /// be anything but a muddy pixel.
-    keyhole: Option<Rect>,
 }
 
 /// How to paint the cursor this frame. `visible` folds the grid's `DECTCEM` state
@@ -792,28 +811,40 @@ impl Painter<'_> {
         let w = width_cells * m.w;
         match cursor.shape {
             CursorShape::Block => self.block_cursor(dr, cc, cursor.focused),
-            // The lock is drawn the same whether the window has focus or not. It is not
-            // really a caret style, it is a status light: "this window is waiting for a
-            // password" is worth reading from across the desk, and there is no legible
-            // hollow rendering of a shape this small anyway.
-            CursorShape::Lock => match self.padlock(x, y, w) {
-                Some(lock) => {
-                    // The lock is the message, so it gets a clean cell to sit on: paint
-                    // out whatever glyph is under the cursor (blank at a real password
-                    // prompt, but nothing guarantees where the cursor is parked), then
-                    // stamp the padlock into it. That background is also what the arch's
-                    // hollow and the keyhole are painted with, so they read as openings.
-                    let (_, behind) = self.resolve(cell, false);
-                    self.list.push(DrawCmd::Fill {
-                        rect: Rect { x, y, w, h: m.h },
-                        color: behind.to_u32(),
-                    });
-                    self.push_padlock(lock, color, behind.to_u32());
-                }
-                // No room for a legible padlock. An honest block beats a smudge, and
-                // beats no cursor at all.
-                None => self.block_cursor(dr, cc, cursor.focused),
-            },
+            // The padlock stands in for the cursor, in the cursor's colour and on the cell's
+            // own background: no block behind it, and it looks the same focused or not. It
+            // is a status light rather than a caret style, and "this window is waiting for a
+            // password" is worth reading from across the desk.
+            //
+            // Without a symbols font there is no padlock to draw, and a tofu box is worse
+            // than no lock at all, so the cursor quietly stays whatever the child asked for.
+            CursorShape::Lock if m.lock_glyph => {
+                // The lock is the whole message, so it gets a clean cell: paint out whatever
+                // is under the cursor (blank at a real password prompt, but nothing promises
+                // where the cursor is parked) and stand the glyph on that background.
+                let (_, behind) = self.resolve(cell, false);
+                self.list.push(DrawCmd::Fill {
+                    rect: Rect { x, y, w, h: m.h },
+                    color: behind.to_u32(),
+                });
+                let baseline = self.baseline(dr);
+                let mut text = self.take_string();
+                text.push(LOCK_GLYPH);
+                self.list.push(DrawCmd::Text {
+                    bounds: text_bounds(x, baseline, w, m),
+                    x,
+                    baseline,
+                    face: FaceKey::Prose {
+                        size: m.size,
+                        style: FontStyle::Regular,
+                    },
+                    color,
+                    bg: behind.to_u32(),
+                    fade: None,
+                    text,
+                });
+            }
+            CursorShape::Lock => self.block_cursor(dr, cc, cursor.focused),
             CursorShape::Bar => self.list.push(DrawCmd::Fill {
                 rect: Rect {
                     x,
@@ -943,168 +974,6 @@ impl Painter<'_> {
             color: self.theme.cursor.to_u32(),
         });
         self.stamp_inverted_glyph(row, col, cell, width_cells);
-    }
-
-    /// A padlock centred in the cursor cell, or `None` when the cell is too small to
-    /// hold one. Four rounded rectangles, laid out to read as the padlock everyone
-    /// knows: an arched shackle standing on a rounded body with a keyhole.
-    ///
-    /// ```text
-    ///      ,--.        shackle:  an outer round-rect, capped at the top, with a
-    ///      |  |                  narrower one painted back to the background inside
-    ///    ,-+--+-.               it -- that hollow is what makes it an arch and not
-    ///    |      |               a lollipop. Its legs run down *into* the body, so
-    ///    |  ()  |               the join needs no mitring: the body covers them.
-    ///    `------'      body:    a round-rect, with the keyhole knocked out of it.
-    /// ```
-    ///
-    /// Drawn rather than typeset, and that is a real fork in the road: **neither wezterm
-    /// nor ghostty draws this.** Both typeset **U+F023**, the padlock in the Nerd Fonts
-    /// private-use area, which is why their locks are pixel-identical. The difference
-    /// between them is only where the font comes from, and it decides everything:
-    ///
-    /// - wezterm resolves it through the *user's* fallback chain, so it tofus whenever
-    ///   that chain has no padlock — a standing trickle of "the lock shows as a blank box"
-    ///   reports (wezterm #4976, #5507, #3902). The one cursor whose entire job is to say
-    ///   "a secret is being typed" degrades to an empty box, on the machines least likely
-    ///   to notice.
-    /// - ghostty dodges that by *shipping* a symbols-only Nerd Font as a built-in
-    ///   fallback, so the glyph is always there.
-    ///
-    /// Both of those are closed to us. bnkterm ships no fonts (and is not about to start
-    /// vendoring one for a single glyph), and it will not stake a security indicator on
-    /// whatever the user's fallback chain happens to hold. So the third door: draw it.
-    /// Rounded rectangles cannot go missing, they scale to the cell instead of to whatever
-    /// size the glyph happens to be, and they take the cursor colour cleanly.
-    ///
-    /// Three things this geometry has to get right, the first two learned the hard way:
-    ///
-    /// - **It is a positive silhouette, not a cutout.** Knocking the lock *out* of a
-    ///   filled cursor block is the tempting version (it is what `stamp_inverted_glyph`
-    ///   does for a character) and it is illegible: to be seen at all the body has to be
-    ///   nearly as wide as the cell, which leaves it flush with the cell edge, so it
-    ///   merges into the background of the cells either side and the whole cursor reads
-    ///   as two stray horizontal bars.
-    /// - **It is inset on every side.** That margin is what makes the lock a shape rather
-    ///   than a region, at an 8px-wide cell as much as at 20.
-    /// - **Width is the binding constraint, not height.** A cell is about twice as tall
-    ///   as it is wide and a padlock is not, so the lock is sized off the cell's *width*
-    ///   and centred in its height. Sizing it off the height gives a stretched, unhappy
-    ///   lock that fills the cell and touches its neighbours.
-    ///
-    /// Every dimension is a ratio of the cell, so it tracks the font size, and the lock
-    /// keeps its own width on a wide (CJK) cell rather than stretching: it is an icon,
-    /// not a glyph.
-    fn padlock(&self, x: i32, y: i32, w: i32) -> Option<Padlock> {
-        let m = self.metrics;
-        let cell_w = m.w.min(w);
-        // Below this there is no room for a lock *and* the margin that lets it read. No
-        // real font gives a cell this small; the guard is what lets the arithmetic below
-        // carve the box up without checking its work, and it keeps the caller honest
-        // about having to draw something else instead.
-        //
-        // The width floor is load-bearing, not decorative: it is what guarantees the lock
-        // box is wide enough (>= 5px) for a shackle to be narrower than the body and still
-        // be 3px across. Lower it and the `clamp` below inverts and panics.
-        if cell_w < 7 || m.h < 9 {
-            return None;
-        }
-        // The lock's box. Width is the scarce dimension (a cell is about twice as tall as
-        // it is wide), so the lock takes all of it that it can: the margin is a proportion
-        // of the cell, which rounds to nothing on the small cells that cannot spare it and
-        // opens up on the large ones that can. Height then follows from the width, capped
-        // by the cell, which is what lets a lock be *tall* -- the only way left to be big
-        // once the width is spent.
-        let lw = cell_w - 2 * (cell_w / 16);
-        let lh = (lw * 7 / 4).min(m.h - 2);
-        let ox = x + (w - lw) / 2;
-        let oy = y + (m.h - lh) / 2;
-
-        // The shackle takes the top two fifths, the body the rest.
-        let shackle_h = (lh * 2 / 5).max(3);
-        let body_h = lh - shackle_h;
-        let body = Rect {
-            x: ox,
-            y: oy + shackle_h,
-            w: lw,
-            h: body_h,
-        };
-
-        // The shackle is narrower than the body, so it reads as standing on it, and its
-        // legs are sunk half-way into the body so the two never show a seam. `t` is the
-        // metal's thickness: thin enough that the arch's two legs cannot meet in the
-        // middle and close the hole.
-        let sw = (lw * 2 / 3).clamp(3, lw - 2);
-        let sx = ox + (lw - sw) / 2;
-        let shackle = Rect {
-            x: sx,
-            y: oy,
-            w: sw,
-            h: shackle_h + body_h / 2,
-        };
-        // Thickness is bounded by *both* of the arch's dimensions, and it has to be: it
-        // scales off the cell's width, while the arch's height is capped by the cell's
-        // height, so a wide, short cell would otherwise give thick metal on a short arch
-        // and squeeze the hollow out of existence.
-        let t = (lw / 6).clamp(1, ((sw - 1) / 2).min(shackle.h - 1));
-        let hole = Rect {
-            x: sx + t,
-            y: oy + t,
-            w: sw - 2 * t,
-            h: shackle.h - t,
-        };
-
-        // The keyhole is the first thing to go. Below a 3px opening it is a smudge that
-        // reads as a rendering fault rather than a lock, and the reference it is imitating
-        // does not show one at small sizes either.
-        let keyhole = (body_h >= 8 && lw >= 12).then(|| {
-            let k = (lw / 4).max(3);
-            Rect {
-                x: ox + (lw - k) / 2,
-                y: body.y + (body_h - k) / 2,
-                w: k,
-                h: k,
-            }
-        });
-
-        Some(Padlock {
-            shackle,
-            hole,
-            body,
-            keyhole,
-        })
-    }
-
-    /// Paint a [`Padlock`] in `ink`, over a cell whose background is `behind`. Order is
-    /// load-bearing: the arch's hollow is painted back to `behind` *before* the body goes
-    /// down over the legs, so the body hides where they end.
-    fn push_padlock(&mut self, lock: Padlock, ink: u32, behind: u32) {
-        self.list.push(DrawCmd::RoundRect {
-            rect: lock.shackle,
-            color: ink,
-            radius: lock.shackle.w / 2,
-            corners: RoundedCorners::Top,
-        });
-        self.list.push(DrawCmd::RoundRect {
-            rect: lock.hole,
-            color: behind,
-            radius: lock.hole.w / 2,
-            corners: RoundedCorners::Top,
-        });
-        self.list.push(DrawCmd::RoundRect {
-            rect: lock.body,
-            color: ink,
-            radius: (lock.body.h / 5).max(1),
-            corners: RoundedCorners::Both,
-        });
-        if let Some(keyhole) = lock.keyhole {
-            self.list.push(DrawCmd::RoundRect {
-                rect: keyhole,
-                color: behind,
-                radius: keyhole.w / 2,
-                corners: RoundedCorners::Both,
-            });
-        }
     }
 
     /// A hollow block outline (unfocused window) as four thin edge fills.
@@ -1524,6 +1393,7 @@ mod tests {
         baseline: 16,
         ascent: 14,
         descent: 4,
+        lock_glyph: true,
     };
 
     fn feed(s: &mut Screen, bytes: &[u8]) {
@@ -1901,194 +1771,134 @@ mod tests {
         }
     }
 
-    /// Every `Fill` and `RoundRect` in `list`, as `(rect, colour)`, in push order. The
-    /// padlock is built from both, so a test about its shape has to see both.
-    fn shapes(list: &[DrawCmd]) -> Vec<(Rect, u32)> {
-        list.iter()
-            .filter_map(|c| match c {
-                DrawCmd::Fill { rect, color } => Some((*rect, *color)),
-                DrawCmd::RoundRect { rect, color, .. } => Some((*rect, *color)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// The padlock the `M` metrics (a 10x20 cell) must produce, in push order. Derived by
-    /// hand from the ratios in `Painter::padlock`, so changing the geometry has to be a
-    /// deliberate act: a 10x17 lock box (the cell's full width -- 10px is too narrow to
-    /// spare a margin -- then all the height that width earns), centred, so it starts at
-    /// (0, 1). The shackle is 6 wide and sinks half-way into the 11-tall body; the hole
-    /// inside it is a 1px wall thinner all round. A 10px cell is too narrow for a keyhole.
-    const SHACKLE: Rect = Rect {
-        x: 2,
-        y: 1,
-        w: 6,
-        h: 11,
-    };
-    const HOLE: Rect = Rect {
-        x: 3,
-        y: 2,
-        w: 4,
-        h: 10,
-    };
-    const BODY: Rect = Rect {
-        x: 0,
-        y: 7,
-        w: 10,
-        h: 11,
-    };
-
-    #[test]
-    fn the_lock_draws_a_padlock_on_a_cleared_cell_focused_or_not() {
-        // The lock is a status light, not a caret style, so it looks the same either way:
-        // a padlock in the cursor colour, standing on the cell's own background. It is
-        // deliberately *not* knocked out of a filled block (see `padlock`), and it does
-        // not re-stamp the glyph under it the way a block cursor does.
-        for focused in [true, false] {
-            let mut s = Screen::new(4, 1);
-            feed(&mut s, b"X");
-            s.move_to(0, 0); // park the cursor on the glyph
-            let t = Theme::default();
-            let list = build_display_list(&FrameInputs {
-                cursor: CursorRender {
-                    shape: CursorShape::Lock,
-                    focused,
-                    ..CursorRender::default()
-                },
-                ..inputs(&s, &t)
-            });
-            let (ink, behind) = (t.cursor.to_u32(), t.bg.to_u32());
-            let shapes = shapes(&list);
-            let cell = Rect {
-                x: 0,
-                y: 0,
-                w: M.w,
-                h: M.h,
-            };
-
-            assert!(
-                !shapes.contains(&(cell, ink)),
-                "focused={focused}: no filled block under the lock, it would swallow it"
-            );
-            // The cell is cleared, then the arch, then its hollow, then the body over the
-            // arch's legs. The order is the drawing.
-            assert_eq!(
-                shapes[shapes.len() - 4..],
-                [(cell, behind), (SHACKLE, ink), (HOLE, behind), (BODY, ink),],
-                "focused={focused}: a padlock in the cursor colour",
-            );
-
-            // The 'X' is painted over, not inverted out: the lock is the whole message.
-            let glyphs = list
-                .iter()
-                .filter(|c| matches!(c, DrawCmd::Cells { .. } | DrawCmd::Text { .. }))
-                .count();
-            assert_eq!(
-                glyphs, 1,
-                "focused={focused}: no inverted glyph over the lock"
-            );
-        }
-    }
-
-    /// The padlock's full height: from the top of the shackle to the bottom of the body.
-    fn lock_h(shackle: Rect, body: Rect) -> i32 {
-        body.y + body.h - shackle.y
+    /// A `Lock` cursor over a cell holding 'X', at `metrics`. Returns the display list.
+    fn lock_frame(metrics: CellMetrics, t: &Theme) -> DisplayList {
+        let mut s = Screen::new(4, 1);
+        feed(&mut s, b"X");
+        s.move_to(0, 0); // park the cursor on the glyph
+        build_display_list(&FrameInputs {
+            metrics,
+            cursor: CursorRender {
+                shape: CursorShape::Lock,
+                ..CursorRender::default()
+            },
+            ..inputs(&s, t)
+        })
     }
 
     #[test]
-    fn the_padlock_is_an_arch_and_stays_inside_its_cell_at_every_size() {
-        // The lock is drawn, not typeset, so nothing but this arithmetic keeps it legible.
-        // Two properties, both of which a green suite once missed:
-        //
-        //   * every rectangle stays inside the cursor's cell, and the body is inset from
-        //     both edges -- a body flush with the edge merges into the background of the
-        //     cells either side and the cursor stops reading as a shape at all;
-        //   * the hole is strictly inside the shackle, so the shackle is an *arch*. Let a
-        //     rounding make the walls meet and the padlock becomes a lollipop.
-        for h in 4..=64i32 {
-            for w in 2..=32i32 {
-                let m = CellMetrics {
-                    size: h as u32,
-                    w,
-                    h,
-                    baseline: h - 2,
-                    ascent: h - 4,
-                    descent: 2,
-                };
-                let mut s = Screen::new(2, 1);
-                s.move_to(0, 0);
-                let t = Theme::default();
-                let list = build_display_list(&FrameInputs {
-                    metrics: m,
-                    surface: (w * 2, h),
-                    cursor: CursorRender {
-                        shape: CursorShape::Lock,
-                        ..CursorRender::default()
-                    },
-                    ..inputs(&s, &t)
-                });
-                // Skip the surface-wide base fill; the rest belongs to the cursor's cell.
-                let drawn: Vec<Rect> = shapes(&list).iter().skip(1).map(|(r, _)| *r).collect();
-                for rect in &drawn {
-                    assert!(
-                        rect.x >= 0
-                            && rect.y >= 0
-                            && rect.x + rect.w <= w
-                            && rect.y + rect.h <= h
-                            && rect.w > 0
-                            && rect.h > 0,
-                        "{rect:?} escapes a {w}x{h} cell",
-                    );
-                }
-                if w < 7 || h < 9 {
-                    continue; // too small for a lock: the block fallback, covered above
-                }
-                // Cleared cell, shackle, hole, body, and a keyhole once there is room.
-                assert!(
-                    drawn.len() == 4 || drawn.len() == 5,
-                    "a {w}x{h} cell draws a padlock, got {} shapes",
-                    drawn.len()
-                );
-                let (shackle, hole, body) = (drawn[1], drawn[2], drawn[3]);
-                // The body is the widest part, so it is what decides whether the lock is
-                // centred. Left and right margins agree to within the odd pixel a centred
-                // odd width leaves over.
-                let (left, right) = (body.x, w - (body.x + body.w));
-                assert!(
-                    (left - right).abs() <= 1,
-                    "the padlock sits off-centre in a {w}x{h} cell: {left} left, {right} right"
-                );
-                // It should be *big*. The whole point of drawing it is that it reads at a
-                // glance, and the first version was a legible padlock that nobody could see
-                // because it rattled around inside its cell. So the sizing policy is pinned
-                // rather than left to drift: take the cell's full usable width, then all the
-                // height that width earns, up to the cell. (Height cannot be pushed further
-                // on its own -- a lock that is tall for its width stops looking like a lock.)
+    fn the_lock_typesets_the_padlock_glyph_on_a_cleared_cell() {
+        // bnkterm's lock is *their* lock: the same Nerd Fonts codepoint wezterm and ghostty
+        // typeset, not a lookalike drawn from rectangles. It stands in the cursor's colour
+        // on the cell's own background, with no block behind it to swallow it, and the cell
+        // is cleared first so whatever the cursor is parked on cannot show through.
+        let t = Theme::default();
+        let list = lock_frame(M, &t);
+
+        let cell = Rect {
+            x: 0,
+            y: 0,
+            w: M.w,
+            h: M.h,
+        };
+        assert_eq!(
+            fills(&list).last(),
+            Some(&(cell, t.bg.to_u32())),
+            "the cell is cleared to its own background before the glyph lands"
+        );
+        match list.last() {
+            Some(DrawCmd::Text {
+                text,
+                color,
+                bg,
+                x,
+                face,
+                ..
+            }) => {
                 assert_eq!(
-                    body.w,
-                    w - 2 * (w / 16),
-                    "the padlock does not use the full width of a {w}x{h} cell"
+                    text,
+                    &LOCK_GLYPH.to_string(),
+                    "the padlock, not a drawn shape"
                 );
+                assert_eq!(*color, t.cursor.to_u32(), "in the cursor's colour");
+                assert_eq!(*bg, t.bg.to_u32());
+                assert_eq!(*x, 0, "in the cursor's cell");
                 assert_eq!(
-                    lock_h(shackle, body),
-                    (body.w * 7 / 4).min(h - 2),
-                    "the padlock does not use the height its width earns in a {w}x{h} cell"
-                );
-                assert!(
-                    hole.x > shackle.x
-                        && hole.x + hole.w < shackle.x + shackle.w
-                        && hole.y > shackle.y
-                        && hole.w > 0,
-                    "the shackle has no hole in a {w}x{h} cell, so it is a lollipop: \
-                     hole {hole:?} in shackle {shackle:?}"
-                );
-                assert!(
-                    shackle.y + shackle.h > body.y && shackle.y + shackle.h <= body.y + body.h,
-                    "the shackle's legs must end inside the body in a {w}x{h} cell: \
-                     shackle {shackle:?}, body {body:?}"
+                    *face,
+                    FaceKey::Prose {
+                        size: M.size,
+                        style: FontStyle::Regular
+                    }
                 );
             }
+            other => panic!("expected the padlock glyph last, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_font_stack_without_the_padlock_falls_back_to_an_ordinary_cursor() {
+        // The padlock is private-use, so a machine with no symbols font simply has no such
+        // glyph. Typesetting it anyway would draw a tofu box: a cursor that is not merely
+        // absent but actively confusing, on exactly the machines least equipped to explain
+        // it. So the lock is silently declined and the caret stays what the child asked for.
+        let t = Theme::default();
+        let bare = CellMetrics {
+            lock_glyph: false,
+            ..M
+        };
+        let list = lock_frame(bare, &t);
+
+        assert!(
+            !list.iter().any(|c| matches!(
+                c,
+                DrawCmd::Text { text, .. } if text.contains(LOCK_GLYPH)
+            )),
+            "no padlock is typeset when the font stack has none"
+        );
+        // An ordinary focused block: filled cell, glyph inverted out of it.
+        assert!(
+            fills(&list).contains(&(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: M.w,
+                    h: M.h
+                },
+                t.cursor.to_u32()
+            )),
+            "the cursor falls back to a block, not to nothing"
+        );
+        match list.last() {
+            Some(DrawCmd::Text { text, color, .. }) => {
+                assert_eq!(text, "X", "the inverted glyph of a normal block cursor");
+                assert_eq!(*color, t.bg.to_u32());
+            }
+            other => panic!("expected the inverted glyph last, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_lock_looks_the_same_focused_or_not() {
+        // The lock is a status light, not a caret style: "this window is waiting for a
+        // password" is worth reading from across the desk, focused or not.
+        let t = Theme::default();
+        let focused = lock_frame(M, &t);
+        let mut s = Screen::new(4, 1);
+        feed(&mut s, b"X");
+        s.move_to(0, 0);
+        let unfocused = build_display_list(&FrameInputs {
+            cursor: CursorRender {
+                shape: CursorShape::Lock,
+                focused: false,
+                ..CursorRender::default()
+            },
+            ..inputs(&s, &t)
+        });
+        assert_eq!(
+            focused.last(),
+            unfocused.last(),
+            "the padlock does not hollow out when the window loses focus"
+        );
     }
 
     #[test]

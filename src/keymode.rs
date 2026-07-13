@@ -256,6 +256,7 @@ mod tests {
         baseline: 12,
         ascent: 12,
         descent: 4,
+        lock_glyph: true,
     };
 
     #[test]
