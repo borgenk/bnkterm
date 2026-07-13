@@ -130,9 +130,57 @@ const MAX_DIMENSION: u32 = 16384;
 /// below this; the free list only ever recycles client ids.
 const SERVER_ID_BASE: u32 = 0xff00_0000;
 
+/// How much bnkterm says about itself on stderr. Quiet by default: a terminal
+/// that narrates its own bring-up prints into the very scrollback the user
+/// opened it to read, and the shell's first line should be the shell's. Only
+/// real errors survive `Quiet`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Verbosity {
+    /// Errors only. The default, and what a user ever sees unless they ask.
+    #[default]
+    Quiet,
+    /// `--verbose`: the bring-up lines (grid size, renderer, presentation path).
+    Verbose,
+    /// `--stats`: the bring-up lines plus a timing line on every presented frame.
+    Stats,
+}
+
+impl Verbosity {
+    /// Read the verbosity out of the command line. `BNKTERM_STATS` in the
+    /// environment is the same knob as `--stats`, kept because the perf lab and
+    /// desktop launchers already set it that way.
+    pub fn from_args(args: &[String]) -> Self {
+        Self::parse(args, std::env::var_os("BNKTERM_STATS").is_some())
+    }
+
+    /// The parse itself, with the environment passed in so it stays pure (and so
+    /// the test does not have to mutate a process-wide variable to run).
+    fn parse(args: &[String], stats_env: bool) -> Self {
+        if stats_env || args.iter().any(|a| a == "--stats") {
+            Self::Stats
+        } else if args.iter().any(|a| a == "--verbose" || a == "-v") {
+            Self::Verbose
+        } else {
+            Self::Quiet
+        }
+    }
+
+    /// Whether bring-up narrates itself: the grid it opened on, the renderer it
+    /// chose, the sync path it negotiated.
+    fn verbose(self) -> bool {
+        self >= Self::Verbose
+    }
+
+    /// Whether every presented frame prints its build/submit timing and glyph
+    /// cache hit rate.
+    fn frame_stats(self) -> bool {
+        self == Self::Stats
+    }
+}
+
 /// Open the window, spawn `$SHELL`, and run the terminal until the shell exits or
 /// the window is closed.
-pub fn run() -> crate::error::Result<()> {
+pub fn run(verbosity: Verbosity) -> crate::error::Result<()> {
     // Export terminal capabilities once, before State construction and before any
     // gather thread can exist. Every shell opened by the process inherits them.
     std::env::set_var("TERM", "xterm-256color");
@@ -151,23 +199,24 @@ pub fn run() -> crate::error::Result<()> {
     // `grid::Screen::set_hyperlink`) — rather than impersonating a terminal on the
     // list to get the same answer.
     std::env::set_var("FORCE_HYPERLINK", "1");
-    let mut state = State::new(false)?;
+    let mut state = State::new(false, verbosity)?;
     state.bring_up()?;
     Ok(())
 }
 
 /// `--demo`: open the window on a static styled grid, without a PTY. The phase-2
 /// bring-up, kept for isolating a render question from the live shell.
-pub fn run_demo() -> crate::error::Result<()> {
-    let mut state = State::new(true)?;
+pub fn run_demo(verbosity: Verbosity) -> crate::error::Result<()> {
+    let mut state = State::new(true, verbosity)?;
     state.bring_up()?;
     Ok(())
 }
 
 /// `--gpu-probe`: report what the compositor and GPU offer the dmabuf
-/// presentation path, without opening a window.
+/// presentation path, without opening a window. Its report *is* its output, so it
+/// prints at any verbosity.
 pub fn gpu_probe() -> crate::error::Result<()> {
-    State::new(true)?.probe_dmabuf()?;
+    State::new(true, Verbosity::Quiet)?.probe_dmabuf()?;
     Ok(())
 }
 
@@ -364,13 +413,13 @@ struct State {
     /// nonzero the loop holds off redrawing, so bursts coalesce into at most one
     /// frame per refresh (frame pacing).
     frame_callback: u32,
-    /// When set (the `BNKTERM_STATS` env var is present), each presented frame
-    /// prints its render time and glyph-cache hit rate to stderr.
-    stats: bool,
+    /// How chatty stderr is: quiet unless the user asked for the bring-up lines
+    /// (`--verbose`) or the per-frame stats line (`--stats`).
+    verbosity: Verbosity,
 }
 
 impl State {
-    fn new(demo: bool) -> Result<Self> {
+    fn new(demo: bool, verbosity: Verbosity) -> Result<Self> {
         let conn = Connection::connect()?;
         // Open at unity scale; the compositor's real scale arrives after bring-up
         // and reopens the fonts (see `apply_scale`).
@@ -448,7 +497,7 @@ impl State {
             configured: false,
             closed: false,
             frame_callback: 0,
-            stats: std::env::var_os("BNKTERM_STATS").is_some(),
+            verbosity,
         })
     }
 
@@ -568,14 +617,21 @@ impl State {
 
         // Now that the window has its granted size, spawn the shell on a PTY
         // sized to the grid. Demo mode skips this and shows its static screen.
+        // Under `--verbose` bring-up says what it landed on; quiet by default, so
+        // the first thing on stderr is the shell's, not ours.
         if !self.tabs.active().is_demo() {
             let (cols, rows) = self.tabs.active_mut().spawn_shell()?;
-            eprintln!("bnkterm: shell on a {cols}x{rows} grid. Close the window to exit.");
-        } else {
-            eprintln!("bnkterm: phase-2 static demo. Close the window to exit.");
+            if self.verbosity.verbose() {
+                eprintln!("bnkterm: shell on a {cols}x{rows} grid.");
+            }
+        } else if self.verbosity.verbose() {
+            eprintln!("bnkterm: static demo grid, no shell.");
         }
-        if let Some(gpu) = &self.presentation.backend {
-            eprintln!("bnkterm: renderer: gpu ({})", gpu.name());
+        if self.verbosity.verbose() {
+            match &self.presentation.backend {
+                Some(gpu) => eprintln!("bnkterm: renderer: gpu ({})", gpu.name()),
+                None => eprintln!("bnkterm: renderer: shm"),
+            }
         }
 
         self.run_until(|s| s.closed)?;
@@ -1922,5 +1978,46 @@ mod tests {
         let s = Scaling::new((800, 600));
         assert_eq!(s.factor_120, SCALE_120_UNITY);
         assert!(!s.is_fractional(), "no viewport yet");
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn verbosity_is_quiet_unless_asked_for() {
+        // The plain launch, and a launch whose other flags say nothing about noise.
+        assert_eq!(Verbosity::parse(&args(&[]), false), Verbosity::Quiet);
+        assert_eq!(
+            Verbosity::parse(&args(&["--demo"]), false),
+            Verbosity::Quiet
+        );
+        assert!(!Verbosity::Quiet.verbose());
+        assert!(!Verbosity::Quiet.frame_stats());
+    }
+
+    #[test]
+    fn verbose_and_stats_flags_climb_the_ladder() {
+        assert_eq!(Verbosity::parse(&args(&["-v"]), false), Verbosity::Verbose);
+        assert_eq!(
+            Verbosity::parse(&args(&["--verbose"]), false),
+            Verbosity::Verbose
+        );
+        assert_eq!(
+            Verbosity::parse(&args(&["--stats"]), false),
+            Verbosity::Stats
+        );
+        // The env var is the same knob as `--stats`, and `--stats` implies verbose:
+        // the frame lines are useless without knowing which renderer produced them.
+        assert_eq!(Verbosity::parse(&args(&[]), true), Verbosity::Stats);
+        assert_eq!(
+            Verbosity::parse(&args(&["--verbose"]), true),
+            Verbosity::Stats,
+            "the louder of the two wins"
+        );
+        assert!(Verbosity::Verbose.verbose());
+        assert!(!Verbosity::Verbose.frame_stats());
+        assert!(Verbosity::Stats.verbose());
+        assert!(Verbosity::Stats.frame_stats());
     }
 }

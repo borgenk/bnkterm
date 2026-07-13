@@ -209,7 +209,7 @@ impl State {
     /// Negotiate explicit sync (`linux-drm-syncobj-v1`) when a GPU backend is
     /// live and the compositor advertises the manager. Best-effort: on any
     /// failure the GPU path keeps the implicit-sync bridge, which is why this
-    /// returns nothing and only logs under stats.
+    /// returns nothing and only says so under `--verbose`.
     pub(super) fn init_explicit_sync(&mut self) {
         let Some(manager) = self.presentation.syncobj_manager else {
             return;
@@ -225,7 +225,7 @@ impl State {
         match self.negotiate_explicit_sync(manager, minor) {
             Ok(es) => self.presentation.explicit_sync = Some(es),
             Err(e) => {
-                if self.stats {
+                if self.verbosity.verbose() {
                     eprintln!("bnkterm: explicit sync unavailable, using the sync bridge: {e}");
                 }
             }
@@ -440,7 +440,7 @@ impl State {
         let Some(idx) = (0..2).find(|&i| !self.presentation.busy[i]) else {
             return Ok(false);
         };
-        let started = self.stats.then(Instant::now);
+        let started = self.verbosity.frame_stats().then(Instant::now);
         let (sw, sh) = (self.width as i32, self.height as i32);
         // Rebuild the display list into the recycled back buffer (salvaging the
         // previous occupant's run strings into the pool first), so a steady frame
@@ -570,7 +570,7 @@ impl State {
         Ok(true)
     }
 
-    /// Print the per-frame stats line under `BNKTERM_STATS`: the build+submit
+    /// Print the per-frame stats line under `--stats`: the build+submit
     /// time, the gap since the last present, the glyph-cache hit rate, and which
     /// sync strategy carried the frame.
     fn log_frame_stats(&self, started: Instant) {
