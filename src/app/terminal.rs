@@ -32,7 +32,7 @@ use crate::mouse::{self, MouseButton, MouseKind};
 use crate::platform::browser;
 use crate::platform::geom::{Rect, Scale};
 use crate::platform::scroll::{self, Scrollbar};
-use crate::pty::{Pty, ZombieChild};
+use crate::pty::{Pty, TtyMode, ZombieChild};
 use crate::render::display::DisplayList;
 use crate::term_render::{self, CellMetrics, CellSpan, CursorRender, CursorShape, Selection};
 use crate::vt::Parser;
@@ -114,6 +114,12 @@ pub(super) struct TerminalCore {
     /// when not blinking, e.g. unfocused). Activity resets it to on.
     blink_on: bool,
     blink_at: Option<Instant>,
+    /// What the child's tty is doing, as of the last time its output settled (see
+    /// [`refresh_tty_mode`](Self::refresh_tty_mode)). Cached rather than probed per
+    /// frame because it changes only when the child calls `tcsetattr`, and because a
+    /// password prompt is *silent* by definition: the user types and nothing comes
+    /// back, so there is no output to re-probe on while the lock must stay up.
+    tty_mode: TtyMode,
     /// The button held for drag reporting under mouse mode (`None` when none is
     /// down).
     mouse_held: Option<MouseButton>,
@@ -201,6 +207,7 @@ impl TerminalCore {
             focused: false,
             blink_on: true,
             blink_at: None,
+            tty_mode: TtyMode::Cooked,
             mouse_held: None,
             selection: None,
             drag: None,
@@ -346,6 +353,25 @@ impl TerminalCore {
         self.cwd = cwd;
         self.foreground = foreground;
         true
+    }
+
+    /// Re-read the tty's line discipline, and repaint if it changed. This is the only
+    /// way a password prompt can be noticed: `sudo` prints no escape sequence to
+    /// announce itself, it just clears `ECHO` on the tty and writes an ordinary line
+    /// of text, so the signal is out of band and has to be fetched (see
+    /// [`Pty::tty_mode`]).
+    ///
+    /// A tty whose mode cannot be read (demo mode, or a child that has exited) keeps
+    /// the last mode seen rather than snapping back to `Cooked`, so a dying shell
+    /// cannot flicker the cursor on its way out.
+    pub(super) fn refresh_tty_mode(&mut self) {
+        let Some(mode) = self.pty.as_ref().and_then(Pty::tty_mode) else {
+            return;
+        };
+        if mode != self.tty_mode {
+            self.tty_mode = mode;
+            self.dirty = true;
+        }
     }
 
     /// Test-only direct feed through the same parser/output bookkeeping used by
@@ -940,7 +966,7 @@ impl TerminalCore {
         // while focused, and DECTCEM hides it entirely.
         let blinked_off = self.cursor_blinking() && !self.blink_on;
         let cursor = CursorRender {
-            shape: cursor_shape(self.screen.cursor_style()),
+            shape: cursor_shape(self.screen.cursor_style(), self.tty_mode),
             visible: self.screen.cursor_visible() && !blinked_off,
             focused: self.focused,
         };
@@ -1164,11 +1190,20 @@ fn abbreviate_under(path: &std::path::Path, home: &std::path::Path) -> String {
 }
 
 /// Map the grid's cursor style (from DECSCUSR) to how the renderer paints it.
-fn cursor_shape(style: CursorStyle) -> CursorShape {
-    match style {
-        CursorStyle::Block => CursorShape::Block,
-        CursorStyle::Underline => CursorShape::Underline,
-        CursorStyle::Bar => CursorShape::Bar,
+///
+/// A tty taking a password outranks whatever style the child last asked for. The two
+/// are not really in competition: `DECSCUSR` is the child stating a preference, while
+/// the lock reports a fact about the tty *underneath* the child, and that fact is the
+/// more important thing to put on screen. It also cannot be spoofed by output, which
+/// is the point of reading it from the kernel instead of trusting an escape sequence.
+fn cursor_shape(style: CursorStyle, tty: TtyMode) -> CursorShape {
+    match tty {
+        TtyMode::PasswordPrompt => CursorShape::Lock,
+        TtyMode::Cooked | TtyMode::Raw => match style {
+            CursorStyle::Block => CursorShape::Block,
+            CursorStyle::Underline => CursorShape::Underline,
+            CursorStyle::Bar => CursorShape::Bar,
+        },
     }
 }
 
@@ -1273,6 +1308,120 @@ mod tests {
         assert_eq!(
             abbreviate_under(Path::new("/home/adam/x"), home),
             "/home/adam/x"
+        );
+    }
+
+    #[test]
+    fn a_password_prompt_outranks_whatever_style_the_child_asked_for() {
+        // A shell that set a bar cursor (DECSCUSR 5) still gets a lock the moment the
+        // tty stops echoing: the child's preference is about taste, the lock is about
+        // what is happening to the user's keystrokes.
+        for style in [CursorStyle::Block, CursorStyle::Underline, CursorStyle::Bar] {
+            assert_eq!(
+                cursor_shape(style, TtyMode::PasswordPrompt),
+                CursorShape::Lock,
+                "{style:?} is overridden while a password is being typed"
+            );
+        }
+
+        // Off the prompt, the child's choice stands. `Raw` is a full-screen program,
+        // which also has echo off: if the lock keyed on echo alone, every minute spent
+        // in vim would show one.
+        for tty in [TtyMode::Cooked, TtyMode::Raw] {
+            assert_eq!(cursor_shape(CursorStyle::Block, tty), CursorShape::Block);
+            assert_eq!(cursor_shape(CursorStyle::Bar, tty), CursorShape::Bar);
+            assert_eq!(
+                cursor_shape(CursorStyle::Underline, tty),
+                CursorShape::Underline
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_tty_dropping_echo_locks_the_cursor_and_restoring_it_lets_go() {
+        // The feature's spine, against a real child and the kernel's real line
+        // discipline: PTY -> refresh_tty_mode -> the frame the window pulls. Only the
+        // one-line call from `Tabs::note_settle` is left out, and that is the same hook
+        // the cwd/foreground refresh already rides.
+        std::env::set_var("SHELL", "/bin/cat");
+        let mut core = TerminalCore::new(false, 40, 10, METRICS, 320, 160, 0);
+        if core.spawn_shell().is_err() {
+            eprintln!("fork/exec unavailable; skipping the live tty-mode test");
+            return;
+        }
+        let fills = |core: &TerminalCore| {
+            let (mut list, mut strings) = (DisplayList::new(), Vec::new());
+            core.fill_frame_list(&mut list, &mut strings);
+            list.iter()
+                .filter(|c| matches!(c, crate::render::display::DrawCmd::Fill { .. }))
+                .count()
+        };
+
+        core.refresh_tty_mode();
+        assert_eq!(core.tty_mode, TtyMode::Cooked, "a fresh tty echoes");
+        let cooked = fills(&core);
+
+        // What sudo does: stop echoing, print an ordinary line of text, say nothing.
+        core.pty.as_ref().expect("a live pty").set_echo(false);
+        core.dirty = false;
+        core.refresh_tty_mode();
+        assert_eq!(core.tty_mode, TtyMode::PasswordPrompt);
+        assert!(
+            core.dirty,
+            "a silent prompt emits no output, so nothing but this would repaint it"
+        );
+        assert_eq!(
+            fills(&core),
+            cooked + 4,
+            "the padlock's four rectangles reach the frame"
+        );
+
+        // And what it does once it has the password: give the echo back.
+        core.pty.as_ref().expect("a live pty").set_echo(true);
+        core.dirty = false;
+        core.refresh_tty_mode();
+        assert_eq!(core.tty_mode, TtyMode::Cooked);
+        assert!(core.dirty, "letting go of the lock repaints too");
+        assert_eq!(fills(&core), cooked, "the padlock is gone");
+    }
+
+    #[test]
+    fn the_lock_reaches_the_frame_and_repaints_when_the_mode_turns() {
+        // End to end through the real core: flip the cached mode the way a settle
+        // would, and confirm the display list the window pulls actually carries a lock
+        // and that the frame was marked for repaint (a silent prompt produces no
+        // output of its own, so nothing else would trigger one).
+        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        core.dirty = false;
+
+        core.tty_mode = TtyMode::PasswordPrompt;
+        core.dirty = true; // what `refresh_tty_mode` sets on a change
+
+        let mut list = DisplayList::new();
+        let mut strings = Vec::new();
+        core.fill_frame_list(&mut list, &mut strings);
+        assert!(core.dirty, "a mode change has to repaint");
+
+        // The padlock body is a fill inside the cursor's cell; a plain block cursor
+        // emits exactly one fill there, so a lock is distinguishable by count alone.
+        let cooked = {
+            let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+            core.tty_mode = TtyMode::Cooked;
+            let mut l = DisplayList::new();
+            let mut s = Vec::new();
+            core.fill_frame_list(&mut l, &mut s);
+            l.iter()
+                .filter(|c| matches!(c, crate::render::display::DrawCmd::Fill { .. }))
+                .count()
+        };
+        let locked = list
+            .iter()
+            .filter(|c| matches!(c, crate::render::display::DrawCmd::Fill { .. }))
+            .count();
+        assert_eq!(
+            locked,
+            cooked + 4,
+            "the lock adds its four rectangles to the frame"
         );
     }
 

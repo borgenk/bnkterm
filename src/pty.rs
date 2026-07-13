@@ -52,6 +52,34 @@ pub enum ReadOutcome {
     Eof,
 }
 
+/// What the tty's line discipline is currently doing, decoded from the two
+/// `c_lflag` bits that decide it. The child owns this state (it is the child that
+/// calls `tcsetattr`); we only ever read it.
+///
+/// ```text
+///   ICANON  ECHO   mode             who does this
+///   ------  ----   --------------   ----------------------------------
+///     1      1     Cooked           an ordinary shell prompt
+///     1      0     PasswordPrompt   sudo / ssh / passwd reading a secret
+///     0      *     Raw              vim / htop driving the screen itself
+/// ```
+///
+/// `PasswordPrompt` is the interesting one, and it is why the pair is needed rather
+/// than `ECHO` alone: a full-screen program *also* turns echo off, so echo-off on its
+/// own cannot tell "hide what I type" from "I am painting the screen myself". Keeping
+/// the line editor on (`ICANON`) while blinding it is the distinctive thing a password
+/// prompt does, and it is the same test wezterm and ghostty make.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TtyMode {
+    /// Canonical with echo: the kernel line-edits and prints what is typed.
+    Cooked,
+    /// Canonical without echo: the kernel line-edits but prints nothing, so the
+    /// user is typing something they do not want on the screen.
+    PasswordPrompt,
+    /// Non-canonical: the program reads keys itself and owns the display.
+    Raw,
+}
+
 /// A spawned child on the far side of a pseudoterminal, owning the master fd and
 /// the child's pid. Dropping it closes the master (which sends the child SIGHUP)
 /// and reaps the child if it has exited.
@@ -225,6 +253,55 @@ impl Pty {
         (!name.is_empty()).then(|| name.to_string())
     }
 
+    /// What the line discipline is doing right now (see [`TtyMode`]), read straight
+    /// from the kernel. `None` if the tty is gone, in which case the caller keeps
+    /// whatever it last saw rather than inventing a mode.
+    ///
+    /// The master and the slave name the same line discipline, so a `tcsetattr` the
+    /// *child* makes on its own tty is visible here without the child telling us
+    /// anything: this is how a password prompt is noticed at all, since `sudo` prints
+    /// no escape sequence to announce itself. It is one `TCGETS`, and like
+    /// [`cwd`](Self::cwd) and [`foreground_program`](Self::foreground_program) it is
+    /// called only when a tab's output settles, never per read (the drain does ~950k
+    /// reads over a 150 MB cat; a syscall on that path is exactly the tax `PERF_LOG`
+    /// exists to prevent).
+    pub fn tty_mode(&self) -> Option<TtyMode> {
+        // SAFETY: `t` is a live, correctly-typed local; tcgetattr either fills it for
+        // a valid fd or returns nonzero, and we read it only on success.
+        let mut t: Termios = unsafe { core::mem::zeroed() };
+        if unsafe { tcgetattr(self.master.as_raw_fd(), &mut t) } != 0 {
+            return None;
+        }
+        Some(match (t.c_lflag & ICANON != 0, t.c_lflag & ECHO != 0) {
+            (true, true) => TtyMode::Cooked,
+            (true, false) => TtyMode::PasswordPrompt,
+            (false, _) => TtyMode::Raw,
+        })
+    }
+
+    /// Do to this tty exactly what a password prompt does to its own: clear (or set)
+    /// `ECHO` on the live line discipline. Test-only, and not a mock: it drives the
+    /// same kernel object `sudo` drives, from the other end of the same pty (proved
+    /// equivalent by `a_password_prompt_on_the_slave_side_is_visible_on_the_master`).
+    /// It exists so the terminal's own tests can raise a real password prompt without
+    /// an interactive shell, whose line editor moves the termios out from under them.
+    #[cfg(test)]
+    pub(crate) fn set_echo(&self, on: bool) {
+        // SAFETY: `t` is a live, correctly-typed local, and the fd is this pty's own
+        // master; tcgetattr fills `t` and tcsetattr applies it unchanged but for ECHO.
+        let mut t: Termios = unsafe { core::mem::zeroed() };
+        assert_eq!(unsafe { tcgetattr(self.master.as_raw_fd(), &mut t) }, 0);
+        if on {
+            t.c_lflag |= ECHO;
+        } else {
+            t.c_lflag &= !ECHO;
+        }
+        assert_eq!(
+            unsafe { tcsetattr(self.master.as_raw_fd(), TCSANOW, &t) },
+            0
+        );
+    }
+
     /// Reap the child if it has exited, returning its exit status, else `None`
     /// (still running). Non-blocking.
     pub fn reap(&self) -> Option<c_int> {
@@ -391,6 +468,12 @@ const TIOCSWINSZ: c_ulong = 0x5414;
 const IUTF8: u32 = 0o40000;
 const TCSANOW: c_int = 0;
 const NCCS: usize = 32;
+/// `ICANON` and `ECHO` (`termios.h` `c_lflag`): the line editor and the echo of what
+/// is typed. Read together they classify the tty (see [`TtyMode`]); their values are
+/// pinned in the tests, since decoding a password prompt from the wrong bits would
+/// silently show a lock at the wrong times.
+const ICANON: u32 = 0o2;
+const ECHO: u32 = 0o10;
 // waitpid options.
 const WNOHANG: c_int = 1;
 // poll events.
@@ -612,6 +695,84 @@ mod tests {
         // c_cc[32] (32), padded to align the two 4-byte speeds = 60 on Linux.
         assert_eq!(std::mem::size_of::<Termios>(), 60);
         assert_eq!(std::mem::align_of::<Termios>(), 4);
+        // The c_lflag bits `tty_mode` decodes (asm-generic/termbits.h). Reading the
+        // wrong bit would not fail loudly, it would just show a lock at the wrong
+        // moments, so the values are pinned rather than trusted.
+        assert_eq!(ICANON, 0x2);
+        assert_eq!(ECHO, 0x8);
+    }
+
+    /// Flip one `c_lflag` bit on the live line discipline behind `fd`.
+    fn set_lflag(fd: RawFd, bits: u32, on: bool) {
+        let mut t: Termios = unsafe { core::mem::zeroed() };
+        assert_eq!(unsafe { tcgetattr(fd, &mut t) }, 0, "tcgetattr");
+        if on {
+            t.c_lflag |= bits;
+        } else {
+            t.c_lflag &= !bits;
+        }
+        assert_eq!(unsafe { tcsetattr(fd, TCSANOW, &t) }, 0, "tcsetattr");
+    }
+
+    #[test]
+    fn tty_mode_decodes_every_line_discipline_state() {
+        // Against a real pty and the kernel's real line discipline (no mocks): drive
+        // the two bits through all four combinations and check each classification.
+        std::env::set_var("SHELL", "/bin/cat");
+        let Ok(pty) = Pty::spawn(80, 24) else {
+            eprintln!("pty spawn unavailable in this environment; skipping");
+            return;
+        };
+        let fd = pty.fd();
+
+        // A tty comes up cooked: the kernel line-edits and echoes.
+        assert_eq!(pty.tty_mode(), Some(TtyMode::Cooked));
+
+        // Echo off, line editor on: sudo/ssh/passwd reading a secret.
+        set_lflag(fd, ECHO, false);
+        assert_eq!(pty.tty_mode(), Some(TtyMode::PasswordPrompt));
+
+        // Restoring echo (what sudo does once it has the password) ends the prompt.
+        set_lflag(fd, ECHO, true);
+        assert_eq!(pty.tty_mode(), Some(TtyMode::Cooked));
+
+        // Line editor off: a full-screen program reading keys itself. Echo is off here
+        // too, which is exactly why ECHO alone cannot stand in for a password prompt.
+        set_lflag(fd, ICANON, false);
+        set_lflag(fd, ECHO, false);
+        assert_eq!(pty.tty_mode(), Some(TtyMode::Raw));
+
+        // Non-canonical but echoing is a rare, deliberate state; it is still the
+        // program driving the tty, so it must not read as a prompt.
+        set_lflag(fd, ECHO, true);
+        assert_eq!(pty.tty_mode(), Some(TtyMode::Raw));
+    }
+
+    #[test]
+    fn a_password_prompt_on_the_slave_side_is_visible_on_the_master() {
+        // The premise the whole feature rests on: `sudo` announces nothing: it calls
+        // tcsetattr on *its* end of the pty (the slave, which is its stdin). If that
+        // were not the same line discipline the master reads, no amount of polling
+        // would ever see a password prompt. Prove it by doing precisely what sudo does
+        // -- open the slave and clear ECHO on it -- and reading the master.
+        std::env::set_var("SHELL", "/bin/cat");
+        let Ok(pty) = Pty::spawn(80, 24) else {
+            eprintln!("pty spawn unavailable in this environment; skipping");
+            return;
+        };
+        assert_eq!(pty.tty_mode(), Some(TtyMode::Cooked));
+
+        let slave_path = ptsname(pty.fd()).expect("the slave's path");
+        // SAFETY: slave_path is a NUL-terminated path from ptsname_r. O_NOCTTY keeps
+        // the test process from adopting the pty as its controlling terminal.
+        let slave = unsafe { open(slave_path.as_ptr(), O_RDWR | O_NOCTTY) };
+        assert!(slave >= 0, "open the slave: errno {}", errno());
+        set_lflag(slave, ECHO, false);
+
+        assert_eq!(pty.tty_mode(), Some(TtyMode::PasswordPrompt));
+
+        // SAFETY: `slave` is the fd just opened above and is not used again.
+        unsafe { close(slave) };
     }
 
     #[test]

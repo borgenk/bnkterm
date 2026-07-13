@@ -487,15 +487,28 @@ impl Tabs {
         self.outbox.push(ToWindow::Title(title));
     }
 
-    /// After a core drained a burst of output with nothing left pending, its shell
-    /// has likely printed a fresh prompt, so its working directory may have moved
-    /// (a bare `cd` reports nothing else) or a foreground program may have started
-    /// or exited. Re-read both, and when either changed and the bar is visible,
-    /// rebuild and repaint it. They are refreshed even for a lone tab so they are
-    /// current the moment a second opens; the bar work is skipped while there is
-    /// nothing to draw.
+    /// Everything a tab has to re-derive from the world outside its byte stream, hung
+    /// off the pump so a tab that says nothing costs nothing.
+    ///
+    /// The tty's mode is re-read on **every batch** that carried bytes. It is one
+    /// `TCGETS` against a batch that just cost a parse of up to 1 MiB, and it cannot
+    /// wait for the settle: `sudo` restores echo the instant it has the password, and
+    /// its command then prints for as long as it likes, so a lock that only cleared on
+    /// the settle would sit there for the whole run.
+    ///
+    /// The `/proc` reads wait for the settle (`!more`), where they are worth their
+    /// cost. A core with nothing left pending has likely printed a fresh prompt, so
+    /// its working directory may have moved (a bare `cd` reports nothing else) or a
+    /// foreground program may have started or exited; when either changed and the bar
+    /// is visible, rebuild and repaint it. Both are refreshed even for a lone tab so
+    /// they are current the moment a second opens, while the bar work itself is
+    /// skipped when there is nothing to draw.
     fn note_settle(&mut self, index: usize, bytes: usize, more: bool) {
-        if bytes == 0 || more {
+        if bytes == 0 {
+            return;
+        }
+        self.entries[index].core.refresh_tty_mode();
+        if more {
             return;
         }
         if self.entries[index].core.refresh_process() && self.shows_bar() {
