@@ -2072,7 +2072,7 @@ mod tests {
         // The one thing that still snaps to the bottom: the user. A keystroke must
         // never land blind in the middle of history.
         core.apply(ToTerminal::Key {
-            key: input::Key::Char('x'),
+            key: input::Key::plain('x'),
             mods: input::Mods::NONE,
         })
         .unwrap();

@@ -75,7 +75,7 @@ pub(crate) enum Disposition {
 /// not defeat it). Requiring an exact chord keeps Ctrl+Shift+A and Alt+Ctrl+A free
 /// for other bindings and for the child.
 fn is_leader(key: Key, mods: Mods) -> bool {
-    matches!(key, Key::Char(c) if c.eq_ignore_ascii_case(&'a')) && mods == Mods::CTRL
+    matches!(key, Key::Char { typed, .. } if typed.eq_ignore_ascii_case(&'a')) && mods == Mods::CTRL
 }
 
 /// The lowercase letter a plain key press carries, or `None` when Ctrl/Alt is held
@@ -86,7 +86,7 @@ fn command_letter(key: Key, mods: Mods) -> Option<char> {
         return None;
     }
     match key {
-        Key::Char(c) => Some(c.to_ascii_lowercase()),
+        Key::Char { typed, .. } => Some(typed.to_ascii_lowercase()),
         _ => None,
     }
 }
@@ -108,7 +108,7 @@ pub(crate) fn advance(mode: KeyMode, key: Key, mods: Mods) -> (KeyMode, Disposit
             if is_leader(key, mods) {
                 return (
                     KeyMode::Normal,
-                    Disposition::SendLiteral(Key::Char('a'), Mods::CTRL),
+                    Disposition::SendLiteral(Key::plain('a'), Mods::CTRL),
                 );
             }
             match command_letter(key, mods) {
@@ -262,20 +262,20 @@ mod tests {
     #[test]
     fn normal_passes_everything_but_the_leader() {
         assert_eq!(
-            advance(KeyMode::Normal, Key::Char('a'), Mods::NONE),
+            advance(KeyMode::Normal, Key::plain('a'), Mods::NONE),
             (KeyMode::Normal, Disposition::Passthrough)
         );
         // Ctrl+A alone is the leader; Ctrl+Shift+A and Alt+Ctrl+A are not.
         assert_eq!(
-            advance(KeyMode::Normal, Key::Char('a'), Mods::CTRL),
+            advance(KeyMode::Normal, Key::plain('a'), Mods::CTRL),
             (KeyMode::Leader, Disposition::Consumed(None))
         );
         assert_eq!(
-            advance(KeyMode::Normal, Key::Char('a'), Mods::CTRL | Mods::SHIFT),
+            advance(KeyMode::Normal, Key::plain('a'), Mods::CTRL | Mods::SHIFT),
             (KeyMode::Normal, Disposition::Passthrough)
         );
         assert_eq!(
-            advance(KeyMode::Normal, Key::Char('a'), Mods::CTRL | Mods::ALT),
+            advance(KeyMode::Normal, Key::plain('a'), Mods::CTRL | Mods::ALT),
             (KeyMode::Normal, Disposition::Passthrough)
         );
     }
@@ -283,10 +283,10 @@ mod tests {
     #[test]
     fn leader_double_tap_sends_a_literal_ctrl_a() {
         assert_eq!(
-            advance(KeyMode::Leader, Key::Char('a'), Mods::CTRL),
+            advance(KeyMode::Leader, Key::plain('a'), Mods::CTRL),
             (
                 KeyMode::Normal,
-                Disposition::SendLiteral(Key::Char('a'), Mods::CTRL)
+                Disposition::SendLiteral(Key::plain('a'), Mods::CTRL)
             )
         );
     }
@@ -294,25 +294,25 @@ mod tests {
     #[test]
     fn leader_commands_map_and_disarm() {
         assert_eq!(
-            advance(KeyMode::Leader, Key::Char('w'), Mods::NONE),
+            advance(KeyMode::Leader, Key::plain('w'), Mods::NONE),
             (KeyMode::Tabs, Disposition::Consumed(None))
         );
         // Shift is folded away, so W is w.
         assert_eq!(
-            advance(KeyMode::Leader, Key::Char('W'), Mods::SHIFT),
+            advance(KeyMode::Leader, Key::plain('W'), Mods::SHIFT),
             (KeyMode::Tabs, Disposition::Consumed(None))
         );
         // `c` (wezterm's binding) and its `t` alias both open a new tab and disarm.
         assert_eq!(
-            advance(KeyMode::Leader, Key::Char('c'), Mods::NONE),
+            advance(KeyMode::Leader, Key::plain('c'), Mods::NONE),
             (KeyMode::Normal, Disposition::Consumed(Some(TabAction::New)))
         );
         assert_eq!(
-            advance(KeyMode::Leader, Key::Char('t'), Mods::NONE),
+            advance(KeyMode::Leader, Key::plain('t'), Mods::NONE),
             (KeyMode::Normal, Disposition::Consumed(Some(TabAction::New)))
         );
         assert_eq!(
-            advance(KeyMode::Leader, Key::Char('x'), Mods::NONE),
+            advance(KeyMode::Leader, Key::plain('x'), Mods::NONE),
             (
                 KeyMode::Normal,
                 Disposition::Consumed(Some(TabAction::Close))
@@ -324,7 +324,7 @@ mod tests {
             (KeyMode::Normal, Disposition::Consumed(None))
         );
         assert_eq!(
-            advance(KeyMode::Leader, Key::Char('z'), Mods::NONE),
+            advance(KeyMode::Leader, Key::plain('z'), Mods::NONE),
             (KeyMode::Normal, Disposition::Consumed(None))
         );
     }
@@ -360,12 +360,12 @@ mod tests {
         );
         // A stray letter leaves the mode and is swallowed, never reaching the shell.
         assert_eq!(
-            advance(KeyMode::Tabs, Key::Char('l'), Mods::NONE),
+            advance(KeyMode::Tabs, Key::plain('l'), Mods::NONE),
             (KeyMode::Normal, Disposition::Consumed(None))
         );
         // Ctrl+A from tab mode reopens the leader menu.
         assert_eq!(
-            advance(KeyMode::Tabs, Key::Char('a'), Mods::CTRL),
+            advance(KeyMode::Tabs, Key::plain('a'), Mods::CTRL),
             (KeyMode::Leader, Disposition::Consumed(None))
         );
     }

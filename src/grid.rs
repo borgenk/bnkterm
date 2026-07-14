@@ -36,6 +36,7 @@
 //!     it scrolls, and the common all-single-codepoint row pays nothing.
 
 use crate::color::Color;
+use crate::input::{KittyFlags, ModifyOtherKeys};
 use crate::mouse::{MouseMode, MouseProtocol};
 use crate::vt::Perform;
 use crate::width::width;
@@ -1150,7 +1151,27 @@ pub struct Screen {
     /// its own link namespace, so an id means the same thing whichever buffer holds it
     /// and switching buffers costs nothing.
     links: LinkTable,
+    /// The kitty keyboard protocol's flag stack. The protocol is a *stack* on purpose:
+    /// a full-screen program pushes the flags it wants on entry and pops them on exit,
+    /// so it cannot strand the terminal in a mode the shell underneath it does not
+    /// understand — and a program that dies without popping is cleaned up by whatever
+    /// pushed beneath it. The top entry is what is in force; an empty stack is legacy.
+    ///
+    /// The child chooses the depth, so this is attacker-controlled and therefore capped
+    /// ([`KITTY_STACK_LIMIT`]); a program in a push loop must not grow the terminal's
+    /// memory without bound.
+    kitty_stack: Vec<KittyFlags>,
+    /// xterm's `modifyOtherKeys` level (`CSI > 4 ; Pv m`). Not a stack: XTMODKEYS has no
+    /// push/pop, a program just sets a level and sets it back.
+    modify_other_keys: ModifyOtherKeys,
 }
+
+/// How deep the kitty keyboard stack may go before a push starts dropping the oldest
+/// entry. kitty itself uses a small fixed depth for the same reason: the stack exists
+/// so a program can nest a mode over its parent's, and nothing legitimate nests deeply.
+/// Dropping from the *bottom* keeps the most recent (the innermost program's) intent,
+/// which is the one that matters.
+const KITTY_STACK_LIMIT: usize = 16;
 
 impl Screen {
     pub fn new(cols: usize, rows: usize) -> Self {
@@ -1176,6 +1197,8 @@ impl Screen {
             cursor_appearance: CursorAppearance::default(),
             responses: Vec::new(),
             links: LinkTable::default(),
+            kitty_stack: Vec::new(),
+            modify_other_keys: ModifyOtherKeys::default(),
         }
     }
 
@@ -2677,6 +2700,81 @@ impl Screen {
         self.keypad_app
     }
 
+    /// The kitty keyboard flags in force: the top of the stack, or none when the child
+    /// has pushed nothing and the legacy encoding applies.
+    pub fn kitty_flags(&self) -> KittyFlags {
+        self.kitty_stack.last().copied().unwrap_or(KittyFlags::NONE)
+    }
+
+    /// The `modifyOtherKeys` level the child asked for.
+    pub fn modify_other_keys(&self) -> ModifyOtherKeys {
+        self.modify_other_keys
+    }
+
+    /// The kitty keyboard protocol's four control sequences, all sharing the final byte
+    /// `u` and distinguished by their private marker:
+    ///
+    /// ```text
+    ///   CSI ? u                 query   ─▶ reply CSI ? <flags> u
+    ///   CSI = <flags> ; <mode> u set     (mode 1 replace, 2 set bits, 3 clear bits)
+    ///   CSI > <flags> u          push
+    ///   CSI < <count> u          pop
+    /// ```
+    ///
+    /// The request is masked to [`KittyFlags::SUPPORTED`] on the way in, so the query
+    /// reports what bnkterm will really do rather than what was asked for. A program
+    /// that wants key-release events and reads back that it is not getting them can
+    /// fall back; one that is told yes and then never sees a release would hang.
+    fn kitty_keyboard(&mut self, params: &[u16], private: u8) {
+        match private {
+            b'?' => {
+                self.respond(b"\x1b[?");
+                let flags = self.kitty_flags().bits();
+                push_decimal(&mut self.responses, flags);
+                self.respond(b"u");
+            }
+            b'=' => {
+                let flags = KittyFlags::from_request(params.first().copied().unwrap_or(0));
+                let mode = params.get(1).copied().unwrap_or(1);
+                let current = self.kitty_flags();
+                let next = current.apply(flags, mode);
+                match self.kitty_stack.last_mut() {
+                    Some(top) => *top = next,
+                    // Setting flags with nothing pushed still has to take effect, so the
+                    // set becomes the stack's first entry.
+                    None => self.kitty_stack.push(next),
+                }
+            }
+            b'>' => {
+                let flags = KittyFlags::from_request(params.first().copied().unwrap_or(0));
+                if self.kitty_stack.len() >= KITTY_STACK_LIMIT {
+                    self.kitty_stack.remove(0);
+                }
+                self.kitty_stack.push(flags);
+            }
+            b'<' => {
+                let count = usize::from(params.first().copied().unwrap_or(1).max(1));
+                let keep = self.kitty_stack.len().saturating_sub(count);
+                self.kitty_stack.truncate(keep);
+            }
+            _ => {}
+        }
+    }
+
+    /// XTMODKEYS (`CSI > Pp ; Pv m`). `Pp = 4` is `modifyOtherKeys`, the only resource
+    /// we implement; the others (`modifyCursorKeys`, `modifyFunctionKeys`) only shuffle
+    /// encodings we already emit in their standard form. Omitting `Pv` resets, which is
+    /// how xterm defines it and how a program turns the mode back off on exit.
+    fn xtmodkeys(&mut self, params: &[u16]) {
+        if params.first().copied() != Some(4) {
+            return;
+        }
+        self.modify_other_keys = match params.get(1) {
+            Some(&level) => ModifyOtherKeys::from_param(level),
+            None => ModifyOtherKeys::Off,
+        };
+    }
+
     /// DECALN: fill the whole screen with 'E' and home the cursor (a vttest
     /// alignment pattern; useful for confirming glyph placement early).
     pub fn decaln(&mut self) {
@@ -2913,6 +3011,7 @@ impl Perform for Screen {
                 self.set_scroll_region(top, bottom);
             }
             b'm' if private == 0 => self.sgr(params),
+            b'm' if private == b'>' => self.xtmodkeys(params),
             b'h' => {
                 let dec = private == b'?';
                 for &m in params {
@@ -2927,6 +3026,9 @@ impl Perform for Screen {
             }
             b's' if private == 0 && params.is_empty() => self.save_cursor(),
             b'u' if private == 0 && params.is_empty() => self.restore_cursor(),
+            // The kitty keyboard protocol shares SCORC's final byte and is told apart by
+            // its private marker, so a bare `CSI u` still restores the cursor.
+            b'u' if private != 0 => self.kitty_keyboard(params, private),
             b'g' => self.clear_tab_stop(csi_arg(params, 0)),
             b'c' => self.device_attributes(private),
             b'n' => self.device_status(params, private),
@@ -4697,6 +4799,111 @@ mod tests {
         // DSR status: OK.
         feed(&mut s, b"\x1b[5n");
         assert_eq!(s.take_responses(), b"\x1b[0n");
+    }
+
+    #[test]
+    fn the_kitty_keyboard_stack_pushes_and_pops() {
+        let mut s = Screen::new(80, 24);
+        // Nothing pushed: legacy.
+        assert_eq!(s.kitty_flags(), KittyFlags::NONE);
+        // `CSI > 1 u`: the push every application starts with.
+        feed(&mut s, b"\x1b[>1u");
+        assert_eq!(s.kitty_flags(), KittyFlags::DISAMBIGUATE);
+        // A nested program pushes its own, then pops back to its parent's.
+        feed(&mut s, b"\x1b[>0u");
+        assert_eq!(s.kitty_flags(), KittyFlags::NONE);
+        feed(&mut s, b"\x1b[<u");
+        assert_eq!(s.kitty_flags(), KittyFlags::DISAMBIGUATE);
+        // Popping past the bottom empties the stack rather than underflowing.
+        feed(&mut s, b"\x1b[<99u");
+        assert_eq!(s.kitty_flags(), KittyFlags::NONE);
+    }
+
+    #[test]
+    fn the_kitty_query_answers_with_the_flags_really_in_force() {
+        let mut s = Screen::new(80, 24);
+        feed(&mut s, b"\x1b[?u");
+        assert_eq!(s.take_responses(), b"\x1b[?0u");
+        feed(&mut s, b"\x1b[>1u\x1b[?u");
+        assert_eq!(s.take_responses(), b"\x1b[?1u");
+        // An application asking for flags we do not implement (here 0b11111: event
+        // types, alternate keys, all-keys, associated text) is told the truth about what
+        // it will get. Reporting them as set would leave it waiting for key-release
+        // events that never come.
+        feed(&mut s, b"\x1b[>31u\x1b[?u");
+        assert_eq!(s.take_responses(), b"\x1b[?1u");
+        assert_eq!(s.kitty_flags(), KittyFlags::DISAMBIGUATE);
+    }
+
+    #[test]
+    fn the_kitty_set_form_replaces_sets_and_clears() {
+        let mut s = Screen::new(80, 24);
+        // `CSI = <flags> ; <mode> u`. Mode 1 (the default) replaces.
+        feed(&mut s, b"\x1b[=1;1u");
+        assert_eq!(s.kitty_flags(), KittyFlags::DISAMBIGUATE);
+        // Mode 3 clears the named bits.
+        feed(&mut s, b"\x1b[=1;3u");
+        assert_eq!(s.kitty_flags(), KittyFlags::NONE);
+        // Mode 2 sets them.
+        feed(&mut s, b"\x1b[=1;2u");
+        assert_eq!(s.kitty_flags(), KittyFlags::DISAMBIGUATE);
+        // An unknown mode changes nothing.
+        feed(&mut s, b"\x1b[=1;9u");
+        assert_eq!(s.kitty_flags(), KittyFlags::DISAMBIGUATE);
+    }
+
+    #[test]
+    fn a_kitty_push_loop_cannot_grow_the_stack_without_bound() {
+        // The child controls the depth, so it is hostile input like any other. The cap
+        // holds and the most recent intent (the top) survives.
+        let mut s = Screen::new(80, 24);
+        for _ in 0..(KITTY_STACK_LIMIT * 4) {
+            feed(&mut s, b"\x1b[>0u");
+        }
+        feed(&mut s, b"\x1b[>1u");
+        assert_eq!(s.kitty_stack.len(), KITTY_STACK_LIMIT);
+        assert_eq!(s.kitty_flags(), KittyFlags::DISAMBIGUATE);
+    }
+
+    #[test]
+    fn a_bare_csi_u_still_restores_the_cursor() {
+        // SCORC and the kitty protocol share the final byte `u`, and only the private
+        // marker tells them apart. A parser that got this wrong would break either the
+        // cursor save/restore or the keyboard protocol.
+        let mut s = Screen::new(80, 24);
+        feed(&mut s, b"\x1b[5;3H\x1b[s"); // save at row 5, col 3
+        feed(&mut s, b"\x1b[1;1H\x1b[u"); // home, then restore
+        assert_eq!(s.cursor(), (4, 2));
+        assert_eq!(s.kitty_flags(), KittyFlags::NONE, "SCORC pushed no flags");
+        assert!(s.take_responses().is_empty(), "and answered no query");
+    }
+
+    #[test]
+    fn xtmodkeys_sets_and_resets_the_modify_other_keys_level() {
+        let mut s = Screen::new(80, 24);
+        assert_eq!(s.modify_other_keys(), ModifyOtherKeys::Off);
+        feed(&mut s, b"\x1b[>4;2m");
+        assert_eq!(s.modify_other_keys(), ModifyOtherKeys::Level2);
+        feed(&mut s, b"\x1b[>4;1m");
+        assert_eq!(s.modify_other_keys(), ModifyOtherKeys::Level1);
+        // No level given resets, which is how a program turns it back off on exit.
+        feed(&mut s, b"\x1b[>4m");
+        assert_eq!(s.modify_other_keys(), ModifyOtherKeys::Off);
+        // A resource other than 4 (modifyCursorKeys, say) is not ours to act on.
+        feed(&mut s, b"\x1b[>4;2m\x1b[>1;2m");
+        assert_eq!(s.modify_other_keys(), ModifyOtherKeys::Level2);
+    }
+
+    #[test]
+    fn a_reset_takes_the_keyboard_protocols_with_it() {
+        // RIS is the escape hatch for a program that died mid-mode. If the flags
+        // survived it, the shell underneath would keep receiving CSI u for its keys.
+        let mut s = Screen::new(80, 24);
+        feed(&mut s, b"\x1b[>1u\x1b[>4;2m");
+        assert_eq!(s.kitty_flags(), KittyFlags::DISAMBIGUATE);
+        feed(&mut s, b"\x1bc"); // RIS
+        assert_eq!(s.kitty_flags(), KittyFlags::NONE);
+        assert_eq!(s.modify_other_keys(), ModifyOtherKeys::Off);
     }
 
     #[test]

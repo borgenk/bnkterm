@@ -1374,10 +1374,16 @@ impl State {
     /// for a bare modifier / unresolved key. xkb belongs with the Wayland keyboard,
     /// so this stays window-side; the terminal half is [`apply`](Self::apply).
     fn resolve_key(&self, keycode: u32) -> Option<input::Key> {
-        match input::key_from_keycode(keycode) {
-            Some(named) => Some(named),
-            None => self.xkb.key_char(keycode).map(input::Key::Char),
+        if let Some(named) = input::key_from_keycode(keycode) {
+            return Some(named);
         }
+        let typed = self.xkb.key_char(keycode)?;
+        // The character the key types, and the character it *is*. They differ on a
+        // shifted key (`Shift+2` types `'@'` but is the `2` key), and the CSI-u keyboard
+        // protocols report the latter. A key whose unshifted level produces no character
+        // is its own base.
+        let base = self.xkb.key_base_char(keycode).unwrap_or(typed);
+        Some(input::Key::Char { typed, base })
     }
 
     /// Arm (or re-arm) auto-repeat on the just-pressed key. A key the keymap marks

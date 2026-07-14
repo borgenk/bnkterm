@@ -867,14 +867,14 @@ mod tests {
         tabs.entries[0]
             .core
             .apply(ToTerminal::Key {
-                key: Key::Char('a'),
+                key: Key::plain('a'),
                 mods: Mods::NONE,
             })
             .expect("write tab A");
         tabs.entries[1]
             .core
             .apply(ToTerminal::Key {
-                key: Key::Char('b'),
+                key: Key::plain('b'),
                 mods: Mods::NONE,
             })
             .expect("write tab B");

@@ -91,6 +91,14 @@ extern "C" {
     fn xkb_state_key_get_utf8(st: *mut c_void, key: u32, buf: *mut c_char, size: usize) -> c_int;
     fn xkb_state_mod_name_is_active(st: *mut c_void, name: *const c_char, type_: u32) -> c_int;
     fn xkb_state_key_get_one_sym(st: *mut c_void, key: u32) -> u32;
+    fn xkb_state_key_get_layout(st: *mut c_void, key: u32) -> u32;
+    fn xkb_keymap_key_get_syms_by_level(
+        keymap: *mut c_void,
+        key: u32,
+        layout: u32,
+        level: u32,
+        syms_out: *mut *const u32,
+    ) -> c_int;
     fn xkb_keysym_to_utf32(keysym: u32) -> u32;
     fn xkb_keymap_key_repeats(keymap: *mut c_void, key: u32) -> c_int;
     fn xkb_compose_table_new_from_locale(
@@ -249,6 +257,43 @@ impl Xkb {
         // SAFETY: state is valid; the sym lookup only reads it. The keysym
         // reflects Shift and the layout but is Ctrl/Alt-independent.
         let sym = unsafe { xkb_state_key_get_one_sym(state.as_ptr(), keycode + EVDEV_OFFSET) };
+        // SAFETY: a pure value conversion; 0 means the keysym has no Unicode form.
+        let cp = unsafe { xkb_keysym_to_utf32(sym) };
+        let c = char::from_u32(cp)?;
+        (cp >= 0x20 && c != '\u{7f}').then_some(c)
+    }
+
+    /// The character `keycode` produces with *no* modifiers applied, under the layout
+    /// group currently in effect: level 0 of the key. This is the key's identity, as
+    /// distinct from what it typed — `Shift+a` types `'A'` but its base is `'a'`, and
+    /// `Shift+2` on a US layout types `'@'` but its base is `'2'`.
+    ///
+    /// The CSI-u keyboard protocols (kitty's and xterm's `modifyOtherKeys`) report a key
+    /// by its base codepoint plus a modifier bitmask, precisely so an application can tell
+    /// `Ctrl+Shift+2` from `Ctrl+@` without knowing the user's layout. Deriving it by
+    /// lowercasing the typed character would be right for letters and wrong for every
+    /// shifted punctuation key, so we ask xkb instead of guessing.
+    ///
+    /// `None` before a keymap arrives, or for a key whose unshifted level produces no
+    /// character (a modifier, a named key); the caller then falls back to the typed
+    /// character.
+    pub fn key_base_char(&self, keycode: u32) -> Option<char> {
+        let (keymap, state) = (self.keymap?, self.state?);
+        let key = keycode + EVDEV_OFFSET;
+        // SAFETY: state and keymap are valid for the lifetime of self. `layout` is the
+        // group xkb itself reports for this key, so it is in range for the keymap.
+        let layout = unsafe { xkb_state_key_get_layout(state.as_ptr(), key) };
+        let mut syms: *const u32 = std::ptr::null();
+        // SAFETY: keymap is valid; the call writes a pointer to keymap-owned storage into
+        // `syms` and returns how many keysyms it holds. The storage lives as long as the
+        // keymap, and we only read from it while `self` (which owns the keymap) is alive.
+        let n =
+            unsafe { xkb_keymap_key_get_syms_by_level(keymap.as_ptr(), key, layout, 0, &mut syms) };
+        if n <= 0 || syms.is_null() {
+            return None;
+        }
+        // SAFETY: n > 0, so the first keysym exists.
+        let sym = unsafe { *syms };
         // SAFETY: a pure value conversion; 0 means the keysym has no Unicode form.
         let cp = unsafe { xkb_keysym_to_utf32(sym) };
         let c = char::from_u32(cp)?;
