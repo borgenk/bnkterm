@@ -101,7 +101,7 @@ pub trait Perform {
     fn execute(&mut self, byte: u8);
     /// A complete CSI sequence: its numeric parameters, intermediate bytes, the
     /// private-marker byte if any (`?`/`<`/`=`/`>`, else 0), and the final byte.
-    fn csi_dispatch(&mut self, params: &[u16], intermediates: &[u8], private: u8, action: u8);
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], private: u8, action: u8);
     /// A complete escape sequence (not CSI/OSC): its intermediates and final byte.
     fn esc_dispatch(&mut self, intermediates: &[u8], byte: u8);
     /// A complete OSC string (the bytes between `ESC ]` and its ST/BEL terminator).
@@ -122,13 +122,132 @@ enum State {
     StringIgnore,
 }
 
+/// The parameters of a CSI sequence.
+///
+/// A parameter is **not** a number: it is a list of colon-separated *sub-parameters*,
+/// of which the number everyone thinks of is merely the first. `SGR 4` is "underline";
+/// `SGR 4:3` is "underline, style 3 (curly)". `SGR 38;2;255;0;0` and
+/// `SGR 38:2::255:0:0` both say "foreground = red", the first as five parameters and
+/// the second as one parameter with five sub-parameters. Both forms are in the wild —
+/// which one a program emits depends on what its terminfo told it — so a terminal has
+/// to read both.
+///
+/// ```text
+///   CSI 4:3 ; 38:2::255:0:0 m
+///       └┬┘   └──────┬─────┘
+///        │           └── one parameter: [38, 2, 0, 255, 0, 0]
+///        └────────────── one parameter: [4, 3]
+/// ```
+///
+/// So `Params` is a flat value buffer plus the length of each parameter, and iterating
+/// it yields `&[u16]` slices rather than numbers. Everything is fixed-size and
+/// saturating: the child controls this input, and a sequence with ten thousand
+/// sub-parameters must cost us nothing.
+///
+/// An omitted sub-parameter is zero, which is what the standard means by "default":
+/// the empty slot in `38:2::255:0:0` is the (unused) colour-space id.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Params {
+    /// Every value of every parameter, laid end to end.
+    values: [u16; MAX_PARAMS],
+    /// Where each parameter's values begin in `values`, and how many it owns. The
+    /// start is stored rather than derived: reading parameter `i` is the hot path (a
+    /// CSI dispatch reads two or three of them, and SGR walks all of them), and
+    /// summing the preceding lengths to find it would make that a quadratic walk.
+    starts: [u8; MAX_PARAMS],
+    lens: [u8; MAX_PARAMS],
+    /// Parameters, and values used.
+    num: usize,
+    total: usize,
+}
+
+impl Params {
+    pub fn len(&self) -> usize {
+        self.num
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.num == 0
+    }
+
+    /// Parameter `i` with its sub-parameters; the first element is the value a caller
+    /// that does not care about sub-parameters wants.
+    ///
+    /// Inlined: a CSI dispatch reads two or three parameters and SGR walks every one of
+    /// them, so this sits directly on the escape-sequence hot path.
+    #[inline]
+    pub fn get(&self, i: usize) -> Option<&[u16]> {
+        if i >= self.num {
+            return None;
+        }
+        let start = usize::from(*self.starts.get(i)?);
+        let len = usize::from(*self.lens.get(i)?);
+        self.values.get(start..start + len)
+    }
+
+    /// The first value of parameter `i`, or 0 when it is absent — the "default" every
+    /// CSI parameter has.
+    #[inline]
+    pub fn value(&self, i: usize) -> u16 {
+        // Not `get(i).first()`: the overwhelmingly common parameter is a single value,
+        // and going through the slice makes the compiler re-derive the range for it.
+        if i >= self.num {
+            return 0;
+        }
+        match self.starts.get(i) {
+            Some(&start) => self.values.get(usize::from(start)).copied().unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// Each parameter in order, as a slice of its sub-parameters.
+    pub fn iter(&self) -> impl Iterator<Item = &[u16]> {
+        (0..self.num).filter_map(|i| self.get(i))
+    }
+
+    fn clear(&mut self) {
+        self.num = 0;
+        self.total = 0;
+    }
+
+    /// Finish the value being accumulated and add it to the parameter under
+    /// construction. Silently dropped once the buffer is full, so a hostile sequence
+    /// truncates rather than growing.
+    #[inline]
+    fn push_value(&mut self, value: u16, cur_len: &mut u8) {
+        if let Some(slot) = self.values.get_mut(self.total) {
+            *slot = value;
+            self.total += 1;
+            *cur_len = cur_len.saturating_add(1);
+        }
+    }
+
+    /// Close the parameter under construction, recording where its values start.
+    #[inline]
+    fn push_param(&mut self, cur_len: &mut u8) {
+        let len = *cur_len;
+        *cur_len = 0;
+        if len == 0 || self.num >= MAX_PARAMS {
+            return;
+        }
+        let start = (self.total as u8).saturating_sub(len);
+        if let (Some(s), Some(l)) = (self.starts.get_mut(self.num), self.lens.get_mut(self.num)) {
+            *s = start;
+            *l = len;
+            self.num += 1;
+        }
+    }
+}
+
 /// The parser. Feed it bytes with [`Parser::advance`] (one byte) or
 /// [`Parser::advance_bytes`] (a chunk); it calls back into a [`Perform`].
 pub struct Parser {
     state: State,
-    params: [u16; MAX_PARAMS],
-    num_params: usize,
+    params: Params,
+    /// The value being accumulated, and how many values the parameter under
+    /// construction has taken so far.
     cur_param: u16,
+    cur_len: u8,
     param_started: bool,
     intermediates: [u8; MAX_INTERMEDIATES],
     num_intermediates: usize,
@@ -152,9 +271,9 @@ impl Parser {
     pub fn new() -> Self {
         Parser {
             state: State::Ground,
-            params: [0; MAX_PARAMS],
-            num_params: 0,
+            params: Params::default(),
             cur_param: 0,
+            cur_len: 0,
             param_started: false,
             intermediates: [0; MAX_INTERMEDIATES],
             num_intermediates: 0,
@@ -343,6 +462,10 @@ impl Parser {
                 self.param_digit(byte);
                 self.state = State::CsiParam;
             }
+            0x3a => {
+                self.subparam_next();
+                self.state = State::CsiParam;
+            }
             0x3b => {
                 self.param_next();
                 self.state = State::CsiParam;
@@ -353,7 +476,7 @@ impl Parser {
             }
             0x40..=0x7e => self.csi_dispatch(p, byte),
             _ => {
-                // 0x3a (':' subparam) and 0x7f: not supported; drop the sequence.
+                // 0x7f (DEL) has no meaning inside a sequence; drop it.
                 self.ignore = true;
                 self.state = State::CsiIgnore;
             }
@@ -367,6 +490,7 @@ impl Parser {
         }
         match byte {
             0x30..=0x39 => self.param_digit(byte),
+            0x3a => self.subparam_next(),
             0x3b => self.param_next(),
             0x20..=0x2f => {
                 self.collect_intermediate(byte);
@@ -374,7 +498,8 @@ impl Parser {
             }
             0x40..=0x7e => self.csi_dispatch(p, byte),
             _ => {
-                // 0x3a ':' or a private marker mid-parameters: drop the sequence.
+                // A private marker is only legal as the first byte after `[`, and DEL
+                // is never legal: the sequence is malformed, so drop it.
                 self.ignore = true;
                 self.state = State::CsiIgnore;
             }
@@ -410,7 +535,7 @@ impl Parser {
         }
         if !self.ignore {
             p.csi_dispatch(
-                &self.params[..self.num_params],
+                &self.params,
                 &self.intermediates[..self.num_intermediates],
                 self.private,
                 byte,
@@ -458,8 +583,9 @@ impl Parser {
     // ---- parameter / intermediate bookkeeping -------------------------------
 
     fn clear(&mut self) {
-        self.num_params = 0;
+        self.params.clear();
         self.cur_param = 0;
+        self.cur_len = 0;
         self.param_started = false;
         self.num_intermediates = 0;
         self.private = 0;
@@ -472,18 +598,27 @@ impl Parser {
         self.param_started = true;
     }
 
-    /// A `;`: finalize the current parameter and open the next.
-    fn param_next(&mut self) {
-        self.push_param();
+    /// A `:`: finalize the sub-parameter and stay inside the same parameter.
+    fn subparam_next(&mut self) {
+        self.params.push_value(self.cur_param, &mut self.cur_len);
         self.cur_param = 0;
         self.param_started = true;
     }
 
+    /// A `;`: finalize the parameter (and whatever sub-parameter was open) and start
+    /// the next one.
+    fn param_next(&mut self) {
+        self.params.push_value(self.cur_param, &mut self.cur_len);
+        self.params.push_param(&mut self.cur_len);
+        self.cur_param = 0;
+        self.param_started = true;
+    }
+
+    /// The final byte: close whatever is still open.
     fn push_param(&mut self) {
-        if self.num_params < MAX_PARAMS {
-            self.params[self.num_params] = self.cur_param;
-            self.num_params += 1;
-        }
+        self.params.push_value(self.cur_param, &mut self.cur_len);
+        self.params.push_param(&mut self.cur_len);
+        self.cur_param = 0;
     }
 
     fn collect_intermediate(&mut self, byte: u8) {
@@ -520,7 +655,8 @@ mod tests {
         Print(char),
         Execute(u8),
         Csi {
-            params: Vec<u16>,
+            /// One entry per parameter, each holding its sub-parameters.
+            params: Vec<Vec<u16>>,
             intermediates: Vec<u8>,
             private: u8,
             action: u8,
@@ -539,9 +675,9 @@ mod tests {
         fn execute(&mut self, byte: u8) {
             self.actions.push(Action::Execute(byte));
         }
-        fn csi_dispatch(&mut self, params: &[u16], intermediates: &[u8], private: u8, action: u8) {
+        fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], private: u8, action: u8) {
             self.actions.push(Action::Csi {
-                params: params.to_vec(),
+                params: params.iter().map(|p| p.to_vec()).collect(),
                 intermediates: intermediates.to_vec(),
                 private,
                 action,
@@ -599,7 +735,7 @@ mod tests {
         assert_eq!(
             run(b"\x1b[1;31m"),
             vec![Action::Csi {
-                params: vec![1, 31],
+                params: vec![vec![1], vec![31]],
                 intermediates: vec![],
                 private: 0,
                 action: b'm',
@@ -626,7 +762,7 @@ mod tests {
         assert_eq!(
             run(b"\x1b[;5H"),
             vec![Action::Csi {
-                params: vec![0, 5],
+                params: vec![vec![0], vec![5]],
                 intermediates: vec![],
                 private: 0,
                 action: b'H',
@@ -635,7 +771,7 @@ mod tests {
         assert_eq!(
             run(b"\x1b[5;H"),
             vec![Action::Csi {
-                params: vec![5, 0],
+                params: vec![vec![5], vec![0]],
                 intermediates: vec![],
                 private: 0,
                 action: b'H',
@@ -648,7 +784,7 @@ mod tests {
         assert_eq!(
             run(b"\x1b[?25h"),
             vec![Action::Csi {
-                params: vec![25],
+                params: vec![vec![25]],
                 intermediates: vec![],
                 private: b'?',
                 action: b'h',
@@ -662,7 +798,7 @@ mod tests {
         assert_eq!(
             run(b"\x1b[2 q"),
             vec![Action::Csi {
-                params: vec![2],
+                params: vec![vec![2]],
                 intermediates: vec![b' '],
                 private: 0,
                 action: b'q',
@@ -671,10 +807,83 @@ mod tests {
     }
 
     #[test]
-    fn colon_subparam_drops_the_sequence() {
-        // We do not support colon sub-parameters; the sequence is ignored, and
-        // the following printable resumes normally.
-        assert_eq!(run(b"\x1b[38:2:1:2:3mX"), vec![Action::Print('X')]);
+    fn colon_groups_sub_parameters_into_one_parameter() {
+        // The ITU form: one parameter carrying its arguments as sub-parameters. This
+        // used to drop the whole sequence, which meant a program underlining an error
+        // with `SGR 4:3;58:2::255:0:0` lost the *colours* too, not just the style.
+        assert_eq!(
+            run(b"\x1b[38:2:1:2:3m"),
+            vec![Action::Csi {
+                params: vec![vec![38, 2, 1, 2, 3]],
+                intermediates: vec![],
+                private: 0,
+                action: b'm',
+            }]
+        );
+    }
+
+    #[test]
+    fn colons_and_semicolons_nest_the_way_the_standard_says() {
+        // Semicolons separate parameters; colons separate the sub-parameters *within*
+        // one. An empty sub-parameter is a zero, which is what "default" means here
+        // (the empty slot in `38:2::r:g:b` is the colour-space id nobody uses).
+        assert_eq!(
+            run(b"\x1b[4:3;38:2::255:0:0m"),
+            vec![Action::Csi {
+                params: vec![vec![4, 3], vec![38, 2, 0, 255, 0, 0]],
+                intermediates: vec![],
+                private: 0,
+                action: b'm',
+            }]
+        );
+    }
+
+    #[test]
+    fn a_lone_colon_yields_a_defaulted_sub_parameter() {
+        // Degenerate but legal shapes must not derail the parser.
+        assert_eq!(
+            run(b"\x1b[:1m"),
+            vec![Action::Csi {
+                params: vec![vec![0, 1]],
+                intermediates: vec![],
+                private: 0,
+                action: b'm',
+            }]
+        );
+        assert_eq!(
+            run(b"\x1b[1:m"),
+            vec![Action::Csi {
+                params: vec![vec![1, 0]],
+                intermediates: vec![],
+                private: 0,
+                action: b'm',
+            }]
+        );
+    }
+
+    #[test]
+    fn a_flood_of_sub_parameters_is_bounded() {
+        // The child writes this. A sequence with more values than we hold must truncate
+        // and stay well-formed, never grow state and never trap.
+        let mut input = b"\x1b[4".to_vec();
+        for _ in 0..500 {
+            input.extend_from_slice(b":9");
+        }
+        input.push(b'm');
+        let actions = run(&input);
+        match actions.as_slice() {
+            [Action::Csi { params, action, .. }] => {
+                assert_eq!(*action, b'm');
+                assert_eq!(params.len(), 1, "still one parameter");
+                let values = params.first().map(Vec::len).unwrap_or(0);
+                assert!(
+                    values <= MAX_PARAMS,
+                    "{values} values, capped at {MAX_PARAMS}"
+                );
+                assert_eq!(params.first().and_then(|p| p.first()), Some(&4));
+            }
+            other => panic!("expected one CSI, got {other:?}"),
+        }
     }
 
     #[test]
@@ -744,7 +953,7 @@ mod tests {
             vec![
                 Action::Execute(b'\r'),
                 Action::Csi {
-                    params: vec![12],
+                    params: vec![vec![12]],
                     intermediates: vec![],
                     private: 0,
                     action: b'H',
@@ -799,7 +1008,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![Action::Csi {
-                params: vec![u16::MAX],
+                params: vec![vec![u16::MAX]],
                 intermediates: vec![],
                 private: 0,
                 action: b'H',

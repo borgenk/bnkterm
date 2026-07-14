@@ -38,7 +38,7 @@
 use crate::color::Color;
 use crate::input::{KittyFlags, ModifyOtherKeys};
 use crate::mouse::{MouseMode, MouseProtocol};
-use crate::vt::Perform;
+use crate::vt::{Params, Perform};
 use crate::width::width;
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
@@ -2367,23 +2367,40 @@ impl Screen {
 
     // ---- rendition (SGR) ----------------------------------------------------
 
-    /// Apply an SGR sequence, updating the pen. An empty parameter list is a
-    /// reset (SGR 0). Handles ANSI-16, bright, 256 (`38;5;n`), and truecolor
-    /// (`38;2;r;g;b`) for both foreground (38) and background (48).
-    pub fn sgr(&mut self, params: &[u16]) {
+    /// Apply an SGR sequence, updating the pen. An empty parameter list is a reset
+    /// (SGR 0). Handles ANSI-16, bright, 256 (`38;5;n` and `38:5:n`), and truecolor
+    /// (`38;2;r;g;b` and `38:2::r:g:b`) for both foreground (38) and background (48).
+    ///
+    /// The rule for everything we do not implement is **consume, then ignore**, and it
+    /// is load-bearing rather than pedantic. An extended-colour introducer owns the
+    /// parameters that follow it, so failing to consume `58;2;255;0;0` would not merely
+    /// skip an underline colour: the `2` would be read as *dim*, the `0` as *reset*, and
+    /// the rest of the line would come out in the wrong style. Skipping a parameter we
+    /// do not understand is only safe once we know how many belong to it.
+    pub fn sgr(&mut self, params: &Params) {
         if params.is_empty() {
             self.pen.reset_rendition();
             return;
         }
         let mut i = 0;
         while i < params.len() {
-            let p = params[i];
+            let Some(param) = params.get(i) else { break };
+            let p = param.first().copied().unwrap_or(0);
             match p {
                 0 => self.pen.reset_rendition(),
                 1 => self.pen.attrs.insert(Attrs::BOLD),
                 2 => self.pen.attrs.insert(Attrs::DIM),
                 3 => self.pen.attrs.insert(Attrs::ITALIC),
-                4 => self.pen.attrs.insert(Attrs::UNDERLINE),
+                // `4` is underline; `4:n` picks a style (1 single, 2 double, 3 curly,
+                // 4 dotted, 5 dashed) and `4:0` turns it off. We draw only a solid
+                // underline for now, so a style other than 0 is an underline of some
+                // kind and that is what the cell records. Storing *which* style needs a
+                // wider `Attrs` and a cell field; until then a curly underline shows up
+                // as a straight one, which is the right kind of wrong.
+                4 => match param.get(1).copied() {
+                    Some(0) => self.pen.attrs.remove(Attrs::UNDERLINE),
+                    _ => self.pen.attrs.insert(Attrs::UNDERLINE),
+                },
                 7 => self.pen.attrs.insert(Attrs::REVERSE),
                 8 => self.pen.attrs.insert(Attrs::HIDDEN),
                 9 => self.pen.attrs.insert(Attrs::STRIKE),
@@ -2396,7 +2413,7 @@ impl Screen {
                 29 => self.pen.attrs.remove(Attrs::STRIKE),
                 30..=37 => self.pen.fg = Color::Ansi((p - 30) as u8),
                 38 => {
-                    let (color, advance) = parse_ext_color(&params[i..]);
+                    let (color, advance) = parse_ext_color(param, params, i);
                     if let Some(color) = color {
                         self.pen.fg = color;
                     }
@@ -2405,13 +2422,19 @@ impl Screen {
                 39 => self.pen.fg = Color::Default,
                 40..=47 => self.pen.bg = Color::Ansi((p - 40) as u8),
                 48 => {
-                    let (color, advance) = parse_ext_color(&params[i..]);
+                    let (color, advance) = parse_ext_color(param, params, i);
                     if let Some(color) = color {
                         self.pen.bg = color;
                     }
                     i += advance;
                 }
                 49 => self.pen.bg = Color::Default,
+                // Underline colour. We have nowhere on a cell to put it, but it takes
+                // the same arguments as 38/48, so it must be consumed all the same.
+                58 => {
+                    let (_, advance) = parse_ext_color(param, params, i);
+                    i += advance;
+                }
                 90..=97 => self.pen.fg = Color::Ansi((p - 90 + 8) as u8),
                 100..=107 => self.pen.bg = Color::Ansi((p - 100 + 8) as u8),
                 _ => {}
@@ -2498,8 +2521,8 @@ impl Screen {
     /// DSR (Device Status Report): `5 n` asks if we are OK (yes), `6 n` asks for
     /// the cursor position (CPR). The `?6 n` private form is the extended report
     /// (DECXCPR) some programs use. The position is 1-based and origin-mode aware.
-    fn device_status(&mut self, params: &[u16], private: u8) {
-        let ps = params.first().copied().unwrap_or(0);
+    fn device_status(&mut self, params: &Params, private: u8) {
+        let ps = params.value(0);
         match (private, ps) {
             (0, 5) => self.respond(b"\x1b[0n"),
             (0, 6) => {
@@ -2725,7 +2748,7 @@ impl Screen {
     /// reports what bnkterm will really do rather than what was asked for. A program
     /// that wants key-release events and reads back that it is not getting them can
     /// fall back; one that is told yes and then never sees a release would hang.
-    fn kitty_keyboard(&mut self, params: &[u16], private: u8) {
+    fn kitty_keyboard(&mut self, params: &Params, private: u8) {
         match private {
             b'?' => {
                 self.respond(b"\x1b[?");
@@ -2734,8 +2757,8 @@ impl Screen {
                 self.respond(b"u");
             }
             b'=' => {
-                let flags = KittyFlags::from_request(params.first().copied().unwrap_or(0));
-                let mode = params.get(1).copied().unwrap_or(1);
+                let flags = KittyFlags::from_request(params.value(0));
+                let mode = if params.len() > 1 { params.value(1) } else { 1 };
                 let current = self.kitty_flags();
                 let next = current.apply(flags, mode);
                 match self.kitty_stack.last_mut() {
@@ -2746,14 +2769,21 @@ impl Screen {
                 }
             }
             b'>' => {
-                let flags = KittyFlags::from_request(params.first().copied().unwrap_or(0));
+                let flags = KittyFlags::from_request(params.value(0));
                 if self.kitty_stack.len() >= KITTY_STACK_LIMIT {
                     self.kitty_stack.remove(0);
                 }
                 self.kitty_stack.push(flags);
             }
             b'<' => {
-                let count = usize::from(params.first().copied().unwrap_or(1).max(1));
+                let count = usize::from(
+                    if params.is_empty() {
+                        1
+                    } else {
+                        params.value(0)
+                    }
+                    .max(1),
+                );
                 let keep = self.kitty_stack.len().saturating_sub(count);
                 self.kitty_stack.truncate(keep);
             }
@@ -2765,13 +2795,14 @@ impl Screen {
     /// we implement; the others (`modifyCursorKeys`, `modifyFunctionKeys`) only shuffle
     /// encodings we already emit in their standard form. Omitting `Pv` resets, which is
     /// how xterm defines it and how a program turns the mode back off on exit.
-    fn xtmodkeys(&mut self, params: &[u16]) {
-        if params.first().copied() != Some(4) {
+    fn xtmodkeys(&mut self, params: &Params) {
+        if params.value(0) != 4 || params.is_empty() {
             return;
         }
-        self.modify_other_keys = match params.get(1) {
-            Some(&level) => ModifyOtherKeys::from_param(level),
-            None => ModifyOtherKeys::Off,
+        self.modify_other_keys = if params.len() > 1 {
+            ModifyOtherKeys::from_param(params.value(1))
+        } else {
+            ModifyOtherKeys::Off
         };
     }
 
@@ -2821,19 +2852,56 @@ fn sgr_component(v: u16) -> u8 {
     v.min(255) as u8
 }
 
-/// Parse a `38`/`48` extended-color introducer at the front of `params`,
-/// returning the color and how many *extra* parameters it consumed (0 if the
-/// form is unrecognized). Handles `;5;n` (indexed) and `;2;r;g;b` (truecolor).
-fn parse_ext_color(params: &[u16]) -> (Option<Color>, usize) {
-    match params.get(1).copied() {
-        Some(5) => {
-            let n = params.get(2).copied().unwrap_or(0);
+/// Parse the extended-colour introducer (`38`, `48`, `58`) at parameter `at`,
+/// returning the colour and how many *extra parameters* it consumed.
+///
+/// The arguments come in one of two spellings, and a terminal has to read both:
+///
+/// ```text
+///   38 ; 2 ; r ; g ; b     five parameters   (xterm's, and the common one)
+///   38 : 2 : : r : g : b   one parameter, six sub-parameters (ITU T.416)
+///   38 : 2 : r : g : b     one parameter, five sub-parameters (seen in the wild)
+/// ```
+///
+/// The empty slot in the T.416 form is a colour-space id, which nobody uses and we
+/// ignore. The sub-parameter form consumes no *extra* parameters — everything it needs
+/// is inside the one it started in — which is why the return value counts parameters
+/// and not values.
+///
+/// An unrecognized form consumes nothing: better to skip one parameter than to swallow
+/// a `1` that was meant to turn on bold.
+fn parse_ext_color(param: &[u16], params: &Params, at: usize) -> (Option<Color>, usize) {
+    // The sub-parameter form: the arguments ride inside this parameter.
+    if param.len() > 1 {
+        return match param.get(1).copied() {
+            Some(5) => {
+                let n = param.get(2).copied().unwrap_or(0);
+                (Some(Color::Indexed(sgr_component(n))), 0)
+            }
+            Some(2) => {
+                // With a colour-space id (6 values) the channels start one later than
+                // without it (5 values). Anything shorter is malformed; read what is
+                // there and let the missing channels default to zero.
+                let base = if param.len() >= 6 { 3 } else { 2 };
+                let r = sgr_component(param.get(base).copied().unwrap_or(0));
+                let g = sgr_component(param.get(base + 1).copied().unwrap_or(0));
+                let b = sgr_component(param.get(base + 2).copied().unwrap_or(0));
+                (Some(Color::Rgb(r, g, b)), 0)
+            }
+            _ => (None, 0),
+        };
+    }
+
+    // The parameter form: the arguments are the parameters that follow.
+    match params.value(at + 1) {
+        5 if params.len() > at + 1 => {
+            let n = params.value(at + 2);
             (Some(Color::Indexed(sgr_component(n))), 2)
         }
-        Some(2) => {
-            let r = sgr_component(params.get(2).copied().unwrap_or(0));
-            let g = sgr_component(params.get(3).copied().unwrap_or(0));
-            let b = sgr_component(params.get(4).copied().unwrap_or(0));
+        2 if params.len() > at + 1 => {
+            let r = sgr_component(params.value(at + 2));
+            let g = sgr_component(params.value(at + 3));
+            let b = sgr_component(params.value(at + 4));
             (Some(Color::Rgb(r, g, b)), 4)
         }
         _ => (None, 0),
@@ -2891,17 +2959,17 @@ fn dec_special_graphics(c: char) -> char {
 }
 
 /// A CSI numeric parameter, or 0 when absent.
-fn csi_arg(params: &[u16], i: usize) -> u16 {
-    params.get(i).copied().unwrap_or(0)
+fn csi_arg(params: &Params, i: usize) -> u16 {
+    params.value(i)
 }
 
 /// A CSI count parameter (for cursor moves, repeat counts): absent or 0 means 1.
-fn csi_count(params: &[u16], i: usize) -> usize {
+fn csi_count(params: &Params, i: usize) -> usize {
     usize::from(csi_arg(params, i).max(1))
 }
 
 /// A 1-based CSI position parameter as a 0-based index (default 1 maps to 0).
-fn csi_index(params: &[u16], i: usize) -> usize {
+fn csi_index(params: &Params, i: usize) -> usize {
     usize::from(csi_arg(params, i).max(1)) - 1
 }
 
@@ -2919,6 +2987,42 @@ fn push_decimal(out: &mut Vec<u8>, mut n: u32) {
         n /= 10;
     }
     out.extend_from_slice(&tmp[i..]);
+}
+
+impl Screen {
+    /// The private-marker CSI space: `CSI ? …` (DEC), `CSI > …`, `CSI = …`, `CSI < …`.
+    ///
+    /// A marker is not a modifier on the ANSI sequence that shares its final byte, it
+    /// selects a *different sequence*. Letting one fall through to its ANSI namesake is
+    /// how `CSI ? Ps r` (XTRESTORE, "restore saved private modes") used to execute as
+    /// DECSTBM — resetting the scroll region and homing the cursor — and how
+    /// `CSI ? Pi ; Pa ; Pv S` (XTSMGRAPHICS, a sixel query) used to execute as SU and
+    /// scroll the screen out from under the program that asked.
+    ///
+    /// So the rule here is: match a marker and a final byte *together*, and drop
+    /// anything else. Dropping an unknown sequence is always safe. Guessing is not.
+    fn csi_private(&mut self, params: &Params, private: u8, action: u8) {
+        match (private, action) {
+            (b'?', b'h') => {
+                for m in params.iter() {
+                    self.set_mode(m.first().copied().unwrap_or(0), true, true);
+                }
+            }
+            (b'?', b'l') => {
+                for m in params.iter() {
+                    self.set_mode(m.first().copied().unwrap_or(0), true, false);
+                }
+            }
+            (b'?', b'n') => self.device_status(params, b'?'),
+            (b'>', b'c') => self.device_attributes(b'>'),
+            (b'>', b'm') => self.xtmodkeys(params),
+            // The kitty keyboard protocol: `?` query, `=` set, `>` push, `<` pop. It
+            // shares SCORC's final byte, and only the marker tells them apart — which is
+            // exactly why this space has to be matched as a pair.
+            (_, b'u') => self.kitty_keyboard(params, private),
+            _ => {}
+        }
+    }
 }
 
 /// The VT interpretation: turn the parser's syntactic callbacks into the grid
@@ -2961,14 +3065,21 @@ impl Perform for Screen {
         }
     }
 
-    fn csi_dispatch(&mut self, params: &[u16], intermediates: &[u8], private: u8, action: u8) {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], private: u8, action: u8) {
         // DECSCUSR (`CSI Ps SP q`) is the one CSI-with-intermediate we act on; the
         // rest are dropped rather than misreading the final byte.
-        if intermediates == [b' '] && action == b'q' {
-            self.set_cursor_style(params.first().copied().unwrap_or(0));
+        if intermediates == [b' '] && action == b'q' && private == 0 {
+            self.set_cursor_style(params.value(0));
             return;
         }
         if !intermediates.is_empty() {
+            return;
+        }
+        // A private marker selects a different sequence space; it does not modify the
+        // ANSI sequence that happens to share the final byte. Splitting them here is
+        // what stops `CSI ? Ps r` (XTRESTORE) from executing as DECSTBM.
+        if private != 0 {
+            self.csi_private(params, private, action);
             return;
         }
         match action {
@@ -3010,28 +3121,22 @@ impl Perform for Screen {
                 };
                 self.set_scroll_region(top, bottom);
             }
-            b'm' if private == 0 => self.sgr(params),
-            b'm' if private == b'>' => self.xtmodkeys(params),
+            b'm' => self.sgr(params),
             b'h' => {
-                let dec = private == b'?';
-                for &m in params {
-                    self.set_mode(m, dec, true);
+                for m in params.iter() {
+                    self.set_mode(m.first().copied().unwrap_or(0), false, true);
                 }
             }
             b'l' => {
-                let dec = private == b'?';
-                for &m in params {
-                    self.set_mode(m, dec, false);
+                for m in params.iter() {
+                    self.set_mode(m.first().copied().unwrap_or(0), false, false);
                 }
             }
-            b's' if private == 0 && params.is_empty() => self.save_cursor(),
-            b'u' if private == 0 && params.is_empty() => self.restore_cursor(),
-            // The kitty keyboard protocol shares SCORC's final byte and is told apart by
-            // its private marker, so a bare `CSI u` still restores the cursor.
-            b'u' if private != 0 => self.kitty_keyboard(params, private),
+            b's' if params.is_empty() => self.save_cursor(),
+            b'u' if params.is_empty() => self.restore_cursor(),
             b'g' => self.clear_tab_stop(csi_arg(params, 0)),
-            b'c' => self.device_attributes(private),
-            b'n' => self.device_status(params, private),
+            b'c' => self.device_attributes(0),
+            b'n' => self.device_status(params, 0),
             _ => {}
         }
     }
@@ -3508,12 +3613,12 @@ mod tests {
     #[test]
     fn sgr_sets_the_pen_and_print_applies_it() {
         let mut s = Screen::new(10, 1);
-        s.sgr(&[1, 31]); // bold, red foreground
+        feed(&mut s, b"\x1b[1;31m"); // bold, red foreground
         s.print('x');
         let c = s.cell(0, 0);
         assert!(c.attrs.contains(Attrs::BOLD));
         assert_eq!(c.fg, Color::Ansi(1));
-        s.sgr(&[0]); // reset
+        feed(&mut s, b"\x1b[0m"); // reset
         s.print('y');
         let c = s.cell(0, 1);
         assert!(c.attrs.is_empty());
@@ -3523,12 +3628,119 @@ mod tests {
     #[test]
     fn sgr_extended_colors() {
         let mut s = Screen::new(10, 1);
-        s.sgr(&[38, 5, 200]); // 256-color foreground
+        feed(&mut s, b"\x1b[38;5;200m"); // 256-color foreground
         assert_eq!(s.pen.fg, Color::Indexed(200));
-        s.sgr(&[48, 2, 10, 20, 30]); // truecolor background
+        feed(&mut s, b"\x1b[48;2;10;20;30m"); // truecolor background
         assert_eq!(s.pen.bg, Color::Rgb(10, 20, 30));
-        s.sgr(&[90]); // bright black foreground -> ANSI 8
+        feed(&mut s, b"\x1b[90m"); // bright black foreground -> ANSI 8
         assert_eq!(s.pen.fg, Color::Ansi(8));
+    }
+
+    #[test]
+    fn a_private_marker_does_not_execute_its_ansi_namesake() {
+        // Three sequences that used to be executed as entirely different commands,
+        // because the final byte was matched without looking at the marker in front of
+        // it. Each must now be a no-op: dropping an unknown sequence is always safe,
+        // guessing at it is not.
+        let mut s = Screen::new(10, 5);
+
+        // XTRESTORE (`CSI ? Ps r`) restores saved private modes. It used to land on
+        // DECSTBM and reset the scroll region, homing the cursor.
+        feed(&mut s, b"\x1b[2;4r"); // a real DECSTBM: rows 2..4
+        feed(&mut s, b"\x1b[5;3H"); // park the cursor inside it
+        feed(&mut s, b"\x1b[?1r"); // XTRESTORE (restore DECCKM) — must do nothing
+        assert_eq!(s.cursor(), (4, 2), "the cursor did not move");
+        let region = (s.active().scroll_top, s.active().scroll_bottom);
+        assert_eq!(region, (1, 3), "the scroll region survived");
+
+        // XTSMGRAPHICS (`CSI ? Pi;Pa;Pv S`) is a sixel geometry query. It used to land
+        // on SU and scroll the screen.
+        let mut s = Screen::new(10, 3);
+        feed(&mut s, b"top\r\nmid\r\nlow");
+        feed(&mut s, b"\x1b[?1;1;0S");
+        assert_eq!(s.row_string(0).trim_end(), "top", "nothing scrolled");
+
+        // `CSI > 4 h` is not a mode set; it used to turn on insert mode (IRM).
+        let mut s = Screen::new(10, 2);
+        feed(&mut s, b"\x1b[>4h");
+        feed(&mut s, b"ab");
+        feed(&mut s, b"\x1b[1;1H");
+        feed(&mut s, b"X");
+        assert_eq!(
+            s.row_string(0).trim_end(),
+            "Xb",
+            "X overwrote, not inserted"
+        );
+    }
+
+    #[test]
+    fn an_extended_color_reads_the_sub_parameter_form_too() {
+        // The same colours, spelled with colons. Which spelling a program uses depends
+        // on what its terminfo told it, so both have to work.
+        let mut s = Screen::new(10, 1);
+        feed(&mut s, b"\x1b[38:5:200m");
+        assert_eq!(s.pen.fg, Color::Indexed(200));
+        // With the (unused) colour-space slot, as the ITU form has it.
+        feed(&mut s, b"\x1b[48:2::10:20:30m");
+        assert_eq!(s.pen.bg, Color::Rgb(10, 20, 30));
+        // And without it, which is just as common.
+        feed(&mut s, b"\x1b[38:2:1:2:3m");
+        assert_eq!(s.pen.fg, Color::Rgb(1, 2, 3));
+    }
+
+    #[test]
+    fn a_curly_underline_no_longer_swallows_the_colours_with_it() {
+        // The bug this all started from, and the exact sequence nvim sends to underline
+        // a diagnostic. The whole CSI used to be dropped on sight of the first colon, so
+        // the *colour* went with it: an error came out unstyled and uncoloured.
+        //
+        // We still draw only a solid underline, so the style is discarded — but it is
+        // discarded on purpose, one parameter at a time, instead of taking the rest of
+        // the sequence down with it.
+        let mut s = Screen::new(10, 1);
+        feed(&mut s, b"\x1b[4:3;58:2::255:0:0;38:2::0:255:0m");
+        assert!(s.pen.attrs.contains(Attrs::UNDERLINE), "underlined");
+        assert_eq!(s.pen.fg, Color::Rgb(0, 255, 0), "and the colour survived");
+    }
+
+    #[test]
+    fn an_underline_style_of_zero_turns_the_underline_off() {
+        // `4:0` is "no underline" — the one sub-parameter of 4 that is not an underline.
+        let mut s = Screen::new(10, 1);
+        feed(&mut s, b"\x1b[4m");
+        assert!(s.pen.attrs.contains(Attrs::UNDERLINE));
+        feed(&mut s, b"\x1b[4:0m");
+        assert!(!s.pen.attrs.contains(Attrs::UNDERLINE));
+        // Every other style is *an* underline, whatever we end up drawing for it.
+        for style in [b"\x1b[4:1m", b"\x1b[4:2m", b"\x1b[4:3m", b"\x1b[4:4m"] {
+            feed(&mut s, b"\x1b[4:0m");
+            feed(&mut s, style);
+            assert!(s.pen.attrs.contains(Attrs::UNDERLINE), "{style:?}");
+        }
+    }
+
+    #[test]
+    fn an_unimplemented_extended_color_is_consumed_not_misread() {
+        // SGR 58 is the underline colour, which we have nowhere to store. The danger is
+        // not that we drop it — it is that we drop it *without consuming its arguments*,
+        // in which case the `2` reads as dim, the `0` as a full reset, and the rest of
+        // the line comes out in the wrong style. Consume, then ignore.
+        let mut s = Screen::new(10, 1);
+        feed(&mut s, b"\x1b[31m"); // red, to be left alone
+        feed(&mut s, b"\x1b[58;2;255;0;0;1m"); // underline colour, then bold
+        assert!(
+            s.pen.attrs.contains(Attrs::BOLD),
+            "the bold after it landed"
+        );
+        assert!(
+            !s.pen.attrs.contains(Attrs::DIM),
+            "the 2 was not read as dim"
+        );
+        assert_eq!(s.pen.fg, Color::Ansi(1), "and nothing reset the colour");
+        // The same in the sub-parameter spelling, which consumes no extra parameters.
+        feed(&mut s, b"\x1b[0;32;58:2::1:2:3;3m");
+        assert!(s.pen.attrs.contains(Attrs::ITALIC));
+        assert_eq!(s.pen.fg, Color::Ansi(2));
     }
 
     #[test]
@@ -3550,10 +3762,10 @@ mod tests {
     fn save_and_restore_cursor() {
         let mut s = Screen::new(10, 5);
         s.move_to(2, 4);
-        s.sgr(&[1]);
+        feed(&mut s, b"\x1b[1m");
         s.save_cursor();
         s.move_to(0, 0);
-        s.sgr(&[0]);
+        feed(&mut s, b"\x1b[0m");
         s.restore_cursor();
         assert_eq!(s.cursor(), (2, 4));
         assert!(s.pen.attrs.contains(Attrs::BOLD));
@@ -3562,7 +3774,7 @@ mod tests {
     #[test]
     fn reset_returns_to_power_on_state() {
         let mut s = Screen::new(6, 3);
-        s.sgr(&[31]);
+        feed(&mut s, b"\x1b[31m");
         print_str(&mut s, "junk");
         s.set_scroll_region(1, 2);
         s.reset();
