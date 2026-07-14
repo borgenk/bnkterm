@@ -2073,7 +2073,7 @@ impl Screen {
         // it, whatever its own width — that is the whole difference between counting
         // scalars and counting characters. The rocket of an astronaut is two columns wide
         // on its own and no columns wide as part of the astronaut.
-        if self.extend_cluster(c) {
+        if self.grapheme_clustering && self.extend_cluster(c) {
             return;
         }
         let cw = usize::from(width(c));
@@ -2149,18 +2149,26 @@ impl Screen {
             b.cursor.pending_wrap = false;
         }
         self.last_printed = Some(c);
-        // This cell is now the one a continuing scalar would join — but only a terminal in
-        // clustering mode has any use for that, and this is the per-character hot path, so
-        // the bookkeeping is not done for the overwhelming majority of terminals that
-        // never turn the mode on.
         if self.grapheme_clustering {
-            let cursor = self.active().cursor;
-            self.cluster_anchor = Some(ClusterAnchor {
-                row,
-                col,
-                after: (cursor.row, cursor.col),
-            });
+            self.set_cluster_anchor(row, col);
         }
+    }
+
+    /// Remember the cell a continuing scalar would join.
+    ///
+    /// `#[inline(never)]`, and that is not a style choice. `print` is the per-character hot
+    /// path, and inlining this into it grew the function past whatever threshold the
+    /// compiler lays code out around: the escape-heavy benchmark lost 10% to it *while the
+    /// mode was switched off and this never ran once*. Code that cannot execute still costs
+    /// what it displaces.
+    #[inline(never)]
+    fn set_cluster_anchor(&mut self, row: usize, col: usize) {
+        let cursor = self.active().cursor;
+        self.cluster_anchor = Some(ClusterAnchor {
+            row,
+            col,
+            after: (cursor.row, cursor.col),
+        });
     }
 
     /// Bulk-write a run of printable ASCII (each width 1) at the cursor. Equivalent
@@ -2212,12 +2220,6 @@ impl Screen {
         }
         // REP repeats the last character printed, and the bulk path prints too.
         self.last_printed = bytes.last().map(|&b| char::from(b));
-        // No ASCII scalar continues a cluster, so a run of it ends whatever was open.
-        // (An ASCII byte cannot be an Extend, a ZWJ or a regional indicator.)
-        if self.grapheme_clustering {
-            self.cluster.reset();
-            self.cluster_anchor = None;
-        }
     }
 
     /// Try to join `c` onto the grapheme cluster already in the cell behind the cursor.
@@ -2231,11 +2233,18 @@ impl Screen {
     /// back waiting to see whether it is finished — a program that writes half an emoji and
     /// crashes must still leave half an emoji on screen.
     ///
-    /// The anchor carries where the cursor was when the cluster last grew. If the cursor
-    /// has moved since, the cluster is over: a cluster cannot span a cursor move, and
-    /// checking this here costs nothing and needs no hook in the twenty places that move a
-    /// cursor — any one of which, if forgotten, would have left a stale anchor pointing at
-    /// a cell that had since been overwritten.
+    /// The anchor carries where the cursor was when the cluster last grew, and that one
+    /// check is the *whole* invalidation rule. If the cursor is not where the cluster left
+    /// it, the cluster is over.
+    ///
+    /// Nothing else needs to say so. A control byte moves the cursor; a run of ASCII moves
+    /// the cursor; a cursor motion sequence moves the cursor — so every one of them breaks
+    /// the anchor by construction, and none of them needs a hook here. The hooks were
+    /// written first and then measured: they sat in `execute` and in the bulk-ASCII print
+    /// run, which are the two hottest functions in the terminal, and cost the
+    /// escape-heavy benchmark 7.5% *while the mode was switched off*. They were also
+    /// redundant. Both facts point the same way.
+    #[inline(never)]
     fn extend_cluster(&mut self, c: char) -> bool {
         if !self.grapheme_clustering {
             return false;
@@ -2277,6 +2286,7 @@ impl Screen {
     /// rather than wrapping: a character that has already been drawn cannot be moved to the
     /// next line without the cursor arithmetic on the far end of the pty disagreeing about
     /// where everything after it went.
+    #[inline(never)]
     fn grow_cluster(&mut self, anchor: ClusterAnchor, c: char) {
         let (row, col) = (anchor.row, anchor.col);
         let cols = self.active().cols;
@@ -4262,27 +4272,25 @@ impl Perform for Screen {
             0x07 => self.bell = true,        // BEL
             _ => {}                          // NUL, XON/XOFF, ...: nothing to draw
         }
-        // Whatever it did, it was not printing: there is nothing left for REP to repeat,
-        // and nothing for a cluster to grow onto. A cluster cannot span a control byte.
+        // Whatever it did, it was not printing: there is nothing left for REP to repeat.
         self.last_printed = None;
-        if self.grapheme_clustering {
-            self.cluster.reset();
-            self.cluster_anchor = None;
-        }
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], private: u8, action: u8) {
-        // The sequences carrying an intermediate byte. Each is matched on the
-        // intermediate, the private marker *and* the final byte together — see
-        // `csi_private` for what happens when a final byte is trusted on its own.
-        match (intermediates, private, action) {
-            ([b'!'], 0, b'p') => return self.soft_reset(), // DECSTR
-            ([b'$'], 0, b'p') => return self.report_mode(params.value(0), false), // DECRQM
-            ([b'$'], b'?', b'p') => return self.report_mode(params.value(0), true), // DECRQM
-            ([b' '], 0, b'q') => return self.set_cursor_style(params.value(0)), // DECSCUSR
-            _ => {}
-        }
+        // The sequences carrying an intermediate byte, and *only* those: the overwhelming
+        // majority of CSIs have none, and they should not pay four slice comparisons to
+        // discover it. Each is matched on the intermediate, the private marker *and* the
+        // final byte together — see `csi_private` for what happens when a final byte is
+        // trusted on its own.
         if !intermediates.is_empty() {
+            match (intermediates, private, action) {
+                ([b'!'], 0, b'p') => self.soft_reset(), // DECSTR
+                ([b'$'], 0, b'p') => self.report_mode(params.value(0), false), // DECRQM
+                ([b'$'], b'?', b'p') => self.report_mode(params.value(0), true), // DECRQM
+                ([b' '], 0, b'q') => self.set_cursor_style(params.value(0)), // DECSCUSR
+                // Anything else with an intermediate is dropped rather than misread.
+                _ => {}
+            }
             return;
         }
         // A private marker selects a different sequence space; it does not modify the

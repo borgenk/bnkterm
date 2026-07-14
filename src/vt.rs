@@ -180,6 +180,29 @@ pub struct Params {
     /// start is stored rather than derived: reading parameter `i` is the hot path (a
     /// CSI dispatch reads two or three of them, and SGR walks all of them), and
     /// summing the preceding lengths to find it would make that a quadratic walk.
+    ///
+    /// # Three optimizations that did not work
+    ///
+    /// This shape costs about 10% of the escape-heavy benchmark against the flat
+    /// `[u16; 32]` it replaced. That is the price of parsing sub-parameters at all, and it
+    /// bought a real bug: a colon used to make the parser drop the entire sequence, so an
+    /// editor's curly underline took its diagnostic *colours* down with it.
+    ///
+    /// Three attempts to win it back, each measured by building two trees identical but
+    /// for the change and running them interleaved on the same machine:
+    ///
+    /// 1. **One `bounds[i]..bounds[i + 1]` array instead of `starts` + `lens`.** Tidier,
+    ///    and one store per parameter instead of two. **3.5% slower** (23.5k vs 22.7k).
+    /// 2. **A flat fast path**, using `values[i]` directly until a colon is seen and
+    ///    promoting only then. Restores the original single store. **12% slower** (25.5k).
+    /// 3. **A `firsts[]` array**, so the first value of a parameter is one load rather than
+    ///    a start-lookup plus a load. **7% slower** (24.3k).
+    ///
+    /// The lesson is in what they have in common: every one of them made *writing* a
+    /// parameter cheaper and *reading* one dearer, and a terminal reads parameters far more
+    /// often than it writes them. The stores were never where the time went. If you come
+    /// back to this, come back with a profiler and start on the read path — and measure two
+    /// trees against each other, because the benchmark moves 10% on code placement alone.
     starts: [u8; MAX_PARAMS],
     lens: [u8; MAX_PARAMS],
     /// Parameters, and values used.
