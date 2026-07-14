@@ -1234,6 +1234,21 @@ pub struct Screen {
     /// to the parser and warm only to the painter, so it goes behind a pointer and the hot
     /// fields close ranks. See the note in `perf/` before undoing this.
     theme: Box<Theme>,
+    /// The working directory the shell reported (`OSC 7`), if it has.
+    ///
+    /// The app can also read this out of `/proc/<pid>/cwd`, and does — but only for a child
+    /// on *this* machine. A shell on the far end of an ssh hop has no /proc we can see, and
+    /// is the case where knowing the directory is worth the most. So when the shell says,
+    /// we believe the shell.
+    cwd: Option<String>,
+    /// The prompts the shell has marked (`OSC 133;A`), oldest first, and how the command
+    /// after each one turned out.
+    ///
+    /// Marks name rows by [`AbsRow`], so they survive output scrolling under them — and
+    /// they are dropped wholesale when the row epoch ends, because at that point the ids
+    /// they hold name lines that no longer exist. Exactly the rule the selection follows,
+    /// and for exactly the same reason.
+    prompts: Vec<Prompt>,
     /// Grapheme clustering (`?2027`): a user-perceived character occupies one cell, rather
     /// than each scalar occupying its own.
     ///
@@ -1284,6 +1299,28 @@ enum NamedColor {
     Background,
     Cursor,
 }
+
+/// A prompt the shell marked, and the fate of the command typed at it.
+///
+/// This is what `OSC 133` buys: the terminal stops seeing an undifferentiated river of
+/// text and starts knowing where one command ended and the next began. Everything good
+/// downstream — jump to the last prompt, select a command's output, colour a failure —
+/// falls out of knowing just this.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Prompt {
+    /// The row the prompt starts on.
+    pub row: AbsRow,
+    /// Where the command's output begins (`OSC 133;C`), once it has.
+    pub output: Option<AbsRow>,
+    /// The command's exit status (`OSC 133;D;<code>`), once it has one. `Some(0)` is a
+    /// success; anything else is the shell telling us it went wrong.
+    pub exit: Option<i32>,
+}
+
+/// How many prompts to remember. The shell writes these, and a shell in a loop is still a
+/// program the terminal must not let grow its memory without bound. Far more than a
+/// scrollback's worth of prompts, so in practice the ring ages them out first.
+const PROMPT_LIMIT: usize = 4096;
 
 /// The cell a grapheme cluster is being built in, and where the cursor was left after it.
 ///
@@ -1341,6 +1378,8 @@ impl Screen {
             kitty_stack: Vec::new(),
             modify_other_keys: ModifyOtherKeys::default(),
             theme: Box::new(Theme::default()),
+            cwd: None,
+            prompts: Vec::new(),
             grapheme_clustering: false,
             cluster: grapheme::BreakState::default(),
             cluster_anchor: None,
@@ -1565,6 +1604,10 @@ impl Screen {
     /// renumbered. See [`RowEpoch`] for the (short) list of things that do this.
     fn break_row_identity(&mut self) {
         self.epoch = self.epoch.next();
+        // The marks hold row ids, and the ids no longer name the lines they named. Keeping
+        // them would mean offering to jump to a prompt that is not there any more — the
+        // same reason the selection is dropped here, and the same fix.
+        self.prompts.clear();
     }
 
     /// The id of the line currently shown at display `row`.
@@ -3338,6 +3381,127 @@ impl Screen {
         }
     }
 
+    /// `OSC 7 ; file://<host>/<path>`: the shell reports its working directory.
+    ///
+    /// The path is percent-encoded, because a directory may contain any byte a filename
+    /// may contain, including the `;` that separates OSC fields. A malformed escape is
+    /// left as written rather than guessed at.
+    fn osc_cwd(&mut self, pt: &[u8]) {
+        let path = match pt.strip_prefix(b"file://") {
+            // Strip the host: it is the machine the shell is on, which we cannot do
+            // anything useful with, and the path begins at the slash that follows it.
+            Some(rest) => match rest.iter().position(|&b| b == b'/') {
+                Some(i) => rest.get(i..).unwrap_or(&[]),
+                None => return,
+            },
+            // A bare path, which some shells send. Accept it.
+            None if pt.starts_with(b"/") => pt,
+            None => return,
+        };
+        self.cwd = Some(percent_decode(path));
+    }
+
+    /// `OSC 133`: the shell tells us where a prompt is, where the command's output starts,
+    /// and how it ended.
+    ///
+    /// ```text
+    ///   OSC 133 ; A ST          a prompt starts here
+    ///   OSC 133 ; B ST          the prompt ends and what you type begins
+    ///   OSC 133 ; C ST          the command's output starts here
+    ///   OSC 133 ; D ; 1 ST      the command finished, and it failed
+    /// ```
+    ///
+    /// Without this a terminal sees an undifferentiated river of text and can only offer
+    /// you a scrollbar. With it, it knows where one command ended and the next began, and
+    /// everything good follows from that: jump back to the last prompt, select a command's
+    /// output, mark the ones that failed.
+    fn osc_shell_mark(&mut self, pt: &[u8]) {
+        let mut fields = pt.split(|&b| b == b';');
+        let kind = fields.next().unwrap_or(&[]);
+        match kind {
+            b"A" => {
+                let row = self.abs_row(self.active().cursor.row);
+                // A shell that redraws its prompt in place (zsh does, on every keystroke
+                // with syntax highlighting) re-marks the same row. It is the same prompt.
+                if self.prompts.last().map(|p| p.row) == Some(row) {
+                    return;
+                }
+                if self.prompts.len() >= PROMPT_LIMIT {
+                    self.prompts.remove(0);
+                }
+                self.prompts.push(Prompt {
+                    row,
+                    output: None,
+                    exit: None,
+                });
+            }
+            b"C" => {
+                let row = self.abs_row(self.active().cursor.row);
+                if let Some(p) = self.prompts.last_mut() {
+                    p.output.get_or_insert(row);
+                }
+            }
+            b"D" => {
+                // The exit code is optional: a shell that reports only "it finished" is
+                // still telling us something worth knowing.
+                let exit = fields
+                    .next()
+                    .and_then(|f| std::str::from_utf8(f).ok())
+                    .and_then(|f| f.trim().parse::<i32>().ok());
+                if let Some(p) = self.prompts.last_mut() {
+                    p.exit = exit.or(p.exit);
+                }
+            }
+            // `B` (the prompt ends, input begins) we parse and do not need: nothing we
+            // offer keys off it, and inventing a use for it would be inventing a feature.
+            _ => {}
+        }
+    }
+
+    /// The prompts the shell has marked, oldest first.
+    pub fn prompts(&self) -> &[Prompt] {
+        &self.prompts
+    }
+
+    /// Scroll so the prompt nearest above (or below) the top of the view comes into sight,
+    /// and answer whether one was found.
+    ///
+    /// This is the payoff, and it is the thing a scrollbar can never do: a scrollbar knows
+    /// how far you have come, and this knows *what* you have come past. Ten screens of a
+    /// build log scroll by in one keystroke because the terminal knows where the command
+    /// that produced them started.
+    ///
+    /// The prompt lands at the top of the screen, which is where you want it: the command
+    /// and everything it printed are then below it, in the order they happened. A prompt
+    /// close to the live bottom cannot be lifted that far — there is not enough text under
+    /// it to fill the screen — so it comes to rest as high as the history allows, which is
+    /// the same thing every scrollbar in the world does at the end of its travel.
+    pub fn scroll_to_prompt(&mut self, backward: bool) -> bool {
+        let top = self.abs_row(0);
+        let target = if backward {
+            self.prompts.iter().rev().find(|p| p.row < top)
+        } else {
+            self.prompts.iter().find(|p| p.row > top)
+        };
+        let Some(row) = target.map(|p| p.row) else {
+            return false;
+        };
+        let b = self.active();
+        let Some(index) = b.stream_index(row) else {
+            return false;
+        };
+        // The offset is measured back from the live top of the screen, which is where the
+        // scrollback ends.
+        let offset = b.scrollback.len().saturating_sub(index);
+        self.view_offset = offset.min(self.scrollback_len());
+        true
+    }
+
+    /// The working directory the shell last reported (`OSC 7`).
+    pub fn reported_cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+
     /// `OSC 52 ; <selection> ; <base64>`: the child puts text on the clipboard.
     ///
     /// This is how a program reaches the system clipboard when it cannot reach the
@@ -3716,6 +3880,41 @@ fn escape_reply(reply: &[u8]) -> String {
         }
     }
     out
+}
+
+/// Percent-decode a URL path, which is how `OSC 7` carries a directory name.
+///
+/// It has to be encoded: a filename may contain any byte except `/` and NUL — including
+/// the `;` that separates OSC fields and the bytes that would terminate the sequence
+/// outright. A `%` that is not followed by two hex digits is a literal `%`, which is what
+/// a shell that forgot to encode one produces, and guessing otherwise would mangle a
+/// directory that is merely unusual rather than malformed.
+///
+/// Invalid UTF-8 becomes U+FFFD rather than being refused: a path we cannot render is
+/// still a path we can show *something* for, and the alternative is silently having no cwd.
+fn percent_decode(input: &[u8]) -> String {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while let Some(&byte) = input.get(i) {
+        let decoded = (byte == b'%')
+            .then(|| {
+                let hi = (*input.get(i + 1)? as char).to_digit(16)?;
+                let lo = (*input.get(i + 2)? as char).to_digit(16)?;
+                Some((hi * 16 + lo) as u8)
+            })
+            .flatten();
+        match decoded {
+            Some(b) => {
+                bytes.push(b);
+                i += 3;
+            }
+            None => {
+                bytes.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Decode the hex that XTGETTCAP encodes capability names in. `None` on anything that is
@@ -4198,8 +4397,10 @@ impl Perform for Screen {
             b"10" => self.osc_named_color(NamedColor::Foreground, pt, bel_terminated),
             b"11" => self.osc_named_color(NamedColor::Background, pt, bel_terminated),
             b"12" => self.osc_named_color(NamedColor::Cursor, pt, bel_terminated),
+            b"7" => self.osc_cwd(pt),
             b"52" => self.osc_clipboard(pt),
             b"104" => self.osc_reset_palette(pt),
+            b"133" => self.osc_shell_mark(pt),
             b"110" => self.theme.fg = Theme::default().fg,
             b"111" => self.theme.bg = Theme::default().bg,
             b"112" => self.theme.cursor = Theme::default().cursor,
@@ -4677,6 +4878,127 @@ mod tests {
         let mut s = Screen::new(cols, rows);
         feed(&mut s, b"\x1b[?2027h");
         s
+    }
+
+    #[test]
+    fn osc_7_takes_the_shells_word_for_the_directory() {
+        let mut s = Screen::new(10, 2);
+        assert_eq!(s.reported_cwd(), None);
+        feed(&mut s, b"\x1b]7;file://host/home/testuser/projects\x07");
+        assert_eq!(s.reported_cwd(), Some("/home/testuser/projects"));
+
+        // A filename may hold any byte a filename may hold, which is why the path is
+        // encoded at all: this one has a space and a semicolon in it, and the semicolon
+        // would otherwise have looked like the end of the field.
+        feed(&mut s, b"\x1b]7;file://host/tmp/a%20b%3Bc\x07");
+        assert_eq!(s.reported_cwd(), Some("/tmp/a b;c"));
+
+        // A bare path (some shells send one) is accepted; a stray `%` is a literal `%`,
+        // because a directory that is merely unusual must not be mangled.
+        feed(&mut s, b"\x1b]7;/plain/path\x07");
+        assert_eq!(s.reported_cwd(), Some("/plain/path"));
+        feed(&mut s, b"\x1b]7;file://h/100%pure\x07");
+        assert_eq!(s.reported_cwd(), Some("/100%pure"));
+    }
+
+    #[test]
+    fn osc_133_marks_where_each_command_began_and_how_it_ended() {
+        // The shell tells the terminal what it could never work out for itself: where one
+        // command ended and the next began. Everything good downstream falls out of this.
+        let mut s = Screen::new(20, 6);
+        feed(&mut s, b"\x1b]133;A\x07$ ls\r\n"); // a prompt on row 0
+        feed(&mut s, b"\x1b]133;C\x07"); // output starts on row 1
+        feed(&mut s, b"a.txt\r\n");
+        feed(&mut s, b"\x1b]133;D;0\x07"); // and it succeeded
+
+        feed(&mut s, b"\x1b]133;A\x07$ false\r\n"); // a second prompt on row 2
+        feed(&mut s, b"\x1b]133;C\x07\x1b]133;D;1\x07"); // which failed
+
+        let prompts = s.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].row, s.abs_row(0));
+        assert_eq!(prompts[0].output, Some(s.abs_row(1)));
+        assert_eq!(prompts[0].exit, Some(0), "ls worked");
+        assert_eq!(prompts[1].row, s.abs_row(2));
+        assert_eq!(prompts[1].exit, Some(1), "false did not");
+    }
+
+    #[test]
+    fn the_exit_code_belongs_to_the_command_that_just_ended() {
+        // These are the bytes a real bash emits, in the order it emits them. The ordering
+        // is the subtlety: `D` reports the status of the command that *just finished*, and
+        // it arrives immediately before the `A` that starts the next prompt — so the code
+        // attaches to the prompt behind it, never the one in front.
+        let mut s = Screen::new(20, 6);
+        feed(&mut s, b"\x1b]133;A\x07\x1b]7;file://h/tmp\x07$ false\r\n");
+        feed(&mut s, b"\x1b]133;D;1\x07"); // `false` failed...
+        feed(&mut s, b"\x1b]133;A\x07$ "); // ...and only now does the next prompt open
+
+        let prompts = s.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].exit, Some(1), "the failure landed on `false`");
+        assert_eq!(prompts[1].exit, None, "and not on the prompt after it");
+        assert_eq!(s.reported_cwd(), Some("/tmp"));
+    }
+
+    #[test]
+    fn a_prompt_redrawn_in_place_is_still_the_same_prompt() {
+        // zsh with syntax highlighting redraws its prompt on every keystroke, re-marking
+        // the same row each time. Counting those as separate prompts would fill the list
+        // with hundreds of copies of the one you are typing at.
+        let mut s = Screen::new(20, 4);
+        for _ in 0..50 {
+            feed(&mut s, b"\x1b]133;A\x07");
+        }
+        assert_eq!(s.prompts().len(), 1);
+    }
+
+    #[test]
+    fn jumping_to_a_prompt_scrolls_past_everything_the_command_printed() {
+        // The payoff, and the thing a scrollbar can never do: a scrollbar knows how far you
+        // have come, this knows *what* you have come past. Ten screens of build log go by
+        // in one keystroke, because the terminal knows where the command that printed them
+        // started.
+        let mut s = Screen::new(20, 4);
+        feed(&mut s, b"\x1b]133;A\x07$ build\r\n");
+        for i in 0..30 {
+            feed(&mut s, format!("log line {i}\r\n").as_bytes());
+        }
+        feed(&mut s, b"\x1b]133;A\x07$ ");
+
+        let first = s.prompts()[0].row;
+        assert!(s.view_offset() == 0, "we are at the live bottom");
+        assert!(s.scroll_to_prompt(true), "there is a prompt behind us");
+        assert_eq!(s.abs_row(0), first, "and it is now the top line on screen");
+        // Read through the *view*, not the live screen: the whole point is that we are
+        // looking at history, and `row_string` would show what is live under it.
+        let seen: String = (0..20).map(|c| s.view_cell(0, c).rune).collect();
+        assert_eq!(seen.trim_end(), "$ build");
+
+        // Nothing further back to find.
+        assert!(!s.scroll_to_prompt(true));
+        // And forward again, to the prompt we left. It sits near the live bottom, so it
+        // cannot be lifted to the top row — there is not enough text under it to fill the
+        // screen — and it comes to rest as high as the history allows. What matters is that
+        // it is on screen.
+        let last = s.prompts()[1].row;
+        assert!(s.scroll_to_prompt(false));
+        assert!(
+            s.display_row(last).is_some(),
+            "the prompt we jumped to is visible"
+        );
+    }
+
+    #[test]
+    fn marks_are_dropped_when_the_rows_they_name_stop_meaning_anything() {
+        // They hold row ids, and a reset renumbers the world. Offering to jump to a prompt
+        // that is no longer there is worse than offering nothing — it is the same rule the
+        // selection follows, for the same reason.
+        let mut s = Screen::new(20, 4);
+        feed(&mut s, b"\x1b]133;A\x07$ ls\r\n");
+        assert_eq!(s.prompts().len(), 1);
+        feed(&mut s, b"\x1b[2J"); // a full erase ends the epoch
+        assert!(s.prompts().is_empty());
     }
 
     #[test]

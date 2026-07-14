@@ -363,7 +363,16 @@ impl TerminalCore {
     /// [`TabBarConfig::path_prefix_programs`]), so a change in either can shift what
     /// is shown; the manager applies the cheap rebuild without re-deriving here.
     pub(super) fn refresh_process(&mut self) -> bool {
-        let cwd = self.pty.as_ref().and_then(Pty::cwd);
+        // The shell's own word (`OSC 7`) beats /proc, and it is not a matter of taste:
+        // /proc tells us the working directory of the process on *this* machine, which is
+        // the ssh client when the shell you are actually looking at is three thousand miles
+        // away. The one case where knowing the directory is worth the most is the one case
+        // /proc gets wrong.
+        let cwd = self
+            .screen
+            .reported_cwd()
+            .map(std::path::PathBuf::from)
+            .or_else(|| self.pty.as_ref().and_then(Pty::cwd));
         let foreground = self.pty.as_ref().and_then(Pty::foreground_program);
         if cwd == self.cwd && foreground == self.foreground {
             return false;
@@ -741,10 +750,11 @@ impl TerminalCore {
         Ok(())
     }
 
-    /// Scroll the scrollback view for a navigation chord (Shift + PageUp/PageDown/
-    /// Home/End) on the primary screen, returning whether the key was consumed. A
-    /// page is a screenful less one line, so a line of context carries across. The
-    /// window resolves the keycode to a named key; the grid does the scrolling.
+    /// Scroll the scrollback view for a navigation chord on the primary screen, returning
+    /// whether the key was consumed: Shift + PageUp/PageDown/Home/End moves by pages and
+    /// ends, and Ctrl+Shift + Up/Down jumps between the prompts the shell marked. A page is
+    /// a screenful less one line, so a line of context carries across. The window resolves
+    /// the keycode to a named key; the grid does the scrolling.
     pub(super) fn handle_scroll_key(&mut self, key: input::Key, mods: input::Mods) -> bool {
         if !mods.contains(input::Mods::SHIFT) || self.screen.is_alt() {
             return false;
@@ -756,6 +766,24 @@ impl TerminalCore {
             input::Key::PageDown => self.screen.scroll_view_down(page),
             input::Key::Home => self.screen.scroll_view_to_top(),
             input::Key::End => self.screen.scroll_view_to_bottom(),
+            // Ctrl+Shift+Up/Down: jump between the prompts the shell marked (`OSC 133`).
+            //
+            // This is the one kind of scrolling a scrollbar cannot do. A scrollbar knows
+            // how far you have come; this knows *what* you have come past. Ten screens of
+            // build output go by in one keystroke because the terminal knows where the
+            // command that printed them started. Without the shell's marks it does nothing
+            // at all, and does nothing *quietly*: a shell that reports no prompts leaves
+            // the chord free rather than making it lie.
+            input::Key::Up if mods.contains(input::Mods::CTRL) => {
+                if !self.screen.scroll_to_prompt(true) {
+                    return false;
+                }
+            }
+            input::Key::Down if mods.contains(input::Mods::CTRL) => {
+                if !self.screen.scroll_to_prompt(false) {
+                    return false;
+                }
+            }
             _ => return false,
         }
         // A keyboard scroll is a scroll: show the bar moving, the way the wheel does.
@@ -1551,6 +1579,31 @@ mod tests {
         core.feed_test_bytes(b"\x1b[?2026l");
         assert!(!core.holds_frame(), "and now it goes up, all at once");
         assert!(core.dirty);
+    }
+
+    #[test]
+    fn ctrl_shift_up_jumps_to_the_prompt_and_stays_out_of_the_way_without_one() {
+        let mut core = TerminalCore::new(false, 20, 5, METRICS, 640, 384, 0);
+        // No shell integration: the chord is not ours, and it must fall through to the
+        // child rather than being swallowed. A terminal that eats a key and does nothing
+        // with it is worse than one that never claimed the key.
+        assert!(!core.handle_scroll_key(input::Key::Up, input::Mods::CTRL | input::Mods::SHIFT));
+
+        // A shell that marks its prompts gets the jump.
+        core.feed_test_bytes(b"\x1b]133;A\x07$ build\r\n");
+        for i in 0..30 {
+            core.feed_test_bytes(format!("log line {i}\r\n").as_bytes());
+        }
+        assert_eq!(core.screen.view_offset(), 0, "at the live bottom");
+        assert!(core.handle_scroll_key(input::Key::Up, input::Mods::CTRL | input::Mods::SHIFT));
+        assert!(core.screen.view_offset() > 0, "we scrolled back");
+        assert_eq!(
+            core.screen.abs_row(0),
+            core.screen.prompts()[0].row,
+            "to the prompt, past everything the command printed"
+        );
+        // And Shift+Up alone is still just a key for the child.
+        assert!(!core.handle_scroll_key(input::Key::Up, input::Mods::SHIFT));
     }
 
     #[test]
