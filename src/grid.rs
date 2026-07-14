@@ -159,9 +159,11 @@ struct Scrolled {
 }
 
 /// A cell's rendition attributes: the SGR styles plus the two layout bits that
-/// mark a wide character's halves and the one that records a soft-wrapped line.
-/// A bitfield newtype (no `bitflags` crate) so it is one `u16`, `Copy`, and
-/// cheap to compare in the damage diff.
+/// mark a wide character's halves. A bitfield newtype (no `bitflags` crate) so it
+/// is one `u16`, `Copy`, and cheap to compare in the damage diff.
+///
+/// Soft wrap is deliberately *not* here: it describes a line, not a cell (see
+/// [`Row::wrapped`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Attrs(u16);
 
@@ -179,12 +181,9 @@ impl Attrs {
     pub const WIDE_LEADER: Attrs = Attrs(1 << 7);
     /// The right half of a wide character; a placeholder the cursor skips.
     pub const WIDE_SPACER: Attrs = Attrs(1 << 8);
-    /// Set on a row's last cell when autowrap carried its line onto the next
-    /// row, so reflow and selection can tell a soft wrap from a hard newline.
-    pub const WRAPPED: Attrs = Attrs(1 << 9);
 
     /// All flags, in bit order, with their names, for `Debug` and for tests.
-    const ALL: [(Attrs, &'static str); 10] = [
+    const ALL: [(Attrs, &'static str); 9] = [
         (Attrs::BOLD, "BOLD"),
         (Attrs::DIM, "DIM"),
         (Attrs::ITALIC, "ITALIC"),
@@ -194,7 +193,6 @@ impl Attrs {
         (Attrs::HIDDEN, "HIDDEN"),
         (Attrs::WIDE_LEADER, "WIDE_LEADER"),
         (Attrs::WIDE_SPACER, "WIDE_SPACER"),
-        (Attrs::WRAPPED, "WRAPPED"),
     ];
 
     pub const fn empty() -> Self {
@@ -508,6 +506,19 @@ struct Saved {
 struct Row {
     cells: Vec<Cell>,
     combining: Vec<(usize, Vec<char>)>,
+    /// Autowrap carried this line onto the next row: the two are one logical line,
+    /// so a selection spanning them copies as unbroken text and a triple-click takes
+    /// both. A hard newline leaves this false.
+    ///
+    /// It lives on the row rather than on the row's last cell because it describes the
+    /// *line*, and a cell is addressed by a column that a resize moves: widening would
+    /// strand the flag mid-row and narrowing would truncate it away, and either one
+    /// silently breaks a wrapped line in half on the next copy. We do not re-wrap on
+    /// resize ([`Buffer::resize`]), so nothing would put it back.
+    ///
+    /// The invariant: true only while the text that wrapped is still the text in the
+    /// final column. Every write or erase reaching that column clears it.
+    wrapped: bool,
 }
 
 impl Row {
@@ -515,11 +526,14 @@ impl Row {
         Row {
             cells: vec![cell; cols],
             combining: Vec::new(),
+            wrapped: false,
         }
     }
 
     /// Reset every cell to `blank` and drop combining marks, reusing the existing
-    /// allocation so a recycled scroll row never allocates.
+    /// allocation so a recycled scroll row never allocates. The wrap link goes with
+    /// the content: a recycled row must not inherit one and glue two unrelated lines
+    /// together.
     fn reset(&mut self, cols: usize, blank: Cell) {
         if self.cells.len() == cols {
             self.cells.iter_mut().for_each(|c| *c = blank);
@@ -528,6 +542,7 @@ impl Row {
             self.cells.resize(cols, blank);
         }
         self.combining.clear();
+        self.wrapped = false;
     }
 
     fn marks_at(&self, col: usize) -> Option<&[char]> {
@@ -551,7 +566,8 @@ impl Row {
     /// Grow or shrink the row to `new_cols`, padding with blanks or truncating.
     /// Truncation drops any combining marks past the new edge and blanks a wide
     /// glyph's leader whose spacer just fell off, so no half of a wide cell is
-    /// ever left dangling. This is the column half of a terminal resize; it does
+    /// ever left dangling. [`Row::wrapped`] is line state, not cell state, so it
+    /// survives untouched. This is the column half of a terminal resize; it does
     /// not re-wrap soft-wrapped content (see [`Buffer::resize`]).
     fn resize_cols(&mut self, new_cols: usize) {
         let old = self.cells.len();
@@ -674,11 +690,20 @@ impl Buffer {
         self.stream_row(base + display_row)
     }
 
+    /// Write `cell` at (row, col) with no wide-pair or combining-mark bookkeeping.
+    /// Replacing a row's final cell replaces the text that wrapped out of it, so the
+    /// line stops there: the wrap link goes (autowrap sets it again if the new text
+    /// wraps in its turn).
     fn set_raw(&mut self, row: usize, col: usize, cell: Cell) {
-        if let Some(r) = self.lines.get_mut(row) {
-            if let Some(slot) = r.cells.get_mut(col) {
-                *slot = cell;
-            }
+        let Some(r) = self.lines.get_mut(row) else {
+            return;
+        };
+        let Some(slot) = r.cells.get_mut(col) else {
+            return;
+        };
+        *slot = cell;
+        if col + 1 == r.cells.len() {
+            r.wrapped = false;
         }
     }
 
@@ -745,6 +770,11 @@ impl Buffer {
             }
         }
         r.combining.retain(|(c, _)| *c < start_col || *c >= end_col);
+        // As in `set_raw`: a run reaching the final column replaces whatever wrapped out
+        // of it. The caller re-wraps this row if the run itself runs off the edge.
+        if end_col >= r.cells.len() {
+            r.wrapped = false;
+        }
     }
 
     /// Scroll `[top, bottom]` up by `n`, feeding `blank` rows in at the bottom.
@@ -914,14 +944,18 @@ impl Buffer {
         self.cursor.pending_wrap = false;
     }
 
-    fn clear_line_full(&mut self, row: usize, blank: Cell) {
+    /// Overwrite every cell of `row` with `fill` (a blank for the erases, an 'E' for
+    /// DECALN), dropping its marks and its wrap link.
+    fn clear_line_full(&mut self, row: usize, fill: Cell) {
         if let Some(r) = self.lines.get_mut(row) {
-            r.cells.iter_mut().for_each(|c| *c = blank);
+            r.cells.iter_mut().for_each(|c| *c = fill);
             r.combining.clear();
+            r.wrapped = false;
         }
     }
 
-    /// Blank cells `[start, end)` of `row`, leaving the rest untouched.
+    /// Blank cells `[start, end)` of `row`, leaving the rest untouched. A range that
+    /// reaches the final column erases the text that wrapped, so the line ends here.
     fn clear_line_range(&mut self, row: usize, start: usize, end: usize, blank: Cell) {
         if let Some(r) = self.lines.get_mut(row) {
             let hi = end.min(r.cells.len());
@@ -930,12 +964,16 @@ impl Buffer {
                     slice.iter_mut().for_each(|c| *c = blank);
                 }
                 r.combining.retain(|(c, _)| *c < start || *c >= hi);
+                if hi == r.cells.len() {
+                    r.wrapped = false;
+                }
             }
         }
     }
 
     /// ICH: shift `[col, len)` right by `n`, blanking the `n` opened cells; cells
-    /// pushed past the right edge are lost.
+    /// pushed past the right edge are lost, including whatever wrapped out of the
+    /// final column, so the wrap link goes with it.
     fn insert_blanks(&mut self, row: usize, col: usize, n: usize, blank: Cell) {
         if let Some(r) = self.lines.get_mut(row) {
             let len = r.cells.len();
@@ -953,10 +991,12 @@ impl Buffer {
                     *c += n
                 }
             });
+            r.wrapped = false;
         }
     }
 
     /// DCH: shift `[col+n, len)` left by `n`, blanking the `n` cells at the right.
+    /// Blanking the tail ends the line there, so the wrap link goes too.
     fn delete_chars(&mut self, row: usize, col: usize, n: usize, blank: Cell) {
         if let Some(r) = self.lines.get_mut(row) {
             let len = r.cells.len();
@@ -974,12 +1014,13 @@ impl Buffer {
                     *c -= n
                 }
             });
+            r.wrapped = false;
         }
     }
 
-    fn clear_all(&mut self, blank: Cell) {
+    fn clear_all(&mut self, fill: Cell) {
         for row in 0..self.rows {
-            self.clear_line_full(row, blank);
+            self.clear_line_full(row, fill);
         }
     }
 }
@@ -1472,10 +1513,14 @@ impl Screen {
     }
 
     /// Whether absolute `row` soft-wrapped into the next one, so the two are one
-    /// logical line.
+    /// logical line. False for a row that has aged out of history.
     fn wraps(&self, row: AbsRow) -> bool {
-        let last_col = self.dimensions().0.saturating_sub(1);
-        self.abs_cell(row, last_col).attrs.contains(Attrs::WRAPPED)
+        self.active().abs_row(row).is_some_and(|r| r.wrapped)
+    }
+
+    /// Whether the line on the live screen at display `row` soft-wrapped into the next.
+    fn row_wraps(&self, row: usize) -> bool {
+        self.active().line(row).is_some_and(|r| r.wrapped)
     }
 
     /// The inclusive cell range of the word at display `(row, col)`, for a
@@ -1706,6 +1751,11 @@ impl Screen {
     /// so a regression reads like a screenshot with a style key beneath it. A
     /// blank default cell is the omission: it shows as a space in `grid:` and
     /// carries no `style:` line.
+    ///
+    /// A row that soft-wrapped into the next is flagged `wrapped` beside its text.
+    /// That is not cosmetic: the flag is what a copy across the wrap depends on, and
+    /// it is invisible in the grid text (both a soft wrap and a hard newline just end
+    /// the row), so without it a regression could not be seen here at all.
     pub fn snapshot(&self) -> String {
         use std::fmt::Write;
         let (cols, rows) = self.dimensions();
@@ -1729,7 +1779,8 @@ impl Screen {
         let _ = writeln!(out, "title {:?}", self.title);
         out.push_str("grid:\n");
         for r in 0..rows {
-            let _ = writeln!(out, "|{}|", self.row_string(r));
+            let cont = if self.row_wraps(r) { " wrapped" } else { "" };
+            let _ = writeln!(out, "|{}|{cont}", self.row_string(r));
         }
         out.push_str("style:\n");
         for r in 0..rows {
@@ -1933,18 +1984,12 @@ impl Screen {
         }
     }
 
-    /// The soft wrap: mark the row being left as `WRAPPED`, then move to the
-    /// start of the next line (scrolling if at the bottom of the region).
+    /// The soft wrap: link the row being left to the next one, then move to the
+    /// start of that next line (scrolling if at the bottom of the region).
     fn wrap_line(&mut self) {
-        let cols = self.active().cols;
         let row = self.active().cursor.row;
-        if cols > 0 {
-            let last = cols - 1;
-            if let Some(r) = self.active_mut().lines.get_mut(row) {
-                if let Some(cell) = r.cells.get_mut(last) {
-                    cell.attrs.insert(Attrs::WRAPPED);
-                }
-            }
+        if let Some(r) = self.active_mut().lines.get_mut(row) {
+            r.wrapped = true;
         }
         self.active_mut().cursor.pending_wrap = false;
         self.line_feed();
@@ -2635,14 +2680,8 @@ impl Screen {
     /// DECALN: fill the whole screen with 'E' and home the cursor (a vttest
     /// alignment pattern; useful for confirming glyph placement early).
     pub fn decaln(&mut self) {
-        let cell = Cell::new('E');
         let b = self.active_mut();
-        for row in 0..b.rows {
-            if let Some(r) = b.lines.get_mut(row) {
-                r.cells.iter_mut().for_each(|c| *c = cell);
-                r.combining.clear();
-            }
-        }
+        b.clear_all(Cell::new('E'));
         b.cursor = Cursor::default();
     }
 
@@ -3036,7 +3075,7 @@ mod tests {
         assert_eq!(s.cursor(), (1, 1));
         assert_eq!(s.cell(1, 0).rune, 'e');
         // The wrapped row is flagged for reflow/selection.
-        assert!(s.cell(0, 3).attrs.contains(Attrs::WRAPPED));
+        assert!(s.row_wraps(0));
     }
 
     #[test]
@@ -3486,7 +3525,7 @@ mod tests {
         feed(&mut s, b"abcde");
         assert_eq!(s.row_string(0).trim_end(), "abc");
         assert_eq!(s.row_string(1).trim_end(), "de");
-        assert!(s.cell(0, 2).attrs.contains(Attrs::WRAPPED));
+        assert!(s.row_wraps(0));
     }
 
     #[test]
@@ -3999,7 +4038,7 @@ mod tests {
         // is not a link, so the scan must read the logical line, not the display row.
         let mut s = Screen::new(16, 3);
         feed(&mut s, b"go https://example.com/xy");
-        assert!(s.cell(0, 15).attrs.contains(Attrs::WRAPPED));
+        assert!(s.row_wraps(0));
         let mut probe = LinkProbe::default();
         // Hovering either half yields the whole link, spanning the wrap.
         let hit = ((0, 3), (1, 8));
@@ -4298,8 +4337,84 @@ mod tests {
         // copy it as one unbroken logical line (no newline at the wrap point).
         let mut s = Screen::new(4, 3);
         feed(&mut s, b"abcdef"); // wraps: "abcd" | "ef"
-        assert!(s.cell(0, 3).attrs.contains(Attrs::WRAPPED));
+        assert!(s.row_wraps(0));
         assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 1, 1)), "abcdef");
+    }
+
+    #[test]
+    fn a_resize_keeps_a_soft_wrapped_line_joined() {
+        // The regression that started this: the wrap link used to live on the row's
+        // last cell, so widening stranded it mid-row and narrowing truncated it away.
+        // Either way the next copy across the wrap grew a newline out of nowhere.
+        for new_cols in [4, 6, 12, 3] {
+            let mut s = Screen::new(4, 3);
+            feed(&mut s, b"abcdef"); // wraps: "abcd" | "ef"
+            s.resize(new_cols, 3);
+            assert!(s.row_wraps(0), "{new_cols} cols: the wrap link survives");
+        }
+    }
+
+    #[test]
+    fn a_resized_wrapped_line_copies_unbroken() {
+        // The user-visible half of the same bug: drag over an old wrapped line after
+        // the window has been resized, and the clipboard must not break mid-sentence.
+        let mut s = Screen::new(4, 3);
+        feed(&mut s, b"abcdef"); // wraps: "abcd" | "ef"
+        s.resize(6, 3);
+        assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 1, 1)), "abcdef");
+    }
+
+    #[test]
+    fn a_recycled_row_never_inherits_a_wrap() {
+        // A row's storage is reused rather than reallocated, so a stale wrap link is the
+        // opposite failure mode: it glues two unrelated lines into one on copy. `DL`
+        // recycles the deleted row straight to the bottom of the region, which is the
+        // shortest path from a wrapped row to a blank one wearing its flag.
+        let mut s = Screen::new(4, 3);
+        feed(&mut s, b"abcdef"); // row 0 "abcd" wraps into row 1 "ef"
+        assert!(s.row_wraps(0));
+        feed(&mut s, b"\x1b[H\x1b[M"); // home, then delete row 0
+        assert_eq!(s.row_string(0).trim_end(), "ef");
+        assert!(!s.row_wraps(2), "the recycled row is not still wrapped");
+        // Two fresh lines in the recycled rows copy as two lines, not one.
+        feed(&mut s, b"\x1b[2;1Hxy\r\nzw");
+        assert_eq!(s.selection_text(at(&s, 1, 0), at(&s, 2, 1)), "xy\nzw");
+    }
+
+    #[test]
+    fn rewriting_the_last_column_ends_the_wrap() {
+        // The wrap link is only true while the text that wrapped is still the text in
+        // the final column. Overwrite it (here without wrapping again) and the line
+        // ends there, so a copy across the two rows takes the newline back.
+        let mut s = Screen::new(4, 3);
+        feed(&mut s, b"abcdef"); // "abcd" wraps into "ef"
+        feed(&mut s, b"\x1b[1;4Hz"); // print 'z' over the last column of row 0
+        assert!(!s.row_wraps(0));
+        assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 1, 1)), "abcz\nef");
+    }
+
+    #[test]
+    fn erasing_the_tail_of_a_wrapped_row_ends_the_wrap() {
+        // EL 0 (cursor to end of line) takes the wrapped text with it; so does DCH,
+        // which blanks the tail as it shifts the rest left. Neither leaves a line that
+        // still continues onto the next row.
+        for erase in [&b"\x1b[1;3H\x1b[K"[..], &b"\x1b[1;3H\x1b[2P"[..]] {
+            let mut s = Screen::new(4, 3);
+            feed(&mut s, b"abcdef");
+            assert!(s.row_wraps(0));
+            feed(&mut s, erase);
+            assert!(!s.row_wraps(0), "{erase:?} ends the line");
+        }
+    }
+
+    #[test]
+    fn a_hard_newline_at_the_margin_is_not_a_wrap() {
+        // The case the flag exists to tell apart: text that exactly fills the row and
+        // then ends with a real newline is two lines, and must copy as two.
+        let mut s = Screen::new(4, 3);
+        feed(&mut s, b"abcd\r\nef");
+        assert!(!s.row_wraps(0));
+        assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 1, 1)), "abcd\nef");
     }
 
     #[test]
