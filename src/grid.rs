@@ -1868,6 +1868,17 @@ impl Screen {
                 }
             }
         }
+        // What we said back. Half of what a terminal *does* is answer questions, and none
+        // of it shows up on the grid — a wrong reply to `OSC 11` leaves the screen
+        // pixel-identical and the editor's colours wrong. So a golden test that cannot
+        // see the replies cannot see half the terminal. Only emitted when there are any,
+        // so a fixture that asks nothing looks exactly as it did before.
+        if !self.responses.is_empty() {
+            out.push_str("replies:\n");
+            for reply in split_replies(&self.responses) {
+                let _ = writeln!(out, "{}", escape_reply(reply));
+            }
+        }
         out
     }
 
@@ -3365,6 +3376,49 @@ fn default_tabs(cols: usize) -> Vec<bool> {
 /// delimiter. A blank cell's rune is a space, so it bounds a word too.
 fn is_word_boundary(c: char) -> bool {
     c.is_whitespace() || matches!(c, '{' | '}' | '[' | ']' | '(' | ')' | '"' | '\'' | '`')
+}
+
+/// Split the reply buffer into individual replies, so a snapshot shows one per line.
+///
+/// Every reply we emit begins with `ESC`, which makes the boundary almost unambiguous —
+/// the exception being the `ESC \` that *terminates* a DCS reply, which opens nothing and
+/// belongs to the reply in front of it.
+fn split_replies(responses: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, &byte) in responses.iter().enumerate() {
+        let terminator = responses.get(i + 1) == Some(&b'\\');
+        if byte == 0x1b && i > start && !terminator {
+            if let Some(reply) = responses.get(start..i) {
+                out.push(reply);
+            }
+            start = i;
+        }
+    }
+    if let Some(reply) = responses.get(start..) {
+        if !reply.is_empty() {
+            out.push(reply);
+        }
+    }
+    out
+}
+
+/// One reply, readable: the control bytes named rather than printed, so a golden diff
+/// reads like the sequence it is instead of a hex dump.
+fn escape_reply(reply: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for &byte in reply {
+        match byte {
+            0x1b => out.push_str("<ESC>"),
+            0x07 => out.push_str("<BEL>"),
+            0x20..=0x7e => out.push(char::from(byte)),
+            _ => {
+                let _ = write!(out, "<{byte:#04x}>");
+            }
+        }
+    }
+    out
 }
 
 /// Decode the hex that XTGETTCAP encodes capability names in. `None` on anything that is
