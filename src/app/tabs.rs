@@ -428,10 +428,31 @@ impl Tabs {
         if self.is_empty() {
             return false;
         }
+        // A child mid-frame under synchronized output holds the *whole* frame back, tab
+        // strip included: the strip is composed over the same grid, so painting it would
+        // put exactly the half-drawn screen on display that the child asked us to avoid.
+        if self.active_holds_frame() {
+            return false;
+        }
         self.entries
             .get(self.active)
             .is_some_and(|entry| entry.core.dirty)
             || self.bar_dirty
+    }
+
+    /// Whether the visible child is mid-frame under `?2026`.
+    fn active_holds_frame(&self) -> bool {
+        self.entries
+            .get(self.active)
+            .is_some_and(|entry| entry.core.holds_frame())
+    }
+
+    /// The visible child's synchronized-output deadline, for the event-loop wait: with
+    /// no output to wake us, nothing else would.
+    pub(super) fn sync_deadline(&self) -> Option<Instant> {
+        self.entries
+            .get(self.active)
+            .and_then(|entry| entry.core.sync_deadline())
     }
 
     /// Mark the visible terminal for repaint.

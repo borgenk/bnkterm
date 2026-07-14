@@ -736,11 +736,16 @@ impl State {
         let scrollbar = (self.frame_callback == 0)
             .then(|| self.tabs.scrollbar_retry_at())
             .flatten();
-        [self.tabs.blink_deadline(), self.repeat_at, scrollbar]
-            .into_iter()
-            .flatten()
-            .map(due)
-            .min()
+        [
+            self.tabs.blink_deadline(),
+            self.repeat_at,
+            scrollbar,
+            self.tabs.sync_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(due)
+        .min()
     }
 
     /// A logical (surface-local) length in device pixels at the current scale,

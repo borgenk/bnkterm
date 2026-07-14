@@ -1168,6 +1168,11 @@ pub struct Screen {
     /// (`OSC 4/10/11/12` with a `?`) and write it, so it has to live where the escape
     /// sequences can reach it. The renderer borrows it at paint time.
     theme: Theme,
+    /// Synchronized output (`?2026`): the child has asked us to hold the frame until it
+    /// finishes drawing, so it is never seen half-painted. The grid keeps *updating*
+    /// while this is set — only presentation waits. The grid owns no clock, so the
+    /// timeout that stops a dead child freezing the window lives in the app.
+    synchronized: bool,
 }
 
 /// Which of the three named colours an `OSC 10/11/12` is about.
@@ -1212,6 +1217,7 @@ impl Screen {
             kitty_stack: Vec::new(),
             modify_other_keys: ModifyOtherKeys::default(),
             theme: Theme::default(),
+            synchronized: false,
         }
     }
 
@@ -2473,6 +2479,62 @@ impl Screen {
 
     // ---- modes --------------------------------------------------------------
 
+    /// DECRQM (`CSI ? Ps $ p`, and `CSI Ps $ p` for the ANSI modes): "do you know this
+    /// mode, and is it on?" Answered with DECRPM, `CSI ? Ps ; Pm $ y`.
+    ///
+    /// This is how anything we implement ever gets *used*. nvim asks five of these
+    /// before it draws a single character, and a terminal that stays silent is told
+    /// nothing and assumes nothing — so a mode we add and never report is a mode nobody
+    /// will ever turn on.
+    ///
+    /// The values are 0 not recognised, 1 set, 2 reset, 3 permanently set, 4 permanently
+    /// reset. Answering *honestly* is the whole job: a mode we do not implement must
+    /// report **0**, never 2. Reporting 2 says "I know that mode, and it is currently
+    /// off", which invites the program to switch it on and then depend on it. A lie here
+    /// is worse than the silence it replaces.
+    fn report_mode(&mut self, mode: u16, private: bool) {
+        let state = match self.mode_state(mode, private) {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        };
+        self.respond(if private { b"\x1b[?" } else { b"\x1b[" });
+        push_decimal(&mut self.responses, u32::from(mode));
+        self.responses.push(b';');
+        push_decimal(&mut self.responses, state);
+        self.respond(b"$y");
+    }
+
+    /// Whether we implement `mode`, and if so whether it is currently on. `None` means
+    /// we do not know it, which is exactly what DECRQM needs to hear and the one thing
+    /// it must never be told falsely.
+    ///
+    /// Every mode [`set_mode`](Self::set_mode) acts on appears here, and nothing else
+    /// does. If you teach the terminal a new mode, teach this at the same time — the two
+    /// lists disagreeing is how a terminal ends up claiming a feature it does not have.
+    fn mode_state(&self, mode: u16, private: bool) -> Option<bool> {
+        if !private {
+            return match mode {
+                4 => Some(self.insert_mode), // IRM
+                _ => None,
+            };
+        }
+        Some(match mode {
+            1 => self.app_cursor_keys,
+            6 => self.origin_mode,
+            7 => self.autowrap,
+            25 => self.cursor_visible,
+            47 | 1047 | 1049 => self.on_alt,
+            1000 => self.mouse.protocol == MouseProtocol::Press,
+            1002 => self.mouse.protocol == MouseProtocol::ButtonEvent,
+            1003 => self.mouse.protocol == MouseProtocol::AnyEvent,
+            1006 => self.mouse.sgr,
+            2004 => self.bracketed_paste,
+            2026 => self.synchronized,
+            _ => return None,
+        })
+    }
+
     /// Set or reset a mode. `private` distinguishes the DEC private modes
     /// (`?`-prefixed, like DECAWM) from the ANSI modes (like IRM).
     pub fn set_mode(&mut self, mode: u16, private: bool, enable: bool) {
@@ -2496,6 +2558,7 @@ impl Screen {
                     }
                 }
                 2004 => self.bracketed_paste = enable,
+                2026 => self.synchronized = enable,
                 // Mouse reporting: the ?1000/?1002/?1003 levels are mutually
                 // exclusive (enabling one, or disabling any, sets the level);
                 // ?1006 is the orthogonal SGR encoding flag.
@@ -2782,6 +2845,12 @@ impl Screen {
     /// DECKPAM/DECKPNM keypad mode, read by the input encoder (phase 3).
     pub fn keypad_app(&self) -> bool {
         self.keypad_app
+    }
+
+    /// Whether the child is mid-frame under synchronized output (`?2026`), and would
+    /// rather we showed nothing than showed it half-drawn.
+    pub fn synchronized(&self) -> bool {
+        self.synchronized
     }
 
     /// The palette in force. The renderer borrows this at paint time; a program can have
@@ -3246,16 +3315,15 @@ impl Perform for Screen {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], private: u8, action: u8) {
-        // DECSTR (`CSI ! p`), the soft reset.
-        if intermediates == [b'!'] && action == b'p' && private == 0 {
-            self.soft_reset();
-            return;
-        }
-        // DECSCUSR (`CSI Ps SP q`) is the one CSI-with-intermediate we act on; the
-        // rest are dropped rather than misreading the final byte.
-        if intermediates == [b' '] && action == b'q' && private == 0 {
-            self.set_cursor_style(params.value(0));
-            return;
+        // The sequences carrying an intermediate byte. Each is matched on the
+        // intermediate, the private marker *and* the final byte together — see
+        // `csi_private` for what happens when a final byte is trusted on its own.
+        match (intermediates, private, action) {
+            ([b'!'], 0, b'p') => return self.soft_reset(), // DECSTR
+            ([b'$'], 0, b'p') => return self.report_mode(params.value(0), false), // DECRQM
+            ([b'$'], b'?', b'p') => return self.report_mode(params.value(0), true), // DECRQM
+            ([b' '], 0, b'q') => return self.set_cursor_style(params.value(0)), // DECSCUSR
+            _ => {}
         }
         if !intermediates.is_empty() {
             return;
@@ -5283,6 +5351,56 @@ mod tests {
         // DSR status: OK.
         feed(&mut s, b"\x1b[5n");
         assert_eq!(s.take_responses(), b"\x1b[0n");
+    }
+
+    #[test]
+    fn decrqm_reports_the_modes_we_have_and_admits_the_ones_we_do_not() {
+        // Of the five nvim asks before drawing anything, we implement one. The honest
+        // answer for the rest is 0 ("I do not know this mode") — never 2, which would
+        // mean "I know it and it is off" and invite nvim to turn it on and rely on it.
+        let mut s = Screen::new(10, 2);
+        for mode in [b"2027", b"2031", b"2048"] {
+            let mut q = b"\x1b[?".to_vec();
+            q.extend_from_slice(mode);
+            q.extend_from_slice(b"$p");
+            feed(&mut s, &q);
+            let mut want = b"\x1b[?".to_vec();
+            want.extend_from_slice(mode);
+            want.extend_from_slice(b";0$y");
+            assert_eq!(
+                s.take_responses(),
+                want,
+                "mode {mode:?} is not ours to claim"
+            );
+        }
+
+        // The ones we do implement report their real state, and follow it as it changes.
+        feed(&mut s, b"\x1b[?7$p"); // DECAWM, on by default
+        assert_eq!(s.take_responses(), b"\x1b[?7;1$y");
+        feed(&mut s, b"\x1b[?7l\x1b[?7$p"); // turn it off, ask again
+        assert_eq!(s.take_responses(), b"\x1b[?7;2$y");
+
+        feed(&mut s, b"\x1b[?2004$p"); // bracketed paste, off by default
+        assert_eq!(s.take_responses(), b"\x1b[?2004;2$y");
+        feed(&mut s, b"\x1b[?2004h\x1b[?2004$p");
+        assert_eq!(s.take_responses(), b"\x1b[?2004;1$y");
+
+        // Synchronized output: we *do* implement it, so it reports honestly rather than
+        // 0 — which is the whole point of answering, since a mode nobody can discover is
+        // a mode nobody will ever use.
+        feed(&mut s, b"\x1b[?2026$p");
+        assert_eq!(s.take_responses(), b"\x1b[?2026;2$y");
+        feed(&mut s, b"\x1b[?2026h\x1b[?2026$p");
+        assert_eq!(s.take_responses(), b"\x1b[?2026;1$y");
+
+        // The ANSI space answers on its own form, without the `?`.
+        feed(&mut s, b"\x1b[4$p"); // IRM
+        assert_eq!(s.take_responses(), b"\x1b[4;2$y");
+        feed(&mut s, b"\x1b[4h\x1b[4$p");
+        assert_eq!(s.take_responses(), b"\x1b[4;1$y");
+        // And an ANSI mode we do not know is 0, like any other.
+        feed(&mut s, b"\x1b[20$p"); // LNM
+        assert_eq!(s.take_responses(), b"\x1b[20;0$y");
     }
 
     #[test]

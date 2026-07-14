@@ -40,6 +40,16 @@ use crate::vt::Parser;
 /// The cursor blink half-period: how long each of the on/off phases lasts.
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
+/// How long a child may hold a frame under synchronized output (`?2026`) before we show
+/// it anyway.
+///
+/// The lock is held by the *child*, which means a child that crashes between "begin
+/// frame" and "end frame" — or simply forgets the second one — would otherwise freeze
+/// the window for good. The escape hatch is not optional, and it is why this mode is
+/// safe to implement at all. 150ms is kitty's figure: far longer than any real frame,
+/// far shorter than a user notices something is wrong.
+const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
+
 /// Lines the scrollback view moves per wheel notch, and arrows sent per notch
 /// when the wheel falls back to arrow keys on the alt screen.
 const WHEEL_LINES: usize = 3;
@@ -111,6 +121,9 @@ pub(super) struct TerminalCore {
     /// when not blinking, e.g. unfocused). Activity resets it to on.
     blink_on: bool,
     blink_at: Option<Instant>,
+    /// When the current synchronized-output lock gives up and we present regardless.
+    /// `None` when the child is not holding a frame.
+    sync_until: Option<Instant>,
     /// What the child's tty is doing, as of the last time its output settled (see
     /// [`refresh_tty_mode`](Self::refresh_tty_mode)). Cached rather than probed per
     /// frame because it changes only when the child calls `tcsetattr`, and because a
@@ -203,6 +216,7 @@ impl TerminalCore {
             focused: false,
             blink_on: true,
             blink_at: None,
+            sync_until: None,
             tty_mode: TtyMode::Cooked,
             mouse_held: None,
             selection: None,
@@ -902,6 +916,35 @@ impl TerminalCore {
         self.bump_cursor();
         self.dirty = true;
         self.refresh_title();
+        self.track_sync_lock();
+    }
+
+    /// Follow the child in and out of synchronized output (`?2026`).
+    ///
+    /// Entering starts the clock; leaving stops it. The deadline is set once on the way
+    /// in and not extended by later output, because the point is to bound how long a
+    /// *frame* can take, and a child that keeps writing while holding the lock is exactly
+    /// the case that must not be able to hold it forever.
+    fn track_sync_lock(&mut self) {
+        if !self.screen.synchronized() {
+            self.sync_until = None;
+        } else if self.sync_until.is_none() {
+            self.sync_until = Some(Instant::now() + SYNC_TIMEOUT);
+        }
+    }
+
+    /// Whether the child is mid-frame and the frame should wait for it.
+    ///
+    /// False once the deadline passes, even though the child still holds the lock: at
+    /// that point we present what we have, exactly as if it had finished. A half-drawn
+    /// frame is a cosmetic problem; a window that never repaints again is not.
+    pub(super) fn holds_frame(&self) -> bool {
+        self.sync_until.is_some_and(|until| Instant::now() < until)
+    }
+
+    /// When to wake and present anyway, for the event loop's wait.
+    pub(super) fn sync_deadline(&self) -> Option<Instant> {
+        self.sync_until
     }
 
     /// Drop the selection, and any drag pinned to it, when the rows they name have
@@ -1427,6 +1470,48 @@ mod tests {
 
         assert!(core.dirty, "a mode change has to repaint");
         assert!(locked(&core), "the block cursor becomes a padlock");
+    }
+
+    #[test]
+    fn synchronized_output_holds_the_frame_and_then_shows_it_whole() {
+        // A program brackets a frame with `?2026 h` … `?2026 l` so it is never seen
+        // half-drawn. The grid keeps updating throughout — only the *presentation* waits.
+        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        core.feed_test_bytes(b"\x1b[?2026h");
+        assert!(core.holds_frame(), "the child is mid-frame");
+        assert!(core.dirty, "and we still know a frame is owed");
+
+        core.feed_test_bytes(b"\x1b[2J\x1b[Hhalf a frame");
+        assert!(core.holds_frame(), "output does not end the frame");
+        assert_eq!(
+            core.row_string(0).trim_end(),
+            "half a frame",
+            "the grid updated all along; only the screen waited"
+        );
+
+        core.feed_test_bytes(b"\x1b[?2026l");
+        assert!(!core.holds_frame(), "and now it goes up, all at once");
+        assert!(core.dirty);
+    }
+
+    #[test]
+    fn a_child_that_dies_mid_frame_cannot_freeze_the_window() {
+        // The lock is held by the child, so the child can lose it — crash between the two
+        // sequences, or simply never send the second. Without a deadline that is a window
+        // that never repaints again, which is far worse than the torn frame the mode
+        // exists to prevent. So the deadline is the feature, not a safety net bolted on.
+        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        core.feed_test_bytes(b"\x1b[?2026h");
+        assert!(core.holds_frame());
+
+        // The child is gone; nothing will ever send `?2026 l`. Pretend the deadline has
+        // passed rather than sleeping for it.
+        core.sync_until = Some(Instant::now() - Duration::from_millis(1));
+        assert!(!core.holds_frame(), "the frame goes up anyway");
+        assert!(
+            core.sync_deadline().is_some(),
+            "and the loop had a deadline to wake on, or nothing would have brought it back"
+        );
     }
 
     #[test]
