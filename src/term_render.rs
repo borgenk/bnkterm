@@ -60,7 +60,7 @@
 //! serve a span that is usually empty. A 13% frame regression established it.
 
 use crate::color::{Ground, Rgb, Theme};
-use crate::grid::{AbsRow, Attrs, Cell, RowEpoch, Screen};
+use crate::grid::{AbsRow, Attrs, Cell, RowEpoch, Screen, UnderlineStyle};
 use crate::platform::freetype::{FaceKey, FontStyle, Fonts};
 use crate::platform::geom::{Rect, Scale};
 use crate::platform::grapheme;
@@ -726,6 +726,95 @@ impl Painter<'_> {
         self.push_decorations(first, x, (end - col) as i32 * m.w, baseline, fg);
     }
 
+    /// One underline, in the shape the cell asked for (`SGR 4:n`).
+    ///
+    /// Every style is built from the one primitive the display list already has, a filled
+    /// rectangle, rather than by adding a shader or a new `DrawCmd`. A dash is a rect; a
+    /// double is two; a curly is a staircase of them.
+    ///
+    /// The staircase is the only one that costs anything, so it is stepped in whole
+    /// *pixels of period*, not per pixel: a wave with a period of roughly a third of a
+    /// cell reads as a squiggle at any size a terminal is legible at, and a run of 20
+    /// underlined cells costs a few dozen rects rather than several hundred. Underlines
+    /// are drawn per *run* of same-attribute cells, not per cell, so an editor squiggling
+    /// one diagnostic is a single call with one width.
+    fn push_underline(&mut self, style: UnderlineStyle, x: i32, w: i32, baseline: i32, fg: Rgb) {
+        let m = self.metrics;
+        let color = fg.to_u32();
+        let thickness = (m.size as i32 / 12).max(1);
+        let base = self.underline_rect(x, w, baseline);
+
+        match style {
+            UnderlineStyle::Single => self.list.push(DrawCmd::Fill { rect: base, color }),
+            UnderlineStyle::Double => {
+                // Two rules, with a gap of at least a pixel, sitting inside the space one
+                // underline would have had so the second never collides with the row below.
+                let gap = thickness.max(1);
+                self.list.push(DrawCmd::Fill {
+                    rect: Rect {
+                        h: thickness,
+                        ..base
+                    },
+                    color,
+                });
+                self.list.push(DrawCmd::Fill {
+                    rect: Rect {
+                        y: base.y + thickness + gap,
+                        h: thickness,
+                        ..base
+                    },
+                    color,
+                });
+            }
+            UnderlineStyle::Dotted | UnderlineStyle::Dashed => {
+                // A dash and its gap, tiled across the run. Dotted is a short dash; the
+                // difference is only the duty cycle.
+                let (dash, gap) = if style == UnderlineStyle::Dotted {
+                    (thickness, thickness)
+                } else {
+                    ((m.w / 3).max(2), (m.w / 4).max(2))
+                };
+                let mut at = base.x;
+                let end = base.x + base.w;
+                while at < end {
+                    self.list.push(DrawCmd::Fill {
+                        rect: Rect {
+                            x: at,
+                            w: dash.min(end - at),
+                            ..base
+                        },
+                        color,
+                    });
+                    at += dash + gap;
+                }
+            }
+            UnderlineStyle::Curly => {
+                // A triangle wave, drawn as a staircase of short rects. The amplitude is
+                // the underline's own thickness, which keeps the squiggle inside the
+                // descent at every font size instead of biting into the row below.
+                let step = (m.w / 3).max(2);
+                let amplitude = thickness;
+                let mut at = base.x;
+                let end = base.x + base.w;
+                let mut up = true;
+                while at < end {
+                    let y = if up { base.y } else { base.y + amplitude };
+                    self.list.push(DrawCmd::Fill {
+                        rect: Rect {
+                            x: at,
+                            y,
+                            w: step.min(end - at),
+                            h: thickness,
+                        },
+                        color,
+                    });
+                    at += step;
+                    up = !up;
+                }
+            }
+        }
+    }
+
     /// The box an underline rule occupies: `w` pixels from `x`, just below `baseline`.
     /// Shared by the SGR underline and the hovered link's rule, so the two can never
     /// end up at different heights.
@@ -745,11 +834,7 @@ impl Painter<'_> {
         let m = self.metrics;
         let thickness = (m.size as i32 / 12).max(1);
         if cell.attrs.contains(Attrs::UNDERLINE) {
-            let rect = self.underline_rect(x, run_w, baseline);
-            self.list.push(DrawCmd::Fill {
-                rect,
-                color: fg.to_u32(),
-            });
+            self.push_underline(cell.attrs.underline_style(), x, run_w, baseline, fg);
         }
         if cell.attrs.contains(Attrs::STRIKE) {
             self.list.push(DrawCmd::Fill {
@@ -1686,6 +1771,71 @@ mod tests {
         assert_eq!(rule.0.x, 0);
         assert_eq!(rule.0.w, 2 * M.w, "the rule spans the whole run");
         assert_eq!(rule.1, t.fg.to_u32());
+    }
+
+    #[test]
+    fn each_underline_style_draws_a_different_shape() {
+        // The point of the whole feature: an editor squiggling an error must not come out
+        // looking like an editor underlining a link. Every style is built from the one
+        // primitive the display list has (a filled rect), so the difference is in how many
+        // and where.
+        let under = |seq: &[u8]| {
+            let mut s = Screen::new(6, 1);
+            let mut p = crate::vt::Parser::new();
+            p.advance_bytes(&mut s, seq);
+            p.advance_bytes(&mut s, b"ok"); // two cells, so a run is 2 * M.w wide
+            let t = Theme::default();
+            let list = list_of(&s);
+            fills(&list)
+                .into_iter()
+                .filter(|(r, c)| r.y > M.baseline && *c == t.fg.to_u32())
+                .map(|(r, _)| r)
+                .collect::<Vec<_>>()
+        };
+
+        // Single: one rule spanning the run.
+        let single = under(b"\x1b[4m");
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].w, 2 * M.w);
+
+        // Double: two rules, one below the other, both spanning the run.
+        let double = under(b"\x1b[4:2m");
+        assert_eq!(double.len(), 2);
+        assert_eq!(double[0].w, 2 * M.w);
+        assert_eq!(double[1].w, 2 * M.w);
+        assert!(double[1].y > double[0].y, "the second sits below the first");
+
+        // Curly: a staircase, alternating between two heights.
+        let curly = under(b"\x1b[4:3m");
+        assert!(curly.len() > 2, "a squiggle is more than a line");
+        let heights: Vec<i32> = curly.iter().map(|r| r.y).collect();
+        assert!(
+            heights.windows(2).all(|w| w[0] != w[1]),
+            "it goes up and down: {heights:?}"
+        );
+        assert_eq!(
+            heights
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            2,
+            "between exactly two heights, so it stays inside the descent"
+        );
+
+        // Dotted and dashed: a run of marks with gaps, at one height.
+        for seq in [&b"\x1b[4:4m"[..], &b"\x1b[4:5m"[..]] {
+            let dashes = under(seq);
+            assert!(dashes.len() > 1, "{seq:?} is more than one mark");
+            assert!(dashes.iter().all(|r| r.y == dashes[0].y), "{seq:?} is flat");
+            assert!(
+                dashes.iter().all(|r| r.w < 2 * M.w),
+                "{seq:?} has gaps in it"
+            );
+        }
+
+        // And the cost stays bounded: a squiggle under two cells is a handful of rects,
+        // not one per pixel. The damage diff walks this list every painted frame.
+        assert!(curly.len() <= 8, "{} rects for two cells", curly.len());
     }
 
     #[test]

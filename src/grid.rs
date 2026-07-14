@@ -168,6 +168,19 @@ struct Scrolled {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Attrs(u16);
 
+/// How an underline is drawn: `SGR 4:n`, where `4:0` is no underline at all, `4:1` the
+/// plain one, and the rest are the shapes an editor uses to mean something. The curly one
+/// is why this exists — every LSP in use marks an error by squiggling under it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum UnderlineStyle {
+    #[default]
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
 impl Attrs {
     pub const BOLD: Attrs = Attrs(1 << 0);
     pub const DIM: Attrs = Attrs(1 << 1);
@@ -182,6 +195,43 @@ impl Attrs {
     pub const WIDE_LEADER: Attrs = Attrs(1 << 7);
     /// The right half of a wide character; a placeholder the cursor skips.
     pub const WIDE_SPACER: Attrs = Attrs(1 << 8);
+
+    /// Bits 9-11: how the underline is drawn ([`UnderlineStyle`]), not *whether* it is —
+    /// that is still [`UNDERLINE`](Self::UNDERLINE), and the style only means anything
+    /// alongside it.
+    ///
+    /// It lives in the bitfield's spare bits because it *fits*, and that is the whole
+    /// design decision: a `Cell` is 16 bytes and the damage diff compares two screenfuls
+    /// of them every painted frame, so carrying the style in a new field would have cost
+    /// the entire grid 25% to decorate the handful of cells an editor squiggles. The
+    /// underline *colour* (SGR 58) does not fit, which is exactly why it is still parsed,
+    /// consumed and dropped rather than stored.
+    const UNDERLINE_STYLE_SHIFT: u16 = 9;
+    const UNDERLINE_STYLE_MASK: u16 = 0b111 << Attrs::UNDERLINE_STYLE_SHIFT;
+
+    /// How the underline on this cell is drawn. Meaningless without
+    /// [`UNDERLINE`](Self::UNDERLINE), and [`UnderlineStyle::Single`] for every cell that
+    /// never asked for anything else.
+    pub fn underline_style(self) -> UnderlineStyle {
+        match (self.0 & Attrs::UNDERLINE_STYLE_MASK) >> Attrs::UNDERLINE_STYLE_SHIFT {
+            1 => UnderlineStyle::Double,
+            2 => UnderlineStyle::Curly,
+            3 => UnderlineStyle::Dotted,
+            4 => UnderlineStyle::Dashed,
+            _ => UnderlineStyle::Single,
+        }
+    }
+
+    pub fn set_underline_style(&mut self, style: UnderlineStyle) {
+        let bits = match style {
+            UnderlineStyle::Single => 0,
+            UnderlineStyle::Double => 1,
+            UnderlineStyle::Curly => 2,
+            UnderlineStyle::Dotted => 3,
+            UnderlineStyle::Dashed => 4,
+        };
+        self.0 = (self.0 & !Attrs::UNDERLINE_STYLE_MASK) | (bits << Attrs::UNDERLINE_STYLE_SHIFT);
+    }
 
     /// All flags, in bit order, with their names, for `Debug` and for tests.
     const ALL: [(Attrs, &'static str); 9] = [
@@ -200,8 +250,11 @@ impl Attrs {
         Attrs(0)
     }
 
+    /// No attributes at all. The style bits do not count: they say how an underline
+    /// *would* be drawn, and with no `UNDERLINE` there is none, so a cell carrying only a
+    /// stale style is as plain as one carrying nothing.
     pub const fn is_empty(self) -> bool {
-        self.0 == 0
+        self.0 & !Attrs::UNDERLINE_STYLE_MASK == 0
     }
 
     /// Whether every flag in `other` is set here.
@@ -258,6 +311,12 @@ impl fmt::Debug for Attrs {
                     f.write_str(name)?;
                     first = false;
                 }
+            }
+            // The style is not a flag, and a curly underline that printed the same as a
+            // straight one would be invisible in a golden dump — which is where a
+            // regression in it would otherwise hide.
+            if self.contains(Attrs::UNDERLINE) && self.underline_style() != UnderlineStyle::Single {
+                write!(f, ":{:?}", self.underline_style())?;
             }
         }
         f.write_str(")")
@@ -2472,9 +2531,26 @@ impl Screen {
                 // kind and that is what the cell records. Storing *which* style needs a
                 // wider `Attrs` and a cell field; until then a curly underline shows up
                 // as a straight one, which is the right kind of wrong.
+                // `4` underlines; `4:n` says with what shape. `4:0` is the one
+                // sub-parameter of 4 that is not an underline at all.
                 4 => match param.get(1).copied() {
-                    Some(0) => self.pen.attrs.remove(Attrs::UNDERLINE),
-                    _ => self.pen.attrs.insert(Attrs::UNDERLINE),
+                    Some(0) => {
+                        self.pen.attrs.remove(Attrs::UNDERLINE);
+                        self.pen.attrs.set_underline_style(UnderlineStyle::Single);
+                    }
+                    style => {
+                        // An unknown style is still an underline: better a straight line
+                        // where a program wanted a fancy one than no mark at all.
+                        let style = match style {
+                            Some(2) => UnderlineStyle::Double,
+                            Some(3) => UnderlineStyle::Curly,
+                            Some(4) => UnderlineStyle::Dotted,
+                            Some(5) => UnderlineStyle::Dashed,
+                            _ => UnderlineStyle::Single,
+                        };
+                        self.pen.attrs.insert(Attrs::UNDERLINE);
+                        self.pen.attrs.set_underline_style(style);
+                    }
                 },
                 7 => self.pen.attrs.insert(Attrs::REVERSE),
                 8 => self.pen.attrs.insert(Attrs::HIDDEN),
@@ -2482,7 +2558,10 @@ impl Screen {
                 21 => self.pen.attrs.remove(Attrs::BOLD),
                 22 => self.pen.attrs.remove(Attrs::BOLD | Attrs::DIM),
                 23 => self.pen.attrs.remove(Attrs::ITALIC),
-                24 => self.pen.attrs.remove(Attrs::UNDERLINE),
+                24 => {
+                    self.pen.attrs.remove(Attrs::UNDERLINE);
+                    self.pen.attrs.set_underline_style(UnderlineStyle::Single);
+                }
                 27 => self.pen.attrs.remove(Attrs::REVERSE),
                 28 => self.pen.attrs.remove(Attrs::HIDDEN),
                 29 => self.pen.attrs.remove(Attrs::STRIKE),
@@ -4507,6 +4586,59 @@ mod tests {
         feed(&mut s, b"\x1b[4:3;58:2::255:0:0;38:2::0:255:0m");
         assert!(s.pen.attrs.contains(Attrs::UNDERLINE), "underlined");
         assert_eq!(s.pen.fg, Color::Rgb(0, 255, 0), "and the colour survived");
+    }
+
+    #[test]
+    fn an_underline_carries_its_style_without_growing_a_cell() {
+        // The design decision, pinned. A `Cell` is 16 bytes and the damage diff compares
+        // two screenfuls of them every painted frame; the style rides in the spare bits of
+        // the attribute bitfield precisely so squiggling one diagnostic does not cost the
+        // whole grid 25%. If this test starts failing, someone has paid that price.
+        assert_eq!(std::mem::size_of::<Cell>(), 16);
+
+        let mut s = Screen::new(10, 1);
+        feed(&mut s, b"\x1b[4:3max"); // the curly underline nvim marks an error with
+        let cell = s.cell(0, 0);
+        assert!(cell.attrs.contains(Attrs::UNDERLINE));
+        assert_eq!(cell.attrs.underline_style(), UnderlineStyle::Curly);
+
+        for (seq, want) in [
+            (&b"\x1b[4m"[..], UnderlineStyle::Single),
+            (&b"\x1b[4:1m"[..], UnderlineStyle::Single),
+            (&b"\x1b[4:2m"[..], UnderlineStyle::Double),
+            (&b"\x1b[4:3m"[..], UnderlineStyle::Curly),
+            (&b"\x1b[4:4m"[..], UnderlineStyle::Dotted),
+            (&b"\x1b[4:5m"[..], UnderlineStyle::Dashed),
+            // A style we have never heard of is still an underline: better a straight
+            // line where a program wanted a fancy one than no mark at all.
+            (&b"\x1b[4:9m"[..], UnderlineStyle::Single),
+        ] {
+            feed(&mut s, b"\x1b[0m");
+            feed(&mut s, seq);
+            assert!(s.pen.attrs.contains(Attrs::UNDERLINE), "{seq:?}");
+            assert_eq!(s.pen.attrs.underline_style(), want, "{seq:?}");
+        }
+    }
+
+    #[test]
+    fn turning_the_underline_off_takes_its_style_with_it() {
+        // Otherwise a stale style would sit in the bits, and the next bare `SGR 4` would
+        // come out curly because something squiggled an hour ago.
+        let mut s = Screen::new(10, 1);
+        feed(&mut s, b"\x1b[4:3m"); // curly
+        feed(&mut s, b"\x1b[24m"); // underline off
+        assert!(!s.pen.attrs.contains(Attrs::UNDERLINE));
+        assert!(
+            s.pen.attrs.is_empty(),
+            "no attribute survives, style included"
+        );
+        feed(&mut s, b"\x1b[4m"); // a plain underline, and it had better be plain
+        assert_eq!(s.pen.attrs.underline_style(), UnderlineStyle::Single);
+
+        // `4:0` is the other way to say it.
+        feed(&mut s, b"\x1b[4:3m\x1b[4:0m");
+        assert!(!s.pen.attrs.contains(Attrs::UNDERLINE));
+        assert!(s.pen.attrs.is_empty());
     }
 
     #[test]
