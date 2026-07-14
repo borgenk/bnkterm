@@ -113,6 +113,20 @@ const SCROLL_INSET: i32 = 3;
 /// Shortest the thumb gets, so even a 100k-line scrollback leaves something to grab.
 const SCROLL_MIN_THUMB: i32 = 30;
 
+/// The colour the whole surface is filled with: the theme background, lifted a third of
+/// the way toward the foreground while the bell is ringing.
+///
+/// It lives here, and not inline in the painter, because the GPU clear must use the very
+/// same colour as the display list's base fill — two places computing "the background"
+/// separately is exactly how a flash tears at the edges.
+pub fn bell_background(theme: &Theme, bell: bool) -> Rgb {
+    if bell {
+        theme.bg.mix(theme.fg, 1, 3)
+    } else {
+        theme.bg
+    }
+}
+
 /// The bar's ink, and the coverages it is tinted onto the theme background at: the
 /// resting thumb, the thumb once the pointer has lifted it, and the trough behind it.
 /// The fade is these falling to zero (the display list has no alpha; see
@@ -318,6 +332,10 @@ pub struct FrameInputs<'a> {
     /// The display scale, so the scrollbar's logical pixel constants land at the right
     /// device size. [`Scale::ONE`] in a test or a headless build.
     pub scale: Scale,
+    /// The bell is ringing: paint the background lifted toward the foreground for the
+    /// moment the flash lasts. A terminal bell on a modern desktop is something you
+    /// *see*; nobody wants a beep out of a terminal in 2026.
+    pub bell: bool,
     /// The overlay scrollbar, as lit and as wide as its last tick left it. The bar
     /// carries no geometry: the painter derives that from the grid and the screen's
     /// [`Screen::scroll_extent`] each frame.
@@ -411,6 +429,7 @@ pub fn build_display_list_into(
     let mut painter = Painter {
         screen: inputs.screen,
         theme: inputs.theme,
+        bell: inputs.bell,
         metrics: inputs.metrics,
         origin: inputs.origin,
         selection: inputs.selection,
@@ -511,6 +530,8 @@ impl DisplayListPool {
 struct Painter<'a> {
     screen: &'a Screen,
     theme: &'a Theme,
+    /// The bell is mid-flash; the base background lifts for it.
+    bell: bool,
     metrics: CellMetrics,
     /// The grid's top-left pixel in the surface: the window padding inset. Every
     /// cell coordinate is measured from here (via [`Self::cell_x`]/[`Self::cell_y`]),
@@ -571,7 +592,7 @@ impl Painter<'_> {
                 w: surface.0.max(0),
                 h: surface.1.max(0),
             },
-            color: self.theme.bg.to_u32(),
+            color: bell_background(self.theme, self.bell).to_u32(),
         });
     }
 
@@ -1412,6 +1433,7 @@ mod tests {
     fn inputs<'a>(s: &'a Screen, theme: &'a Theme) -> FrameInputs<'a> {
         FrameInputs {
             screen: s,
+            bell: false,
             theme,
             metrics: M,
             surface: (s.dimensions().0 as i32 * M.w, s.dimensions().1 as i32 * M.h),

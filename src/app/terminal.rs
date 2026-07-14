@@ -26,7 +26,7 @@ use crate::color::Theme;
 use crate::config::TabBarConfig;
 use crate::error::Result;
 use crate::gather::{GatherEnd, Gatherer};
-use crate::grid::{AbsRow, CursorStyle, LinkProbe, RowEpoch, Screen};
+use crate::grid::{AbsRow, ClipboardTarget, CursorStyle, LinkProbe, RowEpoch, Screen};
 use crate::input;
 use crate::mouse::{self, MouseButton, MouseKind};
 use crate::platform::browser;
@@ -49,6 +49,11 @@ const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 /// safe to implement at all. 150ms is kitty's figure: far longer than any real frame,
 /// far shorter than a user notices something is wrong.
 const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// How long the visual bell lasts. Long enough to catch the eye, short enough that a
+/// program ringing the bell in a loop (a shell tab-completing against nothing does it)
+/// reads as a flicker and not a strobe.
+const BELL_FLASH: Duration = Duration::from_millis(120);
 
 /// Lines the scrollback view moves per wheel notch, and arrows sent per notch
 /// when the wheel falls back to arrow keys on the alt screen.
@@ -124,6 +129,8 @@ pub(super) struct TerminalCore {
     /// When the current synchronized-output lock gives up and we present regardless.
     /// `None` when the child is not holding a frame.
     sync_until: Option<Instant>,
+    /// When the visual bell stops flashing. `None` when it is not ringing.
+    bell_until: Option<Instant>,
     /// What the child's tty is doing, as of the last time its output settled (see
     /// [`refresh_tty_mode`](Self::refresh_tty_mode)). Cached rather than probed per
     /// frame because it changes only when the child calls `tcsetattr`, and because a
@@ -217,6 +224,7 @@ impl TerminalCore {
             blink_on: true,
             blink_at: None,
             sync_until: None,
+            bell_until: None,
             tty_mode: TtyMode::Cooked,
             mouse_held: None,
             selection: None,
@@ -408,7 +416,9 @@ impl TerminalCore {
     pub(super) fn clear_color(&self) -> u32 {
         // The grid owns the palette, because a program can change it (`OSC 11`). Read it
         // from there rather than keeping a second copy that would drift the moment it did.
-        self.screen.theme().bg.to_u32()
+        // The bell lifts it, and the clear must lift with it or the flash tears at the
+        // edges the display list does not cover.
+        term_render::bell_background(self.screen.theme(), self.bell_flashing()).to_u32()
     }
 
     /// Take the outbound messages for the window to act on, leaving the outbox
@@ -482,6 +492,12 @@ impl TerminalCore {
                     if let Some(pty) = &self.pty {
                         let _ = pty.resize(cols, rows);
                     }
+                    // `?2048`: the same news in band, for the child that asked. SIGWINCH
+                    // reaches only this side of the pty, so a program behind ssh or tmux
+                    // hears nothing from it. Silent unless it was asked for.
+                    self.screen.set_pixel_size(width, height);
+                    self.screen.report_size();
+                    self.flush_responses()?;
                 }
                 self.prune_selection();
                 self.dirty = true;
@@ -489,6 +505,11 @@ impl TerminalCore {
             }
             ToTerminal::Focus(focused) => {
                 self.focused = focused;
+                // `?1004`: the child asked to be told. Flushed straight away — a focus
+                // change need not be followed by any output, so waiting for the next pump
+                // could sit on it indefinitely.
+                self.screen.report_focus(focused);
+                self.flush_responses()?;
                 if focused {
                     self.bump_cursor(); // start blinking from a lit cursor
                 } else {
@@ -917,6 +938,43 @@ impl TerminalCore {
         self.dirty = true;
         self.refresh_title();
         self.track_sync_lock();
+        self.flush_clipboard_writes();
+        if self.screen.take_bell() {
+            self.bell_until = Some(Instant::now() + BELL_FLASH);
+        }
+    }
+
+    /// Whether the visual bell is mid-flash.
+    pub(super) fn bell_flashing(&self) -> bool {
+        self.bell_until.is_some_and(|until| Instant::now() < until)
+    }
+
+    /// End the flash when its moment has passed, and repaint to take it back off.
+    /// Without this the lifted background would simply stay lifted.
+    pub(super) fn tick_bell_if_due(&mut self) {
+        if self.bell_until.is_some_and(|until| until <= Instant::now()) {
+            self.bell_until = None;
+            self.dirty = true;
+        }
+    }
+
+    /// When the flash ends, for the event-loop wait.
+    pub(super) fn bell_deadline(&self) -> Option<Instant> {
+        self.bell_until
+    }
+
+    /// Hand the child's `OSC 52` clipboard writes to the window, which owns the Wayland
+    /// data device. The same outbox the select-to-copy path uses: from here on it is
+    /// indistinguishable from the user having copied the text themselves, which is the
+    /// point — the terminal is the only process in the pipeline that is actually on the
+    /// user's desktop.
+    fn flush_clipboard_writes(&mut self) {
+        for (target, bytes) in self.screen.take_clipboard_writes() {
+            self.outbox.push(match target {
+                ClipboardTarget::Clipboard => ToWindow::OfferSelection(bytes),
+                ClipboardTarget::Primary => ToWindow::OfferPrimary(bytes),
+            });
+        }
     }
 
     /// Follow the child in and out of synchronized output (`?2026`).
@@ -1021,6 +1079,7 @@ impl TerminalCore {
             strings,
             &term_render::FrameInputs {
                 screen: &self.screen,
+                bell: self.bell_flashing(),
                 theme: self.screen.theme(),
                 metrics: self.metrics,
                 surface: (self.width as i32, self.height as i32),
@@ -1495,6 +1554,34 @@ mod tests {
     }
 
     #[test]
+    fn the_bell_flashes_and_the_clear_colour_flashes_with_it() {
+        // The GPU clear must use the same colour as the display list's base fill, or the
+        // flash tears along the edges the list does not cover. Two places computing "the
+        // background" independently is how that happens, so they compute it once.
+        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        let calm = core.clear_color();
+        assert!(!core.bell_flashing());
+
+        core.feed_test_bytes(b"\x07");
+        assert!(core.bell_flashing(), "the bell rang");
+        assert_ne!(
+            core.clear_color(),
+            calm,
+            "and the clear lifted with the fill"
+        );
+        assert!(core.bell_deadline().is_some(), "with a deadline to end it");
+
+        // The flash is not a state to be stuck in: when its moment passes it comes off,
+        // and the frame that takes it off has to be asked for.
+        core.bell_until = Some(Instant::now() - Duration::from_millis(1));
+        core.dirty = false;
+        core.tick_bell_if_due();
+        assert!(!core.bell_flashing());
+        assert!(core.dirty, "and it repaints to take the flash back off");
+        assert_eq!(core.clear_color(), calm);
+    }
+
+    #[test]
     fn a_child_that_dies_mid_frame_cannot_freeze_the_window() {
         // The lock is held by the child, so the child can lose it — crash between the two
         // sequences, or simply never send the second. Without a deadline that is a window
@@ -1595,6 +1682,7 @@ mod tests {
         let bar = Scrollbar::hidden();
         let list = term_render::build_display_list(&term_render::FrameInputs {
             screen: &s,
+            bell: false,
             theme: &Theme::default(),
             metrics,
             surface: (80 * 8, 24 * 16),

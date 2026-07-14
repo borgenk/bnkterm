@@ -455,6 +455,21 @@ impl Tabs {
             .and_then(|entry| entry.core.sync_deadline())
     }
 
+    /// The visible child's visual-bell deadline, likewise: the flash has to be taken back
+    /// off, and no output is coming to prompt it.
+    pub(super) fn bell_deadline(&self) -> Option<Instant> {
+        self.entries
+            .get(self.active)
+            .and_then(|entry| entry.core.bell_deadline())
+    }
+
+    /// End the visible child's bell flash if its moment has passed.
+    pub(super) fn tick_bell_if_due(&mut self) {
+        if let Some(entry) = self.entries.get_mut(self.active) {
+            entry.core.tick_bell_if_due();
+        }
+    }
+
     /// Mark the visible terminal for repaint.
     pub(super) fn mark_dirty(&mut self) {
         if let Some(entry) = self.entries.get_mut(self.active) {

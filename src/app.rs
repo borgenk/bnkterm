@@ -714,6 +714,7 @@ impl State {
     /// repeat is the window's (it holds the compositor's `repeat_info` and the held key).
     fn service_timers(&mut self) -> Result<()> {
         self.tabs.tick_blink_if_due();
+        self.tabs.tick_bell_if_due();
         self.tabs.tick_scrollbar();
         if self.repeat_at.is_some_and(|at| at <= Instant::now()) {
             self.fire_repeat()?;
@@ -741,6 +742,7 @@ impl State {
             self.repeat_at,
             scrollbar,
             self.tabs.sync_deadline(),
+            self.tabs.bell_deadline(),
         ]
         .into_iter()
         .flatten()

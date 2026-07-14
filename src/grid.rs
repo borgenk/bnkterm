@@ -1173,6 +1173,23 @@ pub struct Screen {
     /// while this is set — only presentation waits. The grid owns no clock, so the
     /// timeout that stops a dead child freezing the window lives in the app.
     synchronized: bool,
+    /// Text the child has asked to put on a selection (`OSC 52`). The grid owns no
+    /// compositor connection, so it queues the request here the same way it queues query
+    /// replies, and the app drains it and does the Wayland half.
+    clipboard_writes: Vec<(ClipboardTarget, Vec<u8>)>,
+    /// The child rang the bell (BEL, `0x07`) since the app last looked. What a bell
+    /// *means* is the app's business (a flash, a mark on the tab); all the grid knows is
+    /// that it was rung.
+    bell: bool,
+    /// Focus reporting (`?1004`): the child wants to be told when the window gains or
+    /// loses focus, so it can dim an inactive pane or pause an animation.
+    focus_events: bool,
+    /// In-band resize (`?2048`): the child wants the new size as an escape sequence,
+    /// not only as a SIGWINCH.
+    in_band_resize: bool,
+    /// The window's size in pixels, carried by the in-band resize report. The grid has no
+    /// other use for pixels and never computes them; the app sets this.
+    pixel_size: (u32, u32),
 }
 
 /// Which of the three named colours an `OSC 10/11/12` is about.
@@ -1181,6 +1198,14 @@ enum NamedColor {
     Foreground,
     Background,
     Cursor,
+}
+
+/// Which selection an `OSC 52` write is for. The X11 letters: `c` is the clipboard,
+/// `p` (and `s`, the primary/secondary muddle nobody kept straight) the primary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClipboardTarget {
+    Clipboard,
+    Primary,
 }
 
 /// How deep the kitty keyboard stack may go before a push starts dropping the oldest
@@ -1218,6 +1243,11 @@ impl Screen {
             modify_other_keys: ModifyOtherKeys::default(),
             theme: Theme::default(),
             synchronized: false,
+            clipboard_writes: Vec::new(),
+            bell: false,
+            focus_events: false,
+            in_band_resize: false,
+            pixel_size: (0, 0),
         }
     }
 
@@ -2529,6 +2559,8 @@ impl Screen {
             1002 => self.mouse.protocol == MouseProtocol::ButtonEvent,
             1003 => self.mouse.protocol == MouseProtocol::AnyEvent,
             1006 => self.mouse.sgr,
+            1004 => self.focus_events,
+            2048 => self.in_band_resize,
             2004 => self.bracketed_paste,
             2026 => self.synchronized,
             _ => return None,
@@ -2557,6 +2589,8 @@ impl Screen {
                         self.restore_cursor();
                     }
                 }
+                1004 => self.focus_events = enable,
+                2048 => self.set_in_band_resize(enable),
                 2004 => self.bracketed_paste = enable,
                 2026 => self.synchronized = enable,
                 // Mouse reporting: the ?1000/?1002/?1003 levels are mutually
@@ -2847,6 +2881,63 @@ impl Screen {
         self.keypad_app
     }
 
+    /// Whether the bell has rung since this was last asked, clearing it. The grid has no
+    /// opinion on what a bell should *do* — that is the app's call, and on a modern
+    /// desktop it is a visual mark rather than a beep.
+    pub fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.bell)
+    }
+
+    /// `?2048`: report the terminal's size in band, as an escape sequence, rather than
+    /// only through SIGWINCH.
+    ///
+    /// The signal is not enough on its own. It reaches the process group on *this* side of
+    /// the pty and nothing else, so a program on the far end of an ssh hop, or behind
+    /// tmux, learns nothing — and a program that has just been handed a pty has no way to
+    /// ask. Enabling the mode reports the size immediately for exactly that reason: the
+    /// first report is the one that answers "what am I attached to?".
+    fn set_in_band_resize(&mut self, enable: bool) {
+        self.in_band_resize = enable;
+        if enable {
+            self.report_size();
+        }
+    }
+
+    /// `CSI 48 ; rows ; cols ; height ; width t`, the in-band size report. Silent unless
+    /// the child asked for it (`?2048`), which the app calls on every resize.
+    pub fn report_size(&mut self) {
+        if !self.in_band_resize {
+            return;
+        }
+        let (cols, rows) = self.dimensions();
+        let (w, h) = self.pixel_size;
+        self.respond(b"\x1b[48;");
+        push_decimal(&mut self.responses, rows as u32);
+        self.responses.push(b';');
+        push_decimal(&mut self.responses, cols as u32);
+        self.responses.push(b';');
+        push_decimal(&mut self.responses, h);
+        self.responses.push(b';');
+        push_decimal(&mut self.responses, w);
+        self.responses.push(b't');
+    }
+
+    /// The window's pixel size, which the in-band resize report carries alongside the
+    /// cell count. The grid does not otherwise care about pixels; it is told.
+    pub fn set_pixel_size(&mut self, width: u32, height: u32) {
+        self.pixel_size = (width, height);
+    }
+
+    /// Tell the child the window gained or lost focus (`CSI I` / `CSI O`), if it asked to
+    /// be told (`?1004`). Silent otherwise: a program that never enabled focus reporting
+    /// would read these as stray key presses.
+    pub fn report_focus(&mut self, focused: bool) {
+        if !self.focus_events {
+            return;
+        }
+        self.respond(if focused { b"\x1b[I" } else { b"\x1b[O" });
+    }
+
     /// Whether the child is mid-frame under synchronized output (`?2026`), and would
     /// rather we showed nothing than showed it half-drawn.
     pub fn synchronized(&self) -> bool {
@@ -2937,6 +3028,69 @@ impl Screen {
                 self.theme.reset_indexed(index);
             }
         }
+    }
+
+    /// `OSC 52 ; <selection> ; <base64>`: the child puts text on the clipboard.
+    ///
+    /// This is how a program reaches the system clipboard when it cannot reach the
+    /// compositor itself — `nvim` over SSH, tmux's copy mode, Claude Code's `/copy`. The
+    /// terminal is the only process in the pipeline that *is* on your desktop, so it has
+    /// to be the one to do it.
+    ///
+    /// # Reads are refused, and that is deliberate
+    ///
+    /// The protocol also defines a *read* (`OSC 52 ; c ; ?`), which answers with the
+    /// clipboard's contents. We do not implement it, and will not.
+    ///
+    /// A terminal cannot tell which program printed a byte. Anything that reaches your
+    /// screen can send this — a `cat` of a hostile file, a log line, a compiler error
+    /// quoting attacker-controlled text — and the reply goes straight back down the pty
+    /// to whatever is reading it. That turns "display some text" into "exfiltrate the
+    /// user's clipboard", which routinely holds passwords. xterm ships reads disabled for
+    /// exactly this reason and it is the right call.
+    ///
+    /// The *write* is a smaller version of the same problem (a hostile file can clobber
+    /// your clipboard, which is annoying but not a disclosure), and it is the half every
+    /// real program actually needs, so it stays.
+    fn osc_clipboard(&mut self, pt: &[u8]) {
+        let mut fields = pt.splitn(2, |&b| b == b';');
+        let selection = fields.next().unwrap_or(&[]);
+        let payload = fields.next().unwrap_or(&[]);
+        if payload == b"?" {
+            return; // A read. See above: never.
+        }
+        let Some(text) = base64_decode(payload) else {
+            return;
+        };
+        // The X11 selection letters. An empty field means the clipboard, and a program
+        // may name several at once (`OSC 52 ; pc ; …`), so honour each one it lists.
+        let letters = if selection.is_empty() {
+            &b"c"[..]
+        } else {
+            selection
+        };
+        let mut clipboard = false;
+        let mut primary = false;
+        for &letter in letters {
+            match letter {
+                b'c' => clipboard = true,
+                b'p' | b's' => primary = true,
+                _ => {}
+            }
+        }
+        if clipboard {
+            self.clipboard_writes
+                .push((ClipboardTarget::Clipboard, text.clone()));
+        }
+        if primary {
+            self.clipboard_writes.push((ClipboardTarget::Primary, text));
+        }
+    }
+
+    /// Take the clipboard writes the child has asked for, leaving the queue empty. The
+    /// app drains this after each parse batch, exactly as it drains query replies.
+    pub fn take_clipboard_writes(&mut self) -> Vec<(ClipboardTarget, Vec<u8>)> {
+        std::mem::take(&mut self.clipboard_writes)
     }
 
     /// Close a reply that opened with `OSC`, with the same terminator the request used.
@@ -3070,6 +3224,80 @@ fn default_tabs(cols: usize) -> Vec<bool> {
 /// delimiter. A blank cell's rune is a space, so it bounds a word too.
 fn is_word_boundary(c: char) -> bool {
     c.is_whitespace() || matches!(c, '{' | '}' | '[' | ']' | '(' | ')' | '"' | '\'' | '`')
+}
+
+/// Decode base64, the encoding `OSC 52` wraps clipboard text in. `None` for anything
+/// malformed, which the caller drops.
+///
+/// Hand-rolled, and easily: base64 is a fixed 4-to-3 byte fold with no lengths, no
+/// offsets and no allocation decisions taken from the input, which is exactly the shape
+/// of thing the dependency policy says to write rather than depend on. (Image decoding
+/// is the counter-example, and the reason the policy exists at all.)
+///
+/// Strict about what it accepts: the child writes this. Whitespace is skipped (mail-era
+/// encoders wrap lines), padding is optional, and anything else is a refusal rather than
+/// a guess — a decoder that improvises on bad input is how you smuggle bytes past it.
+fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() / 4 * 3 + 3);
+    let mut quad = [0u8; 4];
+    let mut n = 0;
+    let mut padding = 0;
+    for &byte in input {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                padding += 1;
+                if padding > 2 {
+                    return None;
+                }
+                0
+            }
+            _ => return None,
+        };
+        // Padding may only ever be trailing: `A=AA` is malformed, not a clever encoding.
+        if padding > 0 && byte != b'=' {
+            return None;
+        }
+        quad[n] = value;
+        n += 1;
+        if n == 4 {
+            let triple = (u32::from(quad[0]) << 18)
+                | (u32::from(quad[1]) << 12)
+                | (u32::from(quad[2]) << 6)
+                | u32::from(quad[3]);
+            out.push((triple >> 16) as u8);
+            if padding < 2 {
+                out.push((triple >> 8) as u8);
+            }
+            if padding < 1 {
+                out.push(triple as u8);
+            }
+            n = 0;
+        }
+    }
+    match n {
+        // A clean end, padded or exactly aligned.
+        0 => Some(out),
+        // Unpadded input, which the spec allows: finish the partial group.
+        2 | 3 => {
+            let triple =
+                (u32::from(quad[0]) << 18) | (u32::from(quad[1]) << 12) | (u32::from(quad[2]) << 6);
+            out.push((triple >> 16) as u8);
+            if n == 3 {
+                out.push((triple >> 8) as u8);
+            }
+            Some(out)
+        }
+        // One leftover character encodes six bits of nothing.
+        _ => None,
+    }
 }
 
 /// The OSC number that names each colour, for building a reply.
@@ -3310,7 +3538,8 @@ impl Perform for Screen {
             0x0d => self.carriage_return(),  // CR
             0x0e => self.gl_is_g1 = true,    // SO (shift out to G1)
             0x0f => self.gl_is_g1 = false,   // SI (shift in to G0)
-            _ => {}                          // BEL, NUL, ...: nothing to draw
+            0x07 => self.bell = true,        // BEL
+            _ => {}                          // NUL, XON/XOFF, ...: nothing to draw
         }
     }
 
@@ -3428,6 +3657,7 @@ impl Perform for Screen {
             b"10" => self.osc_named_color(NamedColor::Foreground, pt, bel_terminated),
             b"11" => self.osc_named_color(NamedColor::Background, pt, bel_terminated),
             b"12" => self.osc_named_color(NamedColor::Cursor, pt, bel_terminated),
+            b"52" => self.osc_clipboard(pt),
             b"104" => self.osc_reset_palette(pt),
             b"110" => self.theme.fg = Theme::default().fg,
             b"111" => self.theme.bg = Theme::default().bg,
@@ -5354,12 +5584,160 @@ mod tests {
     }
 
     #[test]
-    fn decrqm_reports_the_modes_we_have_and_admits_the_ones_we_do_not() {
-        // Of the five nvim asks before drawing anything, we implement one. The honest
-        // answer for the rest is 0 ("I do not know this mode") — never 2, which would
-        // mean "I know it and it is off" and invite nvim to turn it on and rely on it.
+    fn in_band_resize_reports_only_to_a_program_that_asked() {
+        let mut s = Screen::new(80, 24);
+        s.set_pixel_size(640, 384);
+
+        // Nobody asked: a resize says nothing. A program that never enabled `?2048` would
+        // read the report as garbage on its input.
+        s.resize(100, 30);
+        assert!(s.take_responses().is_empty());
+
+        // Enabling it reports immediately, which is the point: a program handed a fresh
+        // pty has no other way to ask how big it is.
+        feed(&mut s, b"\x1b[?2048h");
+        assert_eq!(s.take_responses(), b"\x1b[48;30;100;384;640t");
+
+        // And every resize after it. This is the news SIGWINCH cannot carry across an ssh
+        // hop or a tmux, because the signal stops at this side of the pty.
+        s.set_pixel_size(800, 400);
+        s.resize(120, 40);
+        s.report_size();
+        assert_eq!(s.take_responses(), b"\x1b[48;40;120;400;800t");
+
+        feed(&mut s, b"\x1b[?2048l");
+        s.report_size();
+        assert!(s.take_responses().is_empty(), "and it can be turned off");
+    }
+
+    #[test]
+    fn bel_rings_the_bell_and_disturbs_nothing_else() {
+        // BEL was dropped on the floor entirely. It is also the *documented fallback* for
+        // desktop notifications in the CLIs that will not send them to a terminal they do
+        // not recognise, so ignoring it broke the workaround for a thing we cannot fix.
         let mut s = Screen::new(10, 2);
-        for mode in [b"2027", b"2031", b"2048"] {
+        feed(&mut s, b"ab\x07cd");
+        assert!(s.take_bell(), "it rang");
+        assert!(!s.take_bell(), "and taking it clears it");
+        assert_eq!(s.row_string(0).trim_end(), "abcd", "and printed nothing");
+        assert_eq!(s.cursor(), (0, 4), "and moved no cursor");
+    }
+
+    #[test]
+    fn focus_events_are_reported_only_to_a_program_that_asked() {
+        // A program that never enabled `?1004` would read `CSI I` as a stray key press,
+        // so silence is not politeness here, it is correctness.
+        let mut s = Screen::new(10, 2);
+        s.report_focus(true);
+        s.report_focus(false);
+        assert!(s.take_responses().is_empty(), "nobody asked");
+
+        feed(&mut s, b"\x1b[?1004h");
+        s.report_focus(true);
+        assert_eq!(s.take_responses(), b"\x1b[I");
+        s.report_focus(false);
+        assert_eq!(s.take_responses(), b"\x1b[O");
+
+        // And it can be turned back off.
+        feed(&mut s, b"\x1b[?1004l");
+        s.report_focus(true);
+        assert!(s.take_responses().is_empty());
+    }
+
+    #[test]
+    fn osc_52_puts_the_childs_text_on_the_clipboard() {
+        // How nvim over SSH, tmux's copy mode and Claude Code's `/copy` reach the system
+        // clipboard: they cannot see the compositor, and the terminal can.
+        let mut s = Screen::new(10, 2);
+        feed(&mut s, b"\x1b]52;c;aGVsbG8=\x07"); // "hello"
+        assert_eq!(
+            s.take_clipboard_writes(),
+            vec![(ClipboardTarget::Clipboard, b"hello".to_vec())]
+        );
+        assert!(s.take_clipboard_writes().is_empty(), "the queue drains");
+
+        // `p` is the primary selection, and a program may name several at once.
+        feed(&mut s, b"\x1b]52;p;aGk=\x07");
+        assert_eq!(
+            s.take_clipboard_writes(),
+            vec![(ClipboardTarget::Primary, b"hi".to_vec())]
+        );
+        feed(&mut s, b"\x1b]52;pc;aGk=\x07");
+        assert_eq!(
+            s.take_clipboard_writes(),
+            vec![
+                (ClipboardTarget::Clipboard, b"hi".to_vec()),
+                (ClipboardTarget::Primary, b"hi".to_vec()),
+            ]
+        );
+        // An empty selection field means the clipboard.
+        feed(&mut s, b"\x1b]52;;aGk=\x07");
+        assert_eq!(
+            s.take_clipboard_writes(),
+            vec![(ClipboardTarget::Clipboard, b"hi".to_vec())]
+        );
+    }
+
+    #[test]
+    fn osc_52_never_reads_the_clipboard_back() {
+        // The protocol defines a read, and we refuse it on purpose.
+        //
+        // A terminal cannot tell which program printed a byte. `cat` a hostile file and
+        // it can send this; the reply goes straight back down the pty to whatever is
+        // reading. That turns "display some text" into "exfiltrate the clipboard", which
+        // routinely holds passwords. The answer is silence, not a reply.
+        let mut s = Screen::new(10, 2);
+        feed(&mut s, b"\x1b]52;c;?\x07");
+        assert!(s.take_responses().is_empty(), "no answer, ever");
+        assert!(s.take_clipboard_writes().is_empty(), "and nothing written");
+    }
+
+    #[test]
+    fn a_malformed_osc_52_is_dropped_rather_than_half_decoded() {
+        // The child writes this, so it is hostile input. A decoder that improvises on bad
+        // bytes is how you smuggle bytes past it.
+        let mut s = Screen::new(10, 2);
+        for junk in [
+            &b"\x1b]52;c;not base64!!\x07"[..],
+            &b"\x1b]52;c;aGVsbG8\x3d\x3d\x3d\x07"[..], // three padding characters
+            &b"\x1b]52;c;a\x07"[..],                   // a lone leftover character
+            &b"\x1b]52;c;aG=sbG8=\x07"[..],            // padding in the middle
+        ] {
+            feed(&mut s, junk);
+            assert!(
+                s.take_clipboard_writes().is_empty(),
+                "refused: {:?}",
+                std::str::from_utf8(junk)
+            );
+        }
+    }
+
+    #[test]
+    fn base64_decodes_what_a_terminal_actually_receives() {
+        assert_eq!(base64_decode(b"aGVsbG8="), Some(b"hello".to_vec()));
+        assert_eq!(base64_decode(b"aGVsbG8h"), Some(b"hello!".to_vec()));
+        assert_eq!(base64_decode(b"eA=="), Some(b"x".to_vec()));
+        assert_eq!(base64_decode(b""), Some(Vec::new()));
+        // Padding is optional, and line breaks (mail-era encoders wrap) are skipped.
+        assert_eq!(base64_decode(b"aGVsbG8"), Some(b"hello".to_vec()));
+        assert_eq!(base64_decode(b"aGVs\nbG8="), Some(b"hello".to_vec()));
+        // Every byte of the alphabet, including the two that are not alphanumeric.
+        assert_eq!(base64_decode(b"+/8="), Some(vec![0xfb, 0xff]));
+        // And the refusals.
+        assert_eq!(base64_decode(b"a"), None);
+        assert_eq!(base64_decode(b"a==="), None);
+        assert_eq!(base64_decode(b"aa=a"), None);
+        assert_eq!(base64_decode(b"////_"), None);
+    }
+
+    #[test]
+    fn decrqm_reports_the_modes_we_have_and_admits_the_ones_we_do_not() {
+        // Of the five modes nvim asks about before drawing anything, we now implement
+        // two. The honest answer for the rest is 0 ("I do not know this mode") — never 2,
+        // which would mean "I know it and it is off" and invite nvim to turn it on and
+        // then rely on it.
+        let mut s = Screen::new(10, 2);
+        for mode in [b"2027", b"2031"] {
             let mut q = b"\x1b[?".to_vec();
             q.extend_from_slice(mode);
             q.extend_from_slice(b"$p");
@@ -5392,6 +5770,18 @@ mod tests {
         assert_eq!(s.take_responses(), b"\x1b[?2026;2$y");
         feed(&mut s, b"\x1b[?2026h\x1b[?2026$p");
         assert_eq!(s.take_responses(), b"\x1b[?2026;1$y");
+
+        // Same for the rest of what this round added, which is the whole point of keeping
+        // the two tables in step: a mode we act on is a mode we report.
+        feed(&mut s, b"\x1b[?1004$p");
+        assert_eq!(s.take_responses(), b"\x1b[?1004;2$y");
+        feed(&mut s, b"\x1b[?2048$p");
+        assert_eq!(s.take_responses(), b"\x1b[?2048;2$y");
+        // Enabling `?2048` also reports the size, so drain that before asking again.
+        feed(&mut s, b"\x1b[?2048h");
+        let _ = s.take_responses();
+        feed(&mut s, b"\x1b[?2048$p");
+        assert_eq!(s.take_responses(), b"\x1b[?2048;1$y");
 
         // The ANSI space answers on its own form, without the `?`.
         feed(&mut s, b"\x1b[4$p"); // IRM
