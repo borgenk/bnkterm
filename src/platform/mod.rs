@@ -7,7 +7,8 @@
 //! - **Input**: keyboard translation via libxkbcommon (`xkb`).
 //! - **Font**: FreeType rasterization (`freetype`), the colour-emoji face
 //!   (`emoji`), HarfBuzz shaping/measurement (`shape`), UAX #29 grapheme
-//!   segmentation (`grapheme`), and ARGB pixel math (`pixel`).
+//!   segmentation (`grapheme`), system font discovery for the characters our own
+//!   font list has no answer for (`fontconfig`), and ARGB pixel math (`pixel`).
 //! - **Foundation**: the syscall FFI surface (`ffi`), the minimal error type
 //!   (`error`), branchless byte scanning (`bytes`), scroll math (`scroll`), and
 //!   finding a URL in text (`link`) so it can be opened in the browser (`browser`).
@@ -19,6 +20,7 @@ pub(crate) mod dmabuf;
 pub(crate) mod emoji;
 pub(crate) mod error;
 pub(crate) mod ffi;
+pub(crate) mod fontconfig;
 pub(crate) mod freetype;
 pub(crate) mod geom;
 pub(crate) mod grapheme;

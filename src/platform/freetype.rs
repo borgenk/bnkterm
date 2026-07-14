@@ -16,12 +16,13 @@
 
 use core::ffi::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_ushort, c_void};
 use core::ptr::{self, NonNull};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::platform::emoji::{wants_emoji, ColorGlyph, EmojiFont};
 use crate::platform::error::{Error, Result};
+use crate::platform::fontconfig::{FontFile, Fontconfig};
 
 /// A font family and the four style files the editor draws emphasis with. A
 /// missing bold, italic, or bold-italic variant falls back to the regular face
@@ -487,8 +488,18 @@ impl Face {
         Ok(face)
     }
 
-    /// Build a face from a font file on disk.
+    /// Build a face from a font file on disk (its first face; see
+    /// [`from_path_index`](Self::from_path_index) for a collection).
     pub fn from_path(path: &str) -> Result<Self> {
+        Self::from_path_index(path, 0)
+    }
+
+    /// Build face `index` of a font file on disk. The index is 0 for an ordinary font
+    /// and only meaningful for a TrueType *collection*, where several faces share one
+    /// file: Noto's CJK fonts ship that way, and taking face 0 of a collection quietly
+    /// gives the wrong language. Font discovery ([`Fontconfig`](crate::platform::fontconfig))
+    /// reports the index alongside the path, so it is carried rather than assumed.
+    pub fn from_path_index(path: &str, index: i32) -> Result<Self> {
         let data = std::fs::read(path).map_err(|e| Error::msg(format!("read font {path}: {e}")))?;
 
         let mut library: FtLibrary = ptr::null_mut();
@@ -508,7 +519,7 @@ impl Face {
                 library.as_ptr(),
                 data.as_ptr(),
                 data.len() as c_long,
-                0,
+                index as c_long,
                 &mut face,
             )
         };
@@ -815,28 +826,41 @@ impl Drop for Face {
 /// set without ever changing line height.
 struct SizedFaces {
     size: u32,
-    regular: Face,
-    bold: Option<Face>,
-    italic: Option<Face>,
-    bold_italic: Option<Face>,
+    regular: Rc<Face>,
+    bold: Option<Rc<Face>>,
+    italic: Option<Rc<Face>>,
+    bold_italic: Option<Rc<Face>>,
     /// The code family's regular face at this size, or `None` when no distinct
     /// code family is installed (code then falls back to `regular`).
-    code: Option<Face>,
+    code: Option<Rc<Face>>,
     /// The interface family's proportional faces at this size (for chrome text; see
     /// [`FaceKey::Ui`]). `ui_regular` is always present (it falls back to the prose
     /// family when no UI family is installed); `ui_medium` and `ui_bold` are `None`
     /// when no such weight file is installed, and then that weight uses `ui_regular`.
     /// `ui_metrics` are the interface face's own vertical metrics, so a UI baseline
     /// centers on the sans ink box rather than the monospace one.
-    ui_regular: Face,
-    ui_medium: Option<Face>,
-    ui_bold: Option<Face>,
+    ui_regular: Rc<Face>,
+    ui_medium: Option<Rc<Face>>,
+    ui_bold: Option<Rc<Face>>,
     ui_metrics: Metrics,
-    /// The fallback chain at this size ([`FontConfig::fallback`]), in priority
+    /// The pinned fallback chain at this size ([`FontConfig::fallback`]), in priority
     /// order, holding only the faces whose files exist. Consulted by
     /// [`Fonts::glyph_face`] for a scalar the keyed face cannot draw; empty when
     /// the config lists none.
-    fallback: Vec<Face>,
+    ///
+    /// This is an *override* list, not the whole story: it is what we insist on
+    /// (the private-use icon range comes from a Nerd Font, whatever the system
+    /// thinks), and anything it does not answer falls through to `discovered`.
+    fallback: Vec<Rc<Face>>,
+    /// Faces the *system* offered for scalars nothing above could draw, memoized by
+    /// character. `None` records a character fontconfig could not place either, so a
+    /// glyph nothing on the machine has is asked about once and then remembered —
+    /// otherwise a screenful of an unavailable character would re-query per cell.
+    discovered: RefCell<HashMap<char, Option<Rc<Face>>>>,
+    /// The faces behind `discovered`, keyed by the file they came from, so a font that
+    /// answers for twenty characters is opened once and shared. This is why the faces
+    /// above are `Rc`: they are reached by two maps and owned by neither.
+    opened: RefCell<HashMap<FontFile, Rc<Face>>>,
     metrics: Metrics,
 }
 
@@ -854,6 +878,39 @@ impl SizedFaces {
             .chain(self.ui_medium.as_ref())
             .chain(self.ui_bold.as_ref())
             .chain(self.fallback.iter())
+            .map(Rc::as_ref)
+    }
+
+    /// The face the system offered for `ch`, opened at this size, or `None` when nothing
+    /// installed can draw it. Memoized both ways: once per character, and once per font
+    /// file behind it.
+    ///
+    /// `fc` is passed in rather than held because discovery is lazy — a session that
+    /// never leaves Latin never builds the system font cache at all (see
+    /// [`Fontconfig::new`]).
+    fn discover(&self, fc: Option<&Fontconfig>, ch: char) -> Option<Rc<Face>> {
+        if let Some(memo) = self.discovered.borrow().get(&ch) {
+            return memo.clone();
+        }
+        let found = fc
+            .and_then(|fc| fc.font_for_char(ch))
+            .and_then(|file| self.open_discovered(file));
+        self.discovered.borrow_mut().insert(ch, found.clone());
+        found
+    }
+
+    /// Open (or reuse) the face for a font file the system named. Discovered faces carry
+    /// no emoji font: a colour cluster is resolved through the emoji path long before a
+    /// scalar reaches discovery.
+    fn open_discovered(&self, file: FontFile) -> Option<Rc<Face>> {
+        if let Some(face) = self.opened.borrow().get(&file) {
+            return Some(Rc::clone(face));
+        }
+        let face = Face::from_path_index(file.path.to_str()?, file.index).ok()?;
+        face.set_pixel_size(self.size).ok()?;
+        let face = Rc::new(face);
+        self.opened.borrow_mut().insert(file, Rc::clone(&face));
+        Some(face)
     }
 }
 
@@ -868,6 +925,11 @@ pub struct Fonts {
     /// The color emoji font, opened once and shared by every face, or `None`
     /// when no emoji font is installed (emoji then render as tofu, as before).
     emoji: Option<Rc<EmojiFont>>,
+    /// The system font configuration, built on first use and never before: it reads the
+    /// font cache, and a session that prints only Latin text has no reason to pay for it.
+    /// The inner `None` is a machine where fontconfig will not start, which is not fatal —
+    /// the pinned fonts still answer, exactly as they did before discovery existed.
+    fc: OnceCell<Option<Fontconfig>>,
 }
 
 impl Fonts {
@@ -947,13 +1009,19 @@ impl Fonts {
                 ui_bold: open_variant(&ui_family.bold, size, None),
                 ui_metrics,
                 fallback,
+                discovered: RefCell::new(HashMap::new()),
+                opened: RefCell::new(HashMap::new()),
                 metrics,
             });
         }
         if sized.is_empty() {
             return Err(Error::msg("Fonts::new needs at least one nonzero size"));
         }
-        Ok(Self { sized, emoji })
+        Ok(Self {
+            sized,
+            emoji,
+            fc: OnceCell::new(),
+        })
     }
 
     /// The entry for `size`, or the fallback (first opened) if `size` is unknown.
@@ -1023,31 +1091,69 @@ impl Fonts {
         }
     }
 
-    /// The physical face to rasterize `ch` in for `key`: the keyed face when its
-    /// character map covers `ch`, otherwise the first fallback face at that size
-    /// that does, otherwise the keyed face again (so a scalar absent everywhere
-    /// still draws its `.notdef` box, the pre-fallback behavior). This is how a
-    /// Nerd Font / Powerline icon a prompt emits reaches its glyph in a symbols
-    /// font even though the prose or code family has no cell for it.
+    /// The physical face to rasterize `ch` in for `key`, resolved in three steps:
     ///
-    /// Emoji never arrive here: a color cluster is resolved through the emoji
-    /// cluster path before any scalar is drawn. The keyed face's own cmap is
-    /// consulted first and answers every ASCII and Latin glyph without touching a
-    /// fallback face, so the common case pays a single [`FT_Get_Char_Index`], and
-    /// only a genuine miss walks the (short) chain. The GPU batcher caches the
-    /// resolved raster by `(key, ch)`, so this runs once per new glyph, never per
-    /// frame. With an empty [`FontConfig::fallback`] the chain is empty and this
-    /// always returns the keyed face.
-    pub fn glyph_face(&self, key: FaceKey, ch: char) -> &Face {
-        let primary = self.face_for(key);
+    /// 1. **The keyed face**, when its character map covers `ch`. Every ASCII and Latin
+    ///    glyph stops here, on one [`FT_Get_Char_Index`], so the common case pays nothing
+    ///    for the machinery below it.
+    /// 2. **The pinned chain** ([`FontConfig::fallback`]) — the fonts we insist on. A
+    ///    terminal's Nerd Font and Powerline icons live in the private-use area, which no
+    ///    text family carries and which no system rule would resolve the way we want, so
+    ///    that range is nailed to a symbols font here rather than left to chance.
+    /// 3. **The system** ([`Fontconfig`]) — whatever is installed. This is what makes
+    ///    bnkterm draw the same `✓` as every other application on the machine, and the
+    ///    reason a program can print a character nobody anticipated and still see it.
+    ///
+    /// Failing all three, the keyed face is returned again, so a scalar that genuinely
+    /// exists nowhere still draws its `.notdef` box, as it always did.
+    ///
+    /// Emoji never arrive here: a colour cluster is resolved through the emoji cluster
+    /// path before any scalar is drawn.
+    ///
+    /// Every step is memoized. Discovery caches per character and per font file
+    /// ([`SizedFaces::discover`]), and the GPU batcher caches the raster by `(key, ch)`
+    /// on top of that, so this runs once per glyph the terminal has never seen — never
+    /// per frame, and never per cell.
+    pub fn glyph_face(&self, key: FaceKey, ch: char) -> Rc<Face> {
+        let primary = self.face_rc(key);
         if primary.has_scalar(ch) {
-            return primary;
+            return Rc::clone(primary);
         }
-        self.entry(key.size())
-            .fallback
-            .iter()
-            .find(|f| f.has_scalar(ch))
-            .unwrap_or(primary)
+        let entry = self.entry(key.size());
+        if let Some(face) = entry.fallback.iter().find(|f| f.has_scalar(ch)) {
+            return Rc::clone(face);
+        }
+        entry
+            .discover(self.fontconfig(), ch)
+            .unwrap_or_else(|| Rc::clone(primary))
+    }
+
+    /// The system font configuration, built on the first character the pinned fonts
+    /// cannot draw. A terminal that only ever shows Latin text never builds it.
+    fn fontconfig(&self) -> Option<&Fontconfig> {
+        self.fc.get_or_init(Fontconfig::new).as_ref()
+    }
+
+    /// The keyed face as the shared handle the caches hold, so [`glyph_face`](Self::glyph_face)
+    /// can hand back either it or a discovered face without the two having different types.
+    fn face_rc(&self, key: FaceKey) -> &Rc<Face> {
+        let entry = self.entry(key.size());
+        match key {
+            FaceKey::Prose { style, .. } => match style {
+                FontStyle::Regular | FontStyle::Medium => &entry.regular,
+                FontStyle::Bold => entry.bold.as_ref().unwrap_or(&entry.regular),
+                FontStyle::Italic => entry.italic.as_ref().unwrap_or(&entry.regular),
+                FontStyle::BoldItalic => entry.bold_italic.as_ref().unwrap_or(&entry.regular),
+            },
+            FaceKey::Code { .. } => entry.code.as_ref().unwrap_or(&entry.regular),
+            FaceKey::Ui { style, .. } => match style {
+                FontStyle::Medium => entry.ui_medium.as_ref().unwrap_or(&entry.ui_regular),
+                FontStyle::Bold | FontStyle::BoldItalic => {
+                    entry.ui_bold.as_ref().unwrap_or(&entry.ui_regular)
+                }
+                FontStyle::Regular | FontStyle::Italic => &entry.ui_regular,
+            },
+        }
     }
 
     /// Whether *any* face reachable from `key` has a real glyph for `ch`: the keyed face
@@ -1060,12 +1166,10 @@ impl Fonts {
     /// private-use area, so on a machine without a symbols font it would render as an
     /// empty rectangle — the one glyph whose whole job is to be understood at a glance.
     pub fn covers(&self, key: FaceKey, ch: char) -> bool {
+        let entry = self.entry(key.size());
         self.face_for(key).has_scalar(ch)
-            || self
-                .entry(key.size())
-                .fallback
-                .iter()
-                .any(|f| f.has_scalar(ch))
+            || entry.fallback.iter().any(|f| f.has_scalar(ch))
+            || entry.discover(self.fontconfig(), ch).is_some()
     }
 
     /// The metrics for `size`, or the fallback's metrics if `size` was not opened.
@@ -1092,17 +1196,17 @@ impl Fonts {
 /// Open `path` at `size` with the shared `emoji` font attached: the three-step
 /// face open (read the file, fix the pixel size, share the emoji font) that
 /// both the required regular face and the optional variants go through.
-fn open_face(path: &str, size: u32, emoji: Option<&Rc<EmojiFont>>) -> Result<Face> {
+fn open_face(path: &str, size: u32, emoji: Option<&Rc<EmojiFont>>) -> Result<Rc<Face>> {
     let mut face = Face::from_path(path)?;
     face.set_pixel_size(size)?;
     face.emoji = emoji.cloned();
-    Ok(face)
+    Ok(Rc::new(face))
 }
 
 /// Open a style variant at `size`, or `None` if the file is absent or fails to
 /// load, leaving the caller to fall back to the regular face. Keeps a family
 /// that ships only some weights from being a hard error.
-fn open_variant(path: &str, size: u32, emoji: Option<&Rc<EmojiFont>>) -> Option<Face> {
+fn open_variant(path: &str, size: u32, emoji: Option<&Rc<EmojiFont>>) -> Option<Rc<Face>> {
     if !std::path::Path::new(path).exists() {
         return None;
     }
@@ -1469,6 +1573,76 @@ mod tests {
         );
     }
 
+    /// The characters the Claude CLI prints that a monospace terminal font has no cell
+    /// for, and that no font we pin carries either. Before discovery these were the
+    /// `.notdef` tofu box; each one is now the system's answer, the same answer every
+    /// other application on the machine gets.
+    const HOMELESS: [char; 6] = [
+        '\u{23FA}', '\u{23BF}', '\u{2713}', '\u{2717}', '\u{273B}', '\u{2801}',
+    ];
+
+    #[test]
+    fn the_system_draws_what_neither_the_family_nor_the_pinned_fonts_can() {
+        let fonts = Fonts::new(&[16]).expect("a default font");
+        let key = FaceKey::Prose {
+            size: 16,
+            style: FontStyle::Regular,
+        };
+        let primary = fonts.face_for(key);
+
+        for ch in HOMELESS {
+            // The premise: nothing we chose ourselves can draw these. If a future font
+            // list *does* cover one, this assert is the reminder to re-pick the sample,
+            // not a failure -- but the test below would then be proving nothing.
+            assert!(
+                !primary.has_scalar(ch),
+                "the primary family now covers {ch:?}; pick a character it does not"
+            );
+
+            let face = fonts.glyph_face(key, ch);
+            assert!(
+                face.has_scalar(ch),
+                "no font on this system draws {ch:?} (U+{:04X})",
+                ch as u32
+            );
+            // Resolving is not enough: the point is ink on the screen. A face that
+            // reports the glyph but rasterizes empty is the tofu box wearing a disguise.
+            let raster = face.rasterize(ch);
+            assert!(
+                raster.coverage.iter().any(|&c| c > 0),
+                "{ch:?} resolved to a face that inks nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_is_memoized_and_never_wakes_for_latin() {
+        let fonts = Fonts::new(&[16]).expect("a default font");
+        let key = FaceKey::Prose {
+            size: 16,
+            style: FontStyle::Regular,
+        };
+
+        // Latin resolves in the primary face's own cmap, so the system is never asked and
+        // the font cache is never built. This is the whole reason discovery is lazy: a
+        // terminal that shows only ASCII must not pay for fontconfig at all.
+        let _ = fonts.glyph_face(key, 'A');
+        assert!(
+            fonts.fc.get().is_none(),
+            "an ASCII glyph woke the system font cache"
+        );
+
+        // The same character twice hands back the same face, from the memo rather than a
+        // second match: a screenful of one symbol must not re-query per cell.
+        let first = fonts.glyph_face(key, HOMELESS[0]);
+        let second = fonts.glyph_face(key, HOMELESS[0]);
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "the same character resolved twice to two different faces"
+        );
+        assert!(fonts.fc.get().is_some(), "discovery never woke the system");
+    }
+
     #[test]
     fn glyph_face_falls_back_for_a_nerd_font_icon() {
         // U+F418 is the Nerd Font octicon "git-branch" (nf-oct-git_branch), the
@@ -1486,10 +1660,13 @@ mod tests {
         };
 
         // A glyph the primary owns resolves to the primary itself, untouched, so
-        // the common path never walks the fallback chain.
+        // the common path never walks the fallback chain and never wakes fontconfig.
         let primary = fonts.face_for(key);
         assert!(primary.has_scalar('A'));
-        assert!(std::ptr::eq(fonts.glyph_face(key, 'A'), primary));
+        assert!(std::ptr::eq(
+            Rc::as_ptr(&fonts.glyph_face(key, 'A')),
+            primary as *const Face
+        ));
 
         // Resolving the icon never panics whether or not a fallback is present.
         // When the primary lacks it but a fallback covers it, the resolved face

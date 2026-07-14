@@ -133,19 +133,29 @@ impl Default for FontConfig {
                 "/usr/share/fonts/TTF/DejaVuSansMono.ttf".into(),
                 "/usr/share/fonts/gnu-free/FreeMono.otf".into(),
             ],
-            // Fallback chain for private-use icons and stray symbols the prose
-            // family lacks. Symbols Nerd Font is the icons-only companion built
-            // to fill the Nerd Font / Powerline ranges; its Mono cut sizes every
-            // icon to one cell, so it leads when installed. When only the non-Mono
-            // cut is present it renders icons larger than one cell, on purpose, see
-            // the natural-size policy in `platform/freetype.rs` (fallback faces are
-            // not scaled to the cell). The Noto symbol faces mop up other Unicode
-            // symbols and dingbats.
+            // The fonts we *insist* on, ahead of whatever the system would choose.
+            // This is an override list, not a coverage list: everything it does not
+            // name is found by fontconfig (see `platform/fontconfig.rs`), the same
+            // way every other application on the desktop finds it, so a program can
+            // print a character nobody anticipated and still see it.
+            //
+            // Only the Nerd Font symbols earn a pin, and for a reason the system
+            // cannot know: the Nerd Font / Powerline icons live in the private-use
+            // area, where the codepoint means nothing on its own. Any font may claim
+            // U+F023 and draw something else entirely, so "whatever the system picks"
+            // is not good enough — the range has to come from *this* font or the
+            // wrong picture appears. Every other symbol (a check, a bullet, a braille
+            // spinner) is a real codepoint with a real meaning, and any font that has
+            // it draws the right thing.
+            //
+            // Both cuts are listed. The Mono cut sizes every icon to one cell and so
+            // leads when installed; the wide cut renders icons larger than one cell,
+            // on purpose (see the natural-size policy in `platform/freetype.rs`, where
+            // fallback faces are not scaled to the cell), and is the cut ghostty and
+            // wezterm map this range to by default.
             fallback: vec![
                 "/usr/share/fonts/TTF/SymbolsNerdFontMono-Regular.ttf".into(),
                 "/usr/share/fonts/TTF/SymbolsNerdFont-Regular.ttf".into(),
-                "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf".into(),
-                "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf".into(),
             ],
         }
     }
