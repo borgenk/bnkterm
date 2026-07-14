@@ -3114,6 +3114,147 @@ impl Screen {
         self.modify_other_keys
     }
 
+    /// XTVERSION (`CSI > 0 q`): "what terminal are you?" Answered `DCS > | bnkterm <ver> ST`.
+    ///
+    /// This does not get us onto anyone's allowlist — the CLIs that gate features on a
+    /// terminal's name match it against a fixed list we are not on, and we do not intend
+    /// to impersonate someone to get on it (see the `TERM_PROGRAM` note in `app.rs`). But
+    /// it is what a terminal is *supposed* to say when asked, it is the only way anything
+    /// could ever recognise us on purpose, and staying silent is how you stay unknown.
+    fn xtversion(&mut self) {
+        self.respond(b"\x1bP>|bnkterm ");
+        self.respond(env!("CARGO_PKG_VERSION").as_bytes());
+        self.respond(b"\x1b\\");
+    }
+
+    /// DECRQSS (`DCS $ q <setting> ST`): "what is this setting currently set to?" The
+    /// answer is the sequence that would *reproduce* it — `DCS 1 $ r 0 m ST` says "SGR is
+    /// at its default" — so a program can save a setting, change it, and put it back
+    /// without knowing what it was.
+    ///
+    /// An unknown request is answered `DCS 0 $ r ST`, which means "I do not support that
+    /// query". Answering 1 with an empty or invented setting would be worse than silence:
+    /// the program would take the reply at face value and restore garbage.
+    fn decrqss(&mut self, setting: &[u8]) {
+        match setting {
+            b"m" => {
+                // SGR. We report the *pen*, which is what a program restoring a rendition
+                // needs; the attribute bits are spelled out in the order xterm uses.
+                self.respond(b"\x1bP1$r0");
+                let attrs = self.pen.attrs;
+                for (bit, code) in [
+                    (Attrs::BOLD, b"1".as_slice()),
+                    (Attrs::DIM, b"2"),
+                    (Attrs::ITALIC, b"3"),
+                    (Attrs::UNDERLINE, b"4"),
+                    (Attrs::REVERSE, b"7"),
+                    (Attrs::HIDDEN, b"8"),
+                    (Attrs::STRIKE, b"9"),
+                ] {
+                    if attrs.contains(bit) {
+                        self.responses.push(b';');
+                        self.respond(code);
+                    }
+                }
+                self.push_sgr_color(true);
+                self.push_sgr_color(false);
+                self.respond(b"m\x1b\\");
+            }
+            b"r" => {
+                // DECSTBM, the scroll region, 1-based as the sequence that sets it.
+                let (top, bottom) = {
+                    let b = self.active();
+                    (b.scroll_top, b.scroll_bottom)
+                };
+                self.respond(b"\x1bP1$r");
+                push_decimal(&mut self.responses, top as u32 + 1);
+                self.responses.push(b';');
+                push_decimal(&mut self.responses, bottom as u32 + 1);
+                self.respond(b"r\x1b\\");
+            }
+            _ => self.respond(b"\x1bP0$r\x1b\\"),
+        }
+    }
+
+    /// One colour of the pen, as the SGR parameters that would set it, appended to a
+    /// DECRQSS reply. Nothing is appended for a default colour: `SGR 0` already said it.
+    fn push_sgr_color(&mut self, foreground: bool) {
+        let color = if foreground { self.pen.fg } else { self.pen.bg };
+        let base = if foreground { 30 } else { 40 };
+        match color {
+            Color::Default => {}
+            Color::Ansi(i) if i < 8 => {
+                self.responses.push(b';');
+                push_decimal(&mut self.responses, u32::from(base + i));
+            }
+            Color::Ansi(i) => {
+                self.responses.push(b';');
+                push_decimal(&mut self.responses, u32::from(base + 60 + (i & 7)));
+            }
+            Color::Indexed(i) => {
+                self.responses.push(b';');
+                push_decimal(&mut self.responses, u32::from(base + 8));
+                self.respond(b";5;");
+                push_decimal(&mut self.responses, u32::from(i));
+            }
+            Color::Rgb(r, g, b) => {
+                self.responses.push(b';');
+                push_decimal(&mut self.responses, u32::from(base + 8));
+                self.respond(b";2;");
+                push_decimal(&mut self.responses, u32::from(r));
+                self.responses.push(b';');
+                push_decimal(&mut self.responses, u32::from(g));
+                self.responses.push(b';');
+                push_decimal(&mut self.responses, u32::from(b));
+            }
+        }
+    }
+
+    /// XTGETTCAP (`DCS + q <hex-encoded names> ST`): "what does your terminfo say about
+    /// these capabilities?" Names and values travel hex-encoded, which is how a value
+    /// containing an escape sequence survives the trip.
+    ///
+    /// This is the query that lets a program learn what we can do *without* a terminfo
+    /// entry installed for us — which matters, because we ship none and claim
+    /// `xterm-256color`, so a terminfo lookup describes xterm rather than bnkterm.
+    ///
+    /// An unknown capability is answered with `DCS 0 + r <name> ST`, which is the
+    /// protocol's way of saying "I do not have that" — and it is a real answer, not a
+    /// silence, so the program stops waiting.
+    fn xtgettcap(&mut self, data: &[u8]) {
+        for name in data.split(|&b| b == b';') {
+            let Some(decoded) = hex_decode(name) else {
+                self.respond(b"\x1bP0+r\x1b\\");
+                continue;
+            };
+            let value: Option<&[u8]> = match decoded.as_slice() {
+                b"TN" | b"name" => Some(b"bnkterm".as_slice()),
+                b"Co" | b"colors" => Some(b"256".as_slice()),
+                // Truecolor. The `RGB` capability is how a program learns it can send
+                // `38;2;r;g;b` and mean it; `COLORTERM=truecolor` says the same thing to
+                // the programs that read the environment instead.
+                b"RGB" => Some(b"8/8/8".as_slice()),
+                _ => None,
+            };
+            match value {
+                Some(value) => {
+                    // The name goes back exactly as it arrived: it is already hex on the
+                    // wire, and re-encoding it here would hex the hex.
+                    self.respond(b"\x1bP1+r");
+                    self.respond(name);
+                    self.responses.push(b'=');
+                    hex_encode(value, &mut self.responses);
+                    self.respond(b"\x1b\\");
+                }
+                None => {
+                    self.respond(b"\x1bP0+r");
+                    self.respond(name);
+                    self.respond(b"\x1b\\");
+                }
+            }
+        }
+    }
+
     /// The kitty keyboard protocol's four control sequences, all sharing the final byte
     /// `u` and distinguished by their private marker:
     ///
@@ -3224,6 +3365,35 @@ fn default_tabs(cols: usize) -> Vec<bool> {
 /// delimiter. A blank cell's rune is a space, so it bounds a word too.
 fn is_word_boundary(c: char) -> bool {
     c.is_whitespace() || matches!(c, '{' | '}' | '[' | ']' | '(' | ')' | '"' | '\'' | '`')
+}
+
+/// Decode the hex that XTGETTCAP encodes capability names in. `None` on anything that is
+/// not an even run of hex digits, which the caller answers as "I do not have that"
+/// rather than guessing at.
+fn hex_decode(input: &[u8]) -> Option<Vec<u8>> {
+    if input.is_empty() || !input.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(input.len() / 2);
+    for pair in input.chunks_exact(2) {
+        let hi = (*pair.first()? as char).to_digit(16)?;
+        let lo = (*pair.get(1)? as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
+}
+
+/// Encode a capability value as the hex XTGETTCAP expects, which is how a value holding
+/// an escape sequence survives being sent inside one.
+fn hex_encode(input: &[u8], out: &mut Vec<u8>) {
+    for &byte in input {
+        for nibble in [byte >> 4, byte & 0x0f] {
+            out.push(match nibble {
+                0..=9 => b'0' + nibble,
+                _ => b'a' + (nibble - 10),
+            });
+        }
+    }
 }
 
 /// Decode base64, the encoding `OSC 52` wraps clipboard text in. `None` for anything
@@ -3493,6 +3663,7 @@ impl Screen {
             (b'?', b'n') => self.device_status(params, b'?'),
             (b'>', b'c') => self.device_attributes(b'>'),
             (b'>', b'm') => self.xtmodkeys(params),
+            (b'>', b'q') => self.xtversion(),
             // The kitty keyboard protocol: `?` query, `=` set, `>` push, `<` pop. It
             // shares SCORC's final byte, and only the marker tells them apart — which is
             // exactly why this space has to be matched as a pair.
@@ -3641,6 +3812,17 @@ impl Perform for Screen {
             Some(b'(') => self.g0 = charset_from(byte), // designate G0
             Some(b')') => self.g1 = charset_from(byte), // designate G1
             Some(b'#') if byte == b'8' => self.decaln(), // DECALN
+            _ => {}
+        }
+    }
+
+    fn dcs_dispatch(&mut self, _params: &Params, intermediates: &[u8], action: u8, data: &[u8]) {
+        // Both of these are questions, and both were previously swallowed whole: DCS had
+        // no callback at all, so a program that asked one waited for an answer that was
+        // never coming.
+        match (intermediates, action) {
+            ([b'$'], b'q') => self.decrqss(data), // "what is this setting?"
+            ([b'+'], b'q') => self.xtgettcap(data), // "what does your terminfo say?"
             _ => {}
         }
     }
@@ -5581,6 +5763,76 @@ mod tests {
         // DSR status: OK.
         feed(&mut s, b"\x1b[5n");
         assert_eq!(s.take_responses(), b"\x1b[0n");
+    }
+
+    #[test]
+    fn xtversion_says_who_we_are() {
+        // It gets us onto nobody's allowlist — that is not what it is for. It is what a
+        // terminal is supposed to say when asked, and silence is how you stay unknown.
+        let mut s = Screen::new(10, 2);
+        feed(&mut s, b"\x1b[>0q");
+        let reply = s.take_responses();
+        let text = String::from_utf8_lossy(&reply).into_owned();
+        assert!(text.starts_with("\x1bP>|bnkterm "), "{text:?}");
+        assert!(text.ends_with("\x1b\\"), "{text:?}");
+        assert!(text.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn decrqss_answers_with_the_sequence_that_would_restore_the_setting() {
+        // A program saves a setting, changes it, and puts it back — without ever knowing
+        // what it was. So the answer is not a description, it is a sequence.
+        let mut s = Screen::new(10, 3);
+        feed(&mut s, b"\x1bP$qm\x1b\\"); // "what is SGR?"
+        assert_eq!(s.take_responses(), b"\x1bP1$r0m\x1b\\");
+
+        feed(&mut s, b"\x1b[1;4;38;5;200m"); // bold, underlined, colour 200
+        feed(&mut s, b"\x1bP$qm\x1b\\");
+        assert_eq!(s.take_responses(), b"\x1bP1$r0;1;4;38;5;200m\x1b\\");
+
+        // The scroll region, 1-based like the sequence that sets it.
+        feed(&mut s, b"\x1b[2;3r");
+        feed(&mut s, b"\x1bP$qr\x1b\\");
+        assert_eq!(s.take_responses(), b"\x1bP1$r2;3r\x1b\\");
+
+        // A setting we do not report is answered "not supported" — a real answer, so the
+        // program stops waiting. Claiming support and inventing a value would be worse
+        // than silence: it would be restored verbatim.
+        feed(&mut s, b"\x1bP$q\"p\x1b\\"); // DECSCL
+        assert_eq!(s.take_responses(), b"\x1bP0$r\x1b\\");
+    }
+
+    #[test]
+    fn xtgettcap_answers_what_our_terminfo_would_have_said() {
+        // The query that lets a program learn what we can do *without* a terminfo entry
+        // installed for us — which matters, because we ship none and claim to be xterm.
+        let mut s = Screen::new(10, 2);
+        feed(&mut s, b"\x1bP+q544e\x1b\\"); // "TN" — terminal name
+        assert_eq!(s.take_responses(), b"\x1bP1+r544e=626e6b7465726d\x1b\\");
+
+        feed(&mut s, b"\x1bP+q524742\x1b\\"); // "RGB" — do you mean it about truecolor?
+        assert_eq!(s.take_responses(), b"\x1bP1+r524742=382f382f38\x1b\\");
+
+        // Several at once, and an unknown one answered 0 rather than ignored.
+        feed(&mut s, b"\x1bP+q436f;7a7a7a\x1b\\"); // "Co" (colors), then "zzz"
+        assert_eq!(
+            s.take_responses(),
+            b"\x1bP1+r436f=323536\x1b\\\x1bP0+r7a7a7a\x1b\\"
+        );
+
+        // Not hex at all: still an answer, still not a guess.
+        feed(&mut s, b"\x1bP+qnothex\x1b\\");
+        assert_eq!(s.take_responses(), b"\x1bP0+r\x1b\\");
+    }
+
+    #[test]
+    fn a_dcs_we_do_not_answer_is_swallowed_whole() {
+        // Sixel arrives here (`DCS q …`), and so does anything else we have no use for.
+        // The payload must never leak onto the screen as text.
+        let mut s = Screen::new(20, 2);
+        feed(&mut s, b"ab\x1bPq#0;2;0;0;0#0~~@@vv@@~~@@~~$\x1b\\cd");
+        assert_eq!(s.row_string(0).trim_end(), "abcd");
+        assert!(s.take_responses().is_empty());
     }
 
     #[test]

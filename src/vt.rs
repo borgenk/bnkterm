@@ -35,6 +35,10 @@ const MAX_INTERMEDIATES: usize = 2;
 /// Cap on the OSC string buffer (e.g. a window title); bytes past it are dropped.
 const OSC_MAX: usize = 4096;
 
+/// Cap on a DCS payload. The sequences we answer (DECRQSS, XTGETTCAP) carry a handful of
+/// bytes; anything approaching this is not one of them.
+const DCS_MAX: usize = 4096;
+
 /// Length of the leading run of printable ASCII (`0x20..=0x7e`) in `bytes`.
 ///
 /// A byte `b` is printable iff `b.wrapping_sub(0x20) <= 0x5e`: one unsigned compare
@@ -104,6 +108,13 @@ pub trait Perform {
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], private: u8, action: u8);
     /// A complete escape sequence (not CSI/OSC): its intermediates and final byte.
     fn esc_dispatch(&mut self, intermediates: &[u8], byte: u8);
+    /// A complete DCS: the prologue's parameters, intermediates and final byte, plus the
+    /// payload that followed it. `DCS $ q m ST` arrives as `([], [b'$'], b'q', b"m")`.
+    ///
+    /// The default does nothing, so an implementor that has no use for DCS (the test
+    /// recorder, a headless consumer) is not made to care.
+    fn dcs_dispatch(&mut self, _params: &Params, _intermediates: &[u8], _action: u8, _data: &[u8]) {
+    }
     /// A complete OSC string (the bytes between `ESC ]` and its terminator), and which
     /// terminator ended it: `true` for BEL (xterm's convention), `false` for ST.
     ///
@@ -123,7 +134,17 @@ enum State {
     CsiIntermediate,
     CsiIgnore,
     OscString,
-    /// DCS/SOS/PM/APC: recognized and swallowed until ST (no DCS in v1).
+    /// DCS: the parameter/intermediate prologue, laid out exactly like a CSI's.
+    DcsEntry,
+    DcsParam,
+    DcsIntermediate,
+    /// DCS: past the final byte, passing the payload through to the string buffer.
+    DcsPassthrough,
+    /// A DCS we cannot use (too many intermediates, a malformed prologue): swallowed to
+    /// the terminator so the payload cannot be mistaken for text.
+    DcsIgnore,
+    /// SOS/PM/APC: recognized and swallowed until ST. Nothing we implement rides on them
+    /// (APC is the kitty graphics transport, and we draw no images).
     StringIgnore,
 }
 
@@ -259,6 +280,11 @@ pub struct Parser {
     private: u8,
     ignore: bool,
     osc: Vec<u8>,
+    /// The DCS payload (the bytes after the final byte, before ST), and the final byte
+    /// that named the sequence. Separate from `osc` so the two cannot be confused; both
+    /// are allocated once and reused, and both are capped.
+    dcs: Vec<u8>,
+    dcs_final: u8,
     /// UTF-8 decode: continuation bytes still expected, the value so far, and the
     /// smallest legal value for this length (to reject overlong encodings).
     utf8_remaining: u8,
@@ -285,6 +311,8 @@ impl Parser {
             private: 0,
             ignore: false,
             osc: Vec::new(),
+            dcs: Vec::new(),
+            dcs_final: 0,
             utf8_remaining: 0,
             utf8_char: 0,
             utf8_min: 0,
@@ -351,6 +379,8 @@ impl Parser {
                     // ESC ends the string; the ST that follows is consumed by the escape
                     // state as a no-op final byte. Not BEL, so an answer uses ST.
                     self.finish_osc(p, false);
+                } else if self.state == State::DcsPassthrough {
+                    self.finish_dcs(p);
                 }
                 self.clear();
                 self.state = State::Escape;
@@ -368,6 +398,11 @@ impl Parser {
             State::CsiIntermediate => self.csi_intermediate(p, byte),
             State::CsiIgnore => self.csi_ignore(byte),
             State::OscString => self.osc_string(p, byte),
+            State::DcsEntry => self.dcs_entry(byte),
+            State::DcsParam => self.dcs_param(byte),
+            State::DcsIntermediate => self.dcs_intermediate(byte),
+            State::DcsPassthrough => self.dcs_passthrough(byte),
+            State::DcsIgnore => {}
             State::StringIgnore => {}
         }
     }
@@ -419,7 +454,8 @@ impl Parser {
             }
             0x50 => {
                 self.clear();
-                self.state = State::StringIgnore; // DCS
+                self.dcs.clear();
+                self.state = State::DcsEntry; // DCS
             }
             0x58 | 0x5e | 0x5f => self.state = State::StringIgnore, // SOS / PM / APC
             0x5b => {
@@ -430,6 +466,11 @@ impl Parser {
                 self.osc.clear();
                 self.state = State::OscString;
             }
+            // ST (`ESC \`) is a string *terminator*, not an escape sequence. The string
+            // it closes has already been dispatched by the ESC that preceded this byte;
+            // passing it on as `esc_dispatch(b'\\')` would be a phantom action every
+            // consumer then has to know to ignore.
+            0x5c => self.state = State::Ground,
             0x30..=0x7e => {
                 p.esc_dispatch(&self.intermediates[..self.num_intermediates], byte);
                 self.state = State::Ground;
@@ -587,6 +628,97 @@ impl Parser {
         }
     }
 
+    // ---- DCS ----------------------------------------------------------------
+    //
+    // A DCS is a CSI with a payload: `ESC P <params> <intermediates> <final> <data> ST`.
+    // The prologue is parsed exactly like a CSI's — same parameters, same intermediates —
+    // and the final byte names the sequence rather than performing it, because what
+    // follows is the argument. `DCS $ q m ST` is "what are the current SGR settings?".
+
+    fn dcs_entry(&mut self, byte: u8) {
+        match byte {
+            0x20..=0x2f => {
+                self.collect_intermediate(byte);
+                self.state = State::DcsIntermediate;
+            }
+            0x30..=0x39 => {
+                self.param_digit(byte);
+                self.state = State::DcsParam;
+            }
+            0x3a => {
+                self.subparam_next();
+                self.state = State::DcsParam;
+            }
+            0x3b => {
+                self.param_next();
+                self.state = State::DcsParam;
+            }
+            0x3c..=0x3f => {
+                self.private = byte;
+                self.state = State::DcsParam;
+            }
+            0x40..=0x7e => self.dcs_hook(byte),
+            _ => self.state = State::DcsIgnore,
+        }
+    }
+
+    fn dcs_param(&mut self, byte: u8) {
+        match byte {
+            0x30..=0x39 => self.param_digit(byte),
+            0x3a => self.subparam_next(),
+            0x3b => self.param_next(),
+            0x20..=0x2f => {
+                self.collect_intermediate(byte);
+                self.state = State::DcsIntermediate;
+            }
+            0x40..=0x7e => self.dcs_hook(byte),
+            _ => self.state = State::DcsIgnore,
+        }
+    }
+
+    fn dcs_intermediate(&mut self, byte: u8) {
+        match byte {
+            0x20..=0x2f => self.collect_intermediate(byte),
+            0x40..=0x7e => self.dcs_hook(byte),
+            _ => self.state = State::DcsIgnore,
+        }
+    }
+
+    /// The final byte: the prologue is complete, so remember what this DCS *is* and start
+    /// collecting its payload.
+    fn dcs_hook(&mut self, byte: u8) {
+        if self.param_started {
+            self.push_param();
+        }
+        if self.ignore {
+            self.state = State::DcsIgnore;
+            return;
+        }
+        self.dcs_final = byte;
+        self.state = State::DcsPassthrough;
+    }
+
+    /// The payload. Capped like every other buffer the child fills: a DCS with a
+    /// megabyte of payload must cost us nothing but the time to skip it.
+    fn dcs_passthrough(&mut self, byte: u8) {
+        if self.dcs.len() < DCS_MAX {
+            self.dcs.push(byte);
+        } else {
+            // Over the cap: the sequence is unusable, so stop buffering and drop it whole
+            // rather than acting on a truncated payload.
+            self.state = State::DcsIgnore;
+        }
+    }
+
+    fn finish_dcs<P: Perform>(&mut self, p: &mut P) {
+        p.dcs_dispatch(
+            &self.params,
+            &self.intermediates[..self.num_intermediates],
+            self.dcs_final,
+            &self.dcs,
+        );
+    }
+
     // ---- parameter / intermediate bookkeeping -------------------------------
 
     fn clear(&mut self) {
@@ -661,6 +793,12 @@ mod tests {
     enum Action {
         Print(char),
         Execute(u8),
+        Dcs {
+            params: Vec<Vec<u16>>,
+            intermediates: Vec<u8>,
+            action: u8,
+            data: Vec<u8>,
+        },
         Csi {
             /// One entry per parameter, each holding its sub-parameters.
             params: Vec<Vec<u16>>,
@@ -698,6 +836,14 @@ mod tests {
         }
         fn osc_dispatch(&mut self, data: &[u8], _bel_terminated: bool) {
             self.actions.push(Action::Osc(data.to_vec()));
+        }
+        fn dcs_dispatch(&mut self, params: &Params, intermediates: &[u8], action: u8, data: &[u8]) {
+            self.actions.push(Action::Dcs {
+                params: params.iter().map(|p| p.to_vec()).collect(),
+                intermediates: intermediates.to_vec(),
+                action,
+                data: data.to_vec(),
+            });
         }
     }
 
@@ -810,6 +956,72 @@ mod tests {
                 private: 0,
                 action: b'q',
             }]
+        );
+    }
+
+    #[test]
+    fn a_dcs_is_a_csi_with_a_payload() {
+        // `ESC P <params> <intermediates> <final> <data> ST`. The prologue parses exactly
+        // like a CSI's; the final byte names the sequence rather than performing it,
+        // because what follows it is the argument.
+        assert_eq!(
+            run(b"\x1bP$qm\x1b\\"),
+            vec![Action::Dcs {
+                params: vec![],
+                intermediates: vec![b'$'],
+                action: b'q',
+                data: b"m".to_vec(),
+            }]
+        );
+        assert_eq!(
+            run(b"\x1bP1;2+qabc\x1b\\"),
+            vec![Action::Dcs {
+                params: vec![vec![1], vec![2]],
+                intermediates: vec![b'+'],
+                action: b'q',
+                data: b"abc".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unterminated_dcs_never_leaks_its_payload_as_text() {
+        // The hostile shape: a DCS that is never closed. Its bytes must not fall out onto
+        // the screen, and the parser must not be stuck in it forever — the ESC that starts
+        // anything else ends it.
+        assert_eq!(run(b"\x1bPqpayload"), vec![]);
+        assert_eq!(
+            run(b"\x1bPqpayload\x1b[1mX"),
+            vec![
+                Action::Dcs {
+                    params: vec![],
+                    intermediates: vec![],
+                    action: b'q',
+                    data: b"payload".to_vec(),
+                },
+                Action::Csi {
+                    params: vec![vec![1]],
+                    intermediates: vec![],
+                    private: 0,
+                    action: b'm',
+                },
+                Action::Print('X'),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dcs_payload_is_capped_like_every_other_buffer() {
+        // The child writes this. A megabyte of payload must cost nothing but the time to
+        // skip it, and an over-long one is dropped whole rather than acted on truncated.
+        let mut input = b"\x1bP$q".to_vec();
+        input.extend(std::iter::repeat_n(b'x', DCS_MAX * 2));
+        input.extend_from_slice(b"\x1b\\");
+        input.push(b'Z');
+        assert_eq!(
+            run(&input),
+            vec![Action::Print('Z')],
+            "dropped, and the stream recovers"
         );
     }
 
@@ -939,17 +1151,8 @@ mod tests {
             run(b"\x1b]0;title\x07"),
             vec![Action::Osc(b"0;title".to_vec())]
         );
-        // ST (ESC \) terminates too: the OSC dispatches, then ESC \ is esc_dispatch.
-        assert_eq!(
-            run(b"\x1b]2;hi\x1b\\"),
-            vec![
-                Action::Osc(b"2;hi".to_vec()),
-                Action::Esc {
-                    intermediates: vec![],
-                    byte: b'\\',
-                },
-            ]
-        );
+        // ST (ESC \) terminates too, and is not itself an action.
+        assert_eq!(run(b"\x1b]2;hi\x1b\\"), vec![Action::Osc(b"2;hi".to_vec())]);
     }
 
     #[test]
@@ -965,22 +1168,6 @@ mod tests {
                     private: 0,
                     action: b'H',
                 },
-            ]
-        );
-    }
-
-    #[test]
-    fn dcs_is_swallowed() {
-        // DCS ... ST produces no actions except the terminating esc_dispatch, and
-        // the trailing printable resumes.
-        assert_eq!(
-            run(b"\x1bPq garbage \x1b\\Z"),
-            vec![
-                Action::Esc {
-                    intermediates: vec![],
-                    byte: b'\\',
-                },
-                Action::Print('Z'),
             ]
         );
     }
