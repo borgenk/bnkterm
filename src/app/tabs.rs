@@ -905,6 +905,7 @@ mod tests {
             .apply(ToTerminal::Key {
                 key: Key::plain('a'),
                 mods: Mods::NONE,
+                event: crate::input::KeyEvent::Press,
             })
             .expect("write tab A");
         tabs.entries[1]
@@ -912,6 +913,7 @@ mod tests {
             .apply(ToTerminal::Key {
                 key: Key::plain('b'),
                 mods: Mods::NONE,
+                event: crate::input::KeyEvent::Press,
             })
             .expect("write tab B");
 

@@ -7,7 +7,7 @@
 //! into window actions. Everything except PTY reads stays on `app::State`'s main
 //! thread; gather threads publish only byte batches.
 
-use crate::input::{Key, Mods};
+use crate::input::{Key, KeyEvent, Mods};
 use crate::mouse::MouseButton;
 use crate::platform::geom::Scale;
 use crate::term_render::CellMetrics;
@@ -47,7 +47,15 @@ pub enum ToTerminal {
     /// A resolved key press. The window did the keycode → keysym mapping (xkb lives
     /// with the Wayland keyboard); the terminal encodes it under the current terminal
     /// modes (which it owns) and writes the bytes to the child.
-    Key { key: Key, mods: Mods },
+    /// A key event: what key, what modifiers, and *what happened to it*. The event is
+    /// almost always a press; a release is sent only because a program can ask to hear
+    /// about them (kitty's `REPORT_EVENT_TYPES`), and the encoder drops it on the floor
+    /// when nobody has.
+    Key {
+        key: Key,
+        mods: Mods,
+        event: KeyEvent,
+    },
     /// A pointer event mapped to a cell, plus the modifier chord (Shift forces local
     /// use even while a program is grabbing the mouse).
     Pointer { event: PointerEvent, mods: Mods },

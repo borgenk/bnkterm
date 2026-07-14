@@ -1163,9 +1163,12 @@ impl State {
                 let key_state = r.u32()?;
                 if key_state == wl_keyboard::KEY_STATE_PRESSED {
                     self.on_key_press(keycode)?;
-                } else if self.repeat_key == Some(keycode) {
-                    // The held key was released: stop repeating it.
-                    self.stop_repeat();
+                } else {
+                    if self.repeat_key == Some(keycode) {
+                        // The held key was released: stop repeating it.
+                        self.stop_repeat();
+                    }
+                    self.on_key_release(keycode)?;
                 }
             }
             wl_keyboard::EV_REPEAT_INFO => {
@@ -1190,6 +1193,24 @@ impl State {
     /// function key) is mapped by its keycode; anything else takes its layout
     /// character, and the [`crate::input`] encoder applies Ctrl/Alt. Modifiers
     /// come from xkb's current state.
+    /// A key came back up.
+    ///
+    /// Almost nothing wants to know: the encoder drops a release unless a program has
+    /// asked for release events (kitty's `REPORT_EVENT_TYPES`), so for every other child
+    /// this resolves the key and then writes nothing. The modal leader tables never see
+    /// it — a mode is armed by pressing a key, not by letting go of one.
+    fn on_key_release(&mut self, keycode: u32) -> Result<()> {
+        let mods = self.current_mods();
+        if let Some(key) = self.resolve_key(keycode) {
+            self.tabs.active_mut().apply(ToTerminal::Key {
+                key,
+                mods,
+                event: input::KeyEvent::Release,
+            })?;
+        }
+        Ok(())
+    }
+
     fn on_key_press(&mut self, keycode: u32) -> Result<()> {
         let mods = self.current_mods();
 
@@ -1214,6 +1235,7 @@ impl State {
                     self.tabs.active_mut().apply(ToTerminal::Key {
                         key: literal,
                         mods: literal_mods,
+                        event: input::KeyEvent::Press,
                     })?;
                     return Ok(());
                 }
@@ -1299,11 +1321,11 @@ impl State {
         // Send the key, and if it produced bytes and the keymap marks it
         // repeatable, arm auto-repeat on it.
         if let Some(key) = self.resolve_key(keycode) {
-            if self
-                .tabs
-                .active_mut()
-                .apply(ToTerminal::Key { key, mods })?
-            {
+            if self.tabs.active_mut().apply(ToTerminal::Key {
+                key,
+                mods,
+                event: input::KeyEvent::Press,
+            })? {
                 self.arm_repeat(keycode);
             }
         }
@@ -1415,10 +1437,14 @@ impl State {
         };
         let mods = self.current_mods();
         let sent = match self.resolve_key(keycode) {
-            Some(key) => self
-                .tabs
-                .active_mut()
-                .apply(ToTerminal::Key { key, mods })?,
+            // The keyboard is repeating a held key. A program that asked to hear about
+            // repeats is told it is one; to everyone else it is another press, which is
+            // exactly what a repeat has always looked like to a terminal.
+            Some(key) => self.tabs.active_mut().apply(ToTerminal::Key {
+                key,
+                mods,
+                event: input::KeyEvent::Repeat,
+            })?,
             None => false,
         };
         if sent {

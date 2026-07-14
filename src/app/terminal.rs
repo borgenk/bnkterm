@@ -433,10 +433,10 @@ impl TerminalCore {
     /// received bytes, which the key path uses to gate auto-repeat.
     pub(super) fn apply(&mut self, msg: ToTerminal) -> Result<bool> {
         match msg {
-            ToTerminal::Key { key, mods } => {
+            ToTerminal::Key { key, mods, event } => {
                 let modes = input::Modes::from_screen(&self.screen);
                 self.key_buf.clear();
-                input::encode(key, mods, modes, &mut self.key_buf);
+                input::encode_event(key, mods, event, modes, &mut self.key_buf);
                 if self.key_buf.is_empty() {
                     return Ok(false);
                 }
@@ -2250,6 +2250,7 @@ mod tests {
         core.apply(ToTerminal::Key {
             key: input::Key::plain('x'),
             mods: input::Mods::NONE,
+            event: input::KeyEvent::Press,
         })
         .unwrap();
         assert_eq!(

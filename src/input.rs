@@ -156,6 +156,30 @@ impl std::ops::BitOr for Mods {
     }
 }
 
+/// What happened to a key. The kitty protocol reports all three when asked; the legacy
+/// encoding has no way to say anything but "pressed", and a repeat is indistinguishable
+/// from someone typing fast.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum KeyEvent {
+    #[default]
+    Press,
+    /// The key is held and the keyboard is repeating it. Without the protocol this is a
+    /// press, which is exactly what a repeat has always looked like to a terminal.
+    Repeat,
+    Release,
+}
+
+impl KeyEvent {
+    /// The protocol's number for the event, for the `modifiers:event` sub-field.
+    fn code(self) -> u32 {
+        match self {
+            KeyEvent::Press => 1,
+            KeyEvent::Repeat => 2,
+            KeyEvent::Release => 3,
+        }
+    }
+}
+
 /// The kitty keyboard protocol's progressive-enhancement flags, as an application
 /// pushes them with `CSI > <flags> u`. A bitfield newtype, not a bare `u8`, so a
 /// caller cannot pass the wrong number.
@@ -175,9 +199,14 @@ impl KittyFlags {
     /// `Alt+key`, and any modified `Enter`/`Tab`/`Backspace`) as `CSI u` sequences.
     pub const DISAMBIGUATE: KittyFlags = KittyFlags(0b1);
 
+    /// `0b10`: report key *release* and *repeat*, not only press. A program tracking a
+    /// held key (a game, a modal editor, anything with a chord) cannot do it otherwise:
+    /// the legacy encoding has no way to say a key stopped being held.
+    pub const REPORT_EVENT_TYPES: KittyFlags = KittyFlags(0b10);
+
     /// The flags bnkterm actually honours. An application's request is masked with
     /// this, so what we store is what we do.
-    pub const SUPPORTED: KittyFlags = KittyFlags(0b1);
+    pub const SUPPORTED: KittyFlags = KittyFlags(0b11);
 
     pub const NONE: KittyFlags = KittyFlags(0);
 
@@ -209,6 +238,13 @@ impl KittyFlags {
             3 => KittyFlags(self.0 & !flags.0),
             _ => self,
         }
+    }
+}
+
+impl std::ops::BitOr for KittyFlags {
+    type Output = KittyFlags;
+    fn bitor(self, rhs: KittyFlags) -> KittyFlags {
+        KittyFlags(self.0 | rhs.0)
     }
 }
 
@@ -285,12 +321,61 @@ impl Modes {
 /// function keys — are *not* touched by either protocol. They were never ambiguous,
 /// both specs leave them alone, and every application already parses them.
 pub fn encode(key: Key, mods: Mods, modes: Modes, out: &mut Vec<u8>) {
-    if modes.kitty.contains(KittyFlags::DISAMBIGUATE) {
-        encode_kitty(key, mods, modes, out);
-    } else if modes.modify_other_keys != ModifyOtherKeys::Off {
-        encode_modify_other_keys(key, mods, modes, out);
-    } else {
-        encode_legacy(key, mods, modes, out);
+    encode_event(key, mods, KeyEvent::Press, modes, out);
+}
+
+/// Encode a key *event*, which is a press unless the application asked to hear about the
+/// others (kitty's `REPORT_EVENT_TYPES`).
+///
+/// Two rules keep a mis-behaving program from wedging the terminal, and both come
+/// straight from the protocol:
+///
+/// - A **release** is reported only for keys that are reported as escape codes in the
+///   first place. A key that produces text produces text; there is no text for "the `a`
+///   key came back up", so nothing is sent.
+/// - **`Enter`, `Tab` and `Backspace` never report a release**, even under the flag. The
+///   spec spells out why, and it is a good reason: a program that turns this mode on and
+///   dies without turning it off would otherwise leave the shell underneath receiving an
+///   escape sequence every time you let go of `Enter` — and you could no longer type
+///   `reset` to fix it.
+///
+/// A **repeat** with the flag off is a press, which is exactly what a repeat has always
+/// looked like to a terminal.
+pub fn encode_event(key: Key, mods: Mods, event: KeyEvent, modes: Modes, out: &mut Vec<u8>) {
+    let kitty = modes.kitty.contains(KittyFlags::DISAMBIGUATE);
+    let events = kitty && modes.kitty.contains(KittyFlags::REPORT_EVENT_TYPES);
+
+    if !events {
+        // Nobody is listening for anything but presses. A repeat is one; a release is
+        // nothing at all.
+        match event {
+            KeyEvent::Release => return,
+            KeyEvent::Press | KeyEvent::Repeat => {}
+        }
+        if kitty {
+            return encode_kitty(key, mods, KeyEvent::Press, modes, out);
+        } else if modes.modify_other_keys != ModifyOtherKeys::Off {
+            return encode_modify_other_keys(key, mods, modes, out);
+        }
+        return encode_legacy(key, mods, modes, out);
+    }
+
+    if event == KeyEvent::Release && !reports_release(key, mods) {
+        return;
+    }
+    encode_kitty(key, mods, event, modes, out);
+}
+
+/// Whether this key reports a release at all under `REPORT_EVENT_TYPES`. See
+/// [`encode_event`] for the two rules; this is where they live.
+fn reports_release(key: Key, mods: Mods) -> bool {
+    match key {
+        // A text key's release has no text to be, and no escape code either.
+        Key::Char { .. } => mods.any(Mods::CTRL | Mods::ALT | Mods::SUPER),
+        // The spec's carve-out, so `reset` stays typable after a program leaves the mode
+        // on and exits.
+        Key::Enter | Key::Tab | Key::Backspace => false,
+        _ => true,
     }
 }
 
@@ -339,18 +424,25 @@ fn encode_legacy(key: Key, mods: Mods, modes: Modes, out: &mut Vec<u8>) {
 /// The keys both protocols leave in their legacy form: the ones that already carry
 /// their modifiers in a CSI parameter and were never ambiguous.
 fn encode_named(key: Key, mods: Mods, modes: Modes, out: &mut Vec<u8>) {
+    encode_named_event(key, mods, KeyEvent::Press, modes, out)
+}
+
+/// The same, with an event type folded into the modifier parameter. Under the protocol a
+/// functional key keeps its legacy shape and gains a `:event` sub-field — so an arrow
+/// release is `CSI 1;1:3A`, still recognisably an arrow.
+fn encode_named_event(key: Key, mods: Mods, event: KeyEvent, modes: Modes, out: &mut Vec<u8>) {
     match key {
-        Key::Up => cursor_key(b'A', mods, modes, out),
-        Key::Down => cursor_key(b'B', mods, modes, out),
-        Key::Right => cursor_key(b'C', mods, modes, out),
-        Key::Left => cursor_key(b'D', mods, modes, out),
-        Key::Home => cursor_key(b'H', mods, modes, out),
-        Key::End => cursor_key(b'F', mods, modes, out),
-        Key::Insert => tilde_key(2, mods, out),
-        Key::Delete => tilde_key(3, mods, out),
-        Key::PageUp => tilde_key(5, mods, out),
-        Key::PageDown => tilde_key(6, mods, out),
-        Key::Function(n) => function_key(n, mods, out),
+        Key::Up => cursor_key(b'A', mods, event, modes, out),
+        Key::Down => cursor_key(b'B', mods, event, modes, out),
+        Key::Right => cursor_key(b'C', mods, event, modes, out),
+        Key::Left => cursor_key(b'D', mods, event, modes, out),
+        Key::Home => cursor_key(b'H', mods, event, modes, out),
+        Key::End => cursor_key(b'F', mods, event, modes, out),
+        Key::Insert => tilde_key(2, mods, event, out),
+        Key::Delete => tilde_key(3, mods, event, out),
+        Key::PageUp => tilde_key(5, mods, event, out),
+        Key::PageDown => tilde_key(6, mods, event, out),
+        Key::Function(n) => function_key(n, mods, event, out),
         Key::KeypadEnter => {
             if modes.app_keypad {
                 out.extend_from_slice(b"\x1bOM");
@@ -375,25 +467,28 @@ fn encode_named(key: Key, mods: Mods, modes: Modes, out: &mut Vec<u8>) {
 /// A key that *does* produce text still sends that text: `a` is `a`, and `Shift+a` is
 /// `A`. Only Ctrl, Alt and Super (which produce no text) push a character key into the
 /// `CSI u` form, where it is named by its `base` codepoint and the modifier bitmask.
-fn encode_kitty(key: Key, mods: Mods, modes: Modes, out: &mut Vec<u8>) {
+fn encode_kitty(key: Key, mods: Mods, event: KeyEvent, modes: Modes, out: &mut Vec<u8>) {
     match key {
         Key::Char { typed, base } => {
             if mods.any(Mods::CTRL | Mods::ALT | Mods::SUPER) {
-                csi_u(base as u32, mods, out);
-            } else {
+                csi_u(base as u32, mods, event, out);
+            } else if event != KeyEvent::Release {
+                // Text on press, and on repeat: a held key typing again is what a repeat
+                // has always meant. A release has no text to be, and `reports_release`
+                // has already turned it away.
                 push_utf8(typed, out);
             }
         }
         Key::Enter | Key::Tab | Key::Backspace => {
             let code = text_key_code(key);
-            if mods.0 == 0 {
+            if mods.0 == 0 && event == KeyEvent::Press {
                 out.push(legacy_text_byte(key));
             } else {
-                csi_u(code, mods, out);
+                csi_u(code, mods, event, out);
             }
         }
-        Key::Escape => csi_u(KEY_ESCAPE, mods, out),
-        _ => encode_named(key, mods, modes, out),
+        Key::Escape => csi_u(KEY_ESCAPE, mods, event, out),
+        _ => encode_named_event(key, mods, event, modes, out),
     }
 }
 
@@ -462,14 +557,29 @@ fn legacy_text_byte(key: Key) -> u8 {
 
 /// `CSI <code> ; <mods> u`, the kitty form. The modifier parameter is omitted when
 /// nothing is held: it defaults to 1, and `CSI 27u` is what the spec shows.
-fn csi_u(code: u32, mods: Mods, out: &mut Vec<u8>) {
+fn csi_u(code: u32, mods: Mods, event: KeyEvent, out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b[");
     push_num(out, code);
-    if mods.0 != 0 {
-        out.push(b';');
-        push_num(out, modifier_param(mods));
-    }
+    push_modifier(mods, event, out);
     out.push(b'u');
+}
+
+/// The modifier parameter, and the event type riding on it as a colon sub-field.
+///
+/// Omitted entirely when there is nothing to say — no modifiers, a plain press — because
+/// the defaults are exactly that and `CSI 27u` is what the spec shows. But an event type
+/// cannot be sent without the modifier in front of it, so a release with no modifiers
+/// still has to spell out the default: `CSI 27;1:3u`.
+fn push_modifier(mods: Mods, event: KeyEvent, out: &mut Vec<u8>) {
+    if mods.0 == 0 && event == KeyEvent::Press {
+        return;
+    }
+    out.push(b';');
+    push_num(out, modifier_param(mods));
+    if event != KeyEvent::Press {
+        out.push(b':');
+        push_num(out, event.code());
+    }
 }
 
 /// `CSI 27 ; <mods> ; <code> ~`, the xterm `modifyOtherKeys` form. Both parameters are
@@ -529,51 +639,51 @@ fn ctrl_byte(c: char) -> Option<u8> {
 /// An arrow or Home/End key. Unmodified, it is `CSI <final>` normally or
 /// `SS3 <final>` under the application cursor-key mode; modified, it is always
 /// `CSI 1 ; <param> <final>`.
-fn cursor_key(final_byte: u8, mods: Mods, modes: Modes, out: &mut Vec<u8>) {
-    if mods.0 == 0 {
+fn cursor_key(final_byte: u8, mods: Mods, event: KeyEvent, modes: Modes, out: &mut Vec<u8>) {
+    if mods.0 == 0 && event == KeyEvent::Press {
         out.push(0x1b);
         out.push(if modes.app_cursor { b'O' } else { b'[' });
         out.push(final_byte);
     } else {
-        out.extend_from_slice(b"\x1b[1;");
-        push_num(out, modifier_param(mods));
+        out.extend_from_slice(b"\x1b[1");
+        push_modifier(mods, event, out);
         out.push(final_byte);
     }
 }
 
 /// An Insert/Delete/Page key: `CSI <n> ~`, or `CSI <n> ; <param> ~` when
 /// modified. These do not vary with the cursor-key mode.
-fn tilde_key(n: u32, mods: Mods, out: &mut Vec<u8>) {
+fn tilde_key(n: u32, mods: Mods, event: KeyEvent, out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b[");
     push_num(out, n);
-    if mods.0 != 0 {
-        out.push(b';');
-        push_num(out, modifier_param(mods));
-    }
+    push_modifier(mods, event, out);
     out.push(b'~');
 }
 
 /// A function key. F1-F4 are `SS3 P..S` (or `CSI 1 ; <param> P..S` when
 /// modified); F5-F12 are tilde codes (`CSI 15 ~` .. `CSI 24 ~`). Keys outside
 /// 1-12 produce nothing.
-fn function_key(n: u8, mods: Mods, out: &mut Vec<u8>) {
+fn function_key(n: u8, mods: Mods, event: KeyEvent, out: &mut Vec<u8>) {
     match n {
         1..=4 => {
             let final_byte = b'P' + (n - 1);
-            if mods.0 == 0 {
+            if mods.0 == 0 && event == KeyEvent::Press {
                 out.push(0x1b);
                 out.push(b'O');
                 out.push(final_byte);
             } else {
-                out.extend_from_slice(b"\x1b[1;");
-                push_num(out, modifier_param(mods));
+                out.extend_from_slice(b"\x1b[1");
+                push_modifier(mods, event, out);
                 out.push(final_byte);
             }
         }
         5..=12 => {
             // The xterm tilde codes for F5..F12, with their two gaps.
             const CODES: [u32; 8] = [15, 17, 18, 19, 20, 21, 23, 24];
-            tilde_key(CODES[(n - 5) as usize], mods, out);
+            let Some(&code) = CODES.get((n - 5) as usize) else {
+                return;
+            };
+            tilde_key(code, mods, event, out);
         }
         _ => {}
     }
@@ -869,6 +979,155 @@ mod tests {
         assert_eq!(encoded(Key::Enter, Mods::SHIFT, m), vec![b'\n']);
     }
 
+    /// Modes with both kitty flags: disambiguate, and report event types. This is what
+    /// nvim pushes (`CSI > 3 u`) and what helix asks for.
+    fn kitty_events() -> Modes {
+        Modes {
+            kitty: KittyFlags::DISAMBIGUATE | KittyFlags::REPORT_EVENT_TYPES,
+            ..Modes::default()
+        }
+    }
+
+    fn enc_event(key: Key, mods: Mods, event: KeyEvent, modes: Modes) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_event(key, mods, event, modes, &mut out);
+        out
+    }
+
+    #[test]
+    fn nobody_hears_a_key_come_up_unless_they_asked() {
+        // A release is silent in every encoding but the one that asked for it. The legacy
+        // encoding has no way to say a key stopped being held, and inventing one would put
+        // bytes into every shell on the machine.
+        for modes in [Modes::default(), kitty(), mok(ModifyOtherKeys::Level2)] {
+            assert!(enc_event(Key::plain('a'), Mods::NONE, KeyEvent::Release, modes).is_empty());
+            assert!(enc_event(Key::Up, Mods::NONE, KeyEvent::Release, modes).is_empty());
+            assert!(enc_event(Key::Escape, Mods::NONE, KeyEvent::Release, modes).is_empty());
+        }
+        // And a repeat, to anyone not listening for one, is just a press — which is
+        // exactly what a repeat has always looked like to a terminal.
+        assert_eq!(
+            enc_event(
+                Key::plain('a'),
+                Mods::NONE,
+                KeyEvent::Repeat,
+                Modes::default()
+            ),
+            b"a"
+        );
+        assert_eq!(
+            enc_event(Key::Up, Mods::NONE, KeyEvent::Repeat, kitty()),
+            b"\x1b[A"
+        );
+    }
+
+    #[test]
+    fn event_types_ride_on_the_modifier_as_a_sub_field() {
+        let m = kitty_events();
+        // Press is the default and says nothing extra.
+        assert_eq!(
+            enc_event(Key::Escape, Mods::NONE, KeyEvent::Press, m),
+            b"\x1b[27u"
+        );
+        // A release cannot be sent without the modifier in front of it, so even with no
+        // modifiers held it spells out the default: `1`.
+        assert_eq!(
+            enc_event(Key::Escape, Mods::NONE, KeyEvent::Release, m),
+            b"\x1b[27;1:3u"
+        );
+        assert_eq!(
+            enc_event(Key::Escape, Mods::NONE, KeyEvent::Repeat, m),
+            b"\x1b[27;1:2u"
+        );
+        // With modifiers, the event rides alongside them.
+        assert_eq!(
+            enc_event(Key::plain('c'), Mods::CTRL, KeyEvent::Release, m),
+            b"\x1b[99;5:3u"
+        );
+    }
+
+    #[test]
+    fn a_functional_key_keeps_its_shape_and_gains_an_event() {
+        // An arrow release is still recognisably an arrow: the event is a sub-field of the
+        // modifier parameter, not a different sequence. Claiming the flag and then
+        // reporting releases for `Ctrl+C` but not for the arrow keys would be a half-truth
+        // of exactly the kind this codebase keeps refusing to tell.
+        let m = kitty_events();
+        assert_eq!(
+            enc_event(Key::Up, Mods::NONE, KeyEvent::Press, m),
+            b"\x1b[A"
+        );
+        assert_eq!(
+            enc_event(Key::Up, Mods::NONE, KeyEvent::Release, m),
+            b"\x1b[1;1:3A"
+        );
+        assert_eq!(
+            enc_event(Key::Up, Mods::CTRL, KeyEvent::Release, m),
+            b"\x1b[1;5:3A"
+        );
+        assert_eq!(
+            enc_event(Key::Delete, Mods::NONE, KeyEvent::Release, m),
+            b"\x1b[3;1:3~"
+        );
+        assert_eq!(
+            enc_event(Key::Function(5), Mods::NONE, KeyEvent::Release, m),
+            b"\x1b[15;1:3~"
+        );
+        assert_eq!(
+            enc_event(Key::Function(1), Mods::NONE, KeyEvent::Release, m),
+            b"\x1b[1;1:3P"
+        );
+    }
+
+    #[test]
+    fn a_text_key_has_no_release_to_report() {
+        // `a` produces text. There is no text for "the `a` key came back up", and no
+        // escape code either, so nothing is sent — the key was never reported as a
+        // sequence in the first place.
+        let m = kitty_events();
+        assert_eq!(
+            enc_event(Key::plain('a'), Mods::NONE, KeyEvent::Press, m),
+            b"a"
+        );
+        assert!(enc_event(Key::plain('a'), Mods::NONE, KeyEvent::Release, m).is_empty());
+        // A held key typing again is a repeat, and a repeat of a text key is the text.
+        assert_eq!(
+            enc_event(Key::plain('a'), Mods::NONE, KeyEvent::Repeat, m),
+            b"a"
+        );
+        // But hold Ctrl and it *is* reported as a sequence, so its release is too.
+        assert_eq!(
+            enc_event(Key::plain('a'), Mods::CTRL, KeyEvent::Release, m),
+            b"\x1b[97;5:3u"
+        );
+    }
+
+    #[test]
+    fn enter_tab_and_backspace_never_report_a_release() {
+        // The spec's carve-out, and it is a good one. A program that turns this mode on
+        // and dies without turning it off would otherwise leave the shell underneath
+        // receiving an escape sequence every time you let go of Enter — and you could no
+        // longer type `reset` to fix it. The keys you need to repair a broken terminal are
+        // the keys that stay boring.
+        let m = kitty_events();
+        for key in [Key::Enter, Key::Tab, Key::Backspace] {
+            assert!(
+                enc_event(key, Mods::NONE, KeyEvent::Release, m).is_empty(),
+                "{key:?} must not report a release"
+            );
+            assert!(
+                enc_event(key, Mods::CTRL, KeyEvent::Release, m).is_empty(),
+                "{key:?} must not report a release even modified"
+            );
+        }
+        // They still report presses, and still take their modifiers.
+        assert_eq!(enc_event(Key::Enter, Mods::NONE, KeyEvent::Press, m), b"\r");
+        assert_eq!(
+            enc_event(Key::Enter, Mods::SHIFT, KeyEvent::Press, m),
+            b"\x1b[13;2u"
+        );
+    }
+
     #[test]
     fn kitty_outranks_modify_other_keys() {
         // An application that turns on both (Claude Code does, to cover terminals that
@@ -947,14 +1206,18 @@ mod tests {
         );
 
         // Having heard back, it pushes flags 3: disambiguate (1) plus report-event-types
-        // (2). We implement the first and not the second, so we take the bit we honour
-        // and leave the other off rather than promising key-release events we never send.
+        // (2). We implement both, so it gets both — and the reply says 3, because the
+        // reply has only ever been allowed to say what is true. The masking machinery is
+        // still there and still honest; it simply has nothing left to take away.
         parser.advance_bytes(&mut screen, b"\x1b[>3u");
-        assert_eq!(screen.kitty_flags(), KittyFlags::DISAMBIGUATE);
+        assert_eq!(
+            screen.kitty_flags(),
+            KittyFlags::DISAMBIGUATE | KittyFlags::REPORT_EVENT_TYPES
+        );
         parser.advance_bytes(&mut screen, b"\x1b[?u");
         assert_eq!(
             screen.take_responses(),
-            b"\x1b[?1u",
+            b"\x1b[?3u",
             "and we say so, truthfully"
         );
 
@@ -964,6 +1227,11 @@ mod tests {
         assert_eq!(encoded(Key::Enter, Mods::SHIFT, modes), b"\x1b[13;2u");
         assert_eq!(encoded(Key::Enter, Mods::CTRL, modes), b"\x1b[13;5u");
         assert_eq!(encoded(Key::plain('i'), Mods::CTRL, modes), b"\x1b[105;5u");
+        // And it hears the key come back up, which it asked for and could not have had.
+        assert_eq!(
+            enc_event(Key::plain('i'), Mods::CTRL, KeyEvent::Release, modes),
+            b"\x1b[105;5:3u"
+        );
         assert_eq!(encoded(Key::Escape, Mods::NONE, modes), b"\x1b[27u");
     }
 

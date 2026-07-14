@@ -6348,13 +6348,16 @@ mod tests {
         assert_eq!(s.take_responses(), b"\x1b[?0u");
         feed(&mut s, b"\x1b[>1u\x1b[?u");
         assert_eq!(s.take_responses(), b"\x1b[?1u");
-        // An application asking for flags we do not implement (here 0b11111: event
-        // types, alternate keys, all-keys, associated text) is told the truth about what
-        // it will get. Reporting them as set would leave it waiting for key-release
-        // events that never come.
+        // An application asking for everything (0b11111) is told exactly what it will
+        // get: disambiguate and event types, which we implement, and not alternate keys,
+        // all-keys-as-escape-codes or associated text, which we do not. Reporting those as
+        // set would leave it waiting for reports that never come.
         feed(&mut s, b"\x1b[>31u\x1b[?u");
-        assert_eq!(s.take_responses(), b"\x1b[?1u");
-        assert_eq!(s.kitty_flags(), KittyFlags::DISAMBIGUATE);
+        assert_eq!(s.take_responses(), b"\x1b[?3u");
+        assert_eq!(
+            s.kitty_flags(),
+            KittyFlags::DISAMBIGUATE | KittyFlags::REPORT_EVENT_TYPES
+        );
     }
 
     #[test]
