@@ -1227,6 +1227,10 @@ pub struct Screen {
     /// (`OSC 4/10/11/12` with a `?`) and write it, so it has to live where the escape
     /// sequences can reach it. The renderer borrows it at paint time.
     theme: Theme,
+    /// The last character actually printed, which is all REP (`CSI b`) has to repeat.
+    /// Cleared by any C0 control, so a REP after a newline repeats nothing rather than
+    /// a screenful of whatever ended the line above.
+    last_printed: Option<char>,
     /// Synchronized output (`?2026`): the child has asked us to hold the frame until it
     /// finishes drawing, so it is never seen half-painted. The grid keeps *updating*
     /// while this is set — only presentation waits. The grid owns no clock, so the
@@ -1301,6 +1305,7 @@ impl Screen {
             kitty_stack: Vec::new(),
             modify_other_keys: ModifyOtherKeys::default(),
             theme: Theme::default(),
+            last_printed: None,
             synchronized: false,
             clipboard_writes: Vec::new(),
             bell: false,
@@ -2054,6 +2059,7 @@ impl Screen {
             b.cursor.col += cw;
             b.cursor.pending_wrap = false;
         }
+        self.last_printed = Some(c);
     }
 
     /// Bulk-write a run of printable ASCII (each width 1) at the cursor. Equivalent
@@ -2103,6 +2109,8 @@ impl Screen {
                 b.cursor.pending_wrap = false;
             }
         }
+        // REP repeats the last character printed, and the bulk path prints too.
+        self.last_printed = bytes.last().map(|&b| char::from(b));
     }
 
     /// Attach a zero-width combining mark to the base cell to the left of where
@@ -2207,6 +2215,23 @@ impl Screen {
         let col = b.cursor.col;
         if let Some(stop) = b.tabs.get_mut(col) {
             *stop = true;
+        }
+    }
+
+    /// REP (`CSI Ps b`): print the last character again, `n` times.
+    ///
+    /// ncurses reaches for this to paint a run of one character without sending it a
+    /// thousand times, so it turns up in real output more than its obscurity suggests.
+    /// It repeats the last *printed* character and nothing else: a control byte, an escape
+    /// sequence, or a fresh line all leave nothing to repeat, and then it does nothing —
+    /// which is the behaviour a program relies on when it uses REP right after a newline
+    /// and expects no output rather than a screenful of the last thing on the line above.
+    pub fn repeat_last(&mut self, n: usize) {
+        let Some(c) = self.last_printed else {
+            return;
+        };
+        for _ in 0..n {
+            self.print(c);
         }
     }
 
@@ -2649,6 +2674,7 @@ impl Screen {
             1002 => self.mouse.protocol == MouseProtocol::ButtonEvent,
             1003 => self.mouse.protocol == MouseProtocol::AnyEvent,
             1006 => self.mouse.sgr,
+            12 => self.cursor_appearance.blink,
             1004 => self.focus_events,
             2048 => self.in_band_resize,
             2004 => self.bracketed_paste,
@@ -2679,6 +2705,11 @@ impl Screen {
                         self.restore_cursor();
                     }
                 }
+                // `?12` blinks the cursor without saying anything about its shape, which
+                // is the one thing DECSCUSR cannot do: its parameters bind the two
+                // together. A program that wants a blinking bar and finds a steady block
+                // has to be able to say only "blink".
+                12 => self.cursor_appearance.blink = enable,
                 1004 => self.focus_events = enable,
                 2048 => self.set_in_band_resize(enable),
                 2004 => self.bracketed_paste = enable,
@@ -3845,6 +3876,8 @@ impl Perform for Screen {
             0x07 => self.bell = true,        // BEL
             _ => {}                          // NUL, XON/XOFF, ...: nothing to draw
         }
+        // Whatever it did, it was not printing: there is nothing left for REP to repeat.
+        self.last_printed = None;
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], private: u8, action: u8) {
@@ -3890,6 +3923,7 @@ impl Perform for Screen {
                 }
             }
             b'Z' => self.back_tab(csi_count(params, 0)), // CBT
+            b'b' => self.repeat_last(csi_count(params, 0)), // REP
             b'J' => self.erase_display(csi_arg(params, 0)),
             b'K' => self.erase_line(csi_arg(params, 0)),
             b'L' => self.insert_lines(csi_count(params, 0)),
@@ -4443,6 +4477,59 @@ mod tests {
         assert_eq!(s.pen.bg, Color::Rgb(10, 20, 30));
         feed(&mut s, b"\x1b[90m"); // bright black foreground -> ANSI 8
         assert_eq!(s.pen.fg, Color::Ansi(8));
+    }
+
+    #[test]
+    fn rep_repeats_the_last_character_and_nothing_else() {
+        // ncurses paints a run of one character with this rather than sending it a
+        // thousand times, so it turns up in real output more than its obscurity suggests.
+        let mut s = Screen::new(10, 3);
+        feed(&mut s, b"-\x1b[4b"); // a dash, then four more
+        assert_eq!(s.row_string(0).trim_end(), "-----");
+
+        // It repeats the last *printed* character, so an escape sequence in between
+        // changes the style and not what gets repeated.
+        feed(&mut s, b"\x1b[2;1Hx\x1b[31m\x1b[2b");
+        assert_eq!(s.row_string(1).trim_end(), "xxx");
+        assert_eq!(
+            s.cell(1, 2).fg,
+            Color::Ansi(1),
+            "the repeat takes the new pen"
+        );
+
+        // But a control byte ends the run: a REP straight after a newline has nothing to
+        // repeat, and must print nothing rather than a screenful of the line above.
+        feed(&mut s, b"\r\n\x1b[5b");
+        assert_eq!(s.row_string(2).trim_end(), "");
+        assert_eq!(s.cursor(), (2, 0));
+
+        // A bare `CSI b` is one repeat, like every other count.
+        feed(&mut s, b"z\x1b[b");
+        assert_eq!(s.row_string(2).trim_end(), "zz");
+    }
+
+    #[test]
+    fn mode_12_blinks_the_cursor_without_reshaping_it() {
+        // DECSCUSR binds shape and blink together in one parameter, so a program that
+        // wants to change only the blink has no way to say it. `?12` is that way.
+        let mut s = Screen::new(10, 2);
+        feed(&mut s, b"\x1b[4 q"); // a steady underline
+        assert_eq!(s.cursor_style(), CursorStyle::Underline);
+        assert!(!s.cursor_blinks());
+
+        feed(&mut s, b"\x1b[?12h");
+        assert!(s.cursor_blinks(), "blinking now");
+        assert_eq!(
+            s.cursor_style(),
+            CursorStyle::Underline,
+            "still an underline"
+        );
+
+        feed(&mut s, b"\x1b[?12l");
+        assert!(!s.cursor_blinks());
+        // And it reports honestly, like every other mode we act on.
+        feed(&mut s, b"\x1b[?12$p");
+        assert_eq!(s.take_responses(), b"\x1b[?12;2$y");
     }
 
     #[test]
