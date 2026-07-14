@@ -1372,20 +1372,13 @@ pub(crate) fn push_cell_text(
     }
 }
 
-/// Display columns occupied by one already-segmented grapheme cluster. Combining
-/// sequences inherit their base width; emoji keycaps and flags are two cells.
+/// Display columns occupied by one already-segmented grapheme cluster.
+///
+/// One line, because the rule itself now lives in `width.rs` beside the scalar width —
+/// the grid decides which cells a cluster occupies and the renderer decides how wide to
+/// draw it, and the two measuring differently is how a cursor drifts from its glyphs.
 pub(crate) fn display_cluster_width(cluster: &str) -> usize {
-    let mut chars = cluster.chars();
-    let Some(first) = chars.next() else {
-        return 0;
-    };
-    if cluster.contains('\u{20e3}')
-        || cluster.contains('\u{fe0f}')
-        || (matches!(first, '\u{1f1e6}'..='\u{1f1ff}') && chars.next().is_some())
-    {
-        return 2;
-    }
-    cluster.chars().map(crate::width::width).max().unwrap_or(0) as usize
+    usize::from(crate::width::cluster_width(cluster))
 }
 
 fn take_string(strings: &mut Vec<String>) -> String {

@@ -25,6 +25,37 @@ use core::cmp::Ordering;
 
 /// Columns `c` occupies when printed: 0, 1, or 2. Zero-width wins over wide, so a
 /// combining mark that also carries an East Asian width still measures 0.
+/// Display columns occupied by one already-segmented grapheme cluster.
+///
+/// This is the *other* width function, and the two must never disagree: [`width`] measures
+/// a scalar, this measures a user-perceived character. A terminal that measures a cluster
+/// one way when it decides which cells to occupy and another way when it draws them puts
+/// the cursor somewhere the glyphs are not, and every subsequent column is wrong. So this
+/// lives here, beside the scalar width, and both the grid and the renderer call it —
+/// rather than each keeping a rule of its own, which is precisely how they used to differ.
+///
+/// A combining sequence inherits its base width. Three cases do not:
+///
+/// - an **emoji presentation selector** (`U+FE0F`) says "draw the preceding character as
+///   an emoji", and an emoji is two cells wide even when the bare character is one (`☀`
+///   is narrow, `☀️` is not);
+/// - a **keycap** (`U+20E3`) likewise, which is how `1️⃣` is two cells and `1` is one;
+/// - a **flag** is two regional indicators, each of which is *narrow* on its own. Nothing
+///   about the pair's scalar widths says two, and yet two is what it draws as.
+pub fn cluster_width(cluster: &str) -> u8 {
+    let mut chars = cluster.chars();
+    let Some(first) = chars.next() else {
+        return 0;
+    };
+    if cluster.contains('\u{20e3}')
+        || cluster.contains('\u{fe0f}')
+        || (matches!(first, '\u{1f1e6}'..='\u{1f1ff}') && chars.next().is_some())
+    {
+        return 2;
+    }
+    cluster.chars().map(width).max().unwrap_or(0)
+}
+
 pub fn width(c: char) -> u8 {
     let cp = u32::from(c);
     if in_ranges(ZERO_WIDTH_RANGES, cp) {

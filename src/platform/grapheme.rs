@@ -65,6 +65,24 @@ pub struct Graphemes<'a> {
     /// Byte offset of the cluster being accumulated.
     start: usize,
     done: bool,
+    state: BreakState,
+}
+
+/// The UAX #29 break machine, carried one scalar at a time.
+///
+/// A terminal needs this *incrementally* and cannot have it any other way. The grid is
+/// handed one scalar at a time as bytes arrive off the pty, and it cannot look ahead: the
+/// rest of a cluster may not have been written yet, may arrive in the next read, or may
+/// never arrive at all because the program crashed mid-emoji. So the question can never be
+/// "where are the boundaries in this string?" — it has to be "does a boundary fall
+/// immediately *before* this scalar, given everything I have seen?", which is what this
+/// answers.
+///
+/// [`Graphemes`] runs the same machine over a string it already holds, so a cluster the
+/// grid assembles and a cluster the renderer segments can never disagree about where it
+/// ends.
+#[derive(Clone, Copy, Default)]
+pub struct BreakState {
     prev: Option<Gcb>,
     /// Consecutive Regional_Indicator scalars ending at `prev` (raw run length): a
     /// break falls between two RIs only when this is even.
@@ -79,20 +97,30 @@ pub struct Graphemes<'a> {
     incb_linker: bool,
 }
 
-impl<'a> Graphemes<'a> {
-    fn new(s: &'a str) -> Self {
-        Graphemes {
-            s,
-            iter: s.char_indices(),
-            start: 0,
-            done: false,
-            prev: None,
-            ri_run: 0,
-            ep_then_extend: false,
-            zwj_after_ep: false,
-            incb_run: false,
-            incb_linker: false,
-        }
+impl BreakState {
+    /// Whether a cluster boundary falls immediately before `c`, folding `c` into the
+    /// state either way.
+    ///
+    /// `false` for the very first scalar it ever sees: there is no cluster in front of it
+    /// to be broken away from. A caller starting a fresh run of text calls [`reset`] and
+    /// gets that behaviour again.
+    pub fn breaks_before(&mut self, c: char) -> bool {
+        let g = gcb(c);
+        let ep = is_extended_pictographic(c);
+        let ci = incb(c);
+        let gb9c = self.incb_run && self.incb_linker && ci == Some(Incb::Consonant);
+        let brk = self
+            .prev
+            .is_some_and(|p| should_break(p, g, ep, self.ri_run, self.zwj_after_ep, gb9c));
+        self.advance(g, ep, ci);
+        brk
+    }
+
+    /// Forget everything: the next scalar starts a cluster rather than continuing one.
+    /// The grid calls this whenever the run of printing is interrupted — a control byte,
+    /// a cursor move — because a cluster cannot span one.
+    pub fn reset(&mut self) {
+        *self = BreakState::default();
     }
 
     /// Fold one scalar's break properties into the carried state (the state-update
@@ -149,16 +177,9 @@ impl<'a> Iterator for Graphemes<'a> {
                 self.done = true;
                 return (self.start < self.s.len()).then(|| (self.start, &self.s[self.start..]));
             };
-            let g = gcb(c);
-            let ep = is_extended_pictographic(c);
-            let ci = incb(c);
-            let gb9c = self.incb_run && self.incb_linker && ci == Some(Incb::Consonant);
             // A break before `c` closes the cluster at `[start, i)`; `c` then opens
             // the next one. State advances for `c` either way.
-            let brk = self
-                .prev
-                .is_some_and(|p| should_break(p, g, ep, self.ri_run, self.zwj_after_ep, gb9c));
-            self.advance(g, ep, ci);
+            let brk = self.state.breaks_before(c);
             if brk {
                 let out = (self.start, &self.s[self.start..i]);
                 self.start = i;
@@ -258,7 +279,13 @@ pub fn is_word_char(c: char) -> bool {
 /// The grapheme clusters of `s`, lazily: each yielded as its byte offset and
 /// substring, with nothing allocated.
 pub fn graphemes(s: &str) -> Graphemes<'_> {
-    Graphemes::new(s)
+    Graphemes {
+        s,
+        iter: s.char_indices(),
+        start: 0,
+        done: false,
+        state: BreakState::default(),
+    }
 }
 
 // ---------------------------------------------------------------------------

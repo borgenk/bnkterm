@@ -38,6 +38,7 @@
 use crate::color::{self, Color, Theme};
 use crate::input::{KittyFlags, ModifyOtherKeys};
 use crate::mouse::{MouseMode, MouseProtocol};
+use crate::platform::grapheme;
 use crate::vt::{Params, Perform};
 use crate::width::width;
 use std::cmp::Ordering;
@@ -1226,7 +1227,28 @@ pub struct Screen {
     /// The colour palette. Terminal state, not renderer state: a program can read it
     /// (`OSC 4/10/11/12` with a `?`) and write it, so it has to live where the escape
     /// sequences can reach it. The renderer borrows it at paint time.
-    theme: Theme,
+    ///
+    /// Boxed, and the reason is measured rather than stylistic. A 256-entry palette is
+    /// ~780 bytes, and inline it pushed the fields the *parser* touches on every byte —
+    /// the pen, the cursor, the mode flags — apart across cache lines. The palette is cold
+    /// to the parser and warm only to the painter, so it goes behind a pointer and the hot
+    /// fields close ranks. See the note in `perf/` before undoing this.
+    theme: Box<Theme>,
+    /// Grapheme clustering (`?2027`): a user-perceived character occupies one cell, rather
+    /// than each scalar occupying its own.
+    ///
+    /// Off by default, and it has to be. Both answers are legitimate — `wcwidth` says the
+    /// astronaut is four columns (woman 2 + ZWJ 0 + rocket 2) and a clustering terminal
+    /// says two — and an application that measures one way while the terminal measures the
+    /// other puts its cursor where the glyphs are not. So the terminal cannot simply pick
+    /// the better answer: it has to *say* which one it uses, and only change it for a
+    /// program that asked. That is the whole reason this is a mode and not a fix.
+    grapheme_clustering: bool,
+    /// The UAX #29 machine, carried across scalars, and the cell the cluster it is
+    /// building lives in. A cluster arrives one scalar at a time and cannot be looked
+    /// ahead of: the rest of it may be in the next read off the pty, or may never come.
+    cluster: grapheme::BreakState,
+    cluster_anchor: Option<ClusterAnchor>,
     /// The last character actually printed, which is all REP (`CSI b`) has to repeat.
     /// Cleared by any C0 control, so a REP after a newline repeats nothing rather than
     /// a screenful of whatever ended the line above.
@@ -1261,6 +1283,20 @@ enum NamedColor {
     Foreground,
     Background,
     Cursor,
+}
+
+/// The cell a grapheme cluster is being built in, and where the cursor was left after it.
+///
+/// The cursor position is what makes the anchor safe: a cluster cannot span a cursor move,
+/// so if the cursor is no longer where this cluster left it, the cluster is over and the
+/// next scalar starts a new one. That check costs nothing and needs no hooks in the twenty
+/// places that move a cursor — any of which would otherwise have been a way to leave a
+/// stale anchor pointing at a cell that has since been overwritten.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ClusterAnchor {
+    row: usize,
+    col: usize,
+    after: (usize, usize),
 }
 
 /// Which selection an `OSC 52` write is for. The X11 letters: `c` is the clipboard,
@@ -1304,7 +1340,10 @@ impl Screen {
             links: LinkTable::default(),
             kitty_stack: Vec::new(),
             modify_other_keys: ModifyOtherKeys::default(),
-            theme: Theme::default(),
+            theme: Box::new(Theme::default()),
+            grapheme_clustering: false,
+            cluster: grapheme::BreakState::default(),
+            cluster_anchor: None,
             last_printed: None,
             synchronized: false,
             clipboard_writes: Vec::new(),
@@ -1987,6 +2026,13 @@ impl Screen {
     /// Print one scalar value at the cursor, applying wide-character and wrap
     /// semantics. Combining marks (width 0) attach to the preceding cell.
     pub fn print(&mut self, c: char) {
+        // Under `?2027` a scalar that continues the cluster in the cell behind us joins
+        // it, whatever its own width — that is the whole difference between counting
+        // scalars and counting characters. The rocket of an astronaut is two columns wide
+        // on its own and no columns wide as part of the astronaut.
+        if self.extend_cluster(c) {
+            return;
+        }
         let cw = usize::from(width(c));
         if cw == 0 {
             self.put_combining(c);
@@ -2060,6 +2106,18 @@ impl Screen {
             b.cursor.pending_wrap = false;
         }
         self.last_printed = Some(c);
+        // This cell is now the one a continuing scalar would join — but only a terminal in
+        // clustering mode has any use for that, and this is the per-character hot path, so
+        // the bookkeeping is not done for the overwhelming majority of terminals that
+        // never turn the mode on.
+        if self.grapheme_clustering {
+            let cursor = self.active().cursor;
+            self.cluster_anchor = Some(ClusterAnchor {
+                row,
+                col,
+                after: (cursor.row, cursor.col),
+            });
+        }
     }
 
     /// Bulk-write a run of printable ASCII (each width 1) at the cursor. Equivalent
@@ -2111,6 +2169,128 @@ impl Screen {
         }
         // REP repeats the last character printed, and the bulk path prints too.
         self.last_printed = bytes.last().map(|&b| char::from(b));
+        // No ASCII scalar continues a cluster, so a run of it ends whatever was open.
+        // (An ASCII byte cannot be an Extend, a ZWJ or a regional indicator.)
+        if self.grapheme_clustering {
+            self.cluster.reset();
+            self.cluster_anchor = None;
+        }
+    }
+
+    /// Try to join `c` onto the grapheme cluster already in the cell behind the cursor.
+    /// Returns whether it did, in which case the caller has nothing left to do.
+    ///
+    /// This is where `?2027` actually lives. Everything else about the mode is
+    /// bookkeeping; the decision is here, and it is made one scalar at a time because that
+    /// is how a terminal receives them. There is no lookahead: when the woman arrives we
+    /// do not know whether a ZWJ and a rocket are coming, so she is printed as herself,
+    /// and the ZWJ and the rocket *join her* when they turn up. A cluster is never held
+    /// back waiting to see whether it is finished — a program that writes half an emoji and
+    /// crashes must still leave half an emoji on screen.
+    ///
+    /// The anchor carries where the cursor was when the cluster last grew. If the cursor
+    /// has moved since, the cluster is over: a cluster cannot span a cursor move, and
+    /// checking this here costs nothing and needs no hook in the twenty places that move a
+    /// cursor — any one of which, if forgotten, would have left a stale anchor pointing at
+    /// a cell that had since been overwritten.
+    fn extend_cluster(&mut self, c: char) -> bool {
+        if !self.grapheme_clustering {
+            return false;
+        }
+        let cursor = self.active().cursor;
+        let anchor = match self.cluster_anchor {
+            Some(a) if a.after == (cursor.row, cursor.col) => Some(a),
+            // The cursor moved, or there is nothing to continue: whatever run of text we
+            // were in has ended, and this scalar starts a fresh cluster.
+            _ => {
+                self.cluster.reset();
+                self.cluster_anchor = None;
+                None
+            }
+        };
+        // The machine is fed every scalar, whether it joins or starts something.
+        let joins = !self.cluster.breaks_before(c);
+        let Some(anchor) = anchor else {
+            return false;
+        };
+        if !joins {
+            return false;
+        }
+        self.grow_cluster(anchor, c);
+        true
+    }
+
+    /// Add `c` to the cluster at `anchor`, and widen the cell if the cluster has grown
+    /// from one column to two.
+    ///
+    /// The widening is the fiddly half, and it is unavoidable: a cluster's width is not
+    /// known until it ends. `☀` is one column, and `☀️` — the very same character with an
+    /// emoji presentation selector after it — is two. The base was already placed in a
+    /// narrow cell by the time the selector arrived, so the cell has to grow under it. The
+    /// same goes for a flag: a regional indicator is narrow on its own and a pair of them
+    /// is an emoji.
+    ///
+    /// At the right margin there is nowhere to grow into, and the cluster stays narrow
+    /// rather than wrapping: a character that has already been drawn cannot be moved to the
+    /// next line without the cursor arithmetic on the far end of the pty disagreeing about
+    /// where everything after it went.
+    fn grow_cluster(&mut self, anchor: ClusterAnchor, c: char) {
+        let (row, col) = (anchor.row, anchor.col);
+        let cols = self.active().cols;
+        let was = self.cluster_text(row, col);
+        let before = crate::width::cluster_width(&was);
+
+        if let Some(r) = self.active_mut().lines.get_mut(row) {
+            r.add_mark(col, c);
+        }
+        let now = self.cluster_text(row, col);
+        let after = crate::width::cluster_width(&now);
+
+        // One column to two: promote the cell to a wide leader and lay a spacer beside it,
+        // the same shape a wide character has had all along, so nothing downstream has to
+        // learn a new one.
+        if before < 2 && after == 2 && col + 1 < cols {
+            let leader = self.active().cell(row, col);
+            let spacer = Cell {
+                rune: ' ',
+                fg: leader.fg,
+                bg: leader.bg,
+                attrs: leader.attrs | Attrs::WIDE_SPACER,
+                link: leader.link,
+            };
+            let b = self.active_mut();
+            b.set_raw(
+                row,
+                col,
+                Cell {
+                    attrs: leader.attrs | Attrs::WIDE_LEADER,
+                    ..leader
+                },
+            );
+            b.set_raw(row, col + 1, spacer);
+            b.cursor.col = (col + 2).min(cols.saturating_sub(1));
+            b.cursor.pending_wrap = col + 2 >= cols;
+        }
+        let cursor = self.active().cursor;
+        self.cluster_anchor = Some(ClusterAnchor {
+            row,
+            col,
+            after: (cursor.row, cursor.col),
+        });
+        self.last_printed = Some(c);
+    }
+
+    /// The full text of the cluster in a cell: its base rune and every mark that has
+    /// joined it. This is what both the width rule and the shaper are handed, so the
+    /// number of columns it takes and the glyph drawn in them come from the same string.
+    fn cluster_text(&self, row: usize, col: usize) -> String {
+        let mut out = String::new();
+        let b = self.active();
+        out.push(b.cell(row, col).rune);
+        if let Some(marks) = b.line(row).and_then(|r| r.marks_at(col)) {
+            out.extend(marks);
+        }
+        out
     }
 
     /// Attach a zero-width combining mark to the base cell to the left of where
@@ -2679,6 +2859,7 @@ impl Screen {
             2048 => self.in_band_resize,
             2004 => self.bracketed_paste,
             2026 => self.synchronized,
+            2027 => self.grapheme_clustering,
             _ => return None,
         })
     }
@@ -2714,6 +2895,12 @@ impl Screen {
                 2048 => self.set_in_band_resize(enable),
                 2004 => self.bracketed_paste = enable,
                 2026 => self.synchronized = enable,
+                2027 => {
+                    self.grapheme_clustering = enable;
+                    // Whatever was on screen was measured the other way; start clean.
+                    self.cluster.reset();
+                    self.cluster_anchor = None;
+                }
                 // Mouse reporting: the ?1000/?1002/?1003 levels are mutually
                 // exclusive (enabling one, or disabling any, sets the level);
                 // ?1006 is the orthogonal SGR encoding flag.
@@ -3876,8 +4063,13 @@ impl Perform for Screen {
             0x07 => self.bell = true,        // BEL
             _ => {}                          // NUL, XON/XOFF, ...: nothing to draw
         }
-        // Whatever it did, it was not printing: there is nothing left for REP to repeat.
+        // Whatever it did, it was not printing: there is nothing left for REP to repeat,
+        // and nothing for a cluster to grow onto. A cluster cannot span a control byte.
         self.last_printed = None;
+        if self.grapheme_clustering {
+            self.cluster.reset();
+            self.cluster_anchor = None;
+        }
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], private: u8, action: u8) {
@@ -4477,6 +4669,117 @@ mod tests {
         assert_eq!(s.pen.bg, Color::Rgb(10, 20, 30));
         feed(&mut s, b"\x1b[90m"); // bright black foreground -> ANSI 8
         assert_eq!(s.pen.fg, Color::Ansi(8));
+    }
+
+    /// Screen with grapheme clustering (`?2027`) turned on, as a program that asked for it
+    /// would have it.
+    fn clustering(cols: usize, rows: usize) -> Screen {
+        let mut s = Screen::new(cols, rows);
+        feed(&mut s, b"\x1b[?2027h");
+        s
+    }
+
+    #[test]
+    fn without_clustering_an_astronaut_is_two_emoji_in_four_columns() {
+        // The default, and it must not change: `wcwidth` counts scalars, so the woman is
+        // two columns, the ZWJ is none, and the rocket is two more. An application that
+        // measures its output that way — which is most of them — needs the terminal to
+        // agree, and this is the terminal agreeing.
+        let mut s = Screen::new(10, 1);
+        print_str(&mut s, "\u{1F469}\u{200D}\u{1F680}"); // 👩‍🚀
+        assert_eq!(s.cursor(), (0, 4), "four columns");
+        assert_eq!(s.cell(0, 0).rune, '\u{1F469}', "a woman");
+        assert_eq!(s.cell(0, 2).rune, '\u{1F680}', "and, separately, a rocket");
+    }
+
+    #[test]
+    fn clustering_makes_an_astronaut_one_character_in_two_columns() {
+        // The same three scalars, counted as the one character a user sees. The rocket does
+        // not start a cell of its own: it joins the cluster already in the one behind it,
+        // and the whole thing is two columns — which is what an application that enabled the
+        // mode is also computing, so the two agree about where the next column is.
+        let mut s = clustering(10, 1);
+        print_str(&mut s, "\u{1F469}\u{200D}\u{1F680}");
+        assert_eq!(s.cursor(), (0, 2), "two columns, not four");
+        assert_eq!(s.cell(0, 0).rune, '\u{1F469}');
+        assert!(s.cell(0, 0).is_wide_leader());
+        assert!(s.cell(0, 1).is_wide_spacer());
+        // The tail of the cluster rides on the base cell, which is exactly the shape the
+        // renderer already shapes as one glyph. The astronaut is drawn, not the woman and
+        // the rocket.
+        assert_eq!(
+            s.marks_at(0, 0),
+            Some(['\u{200D}', '\u{1F680}'].as_slice()),
+            "the joiner and the rocket joined the woman"
+        );
+        // And nothing is left in the columns the scalars would have taken.
+        assert_eq!(s.cell(0, 2).rune, ' ');
+    }
+
+    #[test]
+    fn a_cluster_that_grows_wide_takes_the_column_beside_it() {
+        // The fiddly case, and the reason a cluster's width cannot be known when it starts.
+        // `☀` is one column. `☀️` — the very same character with an emoji presentation
+        // selector after it — is two. The sun was already sitting in a narrow cell by the
+        // time the selector arrived, so the cell has to grow under it.
+        let mut s = clustering(10, 1);
+        print_str(&mut s, "\u{2600}"); // ☀ alone: narrow
+        assert_eq!(s.cursor(), (0, 1));
+        assert!(!s.cell(0, 0).is_wide_leader());
+
+        print_str(&mut s, "\u{FE0F}"); // ...and now make it an emoji
+        assert_eq!(s.cursor(), (0, 2), "it grew into the column beside it");
+        assert!(s.cell(0, 0).is_wide_leader());
+        assert!(s.cell(0, 1).is_wide_spacer());
+    }
+
+    #[test]
+    fn a_flag_is_two_narrow_scalars_that_add_up_to_a_wide_character() {
+        // Neither regional indicator is wide. The pair of them is an emoji, and there is
+        // nothing in either scalar's width that says so — which is exactly why the width of
+        // a cluster is a property of the cluster and not a sum of its parts.
+        let mut s = clustering(10, 1);
+        print_str(&mut s, "\u{1F1F3}\u{1F1F4}"); // 🇳🇴
+        assert_eq!(s.cursor(), (0, 2));
+        assert!(s.cell(0, 0).is_wide_leader());
+        assert_eq!(s.marks_at(0, 0), Some(['\u{1F1F4}'].as_slice()));
+    }
+
+    #[test]
+    fn a_cluster_cannot_span_a_cursor_move_or_a_control_byte() {
+        // The anchor is only good while the cursor has not moved. Otherwise a ZWJ arriving
+        // after a jump across the screen would graft a rocket onto whatever happened to be
+        // sitting there — a cell that may since have been overwritten by something else
+        // entirely.
+        let mut s = clustering(10, 2);
+        print_str(&mut s, "\u{1F469}"); // a woman at (0,0)
+        feed(&mut s, b"\x1b[2;5H"); // jump away
+        print_str(&mut s, "\u{200D}\u{1F680}"); // a joiner and a rocket, elsewhere
+        assert_eq!(
+            s.marks_at(0, 0),
+            None,
+            "the woman did not acquire a rocket from across the screen"
+        );
+
+        // Same for a control byte: a newline ends the cluster.
+        let mut s = clustering(10, 2);
+        print_str(&mut s, "\u{1F469}");
+        feed(&mut s, b"\r\n");
+        print_str(&mut s, "\u{1F680}");
+        assert_eq!(s.marks_at(0, 0), None);
+        assert_eq!(s.cell(1, 0).rune, '\u{1F680}', "the rocket stands alone");
+    }
+
+    #[test]
+    fn clustering_is_reported_so_a_program_can_agree_with_us() {
+        // The mode only works if the application knows about it: both width answers are
+        // legitimate, and the disaster is not picking the wrong one, it is the two ends
+        // picking differently. So DECRQM has to tell the truth about this one above all.
+        let mut s = Screen::new(10, 2);
+        feed(&mut s, b"\x1b[?2027$p");
+        assert_eq!(s.take_responses(), b"\x1b[?2027;2$y", "known, and off");
+        feed(&mut s, b"\x1b[?2027h\x1b[?2027$p");
+        assert_eq!(s.take_responses(), b"\x1b[?2027;1$y", "known, and on");
     }
 
     #[test]
@@ -6257,25 +6560,14 @@ mod tests {
 
     #[test]
     fn decrqm_reports_the_modes_we_have_and_admits_the_ones_we_do_not() {
-        // Of the five modes nvim asks about before drawing anything, we now implement
-        // two. The honest answer for the rest is 0 ("I do not know this mode") — never 2,
-        // which would mean "I know it and it is off" and invite nvim to turn it on and
+        // Of the five modes nvim asks about before drawing anything, we now implement all
+        // but one. The honest answer for that one is 0 ("I do not know this mode") — never
+        // 2, which would mean "I know it and it is off" and invite nvim to turn it on and
         // then rely on it.
         let mut s = Screen::new(10, 2);
-        for mode in [b"2027", b"2031"] {
-            let mut q = b"\x1b[?".to_vec();
-            q.extend_from_slice(mode);
-            q.extend_from_slice(b"$p");
-            feed(&mut s, &q);
-            let mut want = b"\x1b[?".to_vec();
-            want.extend_from_slice(mode);
-            want.extend_from_slice(b";0$y");
-            assert_eq!(
-                s.take_responses(),
-                want,
-                "mode {mode:?} is not ours to claim"
-            );
-        }
+        // `?2031` (colour-scheme change notification) is the one left, and we say so.
+        feed(&mut s, b"\x1b[?2031$p");
+        assert_eq!(s.take_responses(), b"\x1b[?2031;0$y", "not ours to claim");
 
         // The ones we do implement report their real state, and follow it as it changes.
         feed(&mut s, b"\x1b[?7$p"); // DECAWM, on by default
