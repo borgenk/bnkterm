@@ -455,7 +455,7 @@ impl State {
                 out,
                 strings,
                 self.metrics,
-                &self.tabs.active().theme,
+                self.tabs.active().theme(),
                 sw,
                 sh,
             );

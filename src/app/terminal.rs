@@ -104,9 +104,6 @@ pub(super) struct TerminalCore {
     demo: bool,
     /// Reused key-encoding buffer (allocated once, not per key press).
     key_buf: Vec<u8>,
-    /// The color palette the grid renders with, and the clear color the window
-    /// reads for the frame background.
-    pub(super) theme: Theme,
     /// Whether the surface holds keyboard focus, so the cursor draws solid when
     /// focused and hollow when not.
     focused: bool,
@@ -203,7 +200,6 @@ impl TerminalCore {
             pty: None,
             demo,
             key_buf: Vec::new(),
-            theme: Theme::default(),
             focused: false,
             blink_on: true,
             blink_at: None,
@@ -390,8 +386,15 @@ impl TerminalCore {
 
     /// The frame background as a `0x00RRGGBB`, for the GPU clear (which must match
     /// the display list's own base fill).
+    /// The palette the grid is currently rendering with.
+    pub(super) fn theme(&self) -> &Theme {
+        self.screen.theme()
+    }
+
     pub(super) fn clear_color(&self) -> u32 {
-        self.theme.bg.to_u32()
+        // The grid owns the palette, because a program can change it (`OSC 11`). Read it
+        // from there rather than keeping a second copy that would drift the moment it did.
+        self.screen.theme().bg.to_u32()
     }
 
     /// Take the outbound messages for the window to act on, leaving the outbox
@@ -975,7 +978,7 @@ impl TerminalCore {
             strings,
             &term_render::FrameInputs {
                 screen: &self.screen,
-                theme: &self.theme,
+                theme: self.screen.theme(),
                 metrics: self.metrics,
                 surface: (self.width as i32, self.height as i32),
                 origin: (self.pad, self.origin_y),

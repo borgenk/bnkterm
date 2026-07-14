@@ -104,8 +104,13 @@ pub trait Perform {
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], private: u8, action: u8);
     /// A complete escape sequence (not CSI/OSC): its intermediates and final byte.
     fn esc_dispatch(&mut self, intermediates: &[u8], byte: u8);
-    /// A complete OSC string (the bytes between `ESC ]` and its ST/BEL terminator).
-    fn osc_dispatch(&mut self, data: &[u8]);
+    /// A complete OSC string (the bytes between `ESC ]` and its terminator), and which
+    /// terminator ended it: `true` for BEL (xterm's convention), `false` for ST.
+    ///
+    /// The terminator matters because an OSC *query* is answered with an OSC, and a
+    /// client that sent BEL may only be looking for BEL. Mirroring what we were sent is
+    /// the one answer that is right for both kinds of client.
+    fn osc_dispatch(&mut self, data: &[u8], bel_terminated: bool);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -343,7 +348,9 @@ impl Parser {
             }
             0x1b => {
                 if self.state == State::OscString {
-                    self.finish_osc(p);
+                    // ESC ends the string; the ST that follows is consumed by the escape
+                    // state as a no-op final byte. Not BEL, so an answer uses ST.
+                    self.finish_osc(p, false);
                 }
                 self.clear();
                 self.state = State::Escape;
@@ -551,7 +558,7 @@ impl Parser {
         match byte {
             0x07 => {
                 // BEL terminator (xterm convention).
-                self.finish_osc(p);
+                self.finish_osc(p, true);
                 self.state = State::Ground;
             }
             0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f => {} // ignore other controls
@@ -574,9 +581,9 @@ impl Parser {
     /// reshaped `Parser` for the hot `advance` loop), and the price of deriving it
     /// instead is that a legitimate OSC of exactly 4096 bytes is dropped too — a title
     /// or URL that long is already past what we would honour.
-    fn finish_osc<P: Perform>(&mut self, p: &mut P) {
+    fn finish_osc<P: Perform>(&mut self, p: &mut P, bel_terminated: bool) {
         if self.osc.len() < OSC_MAX {
-            p.osc_dispatch(&self.osc);
+            p.osc_dispatch(&self.osc, bel_terminated);
         }
     }
 
@@ -689,7 +696,7 @@ mod tests {
                 byte,
             });
         }
-        fn osc_dispatch(&mut self, data: &[u8]) {
+        fn osc_dispatch(&mut self, data: &[u8], _bel_terminated: bool) {
             self.actions.push(Action::Osc(data.to_vec()));
         }
     }

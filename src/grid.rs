@@ -35,7 +35,7 @@
 //!     a small per-`Row` side list keyed by column. It travels with the row when
 //!     it scrolls, and the common all-single-codepoint row pays nothing.
 
-use crate::color::Color;
+use crate::color::{self, Color, Theme};
 use crate::input::{KittyFlags, ModifyOtherKeys};
 use crate::mouse::{MouseMode, MouseProtocol};
 use crate::vt::{Params, Perform};
@@ -1164,6 +1164,18 @@ pub struct Screen {
     /// xterm's `modifyOtherKeys` level (`CSI > 4 ; Pv m`). Not a stack: XTMODKEYS has no
     /// push/pop, a program just sets a level and sets it back.
     modify_other_keys: ModifyOtherKeys,
+    /// The colour palette. Terminal state, not renderer state: a program can read it
+    /// (`OSC 4/10/11/12` with a `?`) and write it, so it has to live where the escape
+    /// sequences can reach it. The renderer borrows it at paint time.
+    theme: Theme,
+}
+
+/// Which of the three named colours an `OSC 10/11/12` is about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NamedColor {
+    Foreground,
+    Background,
+    Cursor,
 }
 
 /// How deep the kitty keyboard stack may go before a push starts dropping the oldest
@@ -1199,6 +1211,7 @@ impl Screen {
             links: LinkTable::default(),
             kitty_stack: Vec::new(),
             modify_other_keys: ModifyOtherKeys::default(),
+            theme: Theme::default(),
         }
     }
 
@@ -2091,6 +2104,21 @@ impl Screen {
         }
     }
 
+    /// CBT: move back `n` tab stops, stopping at column 0. The mirror of [`tab`](Self::tab).
+    pub fn back_tab(&mut self, n: usize) {
+        let b = self.active_mut();
+        for _ in 0..n.max(1) {
+            let Some(mut c) = b.cursor.col.checked_sub(1) else {
+                break;
+            };
+            while c > 0 && !b.tabs.get(c).copied().unwrap_or(false) {
+                c -= 1;
+            }
+            b.cursor.col = c;
+        }
+        b.cursor.pending_wrap = false;
+    }
+
     /// TBC: clear the tab stop at the cursor (mode 0) or all stops (mode 3).
     pub fn clear_tab_stop(&mut self, mode: u16) {
         let b = self.active_mut();
@@ -2596,6 +2624,39 @@ impl Screen {
         self.epoch = epoch;
     }
 
+    /// DECSTR (`CSI ! p`): soft reset. Puts the *settings* back to their defaults while
+    /// leaving the screen, the scrollback and the cursor position alone — which is why
+    /// programs reach for it instead of RIS: it recovers a sane terminal without
+    /// throwing away what is on it.
+    ///
+    /// One deliberate departure from the DEC table, which lists autowrap as reset ("No
+    /// autowrap"). **xterm leaves autowrap on**, and a terminal that stops wrapping
+    /// after a soft reset breaks the very shell the program handed control back to.
+    /// xterm.js once implemented the letter of the spec here and had to undo it. When
+    /// the spec and xterm disagree, programs were written against xterm.
+    ///
+    /// The saved cursor goes too (DECSC is reset to "home position"), so a stray DECRC
+    /// afterwards cannot restore a cursor from before the reset.
+    pub fn soft_reset(&mut self) {
+        self.pen = Pen::default();
+        self.cursor_visible = true;
+        self.insert_mode = false;
+        self.origin_mode = false;
+        self.autowrap = true; // xterm, not DEC. See above.
+        self.app_cursor_keys = false;
+        self.keypad_app = false;
+        self.g0 = Charset::Ascii;
+        self.g1 = Charset::Ascii;
+        self.gl_is_g1 = false;
+        let b = self.active_mut();
+        b.saved = None;
+        // The margins go back to the full screen, but *without* homing the cursor the
+        // way an explicit DECSTBM would: a soft reset is not a cursor move.
+        b.scroll_top = 0;
+        b.scroll_bottom = b.rows.saturating_sub(1);
+        b.cursor.pending_wrap = false;
+    }
+
     /// Resize both screens to `cols` x `rows` (clamped to at least 1x1). The app
     /// calls this when the window's pixel size divided by the cell size yields a
     /// new grid; it then sends the child the matching `TIOCSWINSZ`. Content is
@@ -2723,6 +2784,102 @@ impl Screen {
         self.keypad_app
     }
 
+    /// The palette in force. The renderer borrows this at paint time; a program can have
+    /// changed any of it through `OSC 4/10/11/12`.
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    /// `OSC 10/11/12`: set or *query* the default foreground, background, or cursor
+    /// colour.
+    ///
+    /// The query is the reason this matters, and it is the most useful reply a terminal
+    /// gives. An editor asks `OSC 11 ; ? ST` to find out whether it is sitting on a dark
+    /// or a light background, and picks its whole colour scheme from the answer. A
+    /// terminal that stays silent does not get a default — it gets a *guess*, and half
+    /// the time the guess is wrong and every colour in the editor is subtly off.
+    ///
+    /// A program may batch several requests in one sequence (`OSC 10 ; ? ; ? ST` asks for
+    /// the foreground and then the background), so the payload is a list, and each field
+    /// steps to the next colour in the sequence fg → bg → cursor.
+    fn osc_named_color(&mut self, first: NamedColor, pt: &[u8], bel: bool) {
+        let mut which = Some(first);
+        for field in pt.split(|&b| b == b';') {
+            let Some(target) = which else { break };
+            let slot = match target {
+                NamedColor::Foreground => &mut self.theme.fg,
+                NamedColor::Background => &mut self.theme.bg,
+                NamedColor::Cursor => &mut self.theme.cursor,
+            };
+            if field == b"?" {
+                let (color, code) = (*slot, osc_color_code(target));
+                self.respond(b"\x1b]");
+                push_decimal(&mut self.responses, code);
+                self.responses.push(b';');
+                color::write_x11_color(color, &mut self.responses);
+                self.end_osc(bel);
+            } else if let Some(color) = color::parse_x11_color(field) {
+                *slot = color;
+            }
+            which = match target {
+                NamedColor::Foreground => Some(NamedColor::Background),
+                NamedColor::Background => Some(NamedColor::Cursor),
+                NamedColor::Cursor => None,
+            };
+        }
+    }
+
+    /// `OSC 4 ; index ; spec` sets a palette entry; `OSC 4 ; index ; ?` queries one.
+    /// Several pairs may ride in one sequence, which is how a theme script repaints the
+    /// whole palette in a single write.
+    fn osc_palette(&mut self, pt: &[u8], bel: bool) {
+        let mut fields = pt.split(|&b| b == b';');
+        while let (Some(index), Some(spec)) = (fields.next(), fields.next()) {
+            let Some(index) = parse_u8(index) else {
+                continue;
+            };
+            if spec == b"?" {
+                self.respond(b"\x1b]4;");
+                push_decimal(&mut self.responses, u32::from(index));
+                self.responses.push(b';');
+                color::write_x11_color(self.theme.indexed(index), &mut self.responses);
+                self.end_osc(bel);
+            } else if let Some(color) = color::parse_x11_color(spec) {
+                self.theme.set_indexed(index, color);
+            }
+        }
+    }
+
+    /// `OSC 104`: reset the named palette entries, or the whole palette when the payload
+    /// is empty.
+    fn osc_reset_palette(&mut self, pt: &[u8]) {
+        if pt.is_empty() {
+            let (fg, bg, cursor) = (self.theme.fg, self.theme.bg, self.theme.cursor);
+            self.theme.reset_palette();
+            // `OSC 104` is about the *indexed* palette; the three named colours have
+            // their own resets (110/111/112) and must survive this one.
+            self.theme.fg = fg;
+            self.theme.bg = bg;
+            self.theme.cursor = cursor;
+            return;
+        }
+        for field in pt.split(|&b| b == b';') {
+            if let Some(index) = parse_u8(field) {
+                self.theme.reset_indexed(index);
+            }
+        }
+    }
+
+    /// Close a reply that opened with `OSC`, with the same terminator the request used.
+    /// A client that asked with BEL may only be listening for BEL.
+    fn end_osc(&mut self, bel: bool) {
+        if bel {
+            self.responses.push(0x07);
+        } else {
+            self.respond(b"\x1b\\");
+        }
+    }
+
     /// The kitty keyboard flags in force: the top of the stack, or none when the child
     /// has pushed nothing and the legacy encoding applies.
     pub fn kitty_flags(&self) -> KittyFlags {
@@ -2844,6 +3001,29 @@ fn default_tabs(cols: usize) -> Vec<bool> {
 /// delimiter. A blank cell's rune is a space, so it bounds a word too.
 fn is_word_boundary(c: char) -> bool {
     c.is_whitespace() || matches!(c, '{' | '}' | '[' | ']' | '(' | ')' | '"' | '\'' | '`')
+}
+
+/// The OSC number that names each colour, for building a reply.
+fn osc_color_code(which: NamedColor) -> u32 {
+    match which {
+        NamedColor::Foreground => 10,
+        NamedColor::Background => 11,
+        NamedColor::Cursor => 12,
+    }
+}
+
+/// A decimal palette index from an OSC field. `None` for anything that is not a plain
+/// number in `0..=255`, which the caller then skips.
+fn parse_u8(field: &[u8]) -> Option<u8> {
+    if field.is_empty() || field.len() > 3 {
+        return None;
+    }
+    let mut n: u32 = 0;
+    for &b in field {
+        let digit = (b as char).to_digit(10)?;
+        n = n * 10 + digit;
+    }
+    u8::try_from(n).ok()
 }
 
 /// Clamp an SGR color component (`0..=255`) to a byte; the parser already bounds
@@ -3066,6 +3246,11 @@ impl Perform for Screen {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], private: u8, action: u8) {
+        // DECSTR (`CSI ! p`), the soft reset.
+        if intermediates == [b'!'] && action == b'p' && private == 0 {
+            self.soft_reset();
+            return;
+        }
         // DECSCUSR (`CSI Ps SP q`) is the one CSI-with-intermediate we act on; the
         // rest are dropped rather than misreading the final byte.
         if intermediates == [b' '] && action == b'q' && private == 0 {
@@ -3103,6 +3288,7 @@ impl Perform for Screen {
                     self.tab();
                 }
             }
+            b'Z' => self.back_tab(csi_count(params, 0)), // CBT
             b'J' => self.erase_display(csi_arg(params, 0)),
             b'K' => self.erase_line(csi_arg(params, 0)),
             b'L' => self.insert_lines(csi_count(params, 0)),
@@ -3147,6 +3333,7 @@ impl Perform for Screen {
                 b'c' => self.reset(),            // RIS
                 b'D' => self.line_feed(),        // IND
                 b'E' => self.next_line(),        // NEL
+                b'H' => self.set_tab_stop(),     // HTS
                 b'M' => self.reverse_index(),    // RI
                 b'7' => self.save_cursor(),      // DECSC
                 b'8' => self.restore_cursor(),   // DECRC
@@ -3161,14 +3348,22 @@ impl Perform for Screen {
         }
     }
 
-    fn osc_dispatch(&mut self, data: &[u8]) {
-        // OSC Ps ; Pt — we handle 0 (icon + title), 2 (title), and 8 (hyperlink).
+    fn osc_dispatch(&mut self, data: &[u8], bel_terminated: bool) {
+        // OSC Ps ; Pt
         let mut parts = data.splitn(2, |&b| b == b';');
         let ps = parts.next().unwrap_or(&[]);
         let pt = parts.next().unwrap_or(&[]);
         match ps {
             b"0" | b"2" => self.set_title(String::from_utf8_lossy(pt).into_owned()),
+            b"4" => self.osc_palette(pt, bel_terminated),
             b"8" => self.set_hyperlink(pt),
+            b"10" => self.osc_named_color(NamedColor::Foreground, pt, bel_terminated),
+            b"11" => self.osc_named_color(NamedColor::Background, pt, bel_terminated),
+            b"12" => self.osc_named_color(NamedColor::Cursor, pt, bel_terminated),
+            b"104" => self.osc_reset_palette(pt),
+            b"110" => self.theme.fg = Theme::default().fg,
+            b"111" => self.theme.bg = Theme::default().bg,
+            b"112" => self.theme.cursor = Theme::default().cursor,
             _ => {}
         }
     }
@@ -3177,6 +3372,7 @@ impl Perform for Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::{Ground, Rgb};
 
     #[test]
     fn cell_layout_is_pinned() {
@@ -3634,6 +3830,82 @@ mod tests {
         assert_eq!(s.pen.bg, Color::Rgb(10, 20, 30));
         feed(&mut s, b"\x1b[90m"); // bright black foreground -> ANSI 8
         assert_eq!(s.pen.fg, Color::Ansi(8));
+    }
+
+    #[test]
+    fn hts_sets_a_tab_stop_and_cbt_walks_back_to_it() {
+        // `set_tab_stop` existed but nothing ever called it: a program could clear tab
+        // stops and never set them, so `ESC H` did nothing and only the default every-8
+        // stops existed. CBT (`CSI Z`) had no arm at all.
+        let mut s = Screen::new(40, 2);
+        feed(&mut s, b"\x1b[3g"); // TBC 3: clear every stop, default or otherwise
+        feed(&mut s, b"\x1b[1;5H\x1bH"); // column 5 (1-based): set a stop here
+        feed(&mut s, b"\x1b[1;20H\x1bH"); // and another at column 20
+                                          // A tab from home now lands on the first stop we set, not on column 8.
+        feed(&mut s, b"\x1b[1;1H\t");
+        assert_eq!(s.cursor(), (0, 4));
+        feed(&mut s, b"\t");
+        assert_eq!(s.cursor(), (0, 19));
+        // And CBT walks back through them.
+        feed(&mut s, b"\x1b[Z");
+        assert_eq!(s.cursor(), (0, 4));
+        feed(&mut s, b"\x1b[Z");
+        assert_eq!(
+            s.cursor(),
+            (0, 0),
+            "past the first stop it stops at column 0"
+        );
+        feed(&mut s, b"\x1b[Z");
+        assert_eq!(s.cursor(), (0, 0), "and does not run off the left edge");
+    }
+
+    #[test]
+    fn decstr_resets_the_settings_and_keeps_the_screen() {
+        // The point of a soft reset: put the *settings* back without throwing away what
+        // is on the screen. A program that has wedged the terminal sends this to hand a
+        // sane state back to the shell, which is why RIS would be too big a hammer.
+        let mut s = Screen::new(10, 4);
+        print_str(&mut s, "keep me");
+        feed(&mut s, b"\x1b[1;31m"); // bold red
+        feed(&mut s, b"\x1b[?1h"); // DECCKM: application cursor keys
+        feed(&mut s, b"\x1b[?6h"); // DECOM: origin mode
+        feed(&mut s, b"\x1b[?25l"); // hide the cursor
+        feed(&mut s, b"\x1b[4h"); // IRM: insert mode
+        feed(&mut s, b"\x1b[2;3r"); // a scroll region
+        feed(&mut s, b"\x1b="); // DECKPAM: application keypad
+        feed(&mut s, b"\x1b[3;2H"); // park the cursor somewhere
+        feed(&mut s, b"\x1b[!p"); // DECSTR
+
+        assert_eq!(s.row_string(0).trim_end(), "keep me", "the screen survived");
+        assert_eq!(s.cursor(), (2, 1), "and so did the cursor position");
+        assert!(s.pen.attrs.is_empty(), "rendition reset");
+        assert_eq!(s.pen.fg, Color::Default);
+        assert!(s.cursor_visible());
+        assert!(!s.app_cursor_keys());
+        assert!(!s.keypad_app());
+        assert!(!s.origin_mode);
+        assert!(!s.insert_mode);
+        let region = (s.active().scroll_top, s.active().scroll_bottom);
+        assert_eq!(region, (0, 3), "margins back to the full screen");
+
+        // The DEC table says autowrap is *reset* by DECSTR. xterm leaves it on, and a
+        // terminal that stops wrapping the moment a program soft-resets would mangle
+        // every long line the shell prints afterwards. We follow xterm.
+        assert!(s.autowrap, "autowrap stays on: xterm, not the DEC table");
+        feed(&mut s, b"\x1b[1;1Habcdefghijkl"); // 12 chars into a 10-column row
+        assert!(s.row_wraps(0), "so a long line still wraps");
+        assert_eq!(s.row_string(1).trim_end(), "kl");
+    }
+
+    #[test]
+    fn decstr_drops_the_saved_cursor() {
+        // DECSC state resets to "home position", so a DECRC after a soft reset must not
+        // resurrect a cursor from before it.
+        let mut s = Screen::new(10, 4);
+        feed(&mut s, b"\x1b[3;5H\x1b7"); // park and save
+        feed(&mut s, b"\x1b[!p"); // soft reset
+        feed(&mut s, b"\x1b[1;1H\x1b8"); // home, then restore
+        assert_eq!(s.cursor(), (0, 0), "there was nothing to restore");
     }
 
     #[test]
@@ -5011,6 +5283,98 @@ mod tests {
         // DSR status: OK.
         feed(&mut s, b"\x1b[5n");
         assert_eq!(s.take_responses(), b"\x1b[0n");
+    }
+
+    #[test]
+    fn osc_11_answers_what_the_background_actually_is() {
+        // The reply nvim and helix wait for. They ask whether they are sitting on a dark
+        // or a light background and choose an entire colour scheme from the answer; a
+        // terminal that says nothing does not get a default, it gets a guess.
+        let mut s = Screen::new(10, 2);
+        feed(&mut s, b"\x1b]11;?\x07");
+        // The default background is #282c34, in the 16-bit-per-channel form xterm uses.
+        assert_eq!(s.take_responses(), b"\x1b]11;rgb:2828/2c2c/3434\x07");
+
+        // Foreground and cursor answer on their own numbers.
+        feed(&mut s, b"\x1b]10;?\x07");
+        assert_eq!(s.take_responses(), b"\x1b]10;rgb:ffff/ffff/ffff\x07");
+        feed(&mut s, b"\x1b]12;?\x07");
+        assert_eq!(s.take_responses(), b"\x1b]12;rgb:ffff/0000/7878\x07");
+    }
+
+    #[test]
+    fn a_color_reply_uses_the_terminator_it_was_asked_with() {
+        // A client that asked with ST may not be listening for BEL, and vice versa.
+        // Mirroring the request is the one answer that is right for both.
+        let mut s = Screen::new(10, 2);
+        feed(&mut s, b"\x1b]11;?\x1b\\"); // asked with ST
+        assert_eq!(s.take_responses(), b"\x1b]11;rgb:2828/2c2c/3434\x1b\\");
+        feed(&mut s, b"\x1b]11;?\x07"); // asked with BEL
+        assert_eq!(s.take_responses(), b"\x1b]11;rgb:2828/2c2c/3434\x07");
+    }
+
+    #[test]
+    fn osc_10_11_12_set_the_colours_and_the_query_follows() {
+        let mut s = Screen::new(10, 2);
+        feed(&mut s, b"\x1b]11;#ff0000\x07"); // a red background
+        assert_eq!(s.theme().bg, Rgb::new(0xff, 0, 0));
+        feed(&mut s, b"\x1b]11;?\x07");
+        assert_eq!(s.take_responses(), b"\x1b]11;rgb:ffff/0000/0000\x07");
+        // A default cell now paints on the new background: the change is not cosmetic,
+        // it is the palette the whole grid resolves against.
+        assert_eq!(
+            Color::Default.resolve(s.theme(), Ground::Background),
+            Rgb::new(0xff, 0, 0)
+        );
+        // `OSC 111` puts it back.
+        feed(&mut s, b"\x1b]111\x07");
+        assert_eq!(s.theme().bg, Theme::default().bg);
+    }
+
+    #[test]
+    fn osc_4_sets_and_queries_any_palette_entry() {
+        let mut s = Screen::new(10, 2);
+        // A base16 theme script repaints far past the ANSI 16, which is exactly why the
+        // palette is stored rather than computed.
+        feed(&mut s, b"\x1b]4;1;rgb:aa/bb/cc;17;#010203\x07");
+        assert_eq!(s.theme().indexed(1), Rgb::new(0xaa, 0xbb, 0xcc));
+        assert_eq!(s.theme().indexed(17), Rgb::new(1, 2, 3));
+        // And an SGR colour resolves through it.
+        assert_eq!(
+            Color::Ansi(1).resolve(s.theme(), Ground::Foreground),
+            Rgb::new(0xaa, 0xbb, 0xcc)
+        );
+        feed(&mut s, b"\x1b]4;1;?\x07");
+        assert_eq!(s.take_responses(), b"\x1b]4;1;rgb:aaaa/bbbb/cccc\x07");
+        // `OSC 104` puts the named entries back without touching fg/bg/cursor.
+        feed(&mut s, b"\x1b]11;#ff0000\x07");
+        feed(&mut s, b"\x1b]104;1\x07");
+        assert_eq!(s.theme().indexed(1), Theme::default().indexed(1));
+        assert_eq!(s.theme().indexed(17), Rgb::new(1, 2, 3), "only 1 was reset");
+        assert_eq!(s.theme().bg, Rgb::new(0xff, 0, 0), "and the bg survived");
+        // With no index, the whole indexed palette resets — still not fg/bg/cursor.
+        feed(&mut s, b"\x1b]104\x07");
+        assert_eq!(s.theme().indexed(17), Theme::default().indexed(17));
+        assert_eq!(s.theme().bg, Rgb::new(0xff, 0, 0));
+    }
+
+    #[test]
+    fn a_malformed_colour_is_ignored_not_guessed_at() {
+        // The child writes these, so they are hostile input like everything else.
+        let mut s = Screen::new(10, 2);
+        let before = *s.theme();
+        for junk in [
+            &b"\x1b]11;lightgoldenrodyellow\x07"[..], // an X11 name: we do not ship rgb.txt
+            &b"\x1b]11;rgb:zz/zz/zz\x07"[..],
+            &b"\x1b]11;#12345\x07"[..], // not divisible by three
+            &b"\x1b]11;\x07"[..],
+            &b"\x1b]4;999;#ffffff\x07"[..], // index out of range
+            &b"\x1b]4;notanumber;#ffffff\x07"[..],
+        ] {
+            feed(&mut s, junk);
+        }
+        assert_eq!(*s.theme(), before, "nothing moved");
+        assert!(s.take_responses().is_empty(), "and nothing was answered");
     }
 
     #[test]
