@@ -13,10 +13,10 @@
 //!      columns (a WIDE_LEADER cell plus a WIDE_SPACER placeholder in the grid).
 //! ```
 //!
-//! The ranges are generated from the Unicode Character Database (16.0.0) by
-//! `tools/gen_width_tables.py` into `width_tables.rs` (committed, never fetched
-//! at build or test time) and binary-searched here. Control characters never
-//! reach `width`: the parser
+//! The ranges are generated from the Unicode Character Database (vendored in
+//! `ucd/`) into `width_tables.rs` (committed, never
+//! fetched at build or test time) and binary-searched here. Control characters
+//! never reach `width`: the parser
 //! dispatches C0/C1 as actions, so only printable scalar values are measured.
 //! xterm is the reference for the two wcwidth tweaks the generator bakes in
 //! (SOFT HYPHEN is width 1, not 0; the Hangul jamo are width 0 though not marks).
@@ -154,8 +154,8 @@ mod tests {
     }
 
     #[test]
-    fn pinned_to_unicode_16() {
-        assert_eq!(UNICODE_VERSION, "16.0.0");
+    fn pinned_to_the_vendored_unicode_version() {
+        assert_eq!(UNICODE_VERSION, "18.0.0");
     }
 
     #[test]

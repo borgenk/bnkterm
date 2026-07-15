@@ -8,9 +8,10 @@
 //! UAX #29 decides cluster boundaries from each scalar's Grapheme_Cluster_Break
 //! property (plus Extended_Pictographic for emoji and Indic_Conjunct_Break for
 //! Brahmic conjuncts). Staying crate-free, all three property tables are
-//! generated from the Unicode Character Database into `grapheme_tables.rs` (see
-//! `tools/gen_grapheme_tables.py`) and binary-searched here, so classification is
-//! complete rather than a hand-curated subset. The full break rule set
+//! generated from the Unicode Character Database (vendored in `ucd/`) into
+//! `grapheme_tables.rs` by the table generator and binary-searched here, so
+//! classification is complete rather than a hand-curated subset. The full break
+//! rule set
 //! GB1..GB13, including GB9c (the Indic conjunct break added in Unicode 15.1), is
 //! implemented.
 //!
@@ -450,5 +451,62 @@ mod tests {
         // At the ends, navigation clamps.
         assert_eq!(prev_boundary(s, 0), 0);
         assert_eq!(next_boundary(s, 9), 9);
+    }
+
+    /// The official UAX #29 conformance suite, vendored in `ucd/` at the pinned
+    /// Unicode version. Each line marks the break (`÷`) and no-break (`×`) points
+    /// between a run of code points; segmenting the run must reproduce exactly those
+    /// clusters. This is what proves the generated `grapheme_tables.rs` correct: a
+    /// wrong property range breaks a real case here, not just a hand-picked one.
+    #[test]
+    fn passes_the_official_grapheme_break_conformance_suite() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/ucd/GraphemeBreakTest.txt");
+        let text = std::fs::read_to_string(path).expect("read ucd/GraphemeBreakTest.txt");
+        let mut cases = 0usize;
+        for (lineno, raw) in text.lines().enumerate() {
+            let content = raw.split('#').next().unwrap_or("").trim();
+            if content.is_empty() {
+                continue;
+            }
+            // `÷` (U+00F7) is a break, `×` (U+00D7) is a no-break, hex tokens are
+            // code points. The clusters are the code-point runs between breaks.
+            let mut expected: Vec<String> = Vec::new();
+            let mut cur = String::new();
+            let mut valid = true;
+            for token in content.split_whitespace() {
+                match token {
+                    "\u{00F7}" => {
+                        if !cur.is_empty() {
+                            expected.push(std::mem::take(&mut cur));
+                        }
+                    }
+                    "\u{00D7}" => {}
+                    hex => match u32::from_str_radix(hex, 16).ok().and_then(char::from_u32) {
+                        Some(c) => cur.push(c),
+                        None => {
+                            valid = false; // a lone surrogate: not a Rust `char`, skip
+                            break;
+                        }
+                    },
+                }
+            }
+            if !valid {
+                continue;
+            }
+            if !cur.is_empty() {
+                expected.push(cur);
+            }
+            let input: String = expected.concat();
+            let got: Vec<&str> = graphemes(&input).map(|(_, cluster)| cluster).collect();
+            let want: Vec<&str> = expected.iter().map(String::as_str).collect();
+            assert_eq!(got, want, "line {}: {raw}", lineno + 1);
+            cases += 1;
+        }
+        // A floor well under the suite size (766 at 18.0.0), to catch a file that
+        // failed to load or parse rather than to pin the exact count.
+        assert!(
+            cases > 500,
+            "expected the full suite, ran only {cases} cases"
+        );
     }
 }

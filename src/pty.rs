@@ -103,6 +103,19 @@ impl Pty {
     /// variables once, before any gather threads start, so every child inherits
     /// them without mutating the environment from a multi-threaded process.
     pub fn spawn(cols: usize, rows: usize) -> Result<Pty> {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        Self::spawn_command(cols, rows, &[&shell])
+    }
+
+    /// The general form of [`spawn`](Self::spawn): fork `argv` (with `argv[0]` the
+    /// program) on a fresh PTY slave instead of the shell. The live terminal wants
+    /// the shell; the golden-fixture capture tool wants an arbitrary command, and
+    /// both share this one fork/exec dance so the `unsafe` never leaves this module.
+    /// Errors on an empty `argv` or an argument carrying an interior NUL.
+    pub fn spawn_command(cols: usize, rows: usize, argv: &[&str]) -> Result<Pty> {
+        if argv.is_empty() {
+            return Err(Error::msg("spawn_command needs a program to run"));
+        }
         // O_CLOEXEC is set atomically at open so a *later* tab's fork/exec cannot
         // leak this master into its shell. A leaked master keeps its slave's
         // hangup from firing, so closing this tab would never reap its child (see
@@ -135,17 +148,22 @@ impl Pty {
         let _ = enable_iutf8(master.as_raw_fd());
 
         // Everything the child touches is built here, in the parent, where the
-        // allocator is safe to use.
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let shell_c =
-            CString::new(shell).map_err(|_| Error::msg("$SHELL contains an interior NUL"))?;
-        // argv is NUL-terminated; argv[0] is the program itself.
-        let argv: [*const c_char; 2] = [shell_c.as_ptr(), core::ptr::null()];
+        // allocator is safe to use. The `CString`s own the bytes; `ptrs` is the
+        // NUL-terminated argv (a trailing null past the arguments) the child execs.
+        let cstrings: Vec<CString> = argv
+            .iter()
+            .map(|arg| {
+                CString::new(*arg)
+                    .map_err(|_| Error::msg("a command argument contains an interior NUL"))
+            })
+            .collect::<Result<_>>()?;
+        let mut ptrs: Vec<*const c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
+        ptrs.push(core::ptr::null());
 
-        // SAFETY: all pointers outlive the call; slave_path and shell_c are
+        // SAFETY: all pointers outlive the call; slave_path and the argv strings are
         // NUL-terminated and stay alive through the fork. The child branch runs
         // only async-signal-safe syscalls before exec (see the module header).
-        let pid = unsafe { fork_child_in_pty(master.as_raw_fd(), slave_path.as_ptr(), &argv) };
+        let pid = unsafe { fork_child_in_pty(master.as_raw_fd(), slave_path.as_ptr(), &ptrs) };
         if pid < 0 {
             return Err(errno_error("fork"));
         }
@@ -627,10 +645,11 @@ fn set_winsize(master: RawFd, cols: usize, rows: usize) -> Result<()> {
 /// process, so it calls only async-signal-safe syscalls and never allocates,
 /// returns a `Result`, or panics; `slave_path` and `argv` must be valid,
 /// NUL-terminated, and outlive the call (the caller builds them before forking).
+/// `argv` must be non-empty (`argv[0]` is the program), which the callers ensure.
 unsafe fn fork_child_in_pty(
     master: RawFd,
     slave_path: *const c_char,
-    argv: &[*const c_char; 2],
+    argv: &[*const c_char],
 ) -> c_int {
     let pid = fork();
     if pid != 0 {
