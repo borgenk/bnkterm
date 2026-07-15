@@ -29,7 +29,7 @@ use crate::platform::freetype::Fonts;
 use crate::platform::geom::Scale;
 use crate::pty::ZombieChild;
 use crate::render::display::DisplayList;
-use crate::tab_bar::{self, BarGeom, Slot, TabLabel};
+use crate::tab_bar::{self, BarGeom, Lift, Slot, TabLabel};
 use crate::term_render::CellMetrics;
 
 /// One global gather budget per event-loop turn. Foreground output is parsed
@@ -55,6 +55,23 @@ struct TabEntry {
     core: TerminalCore,
 }
 
+/// A tab drag in progress. The tab is held by identity, not index, because a
+/// background tab's shell can exit mid-drag and shift every index under us; an id is
+/// immune (the dragged tab is always the active one, so the reorder keeps it active).
+///
+/// `press_x`, `grab_dx`, and `left` are all device pixels. `lifted` stays false until
+/// the pointer has travelled past the lift threshold, so a press that never moves far
+/// enough is a plain click, not a lift. `grab_dx` is where inside the block the tab
+/// was grabbed; `left` is the block's current (clamped) floating left edge, valid once
+/// `lifted`.
+struct TabDrag {
+    id: TabId,
+    press_x: i32,
+    grab_dx: i32,
+    left: i32,
+    lifted: bool,
+}
+
 /// The app-shell owner of terminal tabs.
 pub(super) struct Tabs {
     entries: Vec<TabEntry>,
@@ -71,6 +88,9 @@ pub(super) struct Tabs {
     /// The strip's device-pixel geometry, set by the window each resize (`None`
     /// until the first one, which always precedes a paint that shows the bar).
     bar_geom: Option<BarGeom>,
+    /// A mouse drag-to-reorder in flight, if any. Owns the whole gesture: the pointer
+    /// only converts a surface coordinate to device x and hands it over.
+    drag: Option<TabDrag>,
     /// Strip appearance and layout, the source of truth for `layout`/`fill_bar`.
     cfg: TabBarConfig,
     /// Messages already translated from per-core facts into window actions.
@@ -89,6 +109,7 @@ impl Tabs {
             bar_dirty: false,
             bar_slots: Vec::new(),
             bar_geom: None,
+            drag: None,
             cfg,
             outbox: Vec::new(),
         };
@@ -173,6 +194,12 @@ impl Tabs {
             self.reaping.push(child);
         }
         self.bar_dirty = true;
+        // A drag cannot outlive its own tab, nor the bar itself once a single tab
+        // remains and there is nowhere left to drop. A *background* close leaves the
+        // drag alone: it holds an id, so it simply continues against the new run.
+        if self.drag.as_ref().is_some_and(|drag| drag.id == id) || !self.shows_bar() {
+            self.drag = None;
+        }
 
         if self.is_empty() {
             self.active = 0;
@@ -235,6 +262,31 @@ impl Tabs {
         self.select(id, window_focused)
     }
 
+    /// Move the active tab to `index` (clamped to the run), sliding the tabs in
+    /// between over to fill the gap, and keep it active wherever it lands. Returns
+    /// whether the order actually changed. This is the one reorder primitive: the
+    /// keyboard's adjacent [`move_active`](Self::move_active) is a wrapper on it, and
+    /// a mouse drag hands it an arbitrary landing slot. The tab's content is
+    /// untouched; only the bar reflows.
+    pub(super) fn move_active_to(&mut self, index: usize) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let target = index.min(self.entries.len() - 1);
+        if target == self.active {
+            return false;
+        }
+        // Remove-and-insert (not a swap): a non-adjacent move must preserve the
+        // order of every tab it slides past. For an adjacent move it reduces to the
+        // swap the keyboard reorder used to do.
+        let entry = self.entries.remove(self.active);
+        self.entries.insert(target, entry);
+        self.active = target;
+        self.bar_dirty = true;
+        self.rebuild_bar();
+        true
+    }
+
     /// Reorder the active tab one slot toward index 0 (`Prev`) or the end (`Next`),
     /// keeping it the active tab. Reordering does not wrap: unlike selection (which
     /// cycles), flinging a tab past the edge to the far side would be surprising, so
@@ -249,11 +301,100 @@ impl Tabs {
             Reorder::Next if self.active + 1 < self.entries.len() => self.active + 1,
             _ => return false,
         };
-        self.entries.swap(self.active, target);
-        self.active = target;
-        self.bar_dirty = true;
-        self.rebuild_bar();
-        true
+        self.move_active_to(target)
+    }
+
+    /// Arm a drag on tab `id`, pressed at device-x `x`. Selection has already made it
+    /// the active tab (the pointer path selects on press); this only records where in
+    /// the block the grab landed so the float can track the pointer. The tab does not
+    /// lift until [`drag_to`](Self::drag_to) sees the pointer cross the threshold, so a
+    /// press that never moves stays a plain click. A no-op before the first resize (no
+    /// geometry) or for an unknown id.
+    pub(super) fn begin_drag(&mut self, id: TabId, x: i32) {
+        let Some(index) = self.entries.iter().position(|entry| entry.id == id) else {
+            return;
+        };
+        let Some(bar) = self.bar_geom else {
+            return;
+        };
+        let Some((left, _)) = tab_bar::block_px(&self.bar_slots, &bar, index) else {
+            return;
+        };
+        self.drag = Some(TabDrag {
+            id,
+            press_x: x,
+            grab_dx: x - left,
+            left,
+            lifted: false,
+        });
+    }
+
+    /// Advance a live drag to device-x `x`: lift the tab once the pointer has passed
+    /// the threshold, float its block under the grab point (clamped to the run), and
+    /// reorder when the block's own centre crosses into a new slot. Geometry is read
+    /// fresh each call, so a resize or a background tab exiting mid-drag is absorbed
+    /// rather than remembered wrongly. A no-op with no drag armed or no geometry.
+    pub(super) fn drag_to(&mut self, x: i32) {
+        let Some(mut drag) = self.drag.take() else {
+            return;
+        };
+        let Some(bar) = self.bar_geom else {
+            return;
+        };
+        if !drag.lifted {
+            // The threshold is half a cell: enough that a click's jitter never lifts
+            // the tab, far below the half-block a reorder needs, so it can only gate
+            // the lift, never the landing. `metrics.w` is device pixels and already
+            // tracks DPI, so this is HiDPI-correct with no extra plumbing.
+            let threshold = (bar.metrics.w / 2).max(1);
+            if (x - drag.press_x).abs() <= threshold {
+                self.drag = Some(drag);
+                return;
+            }
+            drag.lifted = true;
+        }
+        // Slot zero is never clipped, so its width is the true pitch.
+        let pitch = self
+            .bar_slots
+            .first()
+            .map_or(1, |slot| slot.cells.len() as i32 * bar.metrics.w)
+            .max(1);
+        // A resize since the press can have shrunk the pitch below the grab offset;
+        // keep the grip inside the block so the float cannot invert.
+        let grab = drag.grab_dx.clamp(0, pitch - 1);
+        let n = self.bar_slots.len() as i32;
+        // Clamp the float to the run: the tab pins at the ends instead of sliding into
+        // the slack, so it can never be dragged somewhere it cannot land.
+        let max_left = bar.pad + (n - 1).max(0) * pitch;
+        let left = (x - grab).clamp(bar.pad, max_left);
+        if left != drag.left {
+            drag.left = left;
+            self.bar_dirty = true;
+        }
+        let want = tab_bar::drop_index(&self.bar_slots, &bar, left);
+        self.drag = Some(drag);
+        // The dragged tab is always the active one, so its current slot is `active`;
+        // move only when its centre has crossed into a different block.
+        if let Some(want) = want {
+            if want != self.active {
+                self.move_active_to(want);
+            }
+        }
+    }
+
+    /// End a drag, letting the tab settle from its float back into its block. Keyed by
+    /// the caller off the pressed button, so a release anywhere (even dragged off the
+    /// grid) ends it. A no-op when no drag was in flight.
+    pub(super) fn end_drag(&mut self) {
+        if self.drag.take().is_some() {
+            self.bar_dirty = true;
+        }
+    }
+
+    /// Whether a drag is in flight (armed or lifted), so the pointer routes motion here
+    /// instead of to the grid beneath the strip.
+    pub(super) fn dragging(&self) -> bool {
+        self.drag.is_some()
     }
 
     /// Apply the window's current geometry eagerly to every tab so background
@@ -497,7 +638,20 @@ impl Tabs {
         self.active().fill_frame_list(out, strings);
         if self.shows_bar() {
             if let Some(bar) = &self.bar_geom {
-                tab_bar::fill_bar(out, strings, &self.bar_slots, bar, &self.cfg, fonts);
+                // A lifted drag resolves to the slot its id now sits in (a background
+                // close may have shifted it) plus the block's floating left edge.
+                let lift = self
+                    .drag
+                    .as_ref()
+                    .filter(|drag| drag.lifted)
+                    .and_then(|drag| {
+                        let slot = self.entries.iter().position(|entry| entry.id == drag.id)?;
+                        Some(Lift {
+                            slot,
+                            left: drag.left,
+                        })
+                    });
+                tab_bar::fill_bar(out, strings, &self.bar_slots, bar, &self.cfg, fonts, lift);
             }
         }
     }
@@ -725,6 +879,162 @@ mod tests {
         // A single tab cannot reorder.
         let mut one = demo_tabs(1);
         assert!(!one.move_active(Reorder::Next));
+    }
+
+    #[test]
+    fn move_active_to_clamps_and_keeps_the_tab_active() {
+        let mut tabs = demo_tabs(3);
+        let ids: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
+        let order = |tabs: &Tabs| tabs.entries.iter().map(|e| e.id).collect::<Vec<_>>();
+
+        // Active starts at tab 0. Move it to the last slot; the others slide left and
+        // the identity follows the move.
+        assert!(tabs.move_active_to(2));
+        assert_eq!(order(&tabs), vec![ids[1], ids[2], ids[0]]);
+        assert_eq!(tabs.active_id(), Some(ids[0]), "identity follows the move");
+
+        // Landing on the current slot is a no-op.
+        assert!(!tabs.move_active_to(2));
+
+        // Back to the front, order fully restored.
+        assert!(tabs.move_active_to(0));
+        assert_eq!(order(&tabs), vec![ids[0], ids[1], ids[2]]);
+
+        // An out-of-range index clamps to the last slot rather than trapping.
+        assert!(tabs.move_active_to(99));
+        assert_eq!(order(&tabs), vec![ids[1], ids[2], ids[0]]);
+        assert_eq!(tabs.active, 2);
+
+        // A single tab has nowhere to move, at any index.
+        let mut one = demo_tabs(1);
+        assert!(!one.move_active_to(0));
+        assert!(!one.move_active_to(5));
+    }
+
+    /// A multi-tab manager with the strip laid out at the test metrics, so drags have
+    /// real device-pixel geometry to work against. `count` equal blocks fill `cols`.
+    fn dragging_tabs(count: usize, cols: usize) -> Tabs {
+        let mut tabs = demo_tabs(count);
+        tabs.resize_all(
+            cols,
+            10,
+            (cols as i32 * METRICS.w) as u32,
+            176,
+            METRICS,
+            METRICS,
+            0,
+            16,
+            0,
+            16,
+            Scale::ONE,
+        )
+        .expect("build the bar");
+        tabs
+    }
+
+    #[test]
+    fn a_drag_past_a_block_boundary_reorders_and_the_identity_follows() {
+        let mut tabs = dragging_tabs(3, 30); // three equal 10-cell blocks
+        let ids: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
+        let pitch = 10 * METRICS.w;
+        assert_eq!(tabs.active_id(), Some(ids[0]), "demo tab 0 starts active");
+
+        // Grab tab 0 at its left edge and drag it fully to the right; its own centre
+        // lands in the last slot.
+        tabs.begin_drag(ids[0], 0);
+        tabs.drag_to(2 * pitch + 5);
+
+        assert_eq!(
+            tabs.active_id(),
+            Some(ids[0]),
+            "the dragged tab stays active"
+        );
+        let order: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
+        assert_eq!(
+            order,
+            vec![ids[1], ids[2], ids[0]],
+            "it reordered to the end"
+        );
+        assert_eq!(tabs.active, 2);
+        assert!(tabs.bar_slots[2].active, "its label is now the last block");
+
+        tabs.end_drag();
+        assert!(!tabs.dragging(), "the drag is done");
+    }
+
+    #[test]
+    fn a_press_that_never_moves_selects_without_reordering() {
+        let mut tabs = dragging_tabs(3, 30);
+        let ids: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
+
+        // The pointer path selects on press, then arms the drag; a plain click never
+        // calls drag_to, so nothing lifts and nothing reorders.
+        assert!(tabs.select(ids[1], false));
+        tabs.begin_drag(ids[1], 12 * METRICS.w); // inside block 1
+        tabs.end_drag();
+
+        assert_eq!(tabs.active_id(), Some(ids[1]), "the press still selected");
+        let order: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
+        assert_eq!(order, vec![ids[0], ids[1], ids[2]], "and never reordered");
+    }
+
+    #[test]
+    fn a_drag_shorter_than_the_threshold_does_not_lift() {
+        let mut tabs = dragging_tabs(2, 20);
+        let ids: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
+
+        tabs.begin_drag(ids[0], 0);
+        tabs.bar_dirty = false; // a clean slate to prove the nudge dirties nothing
+        tabs.drag_to(1); // one device pixel, below the half-cell (4 px) threshold
+
+        assert!(
+            !tabs.bar_dirty,
+            "a sub-threshold nudge lifts nothing and repaints nothing"
+        );
+        let order: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
+        assert_eq!(order, vec![ids[0], ids[1]], "and reorders nothing");
+        assert_eq!(tabs.active_id(), Some(ids[0]));
+    }
+
+    #[test]
+    fn closing_the_dragged_tab_cancels_the_drag() {
+        let mut tabs = dragging_tabs(3, 30);
+        let ids: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
+
+        tabs.begin_drag(ids[0], 0);
+        tabs.drag_to(2 * 10 * METRICS.w); // lift and drag it to the end
+        assert!(tabs.dragging());
+
+        // Its shell exits mid-drag: the drag cannot outlive its own tab.
+        tabs.close(ids[0], false);
+        assert!(!tabs.dragging(), "the drag is cancelled with its tab");
+    }
+
+    #[test]
+    fn a_background_tab_closing_mid_drag_keeps_the_drag_on_its_own_tab() {
+        let mut tabs = dragging_tabs(3, 30);
+        let ids: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
+
+        // Drag tab 0; it lifts but stays in slot 0 for now.
+        tabs.begin_drag(ids[0], 0);
+        tabs.drag_to(5);
+        assert!(tabs.dragging());
+        assert_eq!(tabs.active_id(), Some(ids[0]));
+
+        // A *background* tab's shell exits: every index shifts and the bar re-lays out
+        // at a new pitch, but the drag holds an id, so it survives on tab 0.
+        tabs.close(ids[2], false);
+        assert!(
+            tabs.dragging(),
+            "a background close does not cancel the drag"
+        );
+        assert_eq!(tabs.active_id(), Some(ids[0]));
+
+        // It continues against the new two-tab run and still moves tab 0.
+        tabs.drag_to(10_000); // pinned to the far right of the new run
+        assert_eq!(tabs.active_id(), Some(ids[0]));
+        let order: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
+        assert_eq!(order, vec![ids[1], ids[0]]);
     }
 
     #[test]

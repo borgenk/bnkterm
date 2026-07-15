@@ -184,8 +184,8 @@ pub struct TabColors {
 /// Tab-strip appearance and layout. These were the hardcoded constants the tab
 /// bar once carried inline; gathered here as the single source of truth the app
 /// threads through, exactly as [`FontConfig`] gathers the font choices. There is
-/// no on-disk config loader yet, so these are
-/// the compile-time defaults a future loader will overwrite at startup.
+/// no on-disk config loader yet, so these are the
+/// compile-time defaults a future loader will overwrite at startup.
 ///
 /// The values mirror the sibling `wezterm.lua` tab palette: a muted-turquoise
 /// active block on dark teal, faint inactive tabs that share the bar (terminal)

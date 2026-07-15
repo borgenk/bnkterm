@@ -769,6 +769,12 @@ impl State {
         (self.pointer_x * scale, self.pointer_y * scale)
     }
 
+    /// The pointer's x in device pixels, the coordinate space the bar lays out in and
+    /// the one a tab drag tracks. `Tabs` needs only this scalar from the window.
+    fn pointer_device_x(&self) -> i32 {
+        self.pointer_device().0 as i32
+    }
+
     /// The logical window size scaled to the device buffer size, clamped so a bogus
     /// configure cannot blow up the buffer arithmetic.
     fn device_size(&self, logical_w: u32, logical_h: u32) -> (u32, u32) {
@@ -1538,7 +1544,11 @@ impl State {
         // A scrollbar is a control, not text, so over its grab band (and for as long as
         // its thumb is held) the I-beam gives way to the arrow.
         let on_bar = self.drag_scroll || self.tabs.active().on_scrollbar(px, py);
-        let shape = if self.pointer_in_tab_bar() || on_bar {
+        let shape = if self.tabs.dragging() {
+            // A tab is being held: the grabbing hand is the whole visual affordance,
+            // and it wins over the strip's own arrow.
+            wp_cursor_shape_device_v1::SHAPE_GRABBING
+        } else if self.pointer_in_tab_bar() || on_bar {
             wp_cursor_shape_device_v1::SHAPE_DEFAULT
         } else if self.xkb.ctrl_active() && self.tabs.hovering_link() {
             wp_cursor_shape_device_v1::SHAPE_POINTER
@@ -1620,6 +1630,12 @@ impl State {
                     // A thumb the pointer is holding follows it anywhere, including out
                     // of the lane and off the grid. Nothing else sees the move.
                     self.tabs.active_mut().drag_scrollbar(py);
+                } else if self.tabs.dragging() {
+                    // A tab drag owns the motion: it reorders along x and ignores y, so
+                    // dragging below the strip keeps reordering rather than dropping the
+                    // tab (what every tabbed app does). The grid must not see this, or it
+                    // would start a text selection or emit a mouse report mid-drag.
+                    self.tabs.drag_to(self.pointer_device_x());
                 } else if self.pointer_in_tab_bar() {
                     self.pointer_left_grid()?;
                 } else {
@@ -1645,7 +1661,12 @@ impl State {
                 let pressed = r.u32()? == wl_pointer::BUTTON_STATE_PRESSED;
                 let mapped = pointer_button(button);
                 if !pressed && self.bar_button == mapped {
+                    // The release that matches a bar press ends any drag it armed. This
+                    // keys off the pressed button, not the pointer position, so a
+                    // release dragged off the strip still settles the tab.
+                    self.tabs.end_drag();
                     self.bar_button = None;
+                    self.update_pointer_shape();
                     return Ok(());
                 }
                 // The release that ends a thumb drag is the scrollbar's, wherever the
@@ -1664,7 +1685,11 @@ impl State {
                     if let (Some(button), Some(id)) = (mapped, self.pointer_bar_tab()) {
                         match button {
                             MouseButton::Left => {
+                                // Press selects immediately (unchanged) and arms a
+                                // drag; the tab does not lift until the pointer travels
+                                // past the threshold, so a plain click stays a click.
                                 self.tabs.select(id, self.window_focused);
+                                self.tabs.begin_drag(id, self.pointer_device_x());
                             }
                             MouseButton::Middle => {
                                 self.closed = self.tabs.close(id, self.window_focused);

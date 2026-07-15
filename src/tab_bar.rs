@@ -180,6 +180,14 @@ pub(crate) fn layout(
 /// interface font ([`FaceKey::Ui`]), so `fonts` is needed to measure advances and
 /// fit/center/truncate each title; the fitting runs only on painted frames and emits
 /// pooled strings, so a steady repaint allocates nothing.
+///
+/// When a tab is being dragged, `lift` names it: its home block is left as a gap (the
+/// `continue` in the slot loop) and the block is repainted last, at the floated `left`,
+/// so it rides over its neighbours and any divider it currently covers. The dragged
+/// tab is always the active tab, so the gap is already strip-coloured and the hairlines
+/// beside it are already suppressed (see the divider loop's `active` guard); the lift
+/// therefore needs no divider or gap-colour handling of its own, and adds exactly one
+/// fill and one text run per frame.
 pub(crate) fn fill_bar(
     out: &mut DisplayList,
     strings: &mut Vec<String>,
@@ -187,6 +195,7 @@ pub(crate) fn fill_bar(
     bar: &BarGeom,
     cfg: &TabBarConfig,
     fonts: &Fonts,
+    lift: Option<Lift>,
 ) {
     let m = bar.metrics;
     let lm = bar.label;
@@ -215,7 +224,11 @@ pub(crate) fn fill_bar(
         style: FontStyle::Medium,
     };
 
-    for slot in slots.iter().filter(|slot| !slot.cells.is_empty()) {
+    for (index, slot) in slots.iter().enumerate() {
+        // The lifted tab leaves a gap here; it is repainted at its floated x below.
+        if slot.cells.is_empty() || lift.is_some_and(|l| l.slot == index) {
+            continue;
+        }
         let colors = if slot.active {
             cfg.active
         } else {
@@ -268,12 +281,80 @@ pub(crate) fn fill_bar(
             color: cfg.divider.to_u32(),
         });
     }
+
+    // The dragged tab, painted over everything so it floats above its neighbours and
+    // any divider it now covers. It is the active tab, so it wears the active colours
+    // (no new theme entry): the tab you are holding looks like the tab you selected.
+    // The block floats at its full nominal pitch (slot zero's width) even if its own
+    // home slot was clipped, and its label rides along by the same shift.
+    if let Some(lift) = lift {
+        if let Some(slot) = slots.get(lift.slot).filter(|slot| !slot.cells.is_empty()) {
+            let pitch = slots.first().map_or(0, |s| s.cells.len() as i32 * m.w);
+            out.push(DrawCmd::Fill {
+                rect: Rect {
+                    x: lift.left,
+                    y: bar.y,
+                    w: pitch,
+                    h: bar.h,
+                },
+                color: cfg.active.bg.to_u32(),
+            });
+            let dx = lift.left - (bar.pad + slot.cells.start as i32 * m.w);
+            paint_label(
+                out,
+                strings,
+                fonts,
+                &slot.title,
+                bar.pad + slot.content_left + dx,
+                slot.content_px,
+                baseline,
+                face,
+                cfg.active,
+                lm,
+            );
+        }
+    }
 }
 
 /// Tab index under `col`, if any. Empty ranges (more tabs than columns) are not
 /// hittable, and the slack past the last tab maps to no tab.
 pub(crate) fn hit_test(slots: &[Slot], col: usize) -> Option<usize> {
     slots.iter().position(|slot| slot.cells.contains(&col))
+}
+
+/// A tab lifted out of the run by a drag: which slot, and the device-pixel left
+/// edge its block floats at (already clamped into the run by the caller). Consumed
+/// by [`fill_bar`], which then leaves a gap at `slot`'s home block and paints the
+/// block last at `left` so it rides over its neighbours.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Lift {
+    pub slot: usize,
+    pub left: i32,
+}
+
+/// The device-pixel left edge and width of slot `i`'s block, measured from the
+/// surface origin ([`BarGeom::pad`] included, the same space the pointer scales
+/// into). The press reads slot `i`'s left edge to measure the grab offset; the drag
+/// reads slot zero's width for the pitch (slot zero is never clipped, so its block
+/// is the true pitch even when a narrow window cuts the last one). `None` when `i`
+/// is out of range.
+pub(crate) fn block_px(slots: &[Slot], bar: &BarGeom, i: usize) -> Option<(i32, i32)> {
+    let slot = slots.get(i)?;
+    let left = bar.pad + slot.cells.start as i32 * bar.metrics.w;
+    let width = (slot.cells.end - slot.cells.start) as i32 * bar.metrics.w;
+    Some((left, width))
+}
+
+/// Which slot a block whose left edge sits at device-x `left` wants to land in: the
+/// slot its own midpoint falls in, clamped to the run. Blocks are one equal width,
+/// so this is a divide against the pitch, not a scan; and because the pointer is not
+/// consulted, where within the tab it was grabbed does not shift the landing. The
+/// pitch comes from slot zero (never clipped), so a narrow window cutting the last
+/// block does not skew the divide. `None` only when there are no tabs.
+pub(crate) fn drop_index(slots: &[Slot], bar: &BarGeom, left: i32) -> Option<usize> {
+    let pitch = (slots.first()?.cells.len() as i32 * bar.metrics.w).max(1);
+    let mid = (left + pitch / 2 - bar.pad).max(0);
+    Some(((mid / pitch) as usize).min(slots.len() - 1))
 }
 
 /// Fit `title` into `content_px` device pixels of the proportional interface face,
@@ -436,6 +517,18 @@ mod tests {
         width_cols: usize,
         pad: i32,
     ) -> Vec<DrawCmd> {
+        paint_lift(fonts, slots, cfg, width_cols, pad, None)
+    }
+
+    /// Paint `slots` with a tab lifted out by a drag, returning the display list.
+    fn paint_lift(
+        fonts: &Fonts,
+        slots: &[Slot],
+        cfg: &TabBarConfig,
+        width_cols: usize,
+        pad: i32,
+        lift: Option<Lift>,
+    ) -> Vec<DrawCmd> {
         let mut out = Vec::new();
         let mut strings = Vec::new();
         fill_bar(
@@ -445,6 +538,7 @@ mod tests {
             &geom(fonts, width_cols, pad),
             cfg,
             fonts,
+            lift,
         );
         out
     }
@@ -767,7 +861,7 @@ mod tests {
             y: 0,
             h: 40,
         };
-        fill_bar(&mut out, &mut strings, &slots, &geom, &cfg, &fonts);
+        fill_bar(&mut out, &mut strings, &slots, &geom, &cfg, &fonts, None);
         let baseline = out.iter().find_map(|c| match c {
             DrawCmd::Text { baseline, .. } => Some(*baseline),
             _ => None,
@@ -782,6 +876,179 @@ mod tests {
             baseline,
             Some((40 - gapped.h) / 2 + gapped.ascent),
             "must not center the line box"
+        );
+    }
+
+    /// Four equal 10-cell blocks in 40 cols, pad 0: pitch is exactly 80 device px.
+    fn equal_blocks(cfg: &TabBarConfig, n: usize) -> Vec<Slot> {
+        let labels: Vec<_> = (0..n).map(|_| label("t", false)).collect();
+        lay(n * 10, &labels, cfg)
+    }
+
+    fn equal_cfg() -> TabBarConfig {
+        TabBarConfig {
+            min_width: 10,
+            max_width: 10,
+            ..TabBarConfig::default()
+        }
+    }
+
+    #[test]
+    fn drop_index_follows_the_dragged_blocks_own_centre() {
+        let fonts = fonts();
+        let cfg = equal_cfg();
+        let slots = equal_blocks(&cfg, 4);
+        let bar = geom(&fonts, 40, 0);
+        let pitch = slots[0].cells.len() as i32 * METRICS.w;
+        assert_eq!(pitch, 80);
+
+        // A block whose left edge sits at k*pitch centres in block k and lands at k.
+        for k in 0..4 {
+            assert_eq!(drop_index(&slots, &bar, k as i32 * pitch), Some(k));
+        }
+        // The boundary is exactly half a block of travel: at left = pitch/2 the
+        // centre reaches the 0|1 seam and tips into slot 1, not one pixel before.
+        assert_eq!(drop_index(&slots, &bar, pitch / 2 - 1), Some(0));
+        assert_eq!(drop_index(&slots, &bar, pitch / 2), Some(1));
+
+        // Grab-invariance, pinned explicitly (this is the whole reason the drop reads
+        // the block's own left edge, not the pointer): any (pointer, grab) pair that
+        // places the block's left at the same px lands in the same slot, so where in
+        // the tab it was grabbed never shifts the landing.
+        let left = pitch + 3;
+        for grab in 0..pitch {
+            let pointer = left + grab; // left == pointer - grab
+            assert_eq!(
+                drop_index(&slots, &bar, pointer - grab),
+                drop_index(&slots, &bar, left),
+                "grab offset {grab} must not change the landing"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_index_clamps_to_the_run() {
+        let fonts = fonts();
+        let cfg = equal_cfg();
+        let slots = equal_blocks(&cfg, 3);
+        let bar = geom(&fonts, 30, 0);
+        let pitch = slots[0].cells.len() as i32 * METRICS.w;
+
+        // Dragged left of the strip pins at slot 0; past the last block pins at the
+        // final slot. Neither slides into dead space.
+        assert_eq!(drop_index(&slots, &bar, -1000), Some(0));
+        assert_eq!(drop_index(&slots, &bar, 100 * pitch), Some(2));
+
+        // A single tab always lands at 0, wherever it is dragged.
+        let one = lay(10, &[label("t", true)], &cfg);
+        let bar1 = geom(&fonts, 10, 0);
+        assert_eq!(drop_index(&one, &bar1, 5 * pitch), Some(0));
+        assert_eq!(drop_index(&one, &bar1, -pitch), Some(0));
+
+        // No tabs, no slot.
+        assert_eq!(drop_index(&[], &bar, 0), None);
+    }
+
+    #[test]
+    fn drop_index_uses_the_nominal_pitch_when_the_last_block_is_clipped() {
+        let fonts = fonts();
+        let cfg = equal_cfg();
+        let mut slots = equal_blocks(&cfg, 3); // 0..10, 10..20, 20..30
+                                               // A narrow window cut the final block to half its width.
+        slots[2].cells = 20..25;
+        let bar = geom(&fonts, 30, 0);
+        let pitch = slots[0].cells.len() as i32 * METRICS.w; // 80, from the full slot 0
+
+        // The divide still uses slot zero's pitch, so the clipped last block does not
+        // skew the landing: the boundary into slot 2 is at 1.5 pitches of travel.
+        assert_eq!(drop_index(&slots, &bar, pitch + pitch / 2 - 1), Some(1));
+        assert_eq!(drop_index(&slots, &bar, pitch + pitch / 2), Some(2));
+        assert_eq!(drop_index(&slots, &bar, 2 * pitch), Some(2));
+    }
+
+    #[test]
+    fn a_lifted_tab_leaves_a_gap_and_paints_over_its_neighbours() {
+        let fonts = fonts();
+        let cfg = equal_cfg();
+        // Three tabs, the middle one active: the dragged tab is always the active one.
+        let slots = lay(
+            30,
+            &[label("aa", false), label("bb", true), label("cc", false)],
+            &cfg,
+        );
+        let pitch = slots[0].cells.len() as i32 * METRICS.w;
+        // The middle tab's home block left edge (pad is 0 here).
+        let home1 = slots[1].cells.start as i32 * METRICS.w;
+        // Float the middle tab half a block toward tab 0.
+        let floated = home1 - pitch / 2;
+        let out = paint_lift(
+            &fonts,
+            &slots,
+            &cfg,
+            30,
+            0,
+            Some(Lift {
+                slot: 1,
+                left: floated,
+            }),
+        );
+
+        // All three labels still paint (none is dropped): the two home neighbours plus
+        // the floating one.
+        assert_eq!(text_runs(&out).len(), 3);
+
+        // The floating active block is the last full-height, full-pitch fill, at the
+        // drag x and in the active colour, so it rides over its neighbours.
+        let last_block = out
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                DrawCmd::Fill { rect, color } if rect.h == METRICS.h && rect.w == pitch => {
+                    Some((*rect, *color))
+                }
+                _ => None,
+            })
+            .expect("a floating active block");
+        assert_eq!(last_block.0.x, floated, "it floats at the drag x");
+        assert_eq!(last_block.1, cfg.active.bg.to_u32(), "in the active colour");
+
+        // The lifted tab's home block is a bare gap: no active-coloured fill sits
+        // there.
+        let home_filled = out.iter().any(|c| {
+            matches!(c, DrawCmd::Fill { rect, color }
+                if rect.h == METRICS.h && rect.x == home1 && *color == cfg.active.bg.to_u32())
+        });
+        assert!(
+            !home_filled,
+            "the home block is a gap, not a filled active block"
+        );
+    }
+
+    #[test]
+    fn a_lifted_gap_needs_no_divider_repair() {
+        let fonts = fonts();
+        let cfg = TabBarConfig {
+            min_width: 8,
+            max_width: 8,
+            ..TabBarConfig::default()
+        };
+        // The middle tab active and lifted hard left over tab 0. Its two edges must
+        // stay divider-free: the gap it leaves is bounded by the active tab, whose
+        // neighbours never draw a hairline against it. If a future change ever let a
+        // *non-active* tab be dragged, this is the test that goes red.
+        let slots = lay(
+            24,
+            &[label("a", false), label("b", true), label("c", false)],
+            &cfg,
+        );
+        let out = paint_lift(&fonts, &slots, &cfg, 24, 0, Some(Lift { slot: 1, left: 0 }));
+        let dividers = out
+            .iter()
+            .filter(|c| matches!(c, DrawCmd::Fill { rect, .. } if rect.w == 1))
+            .count();
+        assert_eq!(
+            dividers, 0,
+            "no hairline borders the lifted active tab's gap"
         );
     }
 }
