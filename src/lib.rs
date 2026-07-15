@@ -1,14 +1,4 @@
-//! bnkterm: a native Wayland + Vulkan terminal emulator in Rust, with almost no
-//! dependencies.
-//!
-//! The crate is split lib + thin bin. The terminal core (`vt`,
-//! `grid`, `color`, ...) is greenfield we build stage by stage, and a stage's
-//! types routinely exist a step before their first caller does. A library keeps
-//! that honest: its public surface is reachable API, so a not-yet-wired type is
-//! not "dead code" to be silenced with an `#[allow]`, and the core stays
-//! testable without opening a window (the binary is just the shell around it).
-//!
-//! The stage boundaries the modules fall along:
+//! The modules fall along these stage boundaries:
 //!
 //! ```text
 //!   bytes ─▶ vt::Parser ─▶ grid::Screen ─▶ display list ─▶ GPU

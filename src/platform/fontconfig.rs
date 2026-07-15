@@ -14,7 +14,7 @@
 //!                                        (✓ from FreeSerif, ⏺ from AdwaitaMono, …)
 //! ```
 //!
-//! # Why the system, and not a longer list of our own
+//! # A short list, then the system
 //!
 //! A short hardcoded list keeps the terminal running on a bare machine without a
 //! font-discovery dependency, and it renders identically wherever those files exist.

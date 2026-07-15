@@ -2,7 +2,7 @@
 //! Elements (U+2580..=U+259F) blocks, so a terminal never depends on the font
 //! for them.
 //!
-//! # Why the terminal draws these itself
+//! # Drawn here, not taken from the font
 //!
 //! Two independent reasons, either one decisive:
 //!

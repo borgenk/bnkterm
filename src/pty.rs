@@ -7,7 +7,7 @@
 //!                                        └─ parent: master fd (non-blocking) ── read/write
 //! ```
 //!
-//! # Why the FFI lives here
+//! # FFI kept out of the platform layer
 //!
 //! The PTY needs a cluster of libc calls (`posix_openpt`, `fork`, `execvp`, the
 //! tty ioctls) that the portable `platform` layer deliberately does not carry:

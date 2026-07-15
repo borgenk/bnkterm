@@ -12,10 +12,10 @@
 //!                            free queue ◀── returned buffers ────────┘
 //! ```
 //!
-//! # Why this exists
+//! # The render stall
 //!
-//! bnkterm runs one thread: it reads the PTY, parses, and submits the GPU frame in
-//! a loop. During a paint (~2–8 ms) the loop is not calling `read`, the tty's small
+//! The main thread runs a single loop: read the PTY, parse, submit the GPU frame,
+//! repeat. During a paint (~2–8 ms) it is not calling `read`, the tty's small
 //! output buffer fills, the child blocks on `write`, and drain throughput is lost.
 //! A standalone mechanism probe measured that a
 //! gather thread recovers that loss: it holds the ~145 MB/s drain ceiling through a

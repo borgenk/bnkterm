@@ -364,7 +364,7 @@ pub(crate) fn drop_index(slots: &[Slot], bar: &BarGeom, left: i32) -> Option<usi
 /// Either way this is *one* [`DrawCmd::Text`]; an overflowing label differs only by
 /// carrying a [`Fade`], which ramps the run's ink to nothing across its last
 /// [`FADE_SPAN`] so the tail dissolves in place of an ellipsis. The label keeps its
-/// own foreground throughout, which is what keeps the dissolve honest: the ink lands
+/// own foreground throughout: the ink lands
 /// on exactly the tab background (no stain on a light block), and the coverage gamma
 /// still reads the label's true contrast, so the tail's strokes weigh the same as
 /// the head's. Fitting measures glyph advances but allocates nothing beyond the one

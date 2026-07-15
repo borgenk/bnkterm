@@ -1,6 +1,5 @@
-//! The bnkterm binary: argument dispatch and the process entry point. Everything
-//! of substance lives in the library crate (see `lib.rs`); this is the thin
-//! shell that turns flags into a call into it.
+//! Argument dispatch and the process entry point: command-line flags become a
+//! call into the library crate.
 //!
 //! `--gpu-probe` reports the GPU/dmabuf presentation path
 //! without opening one, and `--demo` opens the window on a static styled grid
