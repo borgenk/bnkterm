@@ -51,8 +51,9 @@ const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// How long the visual bell lasts. Long enough to catch the eye, short enough that a
-/// program ringing the bell in a loop (a shell tab-completing against nothing does it)
-/// reads as a flicker and not a strobe.
+/// program ringing the bell in a loop reads as a flicker and not a strobe. Only ever
+/// seen while unfocused (see [`TerminalCore::after_output`]), so it is genuinely an "over here"
+/// nudge, never feedback on your own keystrokes.
 const BELL_FLASH: Duration = Duration::from_millis(120);
 
 /// Lines the scrollback view moves per wheel notch, and arrows sent per notch
@@ -967,7 +968,13 @@ impl TerminalCore {
         self.refresh_title();
         self.track_sync_lock();
         self.flush_clipboard_writes();
-        if self.screen.take_bell() {
+        // The bell is an attention signal, and it can only signal something you are not
+        // already watching: while the surface holds focus you are the one driving the
+        // child (a shell tab-completing against nothing rings it constantly), so a flash
+        // there is pure noise. Swallow it when focused; flash only to pull the eye back to
+        // a window you are not looking at. `take_bell` still runs so the flag never
+        // accrues across a focus change.
+        if self.screen.take_bell() && !self.focused {
             self.bell_until = Some(Instant::now() + BELL_FLASH);
         }
     }
@@ -1632,6 +1639,37 @@ mod tests {
         assert!(!core.bell_flashing());
         assert!(core.dirty, "and it repaints to take the flash back off");
         assert_eq!(core.clear_color(), calm);
+    }
+
+    #[test]
+    fn a_focused_surface_swallows_the_bell() {
+        // A visual bell only means something on a window you are not watching. Focused,
+        // you are the one driving the child (a shell tab-completing against nothing rings
+        // the bell on every miss), so the flash would be feedback on your own keystrokes:
+        // pure noise. The BEL is swallowed, and the surface never lifts.
+        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        core.focused = true;
+        let calm = core.clear_color();
+
+        core.feed_test_bytes(b"\x07");
+        assert!(!core.bell_flashing(), "focused: the bell is swallowed");
+        assert_eq!(core.clear_color(), calm, "so the surface never lifts");
+        assert!(core.bell_deadline().is_none(), "and no deadline is armed");
+
+        // The swallow consumed the flag rather than parking it, so simply losing focus
+        // does not fire the bell that already rang; only a fresh BEL does.
+        core.focused = false;
+        core.feed_test_bytes(b"");
+        assert!(
+            !core.bell_flashing(),
+            "the earlier bell does not resurface on blur"
+        );
+
+        core.feed_test_bytes(b"\x07");
+        assert!(
+            core.bell_flashing(),
+            "unfocused: a fresh bell pulls the eye back"
+        );
     }
 
     #[test]
