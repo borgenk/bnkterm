@@ -18,7 +18,7 @@
 //! is the window's content origin (the padding inset the caller passes; the whole
 //! grid slides by it as one rigid block). The cursor, the selection, and the
 //! glyphs must all agree on where that box is or the display corrupts (the cursor
-//! "drifts from the glyphs"). We get that for free by
+//! "drifts from the glyphs"). They agree by
 //! *routing every coordinate through `cell_x`/`cell_y`* and never accumulating a font's
 //! (fractional) advance: text goes out as [`DrawCmd::Cells`], whose contract is
 //! exactly "cluster `i` draws at `x + i*cell_w`". The one measurement that keys
@@ -209,9 +209,9 @@ impl CellMetrics {
             baseline: m.baseline,
             ascent: m.ascent,
             descent: m.descent,
-            // The chrome never draws a cursor, but the answer is the fallback chain's, not
-            // this face's, so it is the same answer either way. Measuring it rather than
-            // hardcoding `false` keeps the two constructors from disagreeing.
+            // The chrome never draws a cursor, and lock coverage comes from the fallback
+            // chain, not this face, so it resolves the same either way. Measuring it
+            // rather than hardcoding `false` keeps the two constructors from disagreeing.
             lock_glyph: fonts.covers(
                 FaceKey::Ui {
                     size,

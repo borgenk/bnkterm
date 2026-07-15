@@ -1,7 +1,6 @@
 //! The pseudoterminal: spawn `$SHELL` on the slave side of a PTY and talk to it
-//! over the master fd. This is the terminal's other mouth. `vt.rs` reads what the
-//! child says (its output bytes) and `input.rs` writes what the user says (key
-//! bytes); this module is the pipe between them and the child process.
+//! over the master fd. `vt.rs` reads the child's output bytes and `input.rs` writes
+//! the user's key bytes; this module is the pipe between them and the child process.
 //!
 //! ```text
 //!   Pty::spawn ─▶ posix_openpt ─▶ fork ─┬─ child: setsid, TIOCSCTTY, dup2, exec $SHELL
@@ -13,10 +12,9 @@
 //! The PTY needs a cluster of libc calls (`posix_openpt`, `fork`, `execvp`, the
 //! tty ioctls) that the portable `platform` layer deliberately does not carry:
 //! not every app built on that layer has a PTY, so putting this in the vendored
-//! leaf would muddy it. The raw ABI stays isolated in one module; this
-//! file *is* that module for the PTY concern. The `unsafe` is confined to the FFI
-//! section at the bottom and wrapped so [`Pty`]'s callers only ever deal in safe
-//! types and `Result`.
+//! leaf would muddy it. The raw ABI for the PTY stays isolated in this one module. The
+//! `unsafe` is confined to the FFI section at the bottom and wrapped so [`Pty`]'s
+//! callers only ever deal in safe types and `Result`.
 //!
 //! # The fork/exec dance
 //!

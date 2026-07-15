@@ -16,25 +16,24 @@
 //!
 //! # Why the system, and not a longer list of our own
 //!
-//! bnkterm hardcodes its font paths on purpose: a short list keeps the terminal running
-//! on a bare machine without a font-discovery dependency, and it renders identically
-//! wherever those files exist. The list was never the problem. What it cannot do is
-//! *finish*: the moment a program prints a character no listed font has — and the Claude
-//! CLI prints half a dozen of them (`⏺ ⎿ ✓ ✗ ✻` and the braille spinners) — the list has
-//! no answer and the cell renders as a `.notdef` tofu box.
+//! A short hardcoded list keeps the terminal running on a bare machine without a
+//! font-discovery dependency, and it renders identically wherever those files exist.
+//! What it cannot do is cover everything: the moment a program prints a character no
+//! listed font has — and the Claude CLI prints half a dozen (`⏺ ⎿ ✓ ✗ ✻` and the
+//! braille spinners) — the cell renders as a `.notdef` tofu box.
 //!
-//! Extending the list is not a fix, it is the same bet at longer odds: Unicode is larger
-//! than any list we will maintain, and the glyph a program picks tomorrow is not one we
-//! chose today. Worse, the fonts we *did* choose are not the fonts the rest of the
-//! desktop chose, so the same `✓` came out of a different font in bnkterm than in every
-//! other terminal on the machine — which is exactly how this module came to exist.
+//! Extending the list is the same bet at longer odds: Unicode is larger than any list
+//! we will maintain, and the glyph a program picks tomorrow is not one we chose today.
+//! Worse, the fonts we *did* choose are not the fonts the rest of the desktop chose, so
+//! the same `✓` came out of a different font here than in every other terminal on the
+//! machine.
 //!
-//! So: the pinned list stays, and keeps its meaning (it is now an *override* — "this
-//! range comes from this font, whatever the system thinks"), and fontconfig answers
-//! everything else, the way it answers for every other application. The cost is that
-//! rendering is now a function of what is installed rather than of a fixed list. That is
-//! a real loss of determinism, taken knowingly: matching the desktop is worth more here
-//! than reproducing a tofu box identically on two machines.
+//! The pinned list therefore stays as an *override* ("this range comes from this font,
+//! whatever the system thinks"), and fontconfig answers everything else, the way it
+//! answers for every other application. The cost is that rendering is now a function of
+//! what is installed rather than of a fixed list: a real loss of determinism, taken
+//! knowingly, because matching the desktop is worth more here than reproducing a tofu
+//! box identically on two machines.
 //!
 //! # The dependency
 //!
@@ -182,7 +181,7 @@ pub struct FontFile {
 /// and it is why they can render a page of Chinese without thinking about it.
 ///
 /// `trim` asks fontconfig to drop any font that adds no coverage the ones above it do not
-/// already have, so the list stays short and every entry earns its place in the walk.
+/// already have, so the list stays short and holds no redundant entry.
 pub struct Fontconfig {
     /// The ranked fonts. Owned: the charsets borrowed in [`font_for_char`](Self::font_for_char)
     /// point into these patterns, so the set must outlive every query made against it.

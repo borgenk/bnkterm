@@ -4,8 +4,7 @@
 //! grid holds no parser state: this file knows only semantic operations (print a
 //! rune, move the cursor, erase, scroll), never bytes.
 //!
-//! Structure, chosen for the access pattern (the structure is the
-//! optimization):
+//! Structure, chosen for the access pattern:
 //!
 //! ```text
 //!   Screen ── primary: Buffer ─┐
@@ -22,8 +21,7 @@
 //! moves only the headers inside the region. The evicted row's cell buffer is
 //! recycled into the new blank row, so a steady scroll allocates nothing.
 //!
-//! Two shapes of the cell earn a comment because they corrupt a screen when
-//! gotten wrong:
+//! Two cell shapes corrupt a screen when handled wrong:
 //!
 //!   * Wide characters (CJK, most emoji) occupy two columns. The left column
 //!     carries the rune and the `WIDE_LEADER` attr; the right column is a
@@ -1211,8 +1209,8 @@ pub struct Screen {
     /// its own link namespace, so an id means the same thing whichever buffer holds it
     /// and switching buffers costs nothing.
     links: LinkTable,
-    /// The kitty keyboard protocol's flag stack. The protocol is a *stack* on purpose:
-    /// a full-screen program pushes the flags it wants on entry and pops them on exit,
+    /// The kitty keyboard protocol's flag stack. It is a stack because a full-screen
+    /// program pushes the flags it wants on entry and pops them on exit,
     /// so it cannot strand the terminal in a mode the shell underneath it does not
     /// understand — and a program that dies without popping is cleaned up by whatever
     /// pushed beneath it. The top entry is what is in force; an empty stack is legacy.
@@ -3601,8 +3599,8 @@ impl Screen {
     /// This does not get us onto anyone's allowlist — the CLIs that gate features on a
     /// terminal's name match it against a fixed list we are not on, and we do not intend
     /// to impersonate someone to get on it (see the `TERM_PROGRAM` note in `app.rs`). But
-    /// it is what a terminal is *supposed* to say when asked, it is the only way anything
-    /// could ever recognise us on purpose, and staying silent is how you stay unknown.
+    /// it is what a terminal is *supposed* to say when asked, and the only way a program
+    /// could recognise us deliberately rather than not at all.
     fn xtversion(&mut self) {
         self.respond(b"\x1bP>|bnkterm ");
         self.respond(env!("CARGO_PKG_VERSION").as_bytes());
@@ -5299,9 +5297,9 @@ mod tests {
         // a diagnostic. The whole CSI used to be dropped on sight of the first colon, so
         // the *colour* went with it: an error came out unstyled and uncoloured.
         //
-        // We still draw only a solid underline, so the style is discarded — but it is
-        // discarded on purpose, one parameter at a time, instead of taking the rest of
-        // the sequence down with it.
+        // We still draw only a solid underline, so the style is discarded — but cleanly,
+        // one parameter at a time, instead of taking the rest of the sequence down with
+        // it.
         let mut s = Screen::new(10, 1);
         feed(&mut s, b"\x1b[4:3;58:2::255:0:0;38:2::0:255:0m");
         assert!(s.pen.attrs.contains(Attrs::UNDERLINE), "underlined");
@@ -6686,8 +6684,8 @@ mod tests {
 
     #[test]
     fn decrqss_answers_with_the_sequence_that_would_restore_the_setting() {
-        // A program saves a setting, changes it, and puts it back — without ever knowing
-        // what it was. So the answer is not a description, it is a sequence.
+        // A program saves a setting, changes it, and puts it back without ever knowing
+        // what it was, so the reply is a sequence to replay, not a description.
         let mut s = Screen::new(10, 3);
         feed(&mut s, b"\x1bP$qm\x1b\\"); // "what is SGR?"
         assert_eq!(s.take_responses(), b"\x1bP1$r0m\x1b\\");

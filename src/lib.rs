@@ -1,7 +1,7 @@
 //! bnkterm: a native Wayland + Vulkan terminal emulator in Rust, with almost no
 //! dependencies.
 //!
-//! The crate is split lib + thin bin on purpose. The terminal core (`vt`,
+//! The crate is split lib + thin bin. The terminal core (`vt`,
 //! `grid`, `color`, ...) is greenfield we build stage by stage, and a stage's
 //! types routinely exist a step before their first caller does. A library keeps
 //! that honest: its public surface is reachable API, so a not-yet-wired type is

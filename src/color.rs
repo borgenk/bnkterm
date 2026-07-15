@@ -2,7 +2,7 @@
 //! xterm palette math, and the `Theme` that turns any `Color` into a concrete
 //! `Rgb` at paint time.
 //!
-//! A cell stores a `Color`, not an `Rgb`, on purpose: the same escape sequence
+//! A cell stores a `Color`, not an `Rgb`: the same escape sequence
 //! has to track the live theme, so `Color::Ansi(1)` follows whatever "red" the
 //! theme names and only becomes pixels when it is drawn. The four cases mirror
 //! exactly what SGR can say about a color:

@@ -1605,8 +1605,8 @@ mod tests {
                 "no font on this system draws {ch:?} (U+{:04X})",
                 ch as u32
             );
-            // Resolving is not enough: the point is ink on the screen. A face that
-            // reports the glyph but rasterizes empty is the tofu box wearing a disguise.
+            // Resolving the glyph is not enough; it has to rasterize to actual ink. A
+            // face that reports the glyph but rasterizes empty is a disguised tofu box.
             let raster = face.rasterize(ch);
             assert!(
                 raster.coverage.iter().any(|&c| c > 0),

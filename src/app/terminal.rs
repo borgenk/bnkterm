@@ -581,9 +581,9 @@ impl TerminalCore {
                     self.write_mouse(button, kind, col, row, mods)?;
                 } else if button == MouseButton::Left {
                     // Ctrl+click follows a hyperlink instead of starting a selection.
-                    // It sits inside the local branch on purpose: while a program is
-                    // grabbing the mouse, its clicks are its own, and Shift (which
-                    // already means "this one is mine") is what frees a link there.
+                    // It sits inside the local branch because a program grabbing the
+                    // mouse owns its clicks, and Shift (which already means "this one is
+                    // mine") is what frees a link there.
                     if pressed && mods.contains(input::Mods::CTRL) && self.open_link(row, col) {
                         return Ok(());
                     }
@@ -1008,9 +1008,9 @@ impl TerminalCore {
     /// Follow the child in and out of synchronized output (`?2026`).
     ///
     /// Entering starts the clock; leaving stops it. The deadline is set once on the way
-    /// in and not extended by later output, because the point is to bound how long a
-    /// *frame* can take, and a child that keeps writing while holding the lock is exactly
-    /// the case that must not be able to hold it forever.
+    /// in and not extended by later output: it bounds how long a *frame* can take, and a
+    /// child that keeps writing while holding the lock is exactly the case that must not
+    /// be able to hold it forever.
     fn track_sync_lock(&mut self) {
         if !self.screen.synchronized() {
             self.sync_until = None;

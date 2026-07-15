@@ -812,7 +812,7 @@ fn pack_argb(atlas: &mut Atlas, w: u32, h: u32, argb: &[u32]) -> Option<Slot> {
 /// rests on the line like the caps and digits around it and rises a little above
 /// the x-height, exactly how a warning sign reads in other terminals.
 ///
-/// The bottom dips `h / 12` below the baseline on purpose: a color glyph carries
+/// The bottom dips `h / 12` below the baseline: a color glyph carries
 /// a thin band of transparent padding beneath its ink, so dropping the raster
 /// edge a hair below the line seats the *visible* bottom on it. An inkless glyph
 /// (`slot` `None`) is returned unchanged. Only the fixed-pitch [`Batcher::cells`]

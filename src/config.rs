@@ -149,9 +149,9 @@ impl Default for FontConfig {
             // it draws the right thing.
             //
             // Both cuts are listed. The Mono cut sizes every icon to one cell and so
-            // leads when installed; the wide cut renders icons larger than one cell,
-            // on purpose (see the natural-size policy in `platform/freetype.rs`, where
-            // fallback faces are not scaled to the cell), and is the cut ghostty and
+            // leads when installed; the wide cut renders icons larger than one cell
+            // (see the natural-size policy in `platform/freetype.rs`, where fallback
+            // faces are not scaled to the cell), and is the cut ghostty and
             // wezterm map this range to by default.
             fallback: vec![
                 "/usr/share/fonts/TTF/SymbolsNerdFontMono-Regular.ttf".into(),
