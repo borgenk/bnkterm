@@ -45,7 +45,7 @@ use std::fmt;
 
 /// Default lines of scrollback the primary screen keeps. Overridable by config
 /// later (phase 4); the alternate screen keeps none.
-const DEFAULT_SCROLLBACK: usize = 10_000;
+pub(crate) const DEFAULT_SCROLLBACK: usize = 10_000;
 
 /// Columns between default tab stops.
 const TAB_WIDTH: usize = 8;
@@ -557,6 +557,22 @@ struct Saved {
     origin: bool,
 }
 
+/// The most combining marks a single cell retains. Unicode's Stream-Safe Text
+/// format caps a grapheme at 30, so this sits just above it: real accented and
+/// stacked text is never clipped, but an unbounded Zalgo stream cannot grow one
+/// cell's side table (or the render string it feeds) without limit.
+const MAX_COMBINING_PER_CELL: usize = 32;
+
+/// One combining mark riding along with the base cell in `col`, in arrival order.
+/// Flattened into the row's [`Row::combining`] list rather than owned per marked
+/// cell, so the whole row's marks live in one reusable heap buffer (see the field
+/// docs for why that matters).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CombiningMark {
+    col: usize,
+    ch: char,
+}
+
 /// One row of cells plus its rare combining marks. Cells are contiguous, so a
 /// row is cheap to scan and write. Combining marks live in a tiny side list keyed
 /// by column so they ride along when the row scrolls and cost nothing on the
@@ -564,7 +580,13 @@ struct Saved {
 #[derive(Clone, Debug)]
 struct Row {
     cells: Vec<Cell>,
-    combining: Vec<(usize, Vec<char>)>,
+    /// The row's combining marks, flattened: one `(col, ch)` pair per mark rather
+    /// than an owned `Vec<char>` per marked cell. Flattening keeps the side table a
+    /// single heap buffer that [`Row::reset`] clears in place, so a recycled scroll
+    /// row reuses its capacity and a warmed combining/emoji line allocates nothing.
+    /// A column's marks read back by filtering on `col`, which preserves the order
+    /// they arrived in.
+    combining: Vec<CombiningMark>,
     /// Autowrap carried this line onto the next row: the two are one logical line,
     /// so a selection spanning them copies as unbroken text and a triple-click takes
     /// both. A hard newline leaves this false.
@@ -604,22 +626,36 @@ impl Row {
         self.wrapped = false;
     }
 
-    fn marks_at(&self, col: usize) -> Option<&[char]> {
+    /// The combining marks attached to `col`, in arrival order; empty if the cell
+    /// carries none. Yields `char` so a caller appends them straight onto a run
+    /// string without materializing a temporary collection.
+    fn marks(&self, col: usize) -> impl Iterator<Item = char> + '_ {
         self.combining
             .iter()
-            .find(|(c, _)| *c == col)
-            .map(|(_, m)| m.as_slice())
+            .filter(move |m| m.col == col)
+            .map(|m| m.ch)
+    }
+
+    /// Whether `col` carries any combining mark. Cheaper than `marks(col).next()` at
+    /// the ink test, and reads clearly there.
+    fn has_marks(&self, col: usize) -> bool {
+        self.combining.iter().any(|m| m.col == col)
     }
 
     fn add_mark(&mut self, col: usize, mark: char) {
-        match self.combining.iter_mut().find(|(c, _)| *c == col) {
-            Some((_, marks)) => marks.push(mark),
-            None => self.combining.push((col, vec![mark])),
+        // Clamp how many marks one cell can stack. Unicode's Stream-Safe format caps a
+        // grapheme at 30 combining marks; a hostile stream (Zalgo) piles on thousands,
+        // which would grow this row's side table and every render string it feeds
+        // without bound. Beyond the cap the extra marks are dropped: invisible clutter
+        // no reader needs, and the bound keeps retained memory and render work finite.
+        if self.combining.iter().filter(|m| m.col == col).count() >= MAX_COMBINING_PER_CELL {
+            return;
         }
+        self.combining.push(CombiningMark { col, ch: mark });
     }
 
     fn clear_marks(&mut self, col: usize) {
-        self.combining.retain(|(c, _)| *c != col);
+        self.combining.retain(|m| m.col != col);
     }
 
     /// Grow or shrink the row to `new_cols`, padding with blanks or truncating.
@@ -632,7 +668,7 @@ impl Row {
         let old = self.cells.len();
         if new_cols < old {
             self.cells.truncate(new_cols);
-            self.combining.retain(|(c, _)| *c < new_cols);
+            self.combining.retain(|m| m.col < new_cols);
             if let Some(last) = self.cells.last_mut() {
                 if last.is_wide_leader() {
                     *last = Cell::BLANK;
@@ -828,7 +864,8 @@ impl Buffer {
                 };
             }
         }
-        r.combining.retain(|(c, _)| *c < start_col || *c >= end_col);
+        r.combining
+            .retain(|m| m.col < start_col || m.col >= end_col);
         // As in `set_raw`: a run reaching the final column replaces whatever wrapped out
         // of it. The caller re-wraps this row if the run itself runs off the edge.
         if end_col >= r.cells.len() {
@@ -1022,7 +1059,7 @@ impl Buffer {
                 if let Some(slice) = r.cells.get_mut(start..hi) {
                     slice.iter_mut().for_each(|c| *c = blank);
                 }
-                r.combining.retain(|(c, _)| *c < start || *c >= hi);
+                r.combining.retain(|m| m.col < start || m.col >= hi);
                 if hi == r.cells.len() {
                     r.wrapped = false;
                 }
@@ -1044,10 +1081,10 @@ impl Buffer {
             if let Some(slice) = r.cells.get_mut(col..col + n) {
                 slice.iter_mut().for_each(|c| *c = blank);
             }
-            r.combining.retain(|(c, _)| *c < col || *c + n < len);
-            r.combining.iter_mut().for_each(|(c, _)| {
-                if *c >= col {
-                    *c += n
+            r.combining.retain(|m| m.col < col || m.col + n < len);
+            r.combining.iter_mut().for_each(|m| {
+                if m.col >= col {
+                    m.col += n
                 }
             });
             r.wrapped = false;
@@ -1067,10 +1104,10 @@ impl Buffer {
             if let Some(slice) = r.cells.get_mut(len - n..len) {
                 slice.iter_mut().for_each(|c| *c = blank);
             }
-            r.combining.retain(|(c, _)| *c < col || *c >= col + n);
-            r.combining.iter_mut().for_each(|(c, _)| {
-                if *c >= col + n {
-                    *c -= n
+            r.combining.retain(|m| m.col < col || m.col >= col + n);
+            r.combining.iter_mut().for_each(|m| {
+                if m.col >= col + n {
+                    m.col -= n
                 }
             });
             r.wrapped = false;
@@ -1442,9 +1479,24 @@ impl Screen {
         self.cursor_appearance.blink
     }
 
-    /// Take the bytes queued to write back to the child (DA/DSR answers), leaving
-    /// the queue empty. Empty in the common case (no query since the last parse),
-    /// so the app can call it after every parse cheaply.
+    /// The bytes queued to write back to the child (DA/DSR answers). Empty in the
+    /// common case (no query since the last parse). Borrowed rather than taken so the
+    /// caller writes it straight through and then [`clear_responses`](Self::clear_responses)
+    /// in place, keeping the queue's capacity instead of leaving a zero-cap vec the
+    /// next reply must regrow.
+    pub fn responses(&self) -> &[u8] {
+        &self.responses
+    }
+
+    /// Drop the queued reply bytes after they have been written, retaining capacity.
+    pub fn clear_responses(&mut self) {
+        self.responses.clear();
+    }
+
+    /// Take the queued reply bytes, leaving the queue empty. A read-and-clear
+    /// convenience for tests; the app writes via [`responses`](Self::responses) and
+    /// [`clear_responses`](Self::clear_responses) instead, to keep the capacity.
+    #[cfg(test)]
     pub fn take_responses(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.responses)
     }
@@ -1462,9 +1514,13 @@ impl Screen {
         self.active().cell(row, col)
     }
 
-    /// Combining marks attached to visible `(row, col)`, if any.
-    pub fn marks_at(&self, row: usize, col: usize) -> Option<&[char]> {
-        self.active().line(row).and_then(|r| r.marks_at(col))
+    /// Combining marks attached to visible `(row, col)`, in arrival order; empty if
+    /// none.
+    pub fn marks_at(&self, row: usize, col: usize) -> impl Iterator<Item = char> + '_ {
+        self.active()
+            .line(row)
+            .into_iter()
+            .flat_map(move |r| r.marks(col))
     }
 
     // ---- scrollback viewport ------------------------------------------------
@@ -1650,8 +1706,11 @@ impl Screen {
     }
 
     /// Combining marks at absolute `(row, col)`.
-    fn abs_marks(&self, row: AbsRow, col: usize) -> Option<&[char]> {
-        self.active().abs_row(row).and_then(|r| r.marks_at(col))
+    fn abs_marks(&self, row: AbsRow, col: usize) -> impl Iterator<Item = char> + '_ {
+        self.active()
+            .abs_row(row)
+            .into_iter()
+            .flat_map(move |r| r.marks(col))
     }
 
     /// The cell shown at display `(row, col)` honouring the scroll offset: the live
@@ -1668,15 +1727,30 @@ impl Screen {
             .unwrap_or(Cell::BLANK)
     }
 
-    /// Combining marks at display `(row, col)` honouring the scroll offset.
-    pub fn view_marks(&self, row: usize, col: usize) -> Option<&[char]> {
+    /// Combining marks at display `(row, col)` honouring the scroll offset, in
+    /// arrival order; empty if none.
+    pub fn view_marks(&self, row: usize, col: usize) -> impl Iterator<Item = char> + '_ {
+        self.view_line(row)
+            .into_iter()
+            .flat_map(move |r| r.marks(col))
+    }
+
+    /// Whether display `(row, col)` carries any combining mark, honouring the scroll
+    /// offset. The ink test uses this instead of `view_marks(..).next()` so a caller
+    /// can ask the yes/no without starting an iterator it will not drain.
+    pub fn view_has_marks(&self, row: usize, col: usize) -> bool {
+        self.view_line(row).is_some_and(|r| r.has_marks(col))
+    }
+
+    /// The row shown at display `row` honouring the scroll offset: the live row when
+    /// pinned to the bottom, else the scrollback row scrolled into view.
+    fn view_line(&self, row: usize) -> Option<&Row> {
         let off = self.view_offset();
         if off == 0 {
-            return self.marks_at(row, col);
+            self.active().line(row)
+        } else {
+            self.active().view_row(row, off)
         }
-        self.active()
-            .view_row(row, off)
-            .and_then(|r| r.marks_at(col))
     }
 
     /// The text of a linear selection, `a`..`b` inclusive in absolute `(row, col)`
@@ -1704,18 +1778,21 @@ impl Screen {
         while row <= end_row {
             let first = if row == start.0 { start.1 } else { 0 };
             let last = if row == end.0 { end.1 } else { last_col };
-            let mut line = String::new();
+            // Append this row straight onto the shared buffer rather than into a fresh
+            // per-row `String`, then drop its trailing spaces in place — no further back
+            // than where the row began, so an earlier row's content is untouched.
+            let row_start = out.len();
             for col in first..=last.min(last_col) {
                 let cell = self.abs_cell(row, col);
                 if cell.is_wide_spacer() {
                     continue;
                 }
-                line.push(cell.rune);
-                if let Some(marks) = self.abs_marks(row, col) {
-                    line.extend(marks);
-                }
+                out.push(cell.rune);
+                out.extend(self.abs_marks(row, col));
             }
-            out.push_str(line.trim_end_matches(' '));
+            while out.len() > row_start && out.ends_with(' ') {
+                out.pop();
+            }
             if row != end_row {
                 // A soft wrap continues the same logical line: no newline.
                 if !self.wraps(row) {
@@ -1869,9 +1946,7 @@ impl Screen {
                 }
                 probe.runes.push((probe.text.len(), (r, c)));
                 probe.text.push(cell.rune);
-                if let Some(marks) = self.view_marks(r, c) {
-                    probe.text.extend(marks);
-                }
+                probe.text.extend(self.view_marks(r, c));
             }
         }
 
@@ -1939,9 +2014,7 @@ impl Screen {
                 continue;
             }
             s.push(cell.rune);
-            if let Some(marks) = r.marks_at(col) {
-                s.extend(marks);
-            }
+            s.extend(r.marks(col));
         }
         s
     }
@@ -2338,8 +2411,8 @@ impl Screen {
         let mut out = String::new();
         let b = self.active();
         out.push(b.cell(row, col).rune);
-        if let Some(marks) = b.line(row).and_then(|r| r.marks_at(col)) {
-            out.extend(marks);
+        if let Some(r) = b.line(row) {
+            out.extend(r.marks(col));
         }
         out
     }
@@ -4585,7 +4658,7 @@ mod tests {
                              // The base cell is unchanged; the mark is in the side table.
         assert_eq!(s.cell(0, 0).rune, 'e');
         assert_eq!(s.cursor(), (0, 1)); // zero-width, cursor did not advance
-        assert_eq!(s.marks_at(0, 0), Some(['\u{0301}'].as_slice()));
+        assert_eq!(s.marks_at(0, 0).collect::<Vec<_>>(), ['\u{0301}']);
         assert_eq!(s.row_string(0).trim_end(), "e\u{0301}");
     }
 
@@ -4595,8 +4668,8 @@ mod tests {
         s.print('か'); // wide: leader at 0, spacer at 1, cursor at 2
         s.print('\u{3099}'); // combining voiced sound mark -> が
                              // The mark composes onto the leader (col 0), not the spacer (col 1).
-        assert_eq!(s.marks_at(0, 0), Some(['\u{3099}'].as_slice()));
-        assert_eq!(s.marks_at(0, 1), None);
+        assert_eq!(s.marks_at(0, 0).collect::<Vec<_>>(), ['\u{3099}']);
+        assert!(s.marks_at(0, 1).next().is_none());
     }
 
     #[test]
@@ -5036,8 +5109,8 @@ mod tests {
         // renderer already shapes as one glyph. The astronaut is drawn, not the woman and
         // the rocket.
         assert_eq!(
-            s.marks_at(0, 0),
-            Some(['\u{200D}', '\u{1F680}'].as_slice()),
+            s.marks_at(0, 0).collect::<Vec<_>>(),
+            ['\u{200D}', '\u{1F680}'],
             "the joiner and the rocket joined the woman"
         );
         // And nothing is left in the columns the scalars would have taken.
@@ -5070,7 +5143,7 @@ mod tests {
         print_str(&mut s, "\u{1F1F3}\u{1F1F4}"); // 🇳🇴
         assert_eq!(s.cursor(), (0, 2));
         assert!(s.cell(0, 0).is_wide_leader());
-        assert_eq!(s.marks_at(0, 0), Some(['\u{1F1F4}'].as_slice()));
+        assert_eq!(s.marks_at(0, 0).collect::<Vec<_>>(), ['\u{1F1F4}']);
     }
 
     #[test]
@@ -5083,9 +5156,8 @@ mod tests {
         print_str(&mut s, "\u{1F469}"); // a woman at (0,0)
         feed(&mut s, b"\x1b[2;5H"); // jump away
         print_str(&mut s, "\u{200D}\u{1F680}"); // a joiner and a rocket, elsewhere
-        assert_eq!(
-            s.marks_at(0, 0),
-            None,
+        assert!(
+            s.marks_at(0, 0).next().is_none(),
             "the woman did not acquire a rocket from across the screen"
         );
 
@@ -5094,7 +5166,7 @@ mod tests {
         print_str(&mut s, "\u{1F469}");
         feed(&mut s, b"\r\n");
         print_str(&mut s, "\u{1F680}");
-        assert_eq!(s.marks_at(0, 0), None);
+        assert!(s.marks_at(0, 0).next().is_none());
         assert_eq!(s.cell(1, 0).rune, '\u{1F680}', "the rocket stands alone");
     }
 
@@ -5567,7 +5639,7 @@ mod tests {
         assert_eq!(s.cell(0, 0).rune, 'a');
         assert_eq!(s.cell(0, 1).rune, 'か');
         assert!(s.cell(0, 1).is_wide_leader());
-        assert_eq!(s.marks_at(0, 1), Some(['\u{3099}'].as_slice()));
+        assert_eq!(s.marks_at(0, 1).collect::<Vec<_>>(), ['\u{3099}']);
         assert_eq!(s.cell(0, 3).rune, 'b');
     }
 

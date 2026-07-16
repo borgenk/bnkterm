@@ -75,6 +75,16 @@ impl Paint {
 const ATLAS_START: u32 = 1024;
 const ATLAS_MAX: u32 = 8192;
 
+/// The most slot records a glyph cache keeps before it is dropped whole. The atlas
+/// is bounded by [`ATLAS_MAX`], but the slot maps are not: a `None` record is kept
+/// for every distinct non-emoji cluster (the negative cache) and for every glyph
+/// that would not fit a full atlas, so a hostile stream of distinct clusters or
+/// glyphs — attacker-controlled bytes, per the threat model — would grow them
+/// without limit. Far above any real workload's distinct-glyph count, so ordinary
+/// use never trips it; when it does, dropping the map bounds memory and the glyphs
+/// simply re-cache (a bounded burst) rather than accumulating forever.
+const MAX_GLYPH_CACHE: usize = 1 << 16;
+
 /// One vertex, laid out exactly as the pipeline's vertex input expects
 /// (`repr(C)`: pos, uv, color, extra, mode). Six of these make a quad.
 #[repr(C)]
@@ -251,16 +261,8 @@ impl Atlas {
         Ok::<(), ()>(()).is_ok()
     }
 
-    /// Write a raster's rows into the mirror at `slot` and extend the dirty
-    /// rectangle over it. `src` is `w * h * bpp` bytes, row-major, tight.
-    fn write(&mut self, slot: Slot, src: &[u8]) {
-        let row_bytes = (slot.w * self.bpp) as usize;
-        for row in 0..slot.h {
-            let src_start = row as usize * row_bytes;
-            let dst_start = (((slot.y + row) * self.width + slot.x) * self.bpp) as usize;
-            self.pixels[dst_start..dst_start + row_bytes]
-                .copy_from_slice(&src[src_start..src_start + row_bytes]);
-        }
+    /// Extend the dirty rectangle to cover `slot`, so the next upload carries it.
+    fn mark_dirty(&mut self, slot: Slot) {
         let rect = (slot.x, slot.y, slot.x + slot.w, slot.y + slot.h);
         self.dirty = Some(match self.dirty {
             None => rect,
@@ -273,6 +275,36 @@ impl Atlas {
         });
     }
 
+    /// Write a raster's rows into the mirror at `slot` and extend the dirty
+    /// rectangle over it. `src` is `w * h * bpp` bytes, row-major, tight.
+    fn write(&mut self, slot: Slot, src: &[u8]) {
+        let row_bytes = (slot.w * self.bpp) as usize;
+        for row in 0..slot.h {
+            let src_start = row as usize * row_bytes;
+            let dst_start = (((slot.y + row) * self.width + slot.x) * self.bpp) as usize;
+            self.pixels[dst_start..dst_start + row_bytes]
+                .copy_from_slice(&src[src_start..src_start + row_bytes]);
+        }
+        self.mark_dirty(slot);
+    }
+
+    /// Write a `w`-word-per-row ARGB raster (`w * h` words, row-major, tight) into
+    /// the mirror at `slot`, one pixel's `to_ne_bytes` at a time. Lets the color
+    /// atlas (`bpp == 4`) pack a glyph straight from its words without first
+    /// collecting them into a byte vector.
+    fn write_words(&mut self, slot: Slot, src: &[u32]) {
+        let w = slot.w as usize;
+        for row in 0..slot.h {
+            let src_row = row as usize * w;
+            let dst_row = (((slot.y + row) * self.width + slot.x) * self.bpp) as usize;
+            for x in 0..w {
+                let dst = dst_row + x * self.bpp as usize;
+                self.pixels[dst..dst + 4].copy_from_slice(&src[src_row + x].to_ne_bytes());
+            }
+        }
+        self.mark_dirty(slot);
+    }
+
     /// Reserve a slot for a `w` x `h` raster and write `src` into it, returning
     /// the slot; `None` for a zero-area raster or a full atlas (the caller
     /// records the empty placement so the pen still advances). `src` is
@@ -283,6 +315,17 @@ impl Atlas {
         }
         let slot = self.reserve(w, h)?;
         self.write(slot, src);
+        Some(slot)
+    }
+
+    /// Like [`pack`](Self::pack) but from ARGB words (the color-glyph path), writing
+    /// them into the 4-bpp mirror directly. `src` is `w * h` words, row-major, tight.
+    fn pack_words(&mut self, w: u32, h: u32, src: &[u32]) -> Option<Slot> {
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let slot = self.reserve(w, h)?;
+        self.write_words(slot, src);
         Some(slot)
     }
 
@@ -340,6 +383,28 @@ impl GlyphCache {
         if self.emoji.generation != emoji_gen {
             self.cluster_slots.clear();
         }
+    }
+
+    /// Record a scalar glyph's placement, dropping the whole scalar cache first if it
+    /// has reached [`MAX_GLYPH_CACHE`], so distinct-glyph spam cannot grow it without
+    /// bound. Clearing is safe: the already-emitted quads keep their valid atlas
+    /// slots (the atlas is untouched), and the glyphs simply re-cache on next sight.
+    fn cache_scalar(&mut self, key: (FaceKey, char), packed: PackedGlyph) {
+        if self.scalar_slots.len() >= MAX_GLYPH_CACHE {
+            self.scalar_slots.clear();
+        }
+        self.scalar_slots.insert(key, packed);
+    }
+
+    /// Record a cluster's placement (or `None` for a non-emoji cluster: the negative
+    /// cache that keeps a steady frame off the shaper), capping the per-face map the
+    /// same way so a stream of distinct clusters cannot grow it without bound.
+    fn cache_cluster(&mut self, face_key: FaceKey, cluster: &str, packed: Option<PackedGlyph>) {
+        let by = self.cluster_slots.entry(face_key).or_default();
+        if by.len() >= MAX_GLYPH_CACHE {
+            by.clear();
+        }
+        by.insert(cluster.to_string(), packed);
     }
 }
 
@@ -660,7 +725,7 @@ impl Batcher<'_> {
             top: g.top,
             advance: g.advance,
         };
-        self.cache.scalar_slots.insert((face_key, ch), packed);
+        self.cache.cache_scalar((face_key, ch), packed);
         packed
     }
 
@@ -697,7 +762,7 @@ impl Batcher<'_> {
             top: baseline_offset,
             advance: w as f32,
         };
-        self.cache.scalar_slots.insert((face_key, ch), packed);
+        self.cache.cache_scalar((face_key, ch), packed);
         packed
     }
 
@@ -742,11 +807,7 @@ impl Batcher<'_> {
         if packed.is_some() {
             face.record_cluster_miss();
         }
-        self.cache
-            .cluster_slots
-            .entry(face_key)
-            .or_default()
-            .insert(cluster.to_string(), packed);
+        self.cache.cache_cluster(face_key, cluster, packed);
         packed
     }
 
@@ -800,9 +861,9 @@ fn pack_argb(atlas: &mut Atlas, w: u32, h: u32, argb: &[u32]) -> Option<Slot> {
     if w == 0 || h == 0 || argb.len() < (w * h) as usize {
         return None;
     }
-    // ARGB words are B,G,R,A bytes in memory: B8G8R8A8 verbatim.
-    let bytes: Vec<u8> = argb.iter().flat_map(|px| px.to_ne_bytes()).collect();
-    atlas.pack(w, h, &bytes)
+    // ARGB words are B,G,R,A bytes in memory: B8G8R8A8 verbatim, written straight
+    // into the mirror rather than first collected into a byte-conversion vector.
+    atlas.pack_words(w, h, argb)
 }
 
 /// Re-place a single-width color-emoji glyph so it sits on the text line rather
@@ -924,6 +985,42 @@ mod tests {
         assert_eq!((up.x, up.y, up.w, up.h), (0, 0, 10, 8));
         assert!(up.bytes.iter().all(|&b| b == 7));
         assert!(a.take_upload().is_none(), "dirty cleared");
+    }
+
+    #[test]
+    fn pack_words_lays_down_the_same_bytes_as_a_conversion_would() {
+        // The color-glyph path packs ARGB words straight into the 4-bpp mirror; the
+        // result must match converting each word to its native bytes first, so
+        // dropping that conversion vector changed nothing on screen.
+        let mut a = Atlas::new(4);
+        let argb: [u32; 4] = [0x1122_3344, 0x5566_7788, 0x99AA_BBCC, 0xDDEE_FF00];
+        a.pack_words(2, 2, &argb).expect("fits");
+        let up = a.take_upload().expect("dirty");
+        assert_eq!((up.w, up.h), (2, 2));
+        let expect: Vec<u8> = argb.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        assert_eq!(up.bytes, expect);
+    }
+
+    #[test]
+    fn glyph_caches_stay_bounded_under_distinct_input() {
+        // Past the cap the maps drop and re-fill rather than growing forever, so a
+        // hostile stream of distinct glyphs or clusters cannot exhaust memory.
+        let mut cache = GlyphCache::new();
+        let face = FaceKey::Code { size: 16 };
+        let none = PackedGlyph {
+            slot: None,
+            left: 0,
+            top: 0,
+            advance: 0.0,
+        };
+        for i in 0..MAX_GLYPH_CACHE + 5 {
+            let ch = char::from_u32(0x1_0000 + i as u32).expect("valid scalar");
+            cache.cache_scalar((face, ch), none);
+            cache.cache_cluster(face, &format!("c{i}"), None);
+        }
+        assert!(cache.scalar_slots.len() <= MAX_GLYPH_CACHE);
+        let clusters: usize = cache.cluster_slots.values().map(|m| m.len()).sum();
+        assert!(clusters <= MAX_GLYPH_CACHE);
     }
 
     #[test]

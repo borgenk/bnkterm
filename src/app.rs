@@ -655,9 +655,13 @@ impl State {
     /// the soonest timer (cursor blink, key repeat) comes due. An idle, unfocused
     /// terminal with nothing held waits open-ended.
     fn run_until(&mut self, done: impl Fn(&State) -> bool) -> Result<()> {
+        // One reusable decode buffer for the whole loop: the main loop is a single
+        // app-lifetime `run_until`, so a frame's `wl_callback.done` and every other
+        // event decode into this same body buffer without a per-message allocation.
+        let mut msg = Message::default();
         loop {
-            while let Some(msg) = self.conn.next_message()? {
-                self.handle(msg)?;
+            while self.conn.next_message_into(&mut msg)? {
+                self.handle(&msg)?;
             }
             // Drain the child's output into the grid (a no-op with no PTY, or when
             // nothing is ready), then act on what it produced (a title change, a
@@ -898,7 +902,7 @@ impl State {
         self.set_scale_120(factor_120);
     }
 
-    fn handle(&mut self, msg: Message) -> Result<()> {
+    fn handle(&mut self, msg: &Message) -> Result<()> {
         // Closing the last tab can happen while more Wayland messages are already
         // queued. The process is leaving; ignore those messages so none can route
         // input through an intentionally empty tab list.
@@ -1866,7 +1870,11 @@ impl State {
     /// each is a Wayland request the terminal cannot make itself. Window-side by
     /// necessity; Stage 2 turns this outbox into the terminal→window channel.
     fn drain_outbox(&mut self) -> Result<()> {
-        for msg in self.tabs.take_outbox() {
+        // Swap the queue out so the match arms can take `&mut self` freely, drain it
+        // (which keeps the local buffer's capacity), then hand the emptied buffer back
+        // for the next pump rather than leaving a zero-cap vec the next message regrows.
+        let mut outbox = self.tabs.take_outbox();
+        for msg in outbox.drain(..) {
             match msg {
                 ToWindow::Title(title) => self.set_toplevel_title(&title),
                 ToWindow::OfferSelection(bytes) => self.set_clipboard(bytes),
@@ -1876,6 +1884,7 @@ impl State {
                 ToWindow::Closed => self.closed = true,
             }
         }
+        self.tabs.reclaim_outbox(outbox);
         Ok(())
     }
 

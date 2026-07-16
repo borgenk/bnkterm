@@ -26,6 +26,9 @@ pub enum Arg<'a> {
 
 /// A fully received event: its target object, opcode, and the argument bytes
 /// after the header. Owned so the connection buffer can advance independently.
+/// [`Default`] gives an empty one to reuse as decode scratch across the event loop,
+/// so a warmed frame decodes into the same body buffer without allocating.
+#[derive(Default)]
 pub struct Message {
     pub object: u32,
     pub opcode: u16,

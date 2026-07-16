@@ -50,7 +50,7 @@ pub struct Connection {
     out: Vec<u8>,
     in_buf: Vec<u8>,
     /// How many bytes at the front of `in_buf` have already been consumed by
-    /// [`Connection::next_message`]. Each parsed message advances this cursor
+    /// [`Connection::next_message_into`]. Each parsed message advances this cursor
     /// (cheap) instead of draining the front (O(remaining) per message, O(N^2)
     /// over a burst); the consumed prefix is compacted away once per [`fill`].
     in_pos: usize,
@@ -175,7 +175,7 @@ impl Connection {
     /// lets the caller service key repeats while the socket is idle.
     pub fn fill(&mut self, timeout: Option<Duration>) -> Result<Fill> {
         // Drop the messages consumed since the last fill in one shift, rather
-        // than draining the front per message in `next_message`.
+        // than draining the front per message in `next_message_into`.
         self.compact();
         self.stream
             .set_read_timeout(timeout)
@@ -198,11 +198,15 @@ impl Connection {
         self.fds.pop_front()
     }
 
-    /// Pull one fully buffered message off the front of the stream, if present.
-    pub fn next_message(&mut self) -> Result<Option<Message>> {
+    /// Decode one fully buffered message off the front of the stream into `msg`,
+    /// returning whether one was there. The body is copied into `msg`'s existing
+    /// buffer (cleared and refilled), so a caller that reuses one `Message` across
+    /// the event loop pays no per-message allocation once its buffer has grown; a
+    /// presented frame's `wl_callback.done` is decoded into last frame's buffer.
+    pub fn next_message_into(&mut self, msg: &mut Message) -> Result<bool> {
         let buf = &self.in_buf[self.in_pos..];
         if buf.len() < 8 {
-            return Ok(None);
+            return Ok(false);
         }
         let FrameHeader {
             object,
@@ -213,15 +217,14 @@ impl Connection {
             return Err(Error::msg("malformed wayland message: size < 8"));
         }
         if buf.len() < size {
-            return Ok(None);
+            return Ok(false);
         }
-        let body = buf[8..size].to_vec();
+        msg.object = object;
+        msg.opcode = opcode;
+        msg.body.clear();
+        msg.body.extend_from_slice(&buf[8..size]);
         self.in_pos += size;
-        Ok(Some(Message {
-            object,
-            opcode,
-            body,
-        }))
+        Ok(true)
     }
 
     /// Discard the already-consumed prefix of the input buffer in a single shift.
@@ -233,5 +236,85 @@ impl Connection {
         }
         self.in_buf.drain(..self.in_pos);
         self.in_pos = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Encode a wire message: `object`, the `size | opcode` header word, then `body`.
+    fn framed(object: u32, opcode: u16, body: &[u8]) -> Vec<u8> {
+        let size = (8 + body.len()) as u32;
+        let mut out = Vec::with_capacity(size as usize);
+        out.extend_from_slice(&object.to_ne_bytes());
+        out.extend_from_slice(&((size << 16) | opcode as u32).to_ne_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A connection with a prefilled input buffer and a throwaway socket end. These
+    /// tests decode off `in_buf` directly and never touch the socket; the paired
+    /// stream just satisfies the field and is dropped.
+    fn primed(in_buf: Vec<u8>) -> Connection {
+        let (stream, _peer) = UnixStream::pair().expect("socketpair");
+        Connection {
+            stream,
+            out: Vec::new(),
+            in_buf,
+            in_pos: 0,
+            fds: VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn next_message_into_decodes_each_frame_and_drains() {
+        let body = *b"body8pad";
+        let mut bytes = framed(5, 3, &body);
+        bytes.extend(framed(7, 1, &42u32.to_ne_bytes()));
+        let mut conn = primed(bytes);
+
+        let mut msg = Message::default();
+        assert!(conn.next_message_into(&mut msg).unwrap());
+        assert_eq!((msg.object, msg.opcode), (5, 3));
+        assert_eq!(msg.body, body);
+
+        assert!(conn.next_message_into(&mut msg).unwrap());
+        assert_eq!((msg.object, msg.opcode), (7, 1));
+        assert_eq!(msg.body, 42u32.to_ne_bytes());
+
+        assert!(!conn.next_message_into(&mut msg).unwrap(), "buffer drained");
+    }
+
+    #[test]
+    fn a_partial_frame_reads_as_no_message() {
+        let mut msg = Message::default();
+        // Fewer than the 8-byte header.
+        assert!(!primed(vec![1, 2, 3]).next_message_into(&mut msg).unwrap());
+        // A header whose declared size runs past the bytes present.
+        let mut half = framed(1, 0, &[9, 9, 9, 9]);
+        half.truncate(half.len() - 2);
+        assert!(!primed(half).next_message_into(&mut msg).unwrap());
+    }
+
+    #[test]
+    fn a_warmed_frame_decode_reuses_the_body_buffer() {
+        // A `wl_callback.done`-shaped event (one u32 body) is what a presented frame
+        // produces. Decoded repeatedly into a reused Message, it must reallocate
+        // nothing once the body buffer has grown: the per-frame live-loop cost the
+        // allocation review flagged. Proven without the counting allocator (and so
+        // without reaching into `crate::dev` from this leaf layer) by the heap
+        // buffer's address and capacity staying put across decodes: an in-place
+        // clear-and-refill leaves both untouched, whereas a fresh `to_vec` would move
+        // the pointer.
+        let frame = framed(9, 0, &1u32.to_ne_bytes());
+        let mut conn = primed(frame.repeat(64));
+        let mut msg = Message::default();
+        assert!(conn.next_message_into(&mut msg).unwrap()); // warm: grow the buffer once
+        let (ptr, cap) = (msg.body.as_ptr(), msg.body.capacity());
+        while conn.next_message_into(&mut msg).unwrap() {
+            assert_eq!(msg.body.as_ptr(), ptr, "body buffer moved (reallocated)");
+            assert_eq!(msg.body.capacity(), cap, "body buffer regrew");
+        }
     }
 }

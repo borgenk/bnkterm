@@ -431,9 +431,17 @@ impl TerminalCore {
         term_render::bell_background(self.screen.theme(), self.bell_flashing()).to_u32()
     }
 
-    /// Take the outbound messages for the window to act on, leaving the outbox
-    /// empty (and its capacity for reuse). Empty in steady state, so this is
-    /// allocation-free on the hot path.
+    /// Drain the outbound messages for the routing layer to act on, leaving the
+    /// outbox empty but keeping its capacity for the next batch. Empty in steady
+    /// state, so this is allocation-free on the hot path.
+    pub(super) fn drain_outbox(&mut self) -> std::vec::Drain<'_, ToWindow> {
+        self.outbox.drain(..)
+    }
+
+    /// Take the outbound messages, leaving the outbox empty. A read-and-clear
+    /// convenience for tests; production drains in place via [`drain_outbox`](Self::drain_outbox)
+    /// to keep the capacity.
+    #[cfg(test)]
     pub(super) fn take_outbox(&mut self) -> Vec<ToWindow> {
         std::mem::take(&mut self.outbox)
     }
@@ -533,25 +541,26 @@ impl TerminalCore {
                 if text.is_empty() {
                     return Ok(false);
                 }
-                // A pasted newline is delivered as CR; collapse CRLF so it is not
-                // doubled. Wrap in bracketed-paste markers when the program enabled
-                // them (`?2004`). Snaps the view to the bottom, like any input.
-                let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+                // Build the paste straight into the reused key buffer: bracketed-paste
+                // markers when the program enabled them (`?2004`), and the text with
+                // every line ending folded to a single CR. A pasted newline arrives as
+                // CR, so a bare LF becomes CR and a CRLF collapses to one CR (swallowing
+                // the LF) rather than doubling. Snaps the view to the bottom, like input.
                 let bracketed = self.screen.bracketed_paste();
-                let mut buf = Vec::with_capacity(normalized.len() + 12);
+                self.key_buf.clear();
                 if bracketed {
-                    buf.extend_from_slice(b"\x1b[200~");
+                    self.key_buf.extend_from_slice(b"\x1b[200~");
                 }
-                buf.extend_from_slice(normalized.as_bytes());
+                fold_paste_newlines(&mut self.key_buf, &text);
                 if bracketed {
-                    buf.extend_from_slice(b"\x1b[201~");
+                    self.key_buf.extend_from_slice(b"\x1b[201~");
                 }
                 if self.screen.is_scrolled() {
                     self.screen.scroll_view_to_bottom();
                     self.dirty = true;
                 }
                 if let Some(pty) = &self.pty {
-                    pty.write_all(&buf)?;
+                    pty.write_all(&self.key_buf)?;
                 }
                 Ok(true)
             }
@@ -939,12 +948,12 @@ impl TerminalCore {
     /// Write back any query replies (DA/DSR) the grid queued while parsing, through
     /// the main PTY handle (writes stay on this thread).
     fn flush_responses(&mut self) -> Result<()> {
-        let responses = self.screen.take_responses();
-        if !responses.is_empty() {
+        if !self.screen.responses().is_empty() {
             if let Some(pty) = &self.pty {
-                pty.write_all(&responses)?;
+                pty.write_all(self.screen.responses())?;
             }
         }
+        self.screen.clear_responses();
         Ok(())
     }
 
@@ -1347,6 +1356,29 @@ fn cursor_shape(style: CursorStyle, tty: TtyMode) -> CursorShape {
     }
 }
 
+/// Append `text` to `out` with every line ending folded to a single carriage
+/// return: a pasted newline reaches the child as CR, so a bare LF becomes CR and a
+/// CRLF collapses to one CR (its LF swallowed) rather than arriving doubled; a lone
+/// CR stays one CR. One pass straight into the caller's reused buffer, no
+/// intermediate `String`.
+fn fold_paste_newlines(out: &mut Vec<u8>, text: &str) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' => {
+                out.push(b'\r');
+                if bytes.get(i + 1) == Some(&b'\n') {
+                    i += 1;
+                }
+            }
+            b'\n' => out.push(b'\r'),
+            b => out.push(b),
+        }
+        i += 1;
+    }
+}
+
 /// Fill a fresh grid with a static demo that exercises the phase-2 acceptance
 /// list: the 16 ANSI colors, the text styles, DEC box drawing, a CJK wide char,
 /// an emoji cluster, a combining mark, and truecolor. Driven through the real
@@ -1430,6 +1462,22 @@ fn demo_screen(cols: usize, rows: usize) -> Screen {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn paste_folds_every_newline_shape_to_one_cr() {
+        let mut out = Vec::new();
+        // CRLF, bare LF, and lone CR all become a single CR; other bytes pass through.
+        fold_paste_newlines(&mut out, "a\r\nb\nc\rd");
+        assert_eq!(out, b"a\rb\rc\rd");
+        // A trailing CRLF collapses to one CR (its LF swallowed), not two.
+        out.clear();
+        fold_paste_newlines(&mut out, "line\r\n");
+        assert_eq!(out, b"line\r");
+        // Multibyte UTF-8 is copied verbatim.
+        out.clear();
+        fold_paste_newlines(&mut out, "héllo 日本");
+        assert_eq!(out, "héllo 日本".as_bytes());
+    }
 
     #[test]
     fn home_is_collapsed_to_tilde_and_other_paths_are_left_alone() {

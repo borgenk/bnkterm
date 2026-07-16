@@ -512,10 +512,22 @@ impl Tabs {
     }
 
     /// Drain and route every core's outbound facts, then return the translated
-    /// window actions accumulated so far.
+    /// window actions accumulated so far. The buffer is handed out (leaving the outbox
+    /// empty); the caller returns it via [`reclaim_outbox`](Self::reclaim_outbox) after
+    /// acting on it, so its capacity is not thrown away each pump.
     pub(super) fn take_outbox(&mut self) -> Vec<ToWindow> {
         self.route_core_outboxes();
         std::mem::take(&mut self.outbox)
+    }
+
+    /// Take back the emptied outbox buffer after the caller has acted on it, keeping
+    /// its capacity for the next pump. Nothing queues during the window-side drain, so
+    /// the outbox is empty here and simply adopts the returned buffer; in the
+    /// impossible case a message did arrive, it is kept and the spare buffer dropped.
+    pub(super) fn reclaim_outbox(&mut self, drained: Vec<ToWindow>) {
+        if self.outbox.is_empty() {
+            self.outbox = drained;
+        }
     }
 
     /// Tick only the visible cursor's blink timer.
@@ -741,8 +753,7 @@ impl Tabs {
     fn route_core_outboxes(&mut self) {
         let mut title_changed = false;
         for index in 0..self.entries.len() {
-            let messages = self.entries[index].core.take_outbox();
-            for message in messages {
+            for message in self.entries[index].core.drain_outbox() {
                 match message {
                     ToWindow::Title(title) if index == self.active => {
                         title_changed = true;

@@ -20,8 +20,6 @@
 //!                                                         └─ damage(old,new) ─▶ [Rect]
 //! ```
 
-use std::collections::HashMap;
-
 use crate::platform::freetype::FaceKey;
 use crate::platform::geom::Rect;
 
@@ -155,22 +153,48 @@ impl DrawCmd {
     }
 }
 
+/// Reusable scratch for [`damage_into`]: the rectangle list is cleared and refilled
+/// each frame, so a per-frame diff reuses one buffer instead of allocating a fresh
+/// `Vec` (and, on a full-surface collapse, a second one-element `Vec`). The
+/// presentation loop owns one and passes it in.
+#[derive(Default)]
+pub struct DamageScratch {
+    rects: Vec<Rect>,
+}
+
+impl DamageScratch {
+    /// The rectangles the last [`damage_into`] produced.
+    pub fn rects(&self) -> &[Rect] {
+        &self.rects
+    }
+}
+
 /// The screen regions that differ between the previous frame `old` and the new
-/// frame `new`, clamped to the `width` x `height` surface and free of overlaps.
+/// frame `new`, written into `scratch` and returned as a borrowed slice so a
+/// per-frame call allocates nothing. Clamped to the `width` x `height` surface and
+/// free of overlaps.
 ///
-/// A multiset difference does the work: a command appearing an unequal number of
-/// times in the two frames contributes its bounds, so an identical command (same
-/// geometry, face, colour, text) cancels and costs nothing, while a moved or
-/// restyled run shows up as a removal plus an addition and damages both spots.
-/// A frame that changed most of the surface (a scroll, a resize, a large edit)
-/// returns a single full-surface rectangle, since repainting whole then beats
-/// clipping many regions. An empty result means the two frames are identical.
-pub fn damage(old: &[DrawCmd], new: &[DrawCmd], width: i32, height: i32) -> Vec<Rect> {
-    // Dropping an equal pair (one command from each frame) never changes the
-    // multiset difference, so strip the common prefix and suffix first. Lists are
-    // built in document order, so a blink or a small edit differs only in a
-    // handful of commands and the hash work below shrinks to just those;
-    // equality bails on the first differing field, cheaper than hashing.
+/// After the common prefix and suffix are stripped (lists are built in document
+/// order, so a blink or a small edit differs in only a handful of commands, and
+/// equality bails on the first differing field), the survivors are diffed
+/// positionally: the i-th command of each frame is compared, and a differing pair
+/// damages both its old and new bounds. Inserting or removing a command misaligns
+/// the tails and over-damages, but that is a large change, which collapses to a
+/// single full-surface rectangle anyway; a blink or single-cell edit keeps the
+/// counts equal and damages exactly the changed regions. The diff never
+/// *under*-damages (it only adds bounds), so a stale pixel is never left on screen.
+/// A frame that changed most of the surface returns one full-surface rectangle,
+/// since repainting whole then beats clipping many regions. An empty result means
+/// the two frames are identical.
+pub fn damage_into<'a>(
+    old: &[DrawCmd],
+    new: &[DrawCmd],
+    width: i32,
+    height: i32,
+    scratch: &'a mut DamageScratch,
+) -> &'a [Rect] {
+    scratch.rects.clear();
+
     let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
     let (old, new) = (&old[prefix..], &new[prefix..]);
     let suffix = old
@@ -181,41 +205,53 @@ pub fn damage(old: &[DrawCmd], new: &[DrawCmd], width: i32, height: i32) -> Vec<
         .count();
     let (old, new) = (&old[..old.len() - suffix], &new[..new.len() - suffix]);
 
-    // Sized for the differing commands up front (all distinct in the worst case),
-    // so a full-screen turnover fills the map without a single rehash.
-    let mut counts: HashMap<&DrawCmd, i32> = HashMap::with_capacity(old.len() + new.len());
-    for c in old {
-        *counts.entry(c).or_insert(0) += 1;
-    }
-    for c in new {
-        *counts.entry(c).or_insert(0) -= 1;
-    }
     let surface = Rect {
         x: 0,
         y: 0,
         w: width.max(0),
         h: height.max(0),
     };
-    // Sized for the worst case (every differing command survives the clip) so the
-    // collect grows the vector at most once, not once per doubling.
-    let mut rects: Vec<Rect> = Vec::with_capacity(counts.len());
-    rects.extend(
-        counts
-            .into_iter()
-            .filter(|&(_, n)| n != 0)
-            .filter_map(|(c, _)| intersection(c.bounds(), surface)),
-    );
-    coalesce(&mut rects);
-    let area: i64 = rects.iter().map(|r| r.w as i64 * r.h as i64).sum();
-    let surface_area = surface.w as i64 * surface.h as i64;
-    if rects.len() > MAX_DAMAGE_RECTS || area * 2 > surface_area {
-        return if surface_area > 0 {
-            vec![surface]
-        } else {
-            Vec::new()
+    {
+        let rects = &mut scratch.rects;
+        let mut damage_bounds = |c: &DrawCmd| {
+            if let Some(r) = intersection(c.bounds(), surface) {
+                rects.push(r);
+            }
         };
+        // Pair the survivors; a differing pair damages both spots. The tails past
+        // the shorter list are a pure insertion or removal, damaged outright.
+        let paired = old.len().min(new.len());
+        for i in 0..paired {
+            if old[i] != new[i] {
+                damage_bounds(&old[i]);
+                damage_bounds(&new[i]);
+            }
+        }
+        old[paired..].iter().for_each(&mut damage_bounds);
+        new[paired..].iter().for_each(&mut damage_bounds);
     }
-    rects
+
+    coalesce(&mut scratch.rects);
+    let area: i64 = scratch.rects.iter().map(|r| r.w as i64 * r.h as i64).sum();
+    let surface_area = surface.w as i64 * surface.h as i64;
+    if scratch.rects.len() > MAX_DAMAGE_RECTS || area * 2 > surface_area {
+        // A near-total change: drop the many small rectangles and repaint whole,
+        // reusing the buffer rather than returning a fresh one-element vector.
+        scratch.rects.clear();
+        if surface_area > 0 {
+            scratch.rects.push(surface);
+        }
+    }
+    &scratch.rects
+}
+
+/// One-shot [`damage_into`] with a throwaway scratch, returning an owned `Vec`. For
+/// tests and callers off the per-frame path; the presentation loop keeps a
+/// [`DamageScratch`] and calls [`damage_into`] to avoid the per-frame allocation.
+pub fn damage(old: &[DrawCmd], new: &[DrawCmd], width: i32, height: i32) -> Vec<Rect> {
+    let mut scratch = DamageScratch::default();
+    damage_into(old, new, width, height, &mut scratch);
+    scratch.rects
 }
 
 /// Merge any two overlapping rectangles into their bounding box, repeated until
@@ -313,8 +349,8 @@ mod tests {
 
     #[test]
     fn a_moved_command_damages_both_positions() {
-        // A run that shifts (an edit before it) appears as a remove plus an add;
-        // the two non-overlapping spots both need repainting.
+        // A run that shifts (an edit before it) makes the paired command differ, so
+        // both its old and new spots are repainted.
         let bg = fill(0, 0, W, H, 0x010101);
         let before = vec![bg.clone(), fill(10, 10, 4, 4, 0xaa)];
         let after = vec![bg, fill(500, 400, 4, 4, 0xaa)];

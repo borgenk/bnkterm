@@ -142,6 +142,9 @@ pub(super) struct GpuPresentation {
     pub(super) lists: term_render::DisplayListPool,
     /// The reused GPU frame data (vertices/batches), refilled in place each frame.
     pub(super) frame_scratch: gpu::FrameData,
+    /// The reused damage-diff scratch, so computing the changed regions each frame
+    /// refills one rectangle buffer instead of allocating a fresh one.
+    pub(super) damage_scratch: display::DamageScratch,
     pub(super) frame_count: u64,
     pub(super) last_present: Option<Instant>,
     pub(super) explicit_fence_frames: u64,
@@ -167,10 +170,38 @@ impl GpuPresentation {
             buffer_size: (0, 0),
             lists: term_render::DisplayListPool::default(),
             frame_scratch: gpu::FrameData::default(),
+            damage_scratch: display::DamageScratch::default(),
             frame_count: 0,
             last_present: None,
             explicit_fence_frames: 0,
             explicit_cpu_wait_frames: 0,
+        }
+    }
+}
+
+/// The sync mode reported on a `[stats]` line, written straight into the log via
+/// [`Display`](std::fmt::Display) rather than a heap `String`. `BNKTERM_STATS`
+/// exists to profile live allocation, and the counting allocator watches this exact
+/// path, so a `format!` here would tax the very measurement it prints beside.
+enum SyncStatus {
+    Explicit {
+        fence_frames: u64,
+        cpu_wait_frames: u64,
+    },
+    Implicit,
+}
+
+impl std::fmt::Display for SyncStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SyncStatus::Explicit {
+                fence_frames,
+                cpu_wait_frames,
+            } => write!(
+                f,
+                "explicit-sync {fence_frames} fence/{cpu_wait_frames} cpu-wait"
+            ),
+            SyncStatus::Implicit => f.write_str("implicit-sync bridge"),
         }
     }
 }
@@ -461,19 +492,22 @@ impl State {
             );
         }
 
-        // Nothing changed since the on-screen frame: nothing to present (idle).
-        let screen_dmg = display::damage(
+        // Nothing changed since the on-screen frame: nothing to present (idle). The
+        // rectangles land in the reused scratch and are read from there at each use
+        // point below, so the per-frame diff allocates nothing.
+        display::damage_into(
             self.presentation.lists.front(),
             self.presentation.lists.back(),
             sw,
             sh,
+            &mut self.presentation.damage_scratch,
         );
         // Ack the latest configure paired with this commit, so the buffer the
         // compositor sees is always the one sized to the configure it just acked;
         // that is what keeps an anchored resize edge from jumping. Taken here so
         // it rides the same flush as the commit below.
         let ack = self.pending_configure.take();
-        if screen_dmg.is_empty() {
+        if self.presentation.damage_scratch.rects().is_empty() {
             // Nothing new to draw, but a pending configure must still be acked so
             // the compositor can finalize a state-only change; a bare commit
             // applies it against the current, already correctly sized buffer.
@@ -548,7 +582,7 @@ impl State {
             }
             _ => {}
         }
-        for r in &screen_dmg {
+        for r in self.presentation.damage_scratch.rects() {
             self.conn.request(
                 self.surface,
                 wl_surface::DAMAGE,
@@ -581,12 +615,12 @@ impl State {
             .map(|t| started.duration_since(t).as_secs_f64() * 1000.0)
             .unwrap_or(0.0);
         let sync = if self.presentation.explicit_sync.is_some() {
-            format!(
-                "explicit-sync {} fence/{} cpu-wait",
-                self.presentation.explicit_fence_frames, self.presentation.explicit_cpu_wait_frames
-            )
+            SyncStatus::Explicit {
+                fence_frames: self.presentation.explicit_fence_frames,
+                cpu_wait_frames: self.presentation.explicit_cpu_wait_frames,
+            }
         } else {
-            "implicit-sync bridge".to_string()
+            SyncStatus::Implicit
         };
         eprintln!(
             "[stats] gpu frame {} {:.2}ms build+submit, {:.1}ms since last | glyphs hit {} miss {} ({:.1}% of {}) | {}",
@@ -761,6 +795,18 @@ fn color_f32(color: u32) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_status_formats_without_allocating_a_string() {
+        // The `[stats]` sync tail renders through Display straight into the log; pin
+        // both shapes so the format cannot drift silently.
+        let explicit = SyncStatus::Explicit {
+            fence_frames: 12,
+            cpu_wait_frames: 3,
+        };
+        assert_eq!(explicit.to_string(), "explicit-sync 12 fence/3 cpu-wait");
+        assert_eq!(SyncStatus::Implicit.to_string(), "implicit-sync bridge");
+    }
 
     /// The store-side sRGB encode the attachment applies, inverse of the decode
     /// in color_f32.

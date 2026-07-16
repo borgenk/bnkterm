@@ -688,11 +688,11 @@ impl Painter<'_> {
             let cell = self.cell(row, c);
             let hidden = cell.attrs.contains(Attrs::HIDDEN);
             text.push(if hidden { ' ' } else { cell.rune });
-            let marks = (!hidden).then(|| self.marks(row, c)).flatten();
-            if let Some(marks) = marks {
-                text.extend(marks);
+            let has_marks = !hidden && !self.marks_empty(row, c);
+            if has_marks {
+                text.extend(self.marks(row, c));
             }
-            if !hidden && (cell.rune != ' ' || marks.is_some_and(|m| !m.is_empty())) {
+            if !hidden && (cell.rune != ' ' || has_marks) {
                 inked_bytes = text.len();
                 inked_cells = c - col + 1;
             }
@@ -864,9 +864,7 @@ impl Painter<'_> {
         if inked {
             let mut text = self.take_string();
             text.push(cell.rune);
-            if let Some(marks) = self.marks(row, col) {
-                text.extend(marks);
-            }
+            text.extend(self.marks(row, col));
             self.list.push(DrawCmd::Text {
                 bounds: text_bounds(x, baseline, width_cells * m.w, m),
                 x,
@@ -1035,9 +1033,7 @@ impl Painter<'_> {
         let baseline = self.baseline(row);
         let mut text = self.take_string();
         text.push(cell.rune);
-        if let Some(marks) = self.marks(row, col) {
-            text.extend(marks);
-        }
+        text.extend(self.marks(row, col));
         // The inverted glyph takes the cell's own background (reverse honoured),
         // ignoring any selection so the cursor stays legible over a selection. It is
         // stamped over the cursor block, so that colour is the background the glyph
@@ -1148,8 +1144,9 @@ impl Painter<'_> {
         self.screen.view_cell(row, col)
     }
 
-    /// Combining marks at display `(row, col)`, honouring the scroll offset.
-    fn marks(&self, row: usize, col: usize) -> Option<&[char]> {
+    /// Combining marks at display `(row, col)`, honouring the scroll offset, in
+    /// arrival order; empty if none.
+    fn marks(&self, row: usize, col: usize) -> impl Iterator<Item = char> + '_ {
         self.screen.view_marks(row, col)
     }
 
@@ -1252,7 +1249,7 @@ impl Painter<'_> {
     /// Whether cell `(row, col)` has no combining marks (a blank base rune with no
     /// marks draws nothing).
     fn marks_empty(&self, row: usize, col: usize) -> bool {
-        self.marks(row, col).is_none_or(|m| m.is_empty())
+        !self.screen.view_has_marks(row, col)
     }
 }
 
