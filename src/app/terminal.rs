@@ -1283,6 +1283,15 @@ impl TerminalCore {
         self.hover.is_some()
     }
 
+    /// Whether a program has grabbed the mouse with `?1000`/`?1002`/`?1003`. The window
+    /// reads it to drop the I-beam: while a program is reporting, a drag is that
+    /// program's to interpret, not a text selection, so the pointer must not promise
+    /// one. Mirrors the `reporting` test in [`Self::apply_pointer`], minus the Shift
+    /// override the window applies itself.
+    pub(super) fn mouse_reporting(&self) -> bool {
+        self.screen.mouse_mode().reports()
+    }
+
     /// Flip the blink phase if its deadline has passed (called each loop turn).
     pub(super) fn tick_blink_if_due(&mut self) {
         if self.cursor_blinking() && self.blink_at.is_some_and(|at| at <= Instant::now()) {
@@ -2072,6 +2081,20 @@ mod tests {
             opened_url(&mut core).as_deref(),
             Some("https://example.com/a")
         );
+    }
+
+    #[test]
+    fn mouse_reporting_tracks_the_program_that_grabbed_the_mouse() {
+        // What the window reads to drop the I-beam. It must follow the child's toggles
+        // exactly, since a stale answer leaves the pointer promising the wrong gesture.
+        let mut core = core_showing("");
+        assert!(!core.mouse_reporting(), "a bare shell selects text");
+
+        let mut parser = Parser::new();
+        parser.advance_bytes(&mut core.screen, b"\x1b[?1000h");
+        assert!(core.mouse_reporting(), "the program took the mouse");
+        parser.advance_bytes(&mut core.screen, b"\x1b[?1000l");
+        assert!(!core.mouse_reporting(), "and gave it back on exit");
     }
 
     #[test]

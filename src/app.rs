@@ -673,6 +673,12 @@ impl State {
             // make the bar appear or disappear without a compositor configure.
             self.resize_to(self.width, self.height);
             self.drain_outbox()?;
+            // A program grabbing or releasing the mouse changes what a drag means, and
+            // it arrives as output rather than as a pointer event: without this the
+            // shape would be stale under a parked pointer until the user moved it,
+            // which is exactly when starting a TUI would leave the I-beam behind. The
+            // early-out on an unchanged shape makes the steady-state cost a compare.
+            self.update_pointer_shape();
             // Fire any blink toggle or key repeat that has come due.
             self.service_timers()?;
             // Pace to the compositor: only draw when no frame callback is
@@ -1521,21 +1527,21 @@ impl State {
         self.tabs.tab_at_bar_col(col)
     }
 
-    /// Ask the compositor for the cursor shape that fits where the pointer is: the
-    /// plain arrow over the tab strip (it is chrome, a click target, not text), the
-    /// hand over a hyperlink Ctrl+click would follow, and otherwise the I-beam
-    /// ("text") over the grid, the shape every terminal uses to signal selectable
-    /// text. Only re-sent when the shape changes, so a stream of motion events never
-    /// spams `set_shape`. A no-op when the compositor lacks
-    /// `wp_cursor_shape_manager_v1` (no device, so its default arrow stands) or
+    /// Gather what the pointer is over and ask the compositor for the shape
+    /// [`pointer_shape_for`] picks from it. Only re-sent when the shape changes, so a
+    /// stream of motion events never spams `set_shape`. A no-op when the compositor
+    /// lacks `wp_cursor_shape_manager_v1` (no device, so its default arrow stands) or
     /// before the pointer has entered (no serial to cite).
     ///
-    /// The hand is gated on Ctrl actually being held, not merely on a link being
-    /// under the pointer, because the hand is a promise that clicking does something:
-    /// the underline says "this is a link", the hand says "and now a click follows
-    /// it". That is why the modifiers event re-runs this with the pointer parked.
+    /// Every shape here is a promise about what the next gesture does, which is why
+    /// both of the modifier-gated facts are read live rather than cached: the hand
+    /// needs Ctrl actually held (the underline says "this is a link", the hand says
+    /// "and a click now follows it"), and the I-beam needs Shift to have taken the grid
+    /// back from a program reporting the mouse. Both can flip with the pointer parked,
+    /// so the modifiers event re-runs this, and so does the main loop — a program
+    /// grabbing the mouse arrives as output, not as a pointer event.
     ///
-    /// Whether that promise can be kept while the window is *unfocused* is the
+    /// Whether the Ctrl promise can be kept while the window is *unfocused* is the
     /// compositor's call, not ours: modifier state reaches an unfocused surface only
     /// if the compositor ties it to pointer focus (see the `EV_MODIFIERS` arm). Where
     /// it does, the hand appears over an unfocused window exactly as over a focused
@@ -1545,20 +1551,17 @@ impl State {
     /// it) before the button press is delivered.
     fn update_pointer_shape(&mut self) {
         let (px, py) = self.pointer_device();
-        // A scrollbar is a control, not text, so over its grab band (and for as long as
-        // its thumb is held) the I-beam gives way to the arrow.
-        let on_bar = self.drag_scroll || self.tabs.active().on_scrollbar(px, py);
-        let shape = if self.tabs.dragging() {
-            // A tab is being held: the grabbing hand is the whole visual affordance,
-            // and it wins over the strip's own arrow.
-            wp_cursor_shape_device_v1::SHAPE_GRABBING
-        } else if self.pointer_in_tab_bar() || on_bar {
-            wp_cursor_shape_device_v1::SHAPE_DEFAULT
-        } else if self.xkb.ctrl_active() && self.tabs.hovering_link() {
-            wp_cursor_shape_device_v1::SHAPE_POINTER
-        } else {
-            wp_cursor_shape_device_v1::SHAPE_TEXT
-        };
+        let shape = pointer_shape_for(PointerFacts {
+            tab_dragging: self.tabs.dragging(),
+            // A scrollbar is a control, not text, so over its grab band (and for as
+            // long as its thumb is held) the I-beam gives way to the arrow.
+            on_chrome: self.pointer_in_tab_bar()
+                || self.drag_scroll
+                || self.tabs.active().on_scrollbar(px, py),
+            ctrl_link: self.xkb.ctrl_active() && self.tabs.hovering_link(),
+            reporting: self.tabs.mouse_reporting(),
+            shift: self.xkb.shift_active(),
+        });
         if shape == self.pointer_shape {
             return;
         }
@@ -1908,6 +1911,52 @@ impl State {
     }
 }
 
+/// What the pointer is over and who owns it, gathered from the window, the tab strip,
+/// and the active terminal so that [`pointer_shape_for`] stays a pure function of the
+/// facts (and thus testable without a compositor to enter or a program to run).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PointerFacts {
+    /// A tab is held and travelling along the strip.
+    tab_dragging: bool,
+    /// The pointer is over chrome rather than the grid: the tab strip, or the
+    /// scrollbar's grab band (including a thumb held anywhere).
+    on_chrome: bool,
+    /// Ctrl is held over a hyperlink, so a click would follow it.
+    ctrl_link: bool,
+    /// A program has grabbed the mouse with `?1000`/`?1002`/`?1003`.
+    reporting: bool,
+    /// Shift is held, which forces the gesture back to local selection.
+    shift: bool,
+}
+
+/// Pick the pointer shape the facts call for, most specific claim first: a held tab
+/// owns the pointer outright, then chrome, then a link Ctrl would follow, then a
+/// program reporting the mouse, and failing all of those the grid is plain selectable
+/// text.
+///
+/// The ordering is the point. Chrome outranks `reporting` because the strip and the
+/// scrollbar are ours no matter what the child asked for, and `ctrl_link` outranks it
+/// because Ctrl+click follows a link whether or not a program is watching the mouse.
+fn pointer_shape_for(f: PointerFacts) -> u32 {
+    if f.tab_dragging {
+        // The grabbing hand is the whole visual affordance of a tab drag, and it wins
+        // over the strip's own arrow.
+        wp_cursor_shape_device_v1::SHAPE_GRABBING
+    } else if f.on_chrome {
+        wp_cursor_shape_device_v1::SHAPE_DEFAULT
+    } else if f.ctrl_link {
+        wp_cursor_shape_device_v1::SHAPE_POINTER
+    } else if f.reporting && !f.shift {
+        // The grid belongs to a program grabbing the mouse, so a drag is its event to
+        // interpret, not a selection. Shift is the same override the terminal half
+        // applies to the event itself, so the two never disagree about who the next
+        // drag belongs to.
+        wp_cursor_shape_device_v1::SHAPE_DEFAULT
+    } else {
+        wp_cursor_shape_device_v1::SHAPE_TEXT
+    }
+}
+
 /// Convert a point size to device pixels at compositor scale `scale_120` (120ths;
 /// 120 = 1.0), clamped to [`FONT_SIZE_RANGE`]. The `96/72` factor is the reference
 /// 96 DPI over 72 points per inch, the same basis the sibling terminals use, so a
@@ -2004,6 +2053,104 @@ fn pointer_button(code: u32) -> Option<MouseButton> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pointer resting on plain, unclaimed grid text.
+    const OVER_TEXT: PointerFacts = PointerFacts {
+        tab_dragging: false,
+        on_chrome: false,
+        ctrl_link: false,
+        reporting: false,
+        shift: false,
+    };
+
+    #[test]
+    fn a_plain_grid_offers_the_i_beam() {
+        assert_eq!(
+            pointer_shape_for(OVER_TEXT),
+            wp_cursor_shape_device_v1::SHAPE_TEXT
+        );
+        // Shift alone changes nothing: there is no program to take the grid back from.
+        assert_eq!(
+            pointer_shape_for(PointerFacts {
+                shift: true,
+                ..OVER_TEXT
+            }),
+            wp_cursor_shape_device_v1::SHAPE_TEXT
+        );
+    }
+
+    #[test]
+    fn a_program_grabbing_the_mouse_drops_the_i_beam() {
+        // A TUI (vim, tmux, hunk) reporting the mouse owns the drag, so the pointer
+        // must stop promising a selection: the arrow, as every other terminal shows.
+        assert_eq!(
+            pointer_shape_for(PointerFacts {
+                reporting: true,
+                ..OVER_TEXT
+            }),
+            wp_cursor_shape_device_v1::SHAPE_DEFAULT
+        );
+        // Shift is the override that hands the grid back, and the I-beam returns with
+        // it, matching the `reporting` test the terminal applies to the event itself.
+        assert_eq!(
+            pointer_shape_for(PointerFacts {
+                reporting: true,
+                shift: true,
+                ..OVER_TEXT
+            }),
+            wp_cursor_shape_device_v1::SHAPE_TEXT
+        );
+    }
+
+    #[test]
+    fn chrome_and_links_outrank_a_reporting_program() {
+        // The strip and the scrollbar are ours whatever the child asked for.
+        assert_eq!(
+            pointer_shape_for(PointerFacts {
+                on_chrome: true,
+                reporting: true,
+                ..OVER_TEXT
+            }),
+            wp_cursor_shape_device_v1::SHAPE_DEFAULT
+        );
+        // Ctrl+click follows a link whether or not a program watches the mouse, so the
+        // hand must survive reporting rather than collapse to the arrow.
+        assert_eq!(
+            pointer_shape_for(PointerFacts {
+                ctrl_link: true,
+                reporting: true,
+                ..OVER_TEXT
+            }),
+            wp_cursor_shape_device_v1::SHAPE_POINTER
+        );
+        // A held tab beats everything, including the strip it is travelling over.
+        assert_eq!(
+            pointer_shape_for(PointerFacts {
+                tab_dragging: true,
+                on_chrome: true,
+                ctrl_link: true,
+                reporting: true,
+                shift: true,
+            }),
+            wp_cursor_shape_device_v1::SHAPE_GRABBING
+        );
+    }
+
+    #[test]
+    fn the_shape_is_never_the_unset_zero() {
+        // `pointer_shape: 0` is the sentinel for "forget what was applied" on enter, so
+        // no real choice may collide with it or the re-apply would be skipped.
+        for bits in 0..32u8 {
+            let facts = PointerFacts {
+                tab_dragging: bits & 1 != 0,
+                on_chrome: bits & 2 != 0,
+                ctrl_link: bits & 4 != 0,
+                reporting: bits & 8 != 0,
+                shift: bits & 16 != 0,
+            };
+            assert_ne!(pointer_shape_for(facts), 0, "{facts:?}");
+        }
+    }
 
     #[test]
     fn points_to_px_scales_with_the_display() {

@@ -576,6 +576,14 @@ impl Tabs {
             .is_some_and(|entry| entry.core.hovering_link())
     }
 
+    /// Whether the visible terminal's program has grabbed the mouse, so the window can
+    /// drop the I-beam over a grid whose drags are not selections.
+    pub(super) fn mouse_reporting(&self) -> bool {
+        self.entries
+            .get(self.active)
+            .is_some_and(|entry| entry.core.mouse_reporting())
+    }
+
     /// Whether the active grid or future tab bar needs a frame.
     pub(super) fn needs_frame(&self) -> bool {
         if self.is_empty() {
