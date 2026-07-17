@@ -30,6 +30,9 @@ use crate::platform::error::{Error, Result};
 const PROT_READ: c_int = 0x1;
 const MAP_PRIVATE: c_int = 0x2;
 
+/// `lseek` whence: from the end of the file, i.e. seek(0) yields its size.
+const SEEK_END: c_int = 2;
+
 const SOL_SOCKET: c_int = 1;
 const SCM_RIGHTS: c_int = 1;
 const MSG_NOSIGNAL: c_int = 0x4000;
@@ -117,6 +120,7 @@ extern "C" {
         offset: i64,
     ) -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> c_int;
+    fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64;
     fn sendmsg(sockfd: c_int, msg: *const MsgHdr, flags: c_int) -> isize;
     fn recvmsg(sockfd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
     fn pipe2(pipefd: *mut c_int, flags: c_int) -> c_int;
@@ -156,7 +160,19 @@ fn ok_or_errno(rc: c_int, what: &str) -> Result<()> {
 /// and release the mapping. The one region of `unsafe` needed to read a raw
 /// mapping lives here, so callers deal only in `Vec<u8>`; `len` must be non-zero
 /// (`mmap` rejects a zero length). Errors if the mapping fails.
+///
+/// `len` is always the *sender's* claim about a file we did not create, and mmap
+/// will happily map past the end of a short one: the mapping succeeds, and the
+/// first read of a page beyond the file's last raises SIGBUS, which no `Result`
+/// can catch and no compositor is obliged to spare us. So the claim is measured
+/// against the file before a byte of it is mapped.
 pub fn read_mapped(fd: RawFd, len: usize) -> Result<Vec<u8>> {
+    let size = file_size(fd)?;
+    if len as u64 > size {
+        return Err(Error::msg(format!(
+            "sender claimed {len} bytes over an fd holding {size}"
+        )));
+    }
     let ptr = mmap_ro(fd, len)?;
     // SAFETY: mmap_ro returned a live mapping of `len` readable bytes; the slice
     // is copied into an owned Vec and the mapping is released before returning, so
@@ -165,6 +181,19 @@ pub fn read_mapped(fd: RawFd, len: usize) -> Result<Vec<u8>> {
     // SAFETY: ptr/len came from mmap_ro just above and are not used again.
     unsafe { unmap(ptr, len) };
     Ok(bytes)
+}
+
+/// The size of the file behind `fd`, via a seek to its end. The fds this layer is
+/// handed (memfds, shm segments) are seekable, and the offset is not used again:
+/// [`mmap_ro`] maps from an explicit offset of 0.
+fn file_size(fd: RawFd) -> Result<u64> {
+    // SAFETY: `fd` is a live descriptor owned by the caller for this call; lseek
+    // touches no memory.
+    let end = unsafe { lseek(fd, 0, SEEK_END) };
+    if end < 0 {
+        return Err(Error::msg(format!("lseek failed: errno {}", errno())));
+    }
+    Ok(end as u64)
 }
 
 /// Map `len` bytes of `fd` private and read-only.
@@ -766,6 +795,25 @@ mod tests {
         assert!(ok_or_errno(0, "DRM_IOCTL_X").is_ok());
         let err = ok_or_errno(-1, "DRM_IOCTL_X").unwrap_err();
         assert!(err.to_string().contains("DRM_IOCTL_X failed: errno"));
+    }
+
+    /// The length handed to `read_mapped` is the compositor's claim about a file
+    /// the compositor owns. A claim larger than the file must be refused: mapping
+    /// it succeeds, and reading the bytes past the end raises SIGBUS, killing the
+    /// process where no `Result` can intervene.
+    #[test]
+    fn read_mapped_refuses_a_length_past_the_end_of_the_file() {
+        let path = std::env::temp_dir().join(format!("bnk-read-mapped-{}", std::process::id()));
+        std::fs::write(&path, b"keymap").expect("write fixture");
+        let file = std::fs::File::open(&path).expect("open fixture");
+        let fd = file.as_raw_fd();
+
+        assert_eq!(read_mapped(fd, 6).expect("exact length"), b"keymap");
+        assert_eq!(read_mapped(fd, 3).expect("short length"), b"key");
+        let err = read_mapped(fd, 4096).expect_err("a length past the end must be refused");
+        assert!(err.to_string().contains("holding 6"), "got: {err}");
+
+        std::fs::remove_file(&path).ok();
     }
 
     // The DRM syncobj ioctls talk straight to the kernel, so their request
