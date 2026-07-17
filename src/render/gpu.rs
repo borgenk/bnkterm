@@ -642,6 +642,47 @@ impl Batcher<'_> {
         text: &str,
         paint: Paint,
     ) {
+        if is_plain_ascii(text) {
+            self.cells_ascii(face_key, x, baseline, cell_w, text, paint)
+        } else {
+            self.cells_segmented(face_key, x, baseline, cell_w, text, paint)
+        }
+    }
+
+    /// [`Self::cells`] for a printable-ASCII run: one byte is one cluster in one
+    /// cell, so the pen is the column and the character is the cluster. Skipping the
+    /// segmenter and the emoji probe is not an approximation — [`is_plain_ascii`]
+    /// states the three facts that make this produce the very quads
+    /// [`Self::cells_segmented`] would, and `ascii_runs_batch_exactly_like_the_segmented_path`
+    /// holds the two outputs to being identical.
+    fn cells_ascii(
+        &mut self,
+        face_key: FaceKey,
+        x: i32,
+        baseline: i32,
+        cell_w: i32,
+        text: &str,
+        paint: Paint,
+    ) {
+        for (i, ch) in text.chars().enumerate() {
+            // Fixed pitch: anchor the pen to the column and drop the advance the
+            // scalar path returns, exactly as the segmented path does.
+            let pen = (x + i as i32 * cell_w) as f32;
+            self.scalar(face_key, ch, pen, baseline, paint);
+        }
+    }
+
+    /// [`Self::cells`] for a run that needs real segmentation: anything carrying
+    /// combining marks, box/block glyphs, or emoji.
+    fn cells_segmented(
+        &mut self,
+        face_key: FaceKey,
+        x: i32,
+        baseline: i32,
+        cell_w: i32,
+        text: &str,
+        paint: Paint,
+    ) {
         // The cell box a procedurally-drawn box/block glyph fills: its height and
         // the baseline offset that seats it, both from the same metrics the grid
         // laid out on (read once, not per cluster).
@@ -892,6 +933,26 @@ fn center_in_cell(packed: PackedGlyph, cell_w: i32) -> PackedGlyph {
     }
 }
 
+/// Whether every byte of a fixed-pitch run is printable ASCII (`0x20..=0x7E`),
+/// which is what lets [`Batcher::cells`] skip segmentation for it.
+///
+/// The exclusions are each load-bearing, and all three must hold for one byte to
+/// mean exactly one cluster in one cell:
+///
+/// - **Its own grapheme cluster.** No printable ASCII is `Extend`, `Prepend`, or
+///   `SpacingMark`, so nothing merges with a neighbour. `CR`/`LF` are the one ASCII
+///   pair a segmenter *does* join (UAX #29, GB3), and excluding the controls keeps
+///   them out rather than betting they never reach a run.
+/// - **Never a box/block glyph.** Those are `U+2500`-`U+259F`, well outside ASCII.
+/// - **Never emoji.** `wants_emoji` routes a lone char on `Extended_Pictographic`,
+///   which no ASCII scalar is, so the cluster probe can only ever answer `None`.
+///
+/// So the segmenter and the emoji probe cost a per-cell string hash to confirm what
+/// this scan already knows.
+fn is_plain_ascii(text: &str) -> bool {
+    text.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+}
+
 /// The lone box/block scalar in `cluster`, or `None` if the cluster is not
 /// exactly one such character. A box glyph never carries combining marks, so a
 /// multi-char cluster is disqualified outright.
@@ -1034,6 +1095,88 @@ mod tests {
         assert_eq!((s.x, s.y), (0, 0), "the grown atlas starts empty");
         // Beyond the cap is a clean None.
         assert!(a.reserve(ATLAS_MAX + 1, 1).is_none());
+    }
+
+    /// The fixed-pitch fast path skips the grapheme segmenter and the emoji probe
+    /// for a printable-ASCII run, which is only sound if it is not a *shortcut* but
+    /// the same answer arrived at cheaply. So hold it to exactly that: the quads
+    /// `cells_ascii` emits must be identical, field for field, to the ones
+    /// `cells_segmented` (which does the full work) emits for the same run. Both
+    /// start from a fresh cache, so the atlas slots they hand out line up too.
+    #[test]
+    fn ascii_runs_batch_exactly_like_the_segmented_path() {
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let face_key = FaceKey::Prose {
+            size: 16,
+            style: crate::platform::freetype::FontStyle::Regular,
+        };
+        let paint = Paint::new(0x00ff_ffff, 0x0000_0000, None, GAMMA);
+        let quads = |text: &str, segmented: bool| -> Vec<Vertex> {
+            let mut cache = GlyphCache::new();
+            let (mut vertices, mut batches) = (Vec::new(), Vec::new());
+            let mut b = Batcher {
+                fonts: &fonts,
+                cache: &mut cache,
+                gamma: GAMMA,
+                vertices: &mut vertices,
+                batches: &mut batches,
+            };
+            // A non-zero origin and a cell pitch unequal to any glyph's own advance,
+            // so a path that accumulated advances instead of anchoring to the column
+            // would drift visibly rather than coincidentally agreeing.
+            if segmented {
+                b.cells_segmented(face_key, 7, 16, 9, text, paint);
+            } else {
+                b.cells_ascii(face_key, 7, 16, 9, text, paint);
+            }
+            vertices
+        };
+
+        let alphabet: String = (0x20u8..=0x7e).map(|b| b as char).collect();
+        for text in [
+            alphabet.as_str(),
+            "hello world",
+            "   ", // blanks are inkless: no quads from either path
+            "$ ls -la | grep '*' # 07",
+        ] {
+            assert!(is_plain_ascii(text), "{text:?} should take the fast path");
+            assert_eq!(
+                quads(text, false),
+                quads(text, true),
+                "the ASCII fast path diverged from the segmented path on {text:?}"
+            );
+        }
+    }
+
+    /// The three facts `is_plain_ascii` rests on, asserted over every byte it
+    /// admits rather than argued in a comment. If a future change makes an ASCII
+    /// scalar a box glyph or gives it an emoji presentation, the fast path becomes
+    /// wrong and this goes red before the pixels do.
+    #[test]
+    fn every_printable_ascii_byte_is_one_plain_cluster() {
+        for b in 0x20u8..=0x7e {
+            let s = (b as char).to_string();
+            assert!(is_plain_ascii(&s), "{s:?} should be plain ASCII");
+            assert_eq!(
+                grapheme::graphemes(&s).count(),
+                1,
+                "{s:?} must be exactly one cluster, or the pitch misaligns"
+            );
+            assert!(box_glyph(&s).is_none(), "{s:?} must not be a box glyph");
+            assert!(
+                !crate::platform::emoji::wants_emoji(&s, |_| false),
+                "{s:?} must never route to the emoji font"
+            );
+        }
+        // The controls are excluded, and CR LF is exactly why: it is the one ASCII
+        // pair a segmenter joins, so a byte-per-cell walk would misalign the run.
+        // The guard keeps it off the fast path rather than betting it never occurs.
+        assert!(!is_plain_ascii("\r\n"));
+        assert_eq!(
+            grapheme::graphemes("\r\n").count(),
+            1,
+            "CR LF is one cluster"
+        );
     }
 
     #[test]
