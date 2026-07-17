@@ -1164,14 +1164,49 @@ impl Painter<'_> {
     }
 
     /// The resolved foreground colour of a cell (reverse and dim applied).
+    ///
+    /// Deliberately not [`Self::resolve`]`(cell, false).0`. Both grounds resolve
+    /// through the theme, and the painter's two per-cell scans each want exactly one
+    /// of them — the background scan the background, the run scan the foreground — so
+    /// resolving the pair and dropping half doubled the theme lookups on the hottest
+    /// loops it has. [`Self::resolve`] stays for the callers that genuinely want both,
+    /// which run once per run or per row, not per cell.
     fn cell_fg(&self, cell: Cell) -> Rgb {
-        self.resolve(cell, false).0
+        // Reverse means the foreground is drawn from the cell's *background* colour;
+        // dim then darkens whichever one it landed on, exactly as `resolve` dims after
+        // it swaps.
+        let fg = if cell.attrs.contains(Attrs::REVERSE) {
+            cell.bg.resolve(self.theme, Ground::Background)
+        } else {
+            cell.fg.resolve(self.theme, Ground::Foreground)
+        };
+        if cell.attrs.contains(Attrs::DIM) {
+            dim(fg)
+        } else {
+            fg
+        }
     }
 
     /// The resolved background colour of cell `(row, col)`; `selected` (precomputed
     /// by the caller from the content-trimmed row span) swaps in the selection tint.
+    ///
+    /// A selected cell takes the tint whatever it holds, so that case resolves nothing
+    /// and does not even read the cell. Dim never reaches a background: `resolve`
+    /// applies it to the foreground after reverse has already swapped the two.
     fn cell_bg(&self, row: usize, col: usize, selected: bool) -> Rgb {
-        self.resolve(self.cell(row, col), selected).1
+        if selected {
+            return SELECTION_BG;
+        }
+        self.cell_bg_of(self.cell(row, col))
+    }
+
+    /// The resolved background a cell asks for, before selection has its say.
+    fn cell_bg_of(&self, cell: Cell) -> Rgb {
+        if cell.attrs.contains(Attrs::REVERSE) {
+            cell.fg.resolve(self.theme, Ground::Foreground)
+        } else {
+            cell.bg.resolve(self.theme, Ground::Background)
+        }
     }
 
     /// The inclusive column span of `row` covered by a reading-order [`CellSpan`]: the
@@ -1508,6 +1543,78 @@ mod tests {
     fn feed(s: &mut Screen, bytes: &[u8]) {
         let mut p = crate::vt::Parser::new();
         p.advance_bytes(s, bytes);
+    }
+
+    /// `cell_fg` and `cell_bg` each resolve one ground where [`Painter::resolve`]
+    /// resolves both, which is only sound if they arrive at the same colours it
+    /// would. Reverse and dim interact (dim lands on the foreground *after* reverse
+    /// has swapped the grounds, so it must never darken a background), and selection
+    /// overrides a background outright, so the agreement is asserted over every
+    /// combination of the attributes involved rather than argued for in a comment.
+    #[test]
+    fn the_split_grounds_resolve_exactly_as_the_pair_does() {
+        let screen = Screen::new(1, 1);
+        let theme = Theme::default();
+        let bar = Scrollbar::hidden();
+        let (mut list, mut strings) = (DisplayList::new(), Vec::new());
+        let painter = Painter {
+            screen: &screen,
+            theme: &theme,
+            bell: false,
+            metrics: M,
+            origin: (0, 0),
+            selection: None,
+            hover: None,
+            scale: Scale::ONE,
+            scrollbar: &bar,
+            list: &mut list,
+            strings: &mut strings,
+        };
+
+        let colors = [
+            Color::Default,
+            Color::Ansi(3),
+            Color::Indexed(200),
+            Color::Rgb(10, 20, 30),
+        ];
+        let attr_sets = [
+            Attrs::empty(),
+            Attrs::REVERSE,
+            Attrs::DIM,
+            Attrs::REVERSE | Attrs::DIM,
+            Attrs::BOLD | Attrs::REVERSE | Attrs::DIM,
+        ];
+        for fg in colors {
+            for bg in colors {
+                for attrs in attr_sets {
+                    let cell = Cell {
+                        rune: 'x',
+                        fg,
+                        bg,
+                        attrs,
+                        ..Cell::default()
+                    };
+                    let (want_fg, want_bg) = painter.resolve(cell, false);
+                    assert_eq!(
+                        painter.cell_fg(cell),
+                        want_fg,
+                        "foreground diverged for {fg:?} on {bg:?} with {attrs:?}"
+                    );
+                    assert_eq!(
+                        painter.cell_bg_of(cell),
+                        want_bg,
+                        "background diverged for {fg:?} on {bg:?} with {attrs:?}"
+                    );
+                    // And the reason `cell_bg` can answer a selected cell without
+                    // resolving anything at all.
+                    assert_eq!(
+                        painter.resolve(cell, true).1,
+                        SELECTION_BG,
+                        "a selected cell takes the tint whatever it holds"
+                    );
+                }
+            }
+        }
     }
 
     /// A bar at rest, for the frames that are not about the scrollbar: it is out of
