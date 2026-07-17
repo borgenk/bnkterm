@@ -654,8 +654,7 @@ impl Painter<'_> {
                 col += if cell.is_wide_leader() { 2 } else { 1 };
                 continue;
             }
-            self.push_run(row, col, cols, cell, baseline);
-            col = self.run_end(row, col, cols, cell);
+            col = self.push_run(row, col, cols, cell, baseline);
         }
         // Over the glyphs, like a run's own rules.
         self.push_hover_rule(row);
@@ -667,7 +666,20 @@ impl Painter<'_> {
     /// cost allocation and coarsen the damage diff), while underline/strike rules
     /// span the full styled run, because a styled trailing space still shows its
     /// rule (xterm draws it).
-    fn push_run(&mut self, row: usize, col: usize, cols: usize, first: Cell, baseline: i32) {
+    ///
+    /// Returns the run's end column (exclusive), which is where the caller's scan
+    /// resumes. Handing it back rather than letting the caller re-derive it is what
+    /// keeps [`Self::run_end`] to one pass per run: it walks the whole run resolving
+    /// a colour and a style per cell, so calling it again with the same arguments
+    /// scanned every painted cell twice to reach the same answer.
+    fn push_run(
+        &mut self,
+        row: usize,
+        col: usize,
+        cols: usize,
+        first: Cell,
+        baseline: i32,
+    ) -> usize {
         let m = self.metrics;
         // The run breaks on foreground, not background, so the first cell's background
         // stands in for the run when weighting the glyph anti-aliasing; a same-fg run
@@ -724,6 +736,7 @@ impl Painter<'_> {
             self.strings.push(text);
         }
         self.push_decorations(first, x, (end - col) as i32 * m.w, baseline, fg);
+        end
     }
 
     /// One underline, in the shape the cell asked for (`SGR 4:n`).
