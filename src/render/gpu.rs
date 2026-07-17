@@ -354,9 +354,43 @@ impl Atlas {
 /// The persistent glyph caches the batcher packs into: slots by scalar and by
 /// cluster, over the two atlases. Owned by the app next to the display list;
 /// survives across frames so steady-state frames insert nothing.
+/// The first printable ASCII scalar, and how many there are (`0x20..=0x7E`): the
+/// span [`GlyphCache`] direct-maps.
+const ASCII_FIRST: u32 = 0x20;
+const ASCII_SLOTS: usize = 95;
+
+/// The most faces that hold a direct-mapped ASCII row at once. Four styles across a
+/// couple of sizes is the real ceiling (a `FaceKey`'s size changes only when the
+/// *user* zooms, never at a child's request), so this is slack, not a budget; past
+/// it, ASCII simply falls back to the map and stays correct.
+const MAX_ASCII_FACES: usize = 16;
+
+/// One face's placements for printable ASCII, indexed by `ch - 0x20`.
+struct AsciiRow {
+    face: FaceKey,
+    slots: Box<[Option<PackedGlyph>; ASCII_SLOTS]>,
+}
+
 pub struct GlyphCache {
     pub glyphs: Atlas,
     pub emoji: Atlas,
+    /// Printable ASCII, direct-mapped per face — an index, not a hash.
+    ///
+    /// This is the terminal's whole hot path: the scalar cache is probed once per
+    /// glyph, thousands of times a frame, and hashing `(FaceKey, char)` with the
+    /// standard library's SipHash cost half of `build_frame` on its own. ASCII is 95
+    /// fixed codepoints and a run already knows its face, so the placement is an
+    /// array index off a face found by a compare over a handful of rows.
+    ///
+    /// The split is deliberate rather than incidental: a cheaper *hash* would serve
+    /// the same frame, but `scalar_slots` is keyed on characters a hostile child
+    /// chooses, which is precisely the case the standard library's SipHash default
+    /// exists to defend (`MAX_GLYPH_CACHE` already bounds that map's growth; nothing
+    /// bounds its probe lengths). A direct-mapped row cannot be steered — the 95
+    /// slots are fixed, an index cannot collide, and there is no probe to lengthen —
+    /// so the hot path gives up the hash entirely while every exotic character keeps
+    /// the defended map underneath.
+    ascii_slots: Vec<AsciiRow>,
     scalar_slots: HashMap<(FaceKey, char), PackedGlyph>,
     /// Nested so lookups borrow the cluster as `&str` (no per-frame `String`).
     /// A `None` value records a cluster that is not color emoji, so a
@@ -370,15 +404,35 @@ impl GlyphCache {
         Self {
             glyphs: Atlas::new(1),
             emoji: Atlas::new(4),
+            ascii_slots: Vec::new(),
             scalar_slots: HashMap::new(),
             cluster_slots: HashMap::new(),
         }
+    }
+
+    /// The direct-mapped index for a printable-ASCII scalar, or `None` for anything
+    /// else (which belongs in [`Self::scalar_slots`]). The partition is total: a
+    /// character is direct-mapped or hashed, never both, so the two can never
+    /// disagree about a placement.
+    fn ascii_index(ch: char) -> Option<usize> {
+        let i = (ch as u32).wrapping_sub(ASCII_FIRST);
+        (i < ASCII_SLOTS as u32).then_some(i as usize)
+    }
+
+    /// A printable-ASCII glyph's cached placement: find the face, index the row.
+    fn ascii_get(&self, face: FaceKey, ch: char) -> Option<PackedGlyph> {
+        let i = Self::ascii_index(ch)?;
+        self.ascii_slots.iter().find(|r| r.face == face)?.slots[i]
     }
 
     /// Drop every slot record (after an atlas grew and wiped its content).
     fn reset_for(&mut self, glyphs_gen: u32, emoji_gen: u32) {
         if self.glyphs.generation != glyphs_gen {
             self.scalar_slots.clear();
+            // The direct-mapped rows hold atlas coordinates too; a wipe invalidates
+            // them exactly as it does the map, and forgetting them here would leave
+            // every ASCII glyph pointing into a dead slot.
+            self.ascii_slots.clear();
         }
         if self.emoji.generation != emoji_gen {
             self.cluster_slots.clear();
@@ -390,6 +444,21 @@ impl GlyphCache {
     /// bound. Clearing is safe: the already-emitted quads keep their valid atlas
     /// slots (the atlas is untouched), and the glyphs simply re-cache on next sight.
     fn cache_scalar(&mut self, key: (FaceKey, char), packed: PackedGlyph) {
+        let (face, ch) = key;
+        if let Some(i) = Self::ascii_index(ch) {
+            if let Some(row) = self.ascii_slots.iter_mut().find(|r| r.face == face) {
+                row.slots[i] = Some(packed);
+                return;
+            }
+            if self.ascii_slots.len() < MAX_ASCII_FACES {
+                let mut slots = Box::new([None; ASCII_SLOTS]);
+                slots[i] = Some(packed);
+                self.ascii_slots.push(AsciiRow { face, slots });
+                return;
+            }
+            // Past the face ceiling ASCII keeps working, just through the map, which
+            // is why `ascii_get` missing is never taken as "no such glyph".
+        }
         if self.scalar_slots.len() >= MAX_GLYPH_CACHE {
             self.scalar_slots.clear();
         }
@@ -753,6 +822,10 @@ impl Batcher<'_> {
     /// reported to the face for the frame stats.
     fn packed_scalar(&mut self, face_key: FaceKey, ch: char) -> PackedGlyph {
         let primary = self.fonts.face_for(face_key);
+        if let Some(packed) = self.cache.ascii_get(face_key, ch) {
+            primary.record_glyph_hit();
+            return packed;
+        }
         if let Some(&packed) = self.cache.scalar_slots.get(&(face_key, ch)) {
             primary.record_glyph_hit();
             return packed;
@@ -1095,6 +1168,113 @@ mod tests {
         assert_eq!((s.x, s.y), (0, 0), "the grown atlas starts empty");
         // Beyond the cap is a clean None.
         assert!(a.reserve(ATLAS_MAX + 1, 1).is_none());
+    }
+
+    /// A placed glyph to cache; the coordinates are irrelevant to these tests, only
+    /// whether the record survives or is dropped.
+    fn placed() -> PackedGlyph {
+        PackedGlyph {
+            slot: Some(Slot {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+            }),
+            left: 0,
+            top: 0,
+            advance: 4.0,
+        }
+    }
+
+    /// The direct-mapped rows hold atlas coordinates exactly as the map does, so an
+    /// atlas wipe has to drop both. The map has always been dropped on a generation
+    /// bump; if the rows are not, every ASCII glyph silently renders from a dead slot
+    /// — the one corruption splitting the cache in two could introduce, and one no
+    /// rendering test would notice until it was on screen.
+    #[test]
+    fn an_atlas_wipe_invalidates_the_direct_mapped_ascii_rows() {
+        let mut cache = GlyphCache::new();
+        let face = FaceKey::Code { size: 16 };
+        cache.cache_scalar((face, 'A'), placed());
+        cache.cache_scalar((face, '\u{2500}'), placed());
+        assert!(cache.ascii_get(face, 'A').is_some());
+        assert!(cache.scalar_slots.contains_key(&(face, '\u{2500}')));
+
+        // A raster wider than the atlas forces it to grow, wiping every slot.
+        let g0 = cache.glyphs.generation;
+        let emoji_gen = cache.emoji.generation;
+        cache
+            .glyphs
+            .reserve(ATLAS_START + 1, 4)
+            .expect("grows to fit");
+        assert!(
+            cache.glyphs.generation > g0,
+            "the wipe bumps the generation"
+        );
+        cache.reset_for(g0, emoji_gen);
+
+        assert!(
+            cache.ascii_get(face, 'A').is_none(),
+            "a direct-mapped ASCII row survived an atlas wipe, so it now points at a dead slot"
+        );
+        assert!(
+            cache.scalar_slots.is_empty(),
+            "the map is dropped as before"
+        );
+    }
+
+    /// The two stores must partition the characters between them: direct-mapped or
+    /// hashed, never both, or the two could disagree about one glyph's placement.
+    #[test]
+    fn ascii_is_direct_mapped_and_every_other_scalar_is_hashed() {
+        let mut cache = GlyphCache::new();
+        let face = FaceKey::Code { size: 16 };
+        // The span and both its edges.
+        for ch in [' ', 'A', '~'] {
+            cache.cache_scalar((face, ch), placed());
+            assert!(
+                cache.ascii_get(face, ch).is_some(),
+                "{ch:?} should be mapped"
+            );
+            assert!(
+                !cache.scalar_slots.contains_key(&(face, ch)),
+                "{ch:?} should not also be hashed"
+            );
+        }
+        // Just outside it at either end, plus the exotica an attacker actually picks.
+        for ch in ['\u{1f}', '\u{7f}', 'é', '\u{2500}', '\u{1F600}'] {
+            cache.cache_scalar((face, ch), placed());
+            assert!(
+                cache.ascii_get(face, ch).is_none(),
+                "{ch:?} is not printable ASCII and must not be direct-mapped"
+            );
+            assert!(
+                cache.scalar_slots.contains_key(&(face, ch)),
+                "{ch:?} should be hashed"
+            );
+        }
+    }
+
+    /// Past the face ceiling the rows stop being handed out, and ASCII has to keep
+    /// working through the map — `ascii_get` missing a glyph means "not here", never
+    /// "no such glyph".
+    #[test]
+    fn ascii_past_the_face_ceiling_falls_back_to_the_map() {
+        let mut cache = GlyphCache::new();
+        for i in 0..MAX_ASCII_FACES {
+            cache.cache_scalar((FaceKey::Code { size: i as u32 }, 'A'), placed());
+        }
+        assert_eq!(cache.ascii_slots.len(), MAX_ASCII_FACES);
+        let extra = FaceKey::Code { size: 9999 };
+        cache.cache_scalar((extra, 'A'), placed());
+        assert!(
+            cache.ascii_get(extra, 'A').is_none(),
+            "no row is left for this face"
+        );
+        assert!(
+            cache.scalar_slots.contains_key(&(extra, 'A')),
+            "so the glyph must still be reachable through the map"
+        );
     }
 
     /// The fixed-pitch fast path skips the grapheme segmenter and the emoji probe
