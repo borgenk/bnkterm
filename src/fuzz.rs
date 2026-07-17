@@ -63,11 +63,13 @@ impl Rng {
 /// The CSI final bytes `grid.rs` actually dispatches, plus a few it does not.
 ///
 /// Drawn from the real dispatch table on purpose: a generator that emits finals nothing
-/// handles is testing the ignore path over and over. The unhandled ones (`c`, `n`, `q`,
-/// `t`) are kept deliberately and in the minority — "consume, then ignore" is a rule
-/// with its own bugs, and an introducer that fails to consume its parameters corrupts
-/// everything after it.
-const CSI_FINALS: &[u8] = b"ABCDEFGHIJKLMPSTXZ@`abdfhlmrsu cnqt";
+/// handles is testing the ignore path over and over. Most of these are handled — `c` and
+/// `n` among them (DA and DSR, which also drive the reply path) — while `q` (DECLL) and
+/// `t` (XTWINOPS) are the deliberate minority bnkterm ignores, because "consume, then
+/// ignore" is a rule with its own bugs: an introducer that fails to consume its
+/// parameters corrupts everything after it. Every byte here is a true final; a space
+/// (0x20) is a CSI *intermediate*, not a final, so it has no place in this alphabet.
+const CSI_FINALS: &[u8] = b"ABCDEFGHIJKLMPSTXZ@`abdfhlmrsucnqt";
 
 /// The two-byte `ESC x` sequences worth reaching, and the charset designators.
 const ESC_FINALS: &[u8] = b"78MDEHc=>";

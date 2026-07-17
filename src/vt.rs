@@ -397,6 +397,29 @@ impl Parser {
         }
     }
 
+    /// Flush whatever end-of-input makes final. Call once, after the last byte the child
+    /// will ever write (a PTY EOF or a read error), and never at an ordinary read
+    /// boundary.
+    ///
+    /// The only such state is a UTF-8 sequence split across a read:
+    /// [`advance_bytes`](Self::advance_bytes) holds it for the continuation a live stream
+    /// delivers in the next read (see `a_sequence_cut_by_a_chunk_boundary_waits_for_the_rest`).
+    /// Once the child has exited there is no next read, so the held bytes are the stream's
+    /// final maximal subpart and become a single U+FFFD (Unicode 16 §3.9), rather than
+    /// vanishing. A half-built escape sequence names no character and so leaves nothing to
+    /// show.
+    ///
+    /// Returns whether it printed anything, so a caller can tell the grid changed.
+    pub fn finish<P: Perform>(&mut self, p: &mut P) -> bool {
+        if self.utf8_remaining == 0 {
+            return false;
+        }
+        self.utf8_remaining = 0;
+        self.utf8_next = (0x80, 0xbf);
+        p.print('\u{FFFD}');
+        true
+    }
+
     /// Feed one byte.
     pub fn advance<P: Perform>(&mut self, p: &mut P, byte: u8) {
         // Mid-UTF-8 (only possible in Ground): consume a continuation byte, or,
@@ -1479,15 +1502,16 @@ mod tests {
         );
     }
 
-    /// A sequence cut by the end of a chunk is *held*, not replaced.
+    /// A sequence cut by a *chunk* boundary is held, not replaced.
     ///
-    /// This is the one place bnkterm deliberately parts company with §3.9, which says a
-    /// truncated sequence at the end of the stream is ill-formed and becomes U+FFFD. A
-    /// terminal has no end of stream: a PTY read boundary lands wherever the kernel put
-    /// it, and the rest of the crab is in the next read. Emitting a replacement at the
-    /// chunk edge would corrupt every wide character unlucky enough to straddle one —
-    /// and would break `every_scenario_is_invariant_to_chunking`, which is the property
-    /// that says so.
+    /// This is where bnkterm parts company with §3.9's letter, which calls a truncated
+    /// sequence at the end of the stream ill-formed and replaces it. The distinction is
+    /// end of *chunk* versus end of *stream*: a PTY read boundary lands wherever the
+    /// kernel put it, and the rest of the crab is in the next read, so replacing at the
+    /// chunk edge would corrupt every wide character unlucky enough to straddle one — and
+    /// would break `every_scenario_is_invariant_to_chunking`, the property that says so.
+    /// The real end of the stream is honored instead by [`Parser::finish`], which the
+    /// next test covers.
     #[test]
     fn a_sequence_cut_by_a_chunk_boundary_waits_for_the_rest() {
         let mut p = Parser::new();
@@ -1500,6 +1524,30 @@ mod tests {
         );
         p.advance_bytes(&mut r, &[0xa6, 0x80]); // the other half
         assert_eq!(r.actions, vec![Action::Print('\u{1f980}')]);
+    }
+
+    /// The mirror of the chunk-boundary case: at genuine end of input the held bytes can
+    /// never be completed, so `finish` makes them final (one U+FFFD for the whole held
+    /// subpart, not one per byte), and finishing a clean stream emits nothing.
+    #[test]
+    fn a_sequence_cut_by_end_of_stream_is_replaced_by_finish() {
+        let mut p = Parser::new();
+        let mut r = Recorder::default();
+        p.advance_bytes(&mut r, &[0xf0, 0x9f]); // half a crab, and no more is coming
+        assert_eq!(r.actions, vec![], "still held while the stream is open");
+        assert!(p.finish(&mut r), "the held bytes flush at end of stream");
+        assert_eq!(r.actions, vec![Action::Print('\u{FFFD}')]);
+        // Idempotent, and a no-op once nothing is pending.
+        assert!(!p.finish(&mut r), "nothing pending, nothing emitted");
+        assert_eq!(r.actions, vec![Action::Print('\u{FFFD}')]);
+
+        // A stream that ends cleanly (or with a half-built escape, which names no
+        // character) has nothing to flush.
+        let mut p = Parser::new();
+        let mut r = Recorder::default();
+        p.advance_bytes(&mut r, b"hi\x1b["); // trailing CSI introducer, no final byte
+        assert!(!p.finish(&mut r));
+        assert_eq!(r.actions, vec![Action::Print('h'), Action::Print('i')]);
     }
 
     #[test]

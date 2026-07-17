@@ -894,7 +894,9 @@ impl TerminalCore {
     /// `deadline` is reached. The tab manager shares those limits across every
     /// core in a turn. Query responses are flushed after each batch, and the end
     /// marker is reported only after the gather queue is empty, so teardown never
-    /// drops bytes that were already read. A no-op before a shell is spawned.
+    /// drops bytes that were already read. At that end marker a UTF-8 character split
+    /// across the final read is flushed to U+FFFD (see [`Parser::finish`](crate::vt::Parser::finish)),
+    /// since no further read can complete it. A no-op before a shell is spawned.
     pub(super) fn pump(&mut self, max_bytes: usize, deadline: Instant) -> Result<PumpOutcome> {
         if self.gatherer.is_none() {
             return Ok(PumpOutcome {
@@ -928,16 +930,24 @@ impl TerminalCore {
             // millisecond, so this bounds reply latency while keeping batching.
             self.flush_responses()?;
         }
-        if consumed_any {
-            self.after_output();
-        }
-
         // The end marker is withheld until the ready queue drains, so this only
         // fires once every buffered byte has reached the grid.
         let (end, more) = match &self.gatherer {
             Some(g) => (g.completion(), g.has_pending()),
             None => (None, false),
         };
+        // A genuine end of stream (the child exited, or the read failed) is the one
+        // moment a UTF-8 sequence held across the last read boundary can never be
+        // completed: there is no next read to bring its continuation. Flush it to
+        // U+FFFD now instead of dropping it silently. An ordinary read boundary never
+        // reaches here, so a character split across two reads is still held.
+        if end.is_some() {
+            consumed_any |= self.parser.finish(&mut self.screen);
+        }
+        if consumed_any {
+            self.after_output();
+        }
+
         Ok(PumpOutcome {
             bytes: consumed_bytes,
             more,

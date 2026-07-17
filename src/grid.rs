@@ -3262,8 +3262,9 @@ impl Screen {
         self.responses.extend_from_slice(bytes);
     }
 
-    /// Enter or leave the alternate screen. Entering clears it and homes the
-    /// cursor; the primary buffer is untouched, so leaving reveals it intact.
+    /// Enter or leave the alternate screen. Entering clears it and carries the cursor
+    /// across unchanged (it is one cursor shared by both buffers, see below); the
+    /// primary buffer is untouched, so leaving reveals it intact.
     fn switch_alt(&mut self, enable: bool) {
         if enable == self.on_alt {
             return;
