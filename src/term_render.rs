@@ -668,10 +668,13 @@ impl Painter<'_> {
     /// rule (xterm draws it).
     ///
     /// Returns the run's end column (exclusive), which is where the caller's scan
-    /// resumes. Handing it back rather than letting the caller re-derive it is what
-    /// keeps [`Self::run_end`] to one pass per run: it walks the whole run resolving
-    /// a colour and a style per cell, so calling it again with the same arguments
-    /// scanned every painted cell twice to reach the same answer.
+    /// resumes.
+    ///
+    /// The run's extent is discovered *while* its text is built, in one walk. Finding
+    /// the end first and then filling the string reads more clearly, but it is two
+    /// passes over the same cells — the extent scan resolving a colour and a style per
+    /// cell, the fill re-reading every one of them — to emit a single run. Scanning
+    /// once and copying once is the same rule the grid's own hot paths follow.
     fn push_run(
         &mut self,
         row: usize,
@@ -686,28 +689,51 @@ impl Painter<'_> {
         // over a mixed background is rare (reverse video and selection tint uniformly).
         let (fg, bg) = self.resolve(first, false);
         let style = style_of(first);
-        let end = self.run_end(row, col, cols, first);
-        // A recycled buffer (from the pool) usually already has the capacity a run
-        // needs; reserving covers a fresh one and any run longer than last frame's,
-        // so an all-ASCII run (the common case) fills without reallocating.
-        let mut text = self.take_string_with_capacity(end - col);
-        text.reserve(end - col);
+        let underline = first.attrs.contains(Attrs::UNDERLINE);
+        let strike = first.attrs.contains(Attrs::STRIKE);
+        // A run cannot outlast its row, so ask the pool for that much and let every
+        // run settle on one capacity: the pool probes from the back for the first
+        // buffer that fits, and uniform sizes are what make that probe hit first try.
+        // It is a hint either way — combining marks push more chars than there are
+        // cells, so no bound here is exact.
+        let mut text = self.take_string_with_capacity(cols - col);
         // Bytes and cell count up to and including the last cell with ink, so a
         // trailing blank never lands in the emitted text.
         let mut inked_bytes = 0;
         let mut inked_cells = 0;
-        for c in col..end {
-            let cell = self.cell(row, c);
+        let mut end = col;
+        while end < cols {
+            // The caller already read the first cell to decide this was a run at all.
+            let cell = if end == col {
+                first
+            } else {
+                self.cell(row, end)
+            };
+            if end > col {
+                // A wide glyph or an astral rune stands alone, and a change of colour,
+                // style, or rule ends the run: past here is a different command.
+                if cell.is_wide_leader() || cell.is_wide_spacer() || !cells_safe(cell.rune) {
+                    break;
+                }
+                if self.cell_fg(cell) != fg
+                    || style_of(cell) != style
+                    || cell.attrs.contains(Attrs::UNDERLINE) != underline
+                    || cell.attrs.contains(Attrs::STRIKE) != strike
+                {
+                    break;
+                }
+            }
             let hidden = cell.attrs.contains(Attrs::HIDDEN);
             text.push(if hidden { ' ' } else { cell.rune });
-            let has_marks = !hidden && !self.marks_empty(row, c);
+            let has_marks = !hidden && !self.marks_empty(row, end);
             if has_marks {
-                text.extend(self.marks(row, c));
+                text.extend(self.marks(row, end));
             }
             if !hidden && (cell.rune != ' ' || has_marks) {
                 inked_bytes = text.len();
-                inked_cells = c - col + 1;
+                inked_cells = end - col + 1;
             }
+            end += 1;
         }
         let x = self.cell_x(col);
         if inked_cells > 0 {
@@ -1115,32 +1141,6 @@ impl Painter<'_> {
         for rect in edges {
             self.list.push(DrawCmd::Fill { rect, color });
         }
-    }
-
-    /// The exclusive end column of the run beginning at `col`: it stops at the
-    /// first cell whose style differs, or that is wide or astral (those are drawn
-    /// standalone), or the end of the row.
-    fn run_end(&self, row: usize, col: usize, cols: usize, first: Cell) -> usize {
-        let fg = self.cell_fg(first);
-        let style = style_of(first);
-        let ul = first.attrs.contains(Attrs::UNDERLINE);
-        let st = first.attrs.contains(Attrs::STRIKE);
-        let mut end = col + 1;
-        while end < cols {
-            let c = self.cell(row, end);
-            if c.is_wide_leader() || c.is_wide_spacer() || !cells_safe(c.rune) {
-                break;
-            }
-            if self.cell_fg(c) != fg
-                || style_of(c) != style
-                || c.attrs.contains(Attrs::UNDERLINE) != ul
-                || c.attrs.contains(Attrs::STRIKE) != st
-            {
-                break;
-            }
-            end += 1;
-        }
-        end
     }
 
     /// The cell shown at display `(row, col)`, honouring the scroll offset (the
