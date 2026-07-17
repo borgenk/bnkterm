@@ -6397,6 +6397,38 @@ mod tests {
                     s.primary.scrollback.len()
                 ));
             }
+            // A wide glyph is a leader (the rune) plus a spacer (its second column); an
+            // erase or shift that cuts the pair and leaves an orphan is exactly the
+            // corruption these ICH/DCH/ECH paths were hardened against, and it is
+            // invisible to the size/cursor/count checks above. Every visible row of both
+            // buffers, and the scrollback a wide glyph can scroll into, has to stay paired.
+            for (name, buf) in [("primary", &s.primary), ("alt", &s.alt)] {
+                for row in buf.lines.iter().chain(buf.scrollback.iter()) {
+                    if let Some(why) = wide_pair_break(&row.cells) {
+                        return Some(format!("{name}: {why}"));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Where a row's wide-glyph pairing is broken, or `None`. A leader must be followed by
+    /// a spacer, and a spacer must be preceded by a leader; either half standing alone is
+    /// an orphan that draws as garbage.
+    fn wide_pair_break(row: &[Cell]) -> Option<String> {
+        for (i, cell) in row.iter().enumerate() {
+            if cell.is_wide_leader() && !row.get(i + 1).is_some_and(|c| c.is_wide_spacer()) {
+                return Some(format!("wide leader at col {i} has no spacer to its right"));
+            }
+            if cell.is_wide_spacer()
+                && !i
+                    .checked_sub(1)
+                    .and_then(|p| row.get(p))
+                    .is_some_and(|c| c.is_wide_leader())
+            {
+                return Some(format!("wide spacer at col {i} has no leader to its left"));
+            }
         }
         None
     }

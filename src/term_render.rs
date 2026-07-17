@@ -2688,12 +2688,15 @@ mod tests {
         rects.iter().map(|r| i64::from(r.w) * i64::from(r.h)).sum()
     }
 
-    /// Whether the damage covers every pixel of the cell at `(row, col)`. Under-damage
-    /// is the failure that leaves a stale glyph on screen.
+    /// Whether the damage covers every pixel of the cell at `(row, col)`. Under-damage is
+    /// the failure that leaves a stale glyph on screen, and it shows up first at a cell's
+    /// edges: a rectangle one pixel short of the cell still covers every interior sample,
+    /// so a stepped grid would miss the very row or column that was left stale. Every
+    /// pixel, boundary row and column included, is the point.
     fn covers_cell(rects: &[Rect], row: usize, col: usize) -> bool {
         let (x0, y0) = (col as i32 * M.w, row as i32 * M.h);
-        (x0..x0 + M.w).step_by(3).all(|x| {
-            (y0..y0 + M.h).step_by(3).all(|y| {
+        (x0..x0 + M.w).all(|x| {
+            (y0..y0 + M.h).all(|y| {
                 rects
                     .iter()
                     .any(|r| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)

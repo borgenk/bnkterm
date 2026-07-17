@@ -1603,6 +1603,54 @@ mod tests {
     }
 
     #[test]
+    fn a_child_that_exits_mid_character_flushes_through_the_pump() {
+        // The regression guard for the end-of-stream UTF-8 flush, driven through the real
+        // `pump` and the gatherer's completion rather than by calling `Parser::finish` by
+        // hand: the child's last act is to write half a crab (the first two bytes of
+        // U+1F980) and exit, and the flush must happen because `pump` sees the EOF marker.
+        // Delete the `finish` call in `pump` and this goes red; a hand-rolled `finish`
+        // would not.
+        let Ok(pty) = Pty::spawn_command(40, 10, &["/bin/sh", "-c", "printf '\\360\\237'"]) else {
+            eprintln!("fork/exec unavailable; skipping the end-of-stream pump test");
+            return;
+        };
+        let Ok(gatherer) = Gatherer::start(pty.fd()) else {
+            eprintln!("gatherer unavailable; skipping the end-of-stream pump test");
+            return;
+        };
+        let mut core = TerminalCore::new(false, 40, 10, METRICS, 400, 200, 0);
+        core.pty = Some(pty);
+        core.gatherer = Some(gatherer);
+
+        // Pump until the gatherer reports the child is gone, blocking on its ready fd
+        // between passes so this does not spin, and bounded so a stuck child fails the
+        // test rather than hanging the suite.
+        let mut poll = crate::pty::PollSet::new();
+        let stop = Instant::now() + Duration::from_secs(5);
+        let mut ended = false;
+        while Instant::now() < stop {
+            let outcome = core
+                .pump(1 << 20, Instant::now() + Duration::from_millis(50))
+                .expect("pump");
+            if outcome.end.is_some() {
+                ended = true;
+                break;
+            }
+            poll.clear();
+            if let Some(g) = &core.gatherer {
+                poll.add(g.ready_fd());
+            }
+            let _ = poll.wait(Some(Duration::from_millis(50)));
+        }
+        assert!(ended, "the child never reached EOF through the gatherer");
+        assert_eq!(
+            core.screen.row_string(0).chars().next(),
+            Some('\u{FFFD}'),
+            "pump flushed the held half-character to a replacement at end of stream"
+        );
+    }
+
+    #[test]
     fn the_lock_reaches_the_frame_and_repaints_when_the_mode_turns() {
         // The same journey as the live-tty test above, but without a child, so it still
         // guards the wiring where fork/exec is unavailable: flip the cached mode the way
