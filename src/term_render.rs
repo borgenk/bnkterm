@@ -2662,4 +2662,214 @@ mod tests {
         let top = thumb_of(&list_with_bar(&s, &bar)).expect("scrollable");
         assert_eq!(top.y, track.y);
     }
+
+    // ---- damage ------------------------------------------------------------
+    //
+    // The display list is only half the frame: what the compositor is actually asked to
+    // repaint is `display::damage(previous, current)`. Nothing here asserted that until
+    // now, and the two ways it can be wrong fail in opposite, equally silent directions.
+    // **Under-damage** leaves a stale pixel on screen — the grid is right and the window
+    // is lying. **Over-damage** is invisible in every correctness test there is and only
+    // shows up as a machine running hot: repaint the whole surface for a blinking cursor
+    // and the frame costs what a full redraw costs, forever, and no test goes red.
+
+    /// The rectangles the compositor would be asked to repaint between two states of the
+    /// same screen.
+    fn damage_of(before: &Screen, after: &Screen) -> Vec<Rect> {
+        let theme = Theme::default();
+        let old = build_display_list(&inputs(before, &theme));
+        let new = build_display_list(&inputs(after, &theme));
+        let (w, h) = inputs(after, &theme).surface;
+        crate::render::display::damage(&old, &new, w, h)
+    }
+
+    /// Total area of a damage set, in pixels.
+    fn damaged_area(rects: &[Rect]) -> i64 {
+        rects.iter().map(|r| i64::from(r.w) * i64::from(r.h)).sum()
+    }
+
+    /// Whether the damage covers every pixel of the cell at `(row, col)`. Under-damage
+    /// is the failure that leaves a stale glyph on screen.
+    fn covers_cell(rects: &[Rect], row: usize, col: usize) -> bool {
+        let (x0, y0) = (col as i32 * M.w, row as i32 * M.h);
+        (x0..x0 + M.w).step_by(3).all(|x| {
+            (y0..y0 + M.h).step_by(3).all(|y| {
+                rects
+                    .iter()
+                    .any(|r| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)
+            })
+        })
+    }
+
+    fn screen_after(cols: usize, rows: usize, bytes: &[u8]) -> Screen {
+        let mut s = Screen::new(cols, rows);
+        let mut p = crate::vt::Parser::new();
+        p.advance_bytes(&mut s, bytes);
+        s
+    }
+
+    /// A frame identical to the one before it asks the compositor for nothing.
+    ///
+    /// The cheapest and most load-bearing case: an idle terminal must not repaint. If
+    /// this ever fails, bnkterm is burning a GPU on a screen that is not changing.
+    #[test]
+    fn an_unchanged_screen_damages_nothing() {
+        for bytes in [
+            &b""[..],
+            b"hello",
+            b"\x1b[1;31mcoloured\x1b[0m\r\nlines",
+            "wide \u{4e00} and \u{1f980}".as_bytes(),
+        ] {
+            let a = screen_after(20, 4, bytes);
+            let b = screen_after(20, 4, bytes);
+            assert_eq!(
+                damage_of(&a, &b),
+                vec![],
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    /// One character typed damages that character, and does not repaint the window.
+    ///
+    /// Both halves matter. Covering the cell is correctness; *not* covering the whole
+    /// surface is the perf regression no other test in this repo can see.
+    #[test]
+    fn typing_one_character_damages_about_one_cell() {
+        let before = screen_after(20, 4, b"hello");
+        let after = screen_after(20, 4, b"hellox");
+        let rects = damage_of(&before, &after);
+
+        assert!(!rects.is_empty(), "the new glyph must be repainted");
+        assert!(
+            covers_cell(&rects, 0, 5),
+            "the cell that changed is covered"
+        );
+
+        // The painter emits a text run per row, so a row's worth of damage is the
+        // honest bound here — a screen's worth is not.
+        let surface = i64::from(20 * M.w) * i64::from(4 * M.h);
+        let row = i64::from(20 * M.w) * i64::from(M.h);
+        let area = damaged_area(&rects);
+        assert!(
+            area <= row * 2,
+            "typing one character damaged {area}px of a {surface}px surface"
+        );
+        assert!(area < surface, "a keystroke must not repaint the window");
+    }
+
+    /// An edit far down the screen does not drag the rows above it into the damage.
+    #[test]
+    fn an_edit_damages_only_the_row_it_touches() {
+        let before = screen_after(20, 6, b"aaa\r\nbbb\r\nccc\r\nddd");
+        let after = screen_after(20, 6, b"aaa\r\nbbb\r\nccc\r\nddX");
+        let rects = damage_of(&before, &after);
+
+        assert!(covers_cell(&rects, 3, 2), "the changed cell is covered");
+        // Nothing on the untouched rows: row 0 is three rows away from the edit.
+        assert!(
+            !rects.iter().any(|r| r.y < M.h),
+            "row 0 was repainted for an edit on row 3: {rects:?}"
+        );
+    }
+
+    /// Changing a colour damages the text it recoloured, not the text beside it.
+    #[test]
+    fn a_recolour_damages_the_run_it_recoloured() {
+        let before = screen_after(20, 2, b"\x1b[31mred\x1b[0m plain");
+        let after = screen_after(20, 2, b"\x1b[32mred\x1b[0m plain");
+        let rects = damage_of(&before, &after);
+        assert!(!rects.is_empty(), "a recolour is a change");
+        assert!(covers_cell(&rects, 0, 0), "the recoloured text is covered");
+        assert!(
+            !rects.iter().any(|r| r.y >= M.h),
+            "row 1 is untouched and must not repaint: {rects:?}"
+        );
+    }
+
+    /// A scroll damages the text that moved, and only collapses to a full repaint when
+    /// enough of the surface actually changed to make repainting whole the cheaper job.
+    ///
+    /// The pleasant surprise here, and worth pinning before someone "optimises" it away:
+    /// scrolling a screen of *short* lines does not repaint the window. The painter emits
+    /// a text run per row, so only the runs damage, and a screenful of one-character rows
+    /// costs a column strip rather than a screen.
+    #[test]
+    fn a_scroll_damages_the_text_that_moved() {
+        let surface = i64::from(20 * M.w) * i64::from(4 * M.h);
+
+        // Short lines: every row's text changed, but the text is one column wide.
+        let before = screen_after(20, 4, b"a\r\nb\r\nc\r\nd");
+        let after = screen_after(20, 4, b"a\r\nb\r\nc\r\nd\r\ne");
+        let rects = damage_of(&before, &after);
+        for row in 0..4 {
+            assert!(
+                covers_cell(&rects, row, 0),
+                "row {row} moved and is covered"
+            );
+        }
+        assert!(
+            damaged_area(&rects) * 4 < surface,
+            "scrolling one-column rows repainted {}px of a {surface}px surface",
+            damaged_area(&rects)
+        );
+
+        // Full lines: now most of the surface really has changed, and one rectangle
+        // beats clipping four.
+        let full = |tail: &str| -> Screen {
+            let body: String = [
+                "aaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbb",
+                "cccccccccccccccccccc",
+                "dddddddddddddddddddd",
+            ]
+            .join("\r\n");
+            screen_after(20, 4, format!("{body}{tail}").as_bytes())
+        };
+        let rects = damage_of(&full(""), &full("\r\neeeeeeeeeeeeeeeeeeee"));
+        assert_eq!(rects.len(), 1, "one rectangle, not four: {rects:?}");
+        assert_eq!(damaged_area(&rects), surface, "the whole surface");
+    }
+
+    /// The damage never lies by omission: whatever changed on the grid is covered.
+    ///
+    /// A property rather than a case list — it compares the damage against the cells
+    /// that actually differ, over a structured stream, so it holds for operations nobody
+    /// thought to write a case for. Under-damage is the failure that leaves the window
+    /// showing something the terminal no longer believes.
+    #[test]
+    fn damage_covers_every_cell_that_changed() {
+        let theme = Theme::default();
+        let mut stream = crate::fuzz::Stream::new(0x0DA3_40E0_1234_5678);
+        let (cols, rows) = (12, 5);
+
+        let mut screen = Screen::new(cols, rows);
+        let mut parser = crate::vt::Parser::new();
+        for _ in 0..400 {
+            let before: Vec<Cell> = (0..rows)
+                .flat_map(|r| (0..cols).map(move |c| (r, c)))
+                .map(|(r, c)| screen.cell(r, c))
+                .collect();
+            let old = build_display_list(&inputs(&screen, &theme));
+
+            parser.advance_bytes(&mut screen, &stream.bytes(24));
+
+            let new = build_display_list(&inputs(&screen, &theme));
+            let (w, h) = inputs(&screen, &theme).surface;
+            let rects = crate::render::display::damage(&old, &new, w, h);
+
+            for r in 0..rows {
+                for c in 0..cols {
+                    let changed = screen.cell(r, c) != before[r * cols + c];
+                    if changed {
+                        assert!(
+                            covers_cell(&rects, r, c),
+                            "cell ({r},{c}) changed and was not repainted: {rects:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

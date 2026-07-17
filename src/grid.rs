@@ -555,6 +555,19 @@ struct Saved {
     cursor: Cursor,
     pen: Pen,
     origin: bool,
+    /// The character set shift state: the G0 and G1 designations and which of them GL
+    /// is currently mapped to. DECSC saves it and DECRC restores it, which is not
+    /// optional decoration — see [`Screen::save_cursor`].
+    charsets: Charsets,
+}
+
+/// The character set shift state: what G0 and G1 are designated as, and which one GL
+/// reads through (SI selects G0, SO selects G1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Charsets {
+    g0: Charset,
+    g1: Charset,
+    gl_is_g1: bool,
 }
 
 /// The most combining marks a single cell retains. Unicode's Stream-Safe Text
@@ -624,6 +637,36 @@ impl Row {
         }
         self.combining.clear();
         self.wrapped = false;
+    }
+
+    /// Blank a wide glyph straddling the boundary *before* `col`, so an operation that
+    /// cuts the row there cannot leave half a glyph behind.
+    ///
+    /// A pair straddles the cut exactly when the cell at `col` is a spacer: its leader is
+    /// the cell before it, on the far side of the line about to be drawn.
+    ///
+    /// ```text
+    ///   split before col 2        the pair straddles the cut, so both halves go
+    ///   ┌───┬───┬───┬───┐         ┌───┬───┬───┬───┐
+    ///   │ a │ 一────▶│ b │   ──▶  │ a │   │   │ b │
+    ///   └───┴───┴─┃─┴───┘         └───┴───┴───┴───┘
+    ///             ┃ the cut
+    /// ```
+    ///
+    /// Every shift is a pair of cuts (see [`Buffer::insert_blanks`] and
+    /// [`Buffer::delete_chars`]), which is why this is stated once here rather than
+    /// open-coded per operation: each one gets it independently wrong otherwise.
+    fn split_wide_at(&mut self, col: usize, blank: Cell) {
+        if !self.cells.get(col).is_some_and(|c| c.is_wide_spacer()) {
+            return;
+        }
+        let Some(lead) = col.checked_sub(1) else {
+            return;
+        };
+        if let Some(slice) = self.cells.get_mut(lead..=col) {
+            slice.iter_mut().for_each(|c| *c = blank);
+        }
+        self.combining.retain(|m| m.col != lead && m.col != col);
     }
 
     /// The combining marks attached to `col`, in arrival order; empty if the cell
@@ -698,6 +741,9 @@ struct Buffer {
     /// never reused: the front of the stream only ever moves forward.
     evicted: u64,
     cursor: Cursor,
+    /// What DECSC last stored *for this buffer*. Each screen owns its own slot, and it
+    /// outlives a trip to the other screen and back: a program may save on the alt
+    /// screen, leave, return, and restore, and it expects to find what it saved.
     saved: Option<Saved>,
     /// DECSTBM scroll region, inclusive, within `0..rows`.
     scroll_top: usize,
@@ -999,7 +1045,15 @@ impl Buffer {
                 r.resize_cols(new_cols);
             }
             self.cols = new_cols;
-            self.tabs = default_tabs(new_cols);
+            // Tab stops are not geometry: they are state a program set, and a window
+            // resize is not a program asking to lose it. `HTS` at column 3 has to still
+            // be there after a drag, so the table is never rebuilt — it already covers
+            // [`MAX_TAB_COLUMNS`], and only a screen wider than that needs more. Growing
+            // it is the one case where fresh defaults are right: those columns have never
+            // existed, so nothing has ever said anything about them.
+            for c in self.tabs.len()..new_cols {
+                self.tabs.push(c % TAB_WIDTH == 0);
+            }
             if self.cursor.col >= new_cols {
                 self.cursor.col = new_cols - 1;
             }
@@ -1052,24 +1106,54 @@ impl Buffer {
 
     /// Blank cells `[start, end)` of `row`, leaving the rest untouched. A range that
     /// reaches the final column erases the text that wrapped, so the line ends here.
+    ///
+    /// The range grows over a wide glyph's other half at either edge, and that is not
+    /// politeness — it is the only answer that can be drawn. A wide glyph is a leader
+    /// carrying the rune plus a spacer holding its second column, and neither half means
+    /// anything alone:
+    ///
+    /// ```text
+    ///   erase just the leader        erase just the spacer
+    ///   ┌───┬───┬───┐                ┌───┬───┬───┐
+    ///   │ a │   │▒▒▒│                │ a │ 一────▶│      the leader still draws two
+    ///   └───┴───┴───┘                └───┴───┴───┘      columns, over the erased cell
+    ///           ↑ a spacer holding
+    ///             a column for a rune
+    ///             that is gone
+    /// ```
+    ///
+    /// So landing on a spacer takes its leader, and ending on a leader takes its spacer.
     fn clear_line_range(&mut self, row: usize, start: usize, end: usize, blank: Cell) {
-        if let Some(r) = self.lines.get_mut(row) {
-            let hi = end.min(r.cells.len());
-            if start < hi {
-                if let Some(slice) = r.cells.get_mut(start..hi) {
-                    slice.iter_mut().for_each(|c| *c = blank);
-                }
-                r.combining.retain(|m| m.col < start || m.col >= hi);
-                if hi == r.cells.len() {
-                    r.wrapped = false;
-                }
-            }
+        let Some(r) = self.lines.get_mut(row) else {
+            return;
+        };
+        let len = r.cells.len();
+        let (mut lo, mut hi) = (start, end.min(len));
+        if lo >= hi {
+            return;
+        }
+        if r.cells.get(lo).is_some_and(|c| c.is_wide_spacer()) {
+            lo = lo.saturating_sub(1);
+        }
+        if r.cells.get(hi - 1).is_some_and(|c| c.is_wide_leader()) {
+            hi = (hi + 1).min(len);
+        }
+        if let Some(slice) = r.cells.get_mut(lo..hi) {
+            slice.iter_mut().for_each(|c| *c = blank);
+        }
+        r.combining.retain(|m| m.col < lo || m.col >= hi);
+        if hi == len {
+            r.wrapped = false;
         }
     }
 
     /// ICH: shift `[col, len)` right by `n`, blanking the `n` opened cells; cells
     /// pushed past the right edge are lost, including whatever wrapped out of the
     /// final column, so the wrap link goes with it.
+    ///
+    /// The shift cuts the row twice — at the cursor, where the move begins, and at the
+    /// last cell that survives it, where the right edge eats the rest — and a wide glyph
+    /// straddling either cut would lose half of itself (see [`Row::split_wide_at`]).
     fn insert_blanks(&mut self, row: usize, col: usize, n: usize, blank: Cell) {
         if let Some(r) = self.lines.get_mut(row) {
             let len = r.cells.len();
@@ -1077,6 +1161,8 @@ impl Buffer {
                 return;
             }
             let n = n.min(len - col);
+            r.split_wide_at(col, blank);
+            r.split_wide_at(len - n, blank);
             r.cells.copy_within(col..len - n, col + n);
             if let Some(slice) = r.cells.get_mut(col..col + n) {
                 slice.iter_mut().for_each(|c| *c = blank);
@@ -1093,6 +1179,9 @@ impl Buffer {
 
     /// DCH: shift `[col+n, len)` left by `n`, blanking the `n` cells at the right.
     /// Blanking the tail ends the line there, so the wrap link goes too.
+    ///
+    /// Two cuts again, mirroring ICH's: at the cursor, where the deletion begins, and at
+    /// the first cell pulled in over it (see [`Row::split_wide_at`]).
     fn delete_chars(&mut self, row: usize, col: usize, n: usize, blank: Cell) {
         if let Some(r) = self.lines.get_mut(row) {
             let len = r.cells.len();
@@ -1100,6 +1189,8 @@ impl Buffer {
                 return;
             }
             let n = n.min(len - col);
+            r.split_wide_at(col, blank);
+            r.split_wide_at(col + n, blank);
             r.cells.copy_within(col + n..len, col);
             if let Some(slice) = r.cells.get_mut(len - n..len) {
                 slice.iter_mut().for_each(|c| *c = blank);
@@ -2181,11 +2272,18 @@ impl Screen {
             let blank = self.blank_cell();
             self.active_mut().insert_blanks(row, col, cw, blank);
         }
+        // A wide glyph needs two columns and there is exactly one screen narrow enough to
+        // deny it: a single-column grid, where the wrap has nowhere to go and the back-up
+        // for no-autowrap lands on the same cell. Marking it a leader there would set the
+        // one invariant this grid keeps — a leader always has its spacer — against a
+        // spacer that cannot exist. It goes in as an ordinary cell instead: clipped, and
+        // structurally sound.
+        let fits_wide = cw == 2 && col + 1 < cols;
         let leader = Cell {
             rune: c,
             fg: pen.fg,
             bg: pen.bg,
-            attrs: if cw == 2 {
+            attrs: if fits_wide {
                 pen.attrs | Attrs::WIDE_LEADER
             } else {
                 pen.attrs
@@ -2195,7 +2293,7 @@ impl Screen {
         {
             let b = self.active_mut();
             b.write_cell(row, col, leader);
-            if cw == 2 {
+            if fits_wide {
                 // The spacer carries the link too, so the run the hover probe walks
                 // never breaks in the middle of a wide glyph.
                 let spacer = Cell {
@@ -2554,17 +2652,26 @@ impl Screen {
         b.cursor.pending_wrap = false;
     }
 
-    /// TBC: clear the tab stop at the cursor (mode 0) or all stops (mode 3).
+    /// TBC: clear the tab stop at the cursor (mode 0, the default) or every stop
+    /// (mode 3).
+    ///
+    /// Every other parameter is ignored, which is the whole behavior and not a
+    /// shortcut. ECMA-48 also defines 1, 2, 4 and 5 in terms of *line* tab stops, which
+    /// no terminal in use has; xterm implements 0 and 3 and drops the rest, and vttest's
+    /// tab screen checks exactly that by sending `CSI 1 g` and `CSI 2 g` at a live tab
+    /// stop and requiring the stop to survive. Treating an unknown parameter as 0 would
+    /// silently delete it.
     pub fn clear_tab_stop(&mut self, mode: u16) {
         let b = self.active_mut();
         match mode {
-            3 => b.tabs.iter_mut().for_each(|t| *t = false),
-            _ => {
+            0 => {
                 let col = b.cursor.col;
                 if let Some(stop) = b.tabs.get_mut(col) {
                     *stop = false;
                 }
             }
+            3 => b.tabs.iter_mut().for_each(|t| *t = false),
+            _ => {}
         }
     }
 
@@ -2696,9 +2803,18 @@ impl Screen {
     }
 
     /// ECH: erase `n` cells from the cursor, without shifting the rest.
+    /// ECH: blank `n` cells from the cursor without shifting anything.
+    ///
+    /// Cancels a deferred wrap, as every operator that rewrites the cells around the
+    /// cursor must: the flag is a claim that the next glyph belongs on the next row *on
+    /// behalf of the text already here*, and this just erased that text. Honouring it
+    /// afterwards would wrap for a glyph that no longer exists. Unconditional, and
+    /// before any bounds check refuses the erase itself — a rule about the cursor does
+    /// not wait on whether the cells were in range.
     pub fn erase_chars(&mut self, n: usize) {
         let blank = self.blank_cell();
         let b = self.active_mut();
+        b.cursor.pending_wrap = false;
         let (row, col) = (b.cursor.row, b.cursor.col);
         b.clear_line_range(row, col, col + n.max(1), blank);
     }
@@ -2709,6 +2825,9 @@ impl Screen {
     pub fn insert_chars(&mut self, n: usize) {
         let blank = self.blank_cell();
         let b = self.active_mut();
+        // Cancels a deferred wrap: ICH shifts the text the flag was deferring for out
+        // from under the cursor (see `erase_chars`).
+        b.cursor.pending_wrap = false;
         let (row, col) = (b.cursor.row, b.cursor.col);
         b.insert_blanks(row, col, n.max(1), blank);
     }
@@ -2717,6 +2836,8 @@ impl Screen {
     pub fn delete_chars(&mut self, n: usize) {
         let blank = self.blank_cell();
         let b = self.active_mut();
+        // Cancels a deferred wrap, as ICH does and for the same reason.
+        b.cursor.pending_wrap = false;
         let (row, col) = (b.cursor.row, b.cursor.col);
         b.delete_chars(row, col, n.max(1), blank);
     }
@@ -2801,14 +2922,23 @@ impl Screen {
 
     // ---- save / restore -----------------------------------------------------
 
-    /// DECSC: save the cursor, pen, and origin mode.
+    /// DECSC: save the cursor, pen, origin mode, and character set shift state.
+    ///
+    /// The charsets are part of the saved state by the VT spec's own list ("cursor
+    /// position, graphic rendition, character set shift state, state of wrap flag,
+    /// state of origin mode, state of selective erase"), and leaving them out is
+    /// visible immediately: a shell that saves the cursor, switches to the line-drawing
+    /// set to paint a frame, then restores, is telling the terminal to put the ASCII
+    /// mapping back. Without that, every letter it prints afterwards comes out as box
+    /// glyphs.
     pub fn save_cursor(&mut self) {
-        let (pen, origin) = (self.pen, self.origin_mode);
+        let (pen, origin, charsets) = (self.pen, self.origin_mode, self.charsets());
         let b = self.active_mut();
         b.saved = Some(Saved {
             cursor: b.cursor,
             pen,
             origin,
+            charsets,
         });
     }
 
@@ -2819,6 +2949,7 @@ impl Screen {
             Some(s) => {
                 self.pen = s.pen;
                 self.origin_mode = s.origin;
+                self.set_charsets(s.charsets);
                 let b = self.active_mut();
                 b.cursor = s.cursor;
                 b.cursor.row = b.cursor.row.min(b.rows - 1);
@@ -2826,6 +2957,20 @@ impl Screen {
             }
             None => self.move_to(0, 0),
         }
+    }
+
+    fn charsets(&self) -> Charsets {
+        Charsets {
+            g0: self.g0,
+            g1: self.g1,
+            gl_is_g1: self.gl_is_g1,
+        }
+    }
+
+    fn set_charsets(&mut self, c: Charsets) {
+        self.g0 = c.g0;
+        self.g1 = c.g1;
+        self.gl_is_g1 = c.gl_is_g1;
     }
 
     // ---- rendition (SGR) ----------------------------------------------------
@@ -3130,13 +3275,29 @@ impl Screen {
         self.break_row_identity();
         if enable {
             let blank = self.blank_cell();
+            // The cursor carries across the switch rather than homing: the alt screen
+            // is a different set of cells, not a different cursor. `?1049h` is where
+            // this shows — it saves the cursor, switches, and clears, and a program
+            // that then restores expects to land where it started, not at the origin.
+            // The deferred-wrap flag rides along with it for the same reason.
+            let cursor = self.active().cursor;
             self.alt.clear_all(blank);
-            self.alt.cursor = Cursor::default();
+            self.alt.cursor = cursor;
             self.alt.scroll_top = 0;
             self.alt.scroll_bottom = self.alt.rows - 1;
-            self.alt.saved = None;
             self.on_alt = true;
         } else {
+            // And back the same way. The cursor is one cursor: xterm keeps a single
+            // position across both buffers, so leaving the alt screen has to carry it
+            // home as much as entering it did. Carrying it only one way would be a
+            // cursor that is shared going in and per-buffer coming out, which is the
+            // half-and-half model this is here to remove.
+            //
+            // `?1049l` restores a saved cursor immediately after this and so cannot
+            // tell; `?47l` and `?1047l` do not, and are what a program using the alt
+            // screen without the save/restore pair sends.
+            let cursor = self.alt.cursor;
+            self.primary.cursor = cursor;
             self.on_alt = false;
         }
     }
@@ -3699,7 +3860,15 @@ impl Screen {
                     (Attrs::BOLD, b"1".as_slice()),
                     (Attrs::DIM, b"2"),
                     (Attrs::ITALIC, b"3"),
-                    (Attrs::UNDERLINE, b"4"),
+                    // The underline carries its shape with it. Reporting a bare `4` for a
+                    // curly one answers a program's "what is this set to?" with a
+                    // different setting: it saves the reply, changes the style, replays
+                    // it, and its squiggle has quietly become a straight line. The whole
+                    // point of DECRQSS is that the answer reproduces the state.
+                    (
+                        Attrs::UNDERLINE,
+                        Self::underline_sgr(attrs.underline_style()),
+                    ),
                     (Attrs::REVERSE, b"7"),
                     (Attrs::HIDDEN, b"8"),
                     (Attrs::STRIKE, b"9"),
@@ -3726,6 +3895,20 @@ impl Screen {
                 self.respond(b"r\x1b\\");
             }
             _ => self.respond(b"\x1bP0$r\x1b\\"),
+        }
+    }
+
+    /// The SGR parameter that sets an underline of this shape, for a DECRQSS reply.
+    ///
+    /// Plain underline reports as `4` rather than `4:1`, because that is what everything
+    /// has always written and a program restoring it should get back what it sent.
+    fn underline_sgr(style: UnderlineStyle) -> &'static [u8] {
+        match style {
+            UnderlineStyle::Single => b"4",
+            UnderlineStyle::Double => b"4:2",
+            UnderlineStyle::Curly => b"4:3",
+            UnderlineStyle::Dotted => b"4:4",
+            UnderlineStyle::Dashed => b"4:5",
         }
     }
 
@@ -3880,11 +4063,19 @@ impl Screen {
         };
     }
 
-    /// DECALN: fill the whole screen with 'E' and home the cursor (a vttest
-    /// alignment pattern; useful for confirming glyph placement early).
+    /// DECALN: fill the whole screen with 'E', reset the margins to the extremes of the
+    /// page, and home the cursor (a vttest alignment pattern; useful for confirming
+    /// glyph placement early).
+    ///
+    /// The margins and the cursor are not incidental: DECALN's own definition is that it
+    /// "sets the margins to the extremes of the page, and moves the cursor to the home
+    /// position", so a screen left under a stale scroll region after an alignment test
+    /// would scroll inside it.
     pub fn decaln(&mut self) {
         let b = self.active_mut();
         b.clear_all(Cell::new('E'));
+        b.scroll_top = 0;
+        b.scroll_bottom = b.rows.saturating_sub(1);
         b.cursor = Cursor::default();
     }
 
@@ -3908,8 +4099,23 @@ impl Screen {
 }
 
 /// Tab stops every [`TAB_WIDTH`] columns (the terminal default).
+/// How many columns the tab-stop table covers, regardless of how wide the screen
+/// currently is.
+///
+/// The table is deliberately *not* geometry, and sizing it to the width was a bug: `TBC
+/// 3` ("clear every stop") can only clear the columns the table has, so a later widening
+/// would seed fresh defaults into columns the program had explicitly emptied, and the
+/// stops it deleted would come back. Covering a fixed span from the start means "every"
+/// means every, whatever the window does afterwards. xterm's array is width-independent
+/// (1024 columns) for the same reason.
+const MAX_TAB_COLUMNS: usize = 1024;
+
+/// The default table: a stop every [`TAB_WIDTH`] columns, across [`MAX_TAB_COLUMNS`] or
+/// the screen's width, whichever is more.
 fn default_tabs(cols: usize) -> Vec<bool> {
-    (0..cols).map(|c| c % TAB_WIDTH == 0).collect()
+    (0..cols.max(MAX_TAB_COLUMNS))
+        .map(|c| c % TAB_WIDTH == 0)
+        .collect()
 }
 
 /// Whether a rune bounds a double-click word selection: whitespace, or one of the
@@ -4201,6 +4407,11 @@ fn charset_from(byte: u8) -> Charset {
 /// coverage `less`, `mc`, and framed TUIs depend on.
 fn dec_special_graphics(c: char) -> char {
     match c {
+        // 0x5F is "Blank" in DEC's own chart, not an underscore: the set replaces the
+        // ASCII glyph at every position it defines, and this is the one that maps to
+        // nothing visible. Leaving it through as `_` puts an underscore in the middle
+        // of any line-drawing output that happens to contain one.
+        '_' => ' ',
         '`' => '◆',
         'a' => '▒',
         'b' => '␉',
@@ -4317,12 +4528,20 @@ impl Perform for Screen {
 
     fn print_ascii(&mut self, bytes: &[u8]) {
         // The bulk write assumes each byte is its own glyph placed one column
-        // apart. That holds only under the identity (ASCII) charset and outside
-        // insert mode; DEC Special Graphics remaps each byte to a line-drawing
-        // glyph, and insert mode shifts the row per char. Fall back to the per-char
-        // path (glyph mapping + inherent print) for both, keeping this identical to
-        // calling `Perform::print` on each byte.
-        if self.insert_mode || self.active_charset() != Charset::Ascii {
+        // apart. That holds only under the identity (ASCII) charset, outside
+        // insert mode, and outside grapheme clustering; DEC Special Graphics remaps
+        // each byte to a line-drawing glyph, insert mode shifts the row per char, and
+        // under `?2027` a byte is not its own glyph at all — it may be the *base* of a
+        // cluster that the next scalar joins and widens. `#` is one column; `#️⃣` is the
+        // same byte, two columns, and one keycap. The bulk path places cells without
+        // anchoring a cluster, so a run through it leaves nothing for a following VS16
+        // to attach to and the keycap silently loses half its width.
+        //
+        // The cost is that `?2027` turns off the bulk ASCII path, which is a real
+        // slowdown for a program that opts in. That is the right way round: the mode is
+        // off by default, so nothing pays for it unasked, and a program that asks for
+        // cluster semantics is asking for exactly the thing the fast path cannot do.
+        if self.insert_mode || self.grapheme_clustering || self.active_charset() != Charset::Ascii {
             for &b in bytes {
                 let mapped = self.map_glyph(char::from(b));
                 self.print(mapped);
@@ -4402,6 +4621,12 @@ impl Perform for Screen {
             b'P' => self.delete_chars(csi_count(params, 0)),
             b'X' => self.erase_chars(csi_count(params, 0)),
             b'S' => self.scroll_up(csi_count(params, 0)),
+            // `CSI Ps T` is SD, but `CSI Ps;Ps;Ps;Ps;Ps T` is xterm's highlight mouse
+            // tracking — a different function that merely shares a final byte. bnkterm
+            // does not implement it, and *ignoring* it is the whole of the right answer:
+            // reading it as a scroll would jerk the page every time a program asked to
+            // track the mouse, which is worse than not answering at all.
+            b'T' if params.len() == 5 => {}
             b'T' => self.scroll_down(csi_count(params, 0)),
             b'r' => {
                 let (_, rows) = self.dimensions();
@@ -4859,6 +5084,137 @@ mod tests {
         assert_eq!(s.cell(0, 4).rune, 'e');
     }
 
+    /// An erase cannot split a wide glyph: half of one is not a thing that can be drawn.
+    /// Landing on either half takes the other with it, so the range grows in whichever
+    /// direction it has to.
+    #[test]
+    fn an_erase_cannot_split_a_wide_glyph() {
+        // The leader: erasing it must take the spacer, or the spacer is left holding a
+        // column for a rune that is gone.
+        let mut s = Screen::new(6, 1);
+        print_str(&mut s, "a\u{4e00}b");
+        s.move_to(0, 1);
+        s.erase_chars(1);
+        assert_eq!(s.cell(0, 1).rune, ' ');
+        assert!(s.cell(0, 2).attrs.is_empty(), "the spacer was not orphaned");
+        assert_eq!(s.cell(0, 0).rune, 'a', "its neighbours are untouched");
+        assert_eq!(s.cell(0, 3).rune, 'b');
+
+        // The spacer: erasing it must reach *back* for the leader, or the leader keeps
+        // drawing two columns into the one cell it still owns.
+        let mut s = Screen::new(6, 1);
+        print_str(&mut s, "a\u{4e00}b");
+        s.move_to(0, 2);
+        s.erase_chars(1);
+        assert_eq!(s.cell(0, 1).rune, ' ', "the leader went with its spacer");
+        assert!(s.cell(0, 1).attrs.is_empty());
+        assert_eq!(s.cell(0, 0).rune, 'a');
+        assert_eq!(s.cell(0, 3).rune, 'b');
+    }
+
+    /// The same rule through EL, which shares the erase path: a range that starts on a
+    /// spacer reaches back one cell for its leader.
+    #[test]
+    fn erase_line_cannot_split_a_wide_glyph() {
+        let mut s = Screen::new(6, 1);
+        print_str(&mut s, "a\u{4e00}bcd");
+        s.move_to(0, 2); // the spacer
+        s.erase_line(0);
+        assert_eq!(s.row_string(0).trim_end(), "a");
+        assert!(s.cell(0, 1).attrs.is_empty(), "no orphaned leader survives");
+    }
+
+    /// Every shift cuts the row twice, and a wide glyph straddling either cut would be
+    /// sliced in half. ICH cuts at the cursor and at the last cell the right edge lets
+    /// survive; DCH cuts at the cursor and at the first cell pulled in over it.
+    #[test]
+    fn a_shift_cannot_split_a_wide_glyph() {
+        // ICH with the cursor on a spacer: the leader would stay while its second half
+        // slid away from it.
+        let mut s = Screen::new(6, 1);
+        print_str(&mut s, "a\u{4e00}b");
+        s.move_to(0, 2);
+        s.insert_chars(1);
+        assert!(s.cell(0, 1).attrs.is_empty(), "no leader left behind");
+        assert_eq!(s.cell(0, 1).rune, ' ');
+
+        // ICH pushing a glyph against the right edge: the edge eats the spacer, and the
+        // leader must not be left on the last column with nothing to draw into.
+        let mut s = Screen::new(4, 1);
+        print_str(&mut s, "ab\u{4e00}");
+        s.move_to(0, 0);
+        s.insert_chars(1);
+        assert_eq!(s.row_string(0).trim_end(), " ab");
+        assert!(
+            s.cell(0, 3).attrs.is_empty(),
+            "no orphan on the last column"
+        );
+
+        // DCH deleting a leader: its spacer would slide into the leader's place.
+        let mut s = Screen::new(6, 1);
+        print_str(&mut s, "a\u{4e00}b");
+        s.move_to(0, 1);
+        s.delete_chars(1);
+        assert_eq!(s.row_string(0).trim_end(), "a b");
+        assert!(s.cell(0, 1).attrs.is_empty(), "no spacer left behind");
+
+        // DCH with the cursor on a spacer: the leader behind it would be left drawing
+        // across ground it no longer owns.
+        let mut s = Screen::new(6, 1);
+        print_str(&mut s, "a\u{4e00}b");
+        s.move_to(0, 2);
+        s.delete_chars(1);
+        assert_eq!(s.row_string(0).trim_end(), "a b");
+        assert!(s.cell(0, 1).attrs.is_empty());
+    }
+
+    /// A one-column screen cannot hold a wide glyph, and must not pretend to.
+    ///
+    /// The invariant everything else here rests on is that a leader has its spacer. On a
+    /// single-column grid the spacer has nowhere to go — the wrap cannot help and the
+    /// no-autowrap back-up lands on the same cell — so marking the cell a leader would
+    /// break the invariant on the one screen where it cannot be kept. The glyph goes in
+    /// clipped instead.
+    #[test]
+    fn a_single_column_screen_holds_no_wide_glyph() {
+        // Autowrap moves it to the next row (equally narrow); without autowrap the
+        // back-up lands on the same cell. Both must place a plain cell, wherever it ends
+        // up: the invariant is that no half of a pair is ever left alone.
+        for autowrap in [b"\x1b[?7h".as_slice(), b"\x1b[?7l"] {
+            let mut s = Screen::new(1, 2);
+            feed(&mut s, autowrap);
+            print_str(&mut s, "\u{4e00}");
+            for row in 0..2 {
+                let cell = s.cell(row, 0);
+                assert!(
+                    !cell.is_wide_leader(),
+                    "{autowrap:?} r{row}: a leader with no spacer to own"
+                );
+                assert!(
+                    !cell.is_wide_spacer(),
+                    "{autowrap:?} r{row}: an orphan spacer"
+                );
+            }
+            assert!(
+                (0..2).any(|r| s.cell(r, 0).rune == '\u{4e00}'),
+                "{autowrap:?}: the glyph is still on the screen, clipped"
+            );
+        }
+    }
+
+    /// A shift that touches no wide glyph moves the pair along whole, cut or no cut.
+    #[test]
+    fn a_shift_moves_a_wide_glyph_along_intact() {
+        let mut s = Screen::new(4, 1);
+        print_str(&mut s, "a\u{4e00}");
+        s.move_to(0, 0);
+        s.insert_chars(1);
+        // The pair straddled neither cut, so it simply slid one column right.
+        assert_eq!(s.cell(0, 2).rune, '\u{4e00}');
+        assert!(s.cell(0, 2).is_wide_leader());
+        assert!(s.cell(0, 3).is_wide_spacer());
+    }
+
     #[test]
     fn insert_delete_lines_respect_scroll_region() {
         // The classic scroll-region interaction: IL/DL scroll only within
@@ -4923,6 +5279,204 @@ mod tests {
         s.move_to(0, 0);
         s.tab();
         assert_eq!(s.cursor(), (0, 19)); // no stops: go to last column
+    }
+
+    /// A colour the terminal was told to use is the colour it reports back.
+    ///
+    /// The same self-oracle shape as the DECRQSS one below, over the other query path: a
+    /// theme-aware program (every modern editor) sets a palette entry, asks what it is,
+    /// and paints to match. No expected string is written here — the property is that
+    /// `set` and `query` agree, and it holds for every colour, every index, and both
+    /// terminators.
+    #[test]
+    fn a_colour_query_answers_with_the_colour_that_was_set() {
+        let mut s = Screen::new(4, 1);
+        for index in [0u16, 7, 8, 15, 16, 128, 196, 255] {
+            for rgb in [
+                Rgb::new(0, 0, 0),
+                Rgb::new(255, 255, 255),
+                Rgb::new(0x12, 0x34, 0x56),
+                Rgb::new(1, 2, 3),
+            ] {
+                let mut set = Vec::new();
+                set.extend_from_slice(format!("\x1b]4;{index};").as_bytes());
+                crate::color::write_x11_color(rgb, &mut set);
+                set.push(0x07);
+                feed(&mut s, &set);
+                s.take_responses();
+
+                feed(&mut s, format!("\x1b]4;{index};?\x07").as_bytes());
+                let reply = s.take_responses();
+                let text = String::from_utf8_lossy(&reply).to_string();
+                let body = text
+                    .strip_prefix(&format!("\u{1b}]4;{index};"))
+                    .and_then(|t| t.strip_suffix('\u{7}'))
+                    .unwrap_or_else(|| panic!("index {index}: bad reply {text:?}"));
+                assert_eq!(
+                    crate::color::parse_x11_color(body.as_bytes()),
+                    Some(rgb),
+                    "index {index} was set to {rgb:?} and reported {body:?}"
+                );
+            }
+        }
+
+        // The reply mirrors the terminator it was asked with: a client that sent BEL may
+        // only be listening for BEL, and one that sent ST for ST.
+        feed(&mut s, b"\x1b]4;9;?\x1b\\");
+        let reply = s.take_responses();
+        assert!(reply.ends_with(b"\x1b\\"), "ST asked, ST answered");
+        assert!(!reply.contains(&0x07));
+        feed(&mut s, b"\x1b]4;9;?\x07");
+        let reply = s.take_responses();
+        assert!(reply.ends_with(&[0x07]), "BEL asked, BEL answered");
+    }
+
+    /// DECRQSS answers with a sequence that *reproduces* the setting, so the answer can
+    /// be checked against itself: ask, replay the reply into a fresh screen, and the two
+    /// must end up in the same state.
+    ///
+    /// A self-oracle, and worth more than a table of expected strings would be. Nobody
+    /// writes down what the reply "should" say, so nobody can write down something wrong
+    /// and bless it; the property is that a program which saves a setting, changes it,
+    /// and puts it back gets what it had — which is the entire reason DECRQSS exists.
+    #[test]
+    fn a_decrqss_answer_reproduces_the_state_it_reports() {
+        for sgr in [
+            &b""[..],
+            b"\x1b[1m",
+            b"\x1b[1;4;31m",
+            b"\x1b[3;7;9m",
+            b"\x1b[38;2;255;0;128m",
+            b"\x1b[48;5;196m",
+            b"\x1b[4:3m",
+            b"\x1b[4:2;38;5;9;48;2;1;2;3m",
+            b"\x1b[0m",
+        ] {
+            // Set the pen and print through it, so the cell carries what the pen was.
+            let mut asked = Screen::new(4, 1);
+            feed(&mut asked, sgr);
+            feed(&mut asked, b"\x1bP$qm\x1b\\");
+            let reply = asked.take_responses();
+            print_str(&mut asked, "x");
+
+            // The reply is `DCS 1 $ r <sgr> ST`; take the <sgr> body out of it.
+            let text = String::from_utf8_lossy(&reply).to_string();
+            let body = text
+                .strip_prefix("\u{1b}P1$r")
+                .and_then(|t| t.strip_suffix("\u{1b}\\"))
+                .unwrap_or_else(|| panic!("{sgr:?}: not a valid DECRQSS answer: {text:?}"));
+
+            // Replay it into a screen that has never seen the original sequence.
+            let mut replayed = Screen::new(4, 1);
+            feed(&mut replayed, format!("\u{1b}[{body}").as_bytes());
+            print_str(&mut replayed, "x");
+
+            assert_eq!(
+                replayed.cell(0, 0),
+                asked.cell(0, 0),
+                "{sgr:?} was reported as {body:?}, which does not reproduce it"
+            );
+        }
+    }
+
+    /// A resize is a window being dragged, not a program asking to lose the tab stops it
+    /// set. They survive it, in both directions.
+    #[test]
+    fn tab_stops_survive_a_resize() {
+        let mut s = Screen::new(25, 3);
+        // A custom stop at column 3, alongside the defaults at 0, 8, 16, 24.
+        feed(&mut s, b"\x1b[1;4H\x1bH");
+        s.resize(80, 3);
+
+        let stops = |s: &mut Screen| -> Vec<usize> {
+            let mut out = Vec::new();
+            s.move_to(0, 0);
+            loop {
+                s.tab();
+                let (_, col) = s.cursor();
+                if out.last() == Some(&col) {
+                    break; // parked at the last column: no further stops
+                }
+                out.push(col);
+                if out.len() > 16 {
+                    break;
+                }
+            }
+            out
+        };
+        assert_eq!(
+            stops(&mut s),
+            vec![3, 8, 16, 24, 32, 40, 48, 56, 64, 72, 79],
+            "the custom stop survived, and the defaults extend into the new width"
+        );
+
+        // And narrowing does not forget the stops it merely hid: widening finds them.
+        s.resize(25, 3);
+        assert_eq!(stops(&mut s), vec![3, 8, 16, 24]);
+        s.resize(80, 3);
+        assert_eq!(
+            stops(&mut s),
+            vec![3, 8, 16, 24, 32, 40, 48, 56, 64, 72, 79]
+        );
+    }
+
+    /// "Clear every tab stop" has to mean every one, including in columns the window has
+    /// not grown into yet.
+    ///
+    /// The table used to be sized to the width, so `TBC 3` could only clear as far as the
+    /// screen went and a later widening seeded fresh defaults into the columns it had
+    /// emptied — the stops came back from the dead. A program that clears the stops and
+    /// sets its own gets someone else's every time the window is dragged wider.
+    #[test]
+    fn clearing_every_tab_stop_survives_a_widening() {
+        let first_stop = |s: &mut Screen| -> usize {
+            s.move_to(0, 0);
+            s.tab();
+            s.cursor().1
+        };
+        let mut s = Screen::new(80, 3);
+        feed(&mut s, b"\x1b[3g");
+        assert_eq!(
+            first_stop(&mut s),
+            79,
+            "no stops left: HT parks at the margin"
+        );
+
+        s.resize(100, 3);
+        assert_eq!(
+            first_stop(&mut s),
+            99,
+            "the cleared stops stayed cleared past the old width"
+        );
+
+        // And a stop set after the clear is the only one there, at either width.
+        feed(&mut s, b"\x1b[1;11H\x1bH");
+        assert_eq!(first_stop(&mut s), 10);
+        s.resize(120, 3);
+        assert_eq!(first_stop(&mut s), 10);
+    }
+
+    /// TBC defines 0 (this column) and 3 (all). ECMA-48's other parameters speak of
+    /// line tab stops, which no terminal in use has, and xterm drops them — so a stop
+    /// must survive them. vttest's tab screen tests exactly this, by sending both at a
+    /// live stop and requiring the two lines it then prints to come out identical.
+    #[test]
+    fn tbc_ignores_the_parameters_it_does_not_define() {
+        let mut s = Screen::new(20, 1);
+        s.move_to(0, 8); // a default tab stop
+        for mode in [1, 2, 4, 5, 9] {
+            s.clear_tab_stop(mode);
+        }
+        s.move_to(0, 0);
+        s.tab();
+        assert_eq!(s.cursor(), (0, 8), "the stop survived every undefined TBC");
+
+        // 0 is the one that clears this column, and the default when absent.
+        s.move_to(0, 8);
+        s.clear_tab_stop(0);
+        s.move_to(0, 0);
+        s.tab();
+        assert_eq!(s.cursor(), (0, 16), "TBC 0 cleared the stop at column 8");
     }
 
     #[test]
@@ -5091,6 +5645,43 @@ mod tests {
         assert_eq!(s.cursor(), (0, 4), "four columns");
         assert_eq!(s.cell(0, 0).rune, '\u{1F469}', "a woman");
         assert_eq!(s.cell(0, 2).rune, '\u{1F680}', "and, separately, a rocket");
+    }
+
+    /// An ASCII byte can be the *base* of a cluster, so the bulk-write fast path has to
+    /// stand aside under `?2027`.
+    ///
+    /// `#` is one column. `#️⃣` is the same byte plus a presentation selector and a
+    /// keycap, and it is two columns and one character. The bulk path places cells
+    /// without anchoring a cluster, so a run through it left the VS16 nothing to join and
+    /// the keycap came out half width — invisible to every test that only prints
+    /// non-ASCII bases, which is what an astronaut is.
+    #[test]
+    fn an_ascii_base_still_starts_a_cluster() {
+        for base in ['#', '1', '*'] {
+            let mut s = clustering(10, 1);
+            print_str(&mut s, &format!("{base}\u{fe0f}\u{20e3}"));
+            assert_eq!(s.cursor(), (0, 2), "{base}\u{fe0f}\u{20e3} is two columns");
+            assert_eq!(s.cell(0, 0).rune, base);
+            assert!(s.cell(0, 0).is_wide_leader(), "{base}: the base widened");
+            assert!(s.cell(0, 1).is_wide_spacer());
+        }
+
+        // A whole ASCII run still works, and the last byte of it is what the next scalar
+        // joins: the fallback must not lose the anchor either.
+        let mut s = clustering(10, 1);
+        print_str(&mut s, "ab#\u{fe0f}");
+        assert_eq!(s.cursor(), (0, 4), "'a','b' one column each, '#'+VS16 two");
+        assert!(s.cell(0, 2).is_wide_leader());
+
+        // And with the mode off, the same bytes are plain wcwidth again: a zero-width
+        // selector attaches to a one-column '#'.
+        let mut s = Screen::new(10, 1);
+        print_str(&mut s, "#\u{fe0f}\u{20e3}");
+        assert_eq!(
+            s.cursor(),
+            (0, 1),
+            "?2027 off: scalars are counted, not clusters"
+        );
     }
 
     #[test]
@@ -5478,12 +6069,69 @@ mod tests {
         s.set_mode(1049, true, true); // enter alt, save cursor
         assert!(s.is_alt());
         assert_eq!(s.dump().trim(), ""); // alt starts cleared
+        assert_eq!(s.cursor(), (0, 4), "the cursor carries onto the alt screen");
+        s.move_to(0, 0);
         print_str(&mut s, "alt");
         assert_eq!(s.row_string(0).trim_end(), "alt");
         s.set_mode(1049, true, false); // leave alt, restore cursor
         assert!(!s.is_alt());
         assert_eq!(s.row_string(0).trim_end(), "main"); // primary intact
         assert_eq!(s.cursor(), (0, 4)); // cursor restored to after "main"
+    }
+
+    /// The alt screen is a different set of cells, not a different cursor: switching
+    /// carries the cursor across rather than homing it. `?1049h` saves the cursor and
+    /// clears the alt, and a program that restores expects to land where it started.
+    #[test]
+    fn the_cursor_carries_onto_the_alt_screen() {
+        let mut s = Screen::new(10, 3);
+        s.move_to(2, 5);
+        feed(&mut s, b"\x1b[?1049h");
+        assert_eq!(s.cursor(), (2, 5), "not homed to the origin");
+        feed(&mut s, b"x");
+        assert_eq!(s.cell(2, 5).rune, 'x');
+    }
+
+    /// The cursor is one cursor, and it carries *both* ways.
+    ///
+    /// Carrying it only on the way in would be a cursor that is shared entering the alt
+    /// screen and per-buffer leaving it. `?1049` cannot tell, because its restore lands
+    /// on top; `?47`/`?1047` — what a program using the alt screen without the
+    /// save/restore pair sends — can.
+    #[test]
+    fn the_cursor_carries_off_the_alt_screen_as_well_as_onto_it() {
+        let mut s = Screen::new(10, 3);
+        print_str(&mut s, "main");
+        assert_eq!(s.cursor(), (0, 4));
+
+        feed(&mut s, b"\x1b[?1047h");
+        assert_eq!(s.cursor(), (0, 4), "carried onto the alt screen");
+        feed(&mut s, b"\x1b[3;1H");
+        assert_eq!(s.cursor(), (2, 0));
+
+        feed(&mut s, b"\x1b[?1047l");
+        assert_eq!(
+            s.cursor(),
+            (2, 0),
+            "and back off it: one cursor, not one per buffer"
+        );
+        // The primary's cells are of course untouched by any of it.
+        assert_eq!(s.row_string(0).trim_end(), "main");
+    }
+
+    /// Each screen owns its DECSC slot, and it survives a trip to the other screen and
+    /// back: a program may save on the alt screen, leave, return, and restore.
+    #[test]
+    fn each_screen_keeps_its_own_saved_cursor_across_a_switch() {
+        let mut s = Screen::new(10, 4);
+        feed(&mut s, b"\x1b[?1049h"); // to the alt screen
+        s.move_to(3, 7);
+        feed(&mut s, b"\x1b7"); // DECSC on the alt screen
+        feed(&mut s, b"\x1b[?1049l"); // back to the primary
+        feed(&mut s, b"\x1b[?1049h"); // and to the alt screen again
+        feed(&mut s, b"\x1b[1;1H"); // somewhere else entirely
+        feed(&mut s, b"\x1b8"); // DECRC finds what the alt screen saved
+        assert_eq!(s.cursor(), (3, 7));
     }
 
     #[test]
@@ -5581,6 +6229,62 @@ mod tests {
         assert_eq!(s.cell(0, 3).rune, 'x');
     }
 
+    /// 0x5F is "Blank" in DEC's chart, not an underscore. A path or an identifier
+    /// printed while the line-drawing set is designated is where this shows: every
+    /// `_` in it is a blank on a real VT.
+    #[test]
+    fn the_dec_graphics_underscore_is_a_blank() {
+        let mut s = Screen::new(10, 1);
+        feed(&mut s, b"\x1b(0a_b\x1b(B_");
+        assert_eq!(s.cell(0, 0).rune, '▒');
+        assert_eq!(s.cell(0, 1).rune, ' ', "0x5F is Blank in the graphics set");
+        assert_eq!(s.cell(0, 2).rune, '␉');
+        assert_eq!(
+            s.cell(0, 3).rune,
+            '_',
+            "and an ordinary underscore in ASCII"
+        );
+    }
+
+    /// DECSC/DECRC save and restore the character set shift state, which the VT spec
+    /// lists alongside the cursor and the rendition. A program that saves, designates
+    /// the line-drawing set to paint a frame, and restores is asking for the ASCII
+    /// mapping back; without it every letter after the restore is a box glyph.
+    /// The drawing happens on row 1 so that DECRC's cursor restore (back to row 0) does
+    /// not simply overwrite the cell under test.
+    #[test]
+    fn decsc_restores_the_charset_designation() {
+        let mut s = Screen::new(10, 2);
+        // Save at (0,0) in ASCII, designate G0 = line drawing, draw on row 1, restore.
+        feed(&mut s, b"\x1b7\x1b(0\x1b[2;1Hq\x1b8q");
+        assert_eq!(
+            s.cell(1, 0).rune,
+            '─',
+            "drawn while graphics were designated"
+        );
+        assert_eq!(
+            s.cell(0, 0).rune,
+            'q',
+            "the restore put the ASCII designation back"
+        );
+    }
+
+    /// The shift state (SO/SI), not only the designation, is part of what DECSC holds.
+    #[test]
+    fn decsc_restores_the_shift_state() {
+        let mut s = Screen::new(10, 2);
+        // G1 = graphics. Save while shifted in, shift out, draw, restore, print.
+        feed(&mut s, b"\x1b)0\x1b7\x0e\x1b[2;1Hq\x1b8q");
+        assert_eq!(s.cell(1, 0).rune, '─', "drawn while shifted out to G1");
+        assert_eq!(s.cell(0, 0).rune, 'q', "the restore shifted back in to G0");
+
+        // And the other way round: saved while shifted out, the restore shifts out again.
+        let mut s = Screen::new(10, 2);
+        feed(&mut s, b"\x1b)0\x0e\x1b7\x0f\x1b[2;1Hq\x1b8q");
+        assert_eq!(s.cell(1, 0).rune, 'q', "drawn while shifted in to ASCII");
+        assert_eq!(s.cell(0, 0).rune, '─', "the restore shifted back out to G1");
+    }
+
     #[test]
     fn shift_out_in_switches_charset() {
         let mut s = Screen::new(10, 1);
@@ -5595,7 +6299,7 @@ mod tests {
     fn alt_screen_via_parser() {
         let mut s = Screen::new(6, 2);
         feed(&mut s, b"main");
-        feed(&mut s, b"\x1b[?1049h");
+        feed(&mut s, b"\x1b[?1049h\x1b[H"); // the cursor carries over, so home it
         assert!(s.is_alt());
         feed(&mut s, b"alt");
         assert_eq!(s.row_string(0).trim_end(), "alt");
@@ -5632,6 +6336,27 @@ mod tests {
         assert_eq!(s.cursor(), (0, 0));
     }
 
+    /// DECALN "sets the margins to the extremes of the page, and moves the cursor to
+    /// the home position". A stale scroll region left behind would confine every later
+    /// scroll to it.
+    #[test]
+    fn decaln_resets_the_scroll_margins() {
+        let mut s = Screen::new(3, 4);
+        s.set_scroll_region(1, 2);
+        feed(&mut s, b"\x1b#8");
+        assert_eq!(s.cursor(), (0, 0));
+
+        // With the margins back at the extremes, a scroll moves the whole page: fill
+        // the rows, then one more line feed from the bottom scrolls row 0 off.
+        feed(&mut s, b"\x1b[4;1Ha\n");
+        assert_eq!(s.row_string(0), "EEE");
+        assert_eq!(
+            s.row_string(3),
+            "   ",
+            "the whole page scrolled, not a region"
+        );
+    }
+
     #[test]
     fn wide_and_combining_via_parser() {
         let mut s = Screen::new(10, 1);
@@ -5643,31 +6368,70 @@ mod tests {
         assert_eq!(s.cell(0, 3).rune, 'b');
     }
 
+    /// The structural invariants that must hold after any input whatsoever, or `None`.
+    ///
+    /// Returns the break rather than asserting it, and that is what makes the fuzz
+    /// find promotable: an assertion cannot be asked "*would* this input have failed?",
+    /// which is the question a shrinker has to ask a few thousand times.
+    fn invariant_break(bytes: &[u8], cols: usize, rows: usize) -> Option<String> {
+        let mut s = Screen::new(cols, rows);
+        let mut p = crate::vt::Parser::new();
+        // Fed in chunks, so the incremental path is what gets checked: a break that only
+        // appears mid-stream is exactly the kind worth catching.
+        for chunk in bytes.chunks(4096) {
+            p.advance_bytes(&mut s, chunk);
+            if s.dimensions() != (cols, rows) {
+                return Some(format!("size drifted to {:?}", s.dimensions()));
+            }
+            let (cr, cc) = s.cursor();
+            if cr >= rows || cc >= cols {
+                return Some(format!("cursor {cr},{cc} is outside {cols}x{rows}"));
+            }
+            if s.primary.lines.len() != rows || s.alt.lines.len() != rows {
+                return Some("a buffer stopped holding exactly `rows` lines".to_string());
+            }
+            if s.primary.scrollback.len() > DEFAULT_SCROLLBACK {
+                return Some(format!(
+                    "scrollback grew to {} past its {DEFAULT_SCROLLBACK} cap",
+                    s.primary.scrollback.len()
+                ));
+            }
+        }
+        None
+    }
+
     #[test]
     fn random_bytes_into_screen_keep_invariants() {
-        // The whole pipeline under fuzz: ~1.2 MB of arbitrary bytes through the
-        // parser into a real Screen must never panic and must keep the grid's
-        // structural invariants (a seeded LCG, no crate).
-        let mut s = Screen::new(24, 8);
-        let mut p = crate::vt::Parser::new();
-        let mut seed: u64 = 0xDEAD_BEEF_CAFE_1234;
-        let mut buf = [0u8; 4096];
-        for _ in 0..300 {
-            for b in buf.iter_mut() {
-                seed = seed
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                *b = (seed >> 33) as u8;
-            }
-            p.advance_bytes(&mut s, &buf);
-            let (cols, rows) = s.dimensions();
-            assert_eq!((cols, rows), (24, 8));
-            let (cr, cc) = s.cursor();
-            assert!(cr < rows && cc < cols, "cursor {cr},{cc} out of bounds");
-            assert_eq!(s.primary.lines.len(), rows);
-            assert_eq!(s.alt.lines.len(), rows);
-            assert!(s.primary.scrollback.len() <= DEFAULT_SCROLLBACK);
-        }
+        // The whole pipeline under fuzz: ~1.2 MB of arbitrary bytes through the parser
+        // into a real Screen must never panic and must keep the grid's structural
+        // invariants.
+        //
+        // On a break the input is shrunk before it is reported, which is the difference
+        // between a find and a fixed bug: "an invariant broke somewhere in 1.2 MB, 200
+        // chunks deep" is a sentence, and the six bytes this prints instead are a
+        // scenario you can paste into `tests/scenarios.rs` and keep forever.
+        // A small grid on purpose: 24x8 puts every wrap, scroll and margin edge within
+        // a few characters of wherever the cursor is, so the interesting collisions
+        // happen constantly instead of once a megabyte.
+        let (cols, rows) = (24, 8);
+        let bytes = crate::fuzz::Stream::new(0xDEAD_BEEF_CAFE_1234).bytes(300 * 4096);
+
+        let Some(why) = invariant_break(&bytes, cols, rows) else {
+            return;
+        };
+        let minimal = crate::fuzz::shrink(&bytes, |b| invariant_break(b, cols, rows).is_some());
+        let because = invariant_break(&minimal, cols, rows).unwrap_or_else(|| why.clone());
+        panic!(
+            "the grid's structural invariants broke: {because}\n\n\
+             Shrunk from {} bytes to {}:\n\n    \
+             let mut s = Screen::new({cols}, {rows});\n    \
+             feed(&mut s, {});\n\n\
+             Fix the bug, then keep this: it belongs in tests/scenarios.rs as a scenario \
+             so the seed that found it never has to find it twice.",
+            bytes.len(),
+            minimal.len(),
+            crate::fuzz::as_byte_literal(&minimal),
+        );
     }
 
     /// Feed `bytes` two ways — `advance_bytes` (which bulk-writes printable-ASCII
@@ -5908,6 +6672,25 @@ mod tests {
             "and keeps showing the newest rows"
         );
         assert_eq!(s.view_cell(1, 0).rune, 'e');
+    }
+
+    /// The cap a screen is given is the cap it keeps, in both directions: a ring that
+    /// is told to hold two lines evicts the third, and one told to hold none keeps
+    /// nothing at all.
+    #[test]
+    fn with_scrollback_caps_history_where_it_is_told_to() {
+        let mut s = Screen::with_scrollback(4, 1, 2);
+        feed(&mut s, b"a\r\nb\r\nc\r\nd");
+        assert_eq!(s.scrollback_len(), 2, "the ring holds its limit, not more");
+        s.scroll_view_to_top();
+        assert_eq!(s.view_cell(0, 0).rune, 'b', "the oldest rows evicted");
+
+        // A zero-line history must keep nothing at all, where the default screen would
+        // keep it all: the alt screen is built exactly this way.
+        let mut none = Screen::with_scrollback(4, 1, 0);
+        feed(&mut none, b"a\r\nb\r\nc");
+        assert_eq!(none.scrollback_len(), 0);
+        assert_eq!(none.view_cell(0, 0).rune, 'c');
     }
 
     #[test]

@@ -13,6 +13,10 @@ pub mod app;
 pub mod color;
 pub mod config;
 pub mod error;
+/// The property lane's shared machinery (a seeded generator and a shrinker), compiled
+/// only under test so none of it can reach the shipping binary.
+#[cfg(test)]
+mod fuzz;
 pub mod gather;
 pub mod grid;
 pub mod input;

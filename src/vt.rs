@@ -208,6 +208,16 @@ pub struct Params {
     /// Parameters, and values used.
     num: usize,
     total: usize,
+    /// Whether more parameters or values arrived than this could hold.
+    ///
+    /// Recorded rather than shrugged off, because a *truncated* sequence is not a
+    /// shorter version of the sequence — it is a different one. `SGR 38;2;255;0;0` cut
+    /// after `38;2` does not mean "no colour", it means red becomes
+    /// `Rgb(0,0,0)`: black text, which on most themes is invisible. An introducer owns
+    /// the parameters that follow it, so honouring a prefix of one is the same class of
+    /// bug as failing to consume it (see `Screen::sgr`), reached from the other side.
+    /// The dispatch refuses the whole sequence instead.
+    overflowed: bool,
 }
 
 impl Params {
@@ -257,6 +267,7 @@ impl Params {
     fn clear(&mut self) {
         self.num = 0;
         self.total = 0;
+        self.overflowed = false;
     }
 
     /// Finish the value being accumulated and add it to the parameter under
@@ -264,11 +275,13 @@ impl Params {
     /// truncates rather than growing.
     #[inline]
     fn push_value(&mut self, value: u16, cur_len: &mut u8) {
-        if let Some(slot) = self.values.get_mut(self.total) {
-            *slot = value;
-            self.total += 1;
-            *cur_len = cur_len.saturating_add(1);
-        }
+        let Some(slot) = self.values.get_mut(self.total) else {
+            self.overflowed = true;
+            return;
+        };
+        *slot = value;
+        self.total += 1;
+        *cur_len = cur_len.saturating_add(1);
     }
 
     /// Close the parameter under construction, recording where its values start.
@@ -276,7 +289,11 @@ impl Params {
     fn push_param(&mut self, cur_len: &mut u8) {
         let len = *cur_len;
         *cur_len = 0;
-        if len == 0 || self.num >= MAX_PARAMS {
+        if len == 0 {
+            return;
+        }
+        if self.num >= MAX_PARAMS {
+            self.overflowed = true;
             return;
         }
         let start = (self.total as u8).saturating_sub(len);
@@ -312,7 +329,15 @@ pub struct Parser {
     /// smallest legal value for this length (to reject overlong encodings).
     utf8_remaining: u8,
     utf8_char: u32,
-    utf8_min: u32,
+    /// The byte range the *next* continuation may fall in.
+    ///
+    /// Usually `0x80..=0xbf`, but four lead bytes narrow it (Unicode Table 3-7), and
+    /// that narrowing is the whole of UTF-8's well-formedness: `E0` restricted to
+    /// `A0..BF` is what makes an overlong three-byte encoding unrepresentable rather
+    /// than merely detectable afterwards, and `ED` restricted to `80..9F` is what makes
+    /// a surrogate unrepresentable. Checking the range up front, instead of the value
+    /// after the fact, is also what makes the *count* of U+FFFDs right (see `ground`).
+    utf8_next: (u8, u8),
 }
 
 impl Default for Parser {
@@ -338,7 +363,7 @@ impl Parser {
             dcs_final: 0,
             utf8_remaining: 0,
             utf8_char: 0,
-            utf8_min: 0,
+            utf8_next: (0x80, 0xbf),
         }
     }
 
@@ -377,14 +402,21 @@ impl Parser {
         // Mid-UTF-8 (only possible in Ground): consume a continuation byte, or,
         // if this is not one, emit the replacement char and reprocess `byte`.
         if self.utf8_remaining > 0 {
-            if byte & 0xc0 == 0x80 {
+            let (lo, hi) = self.utf8_next;
+            if (lo..=hi).contains(&byte) {
                 self.utf8_char = (self.utf8_char << 6) | u32::from(byte & 0x3f);
                 self.utf8_remaining -= 1;
+                // Only the second byte is ever restricted; the rest are plain
+                // continuations.
+                self.utf8_next = (0x80, 0xbf);
                 if self.utf8_remaining == 0 {
                     p.print(self.finish_utf8());
                 }
                 return;
             }
+            // The sequence ends here, at its maximal well-formed subpart, and `byte`
+            // was never part of it: it is reprocessed below rather than swallowed.
+            // That is what puts the `(` back in `e1 28 a1` -> U+FFFD `(` U+FFFD.
             self.utf8_remaining = 0;
             p.print('\u{FFFD}');
             // fall through: handle `byte` fresh
@@ -441,25 +473,35 @@ impl Parser {
             0x20..=0x7e => p.print(char::from(byte)),
             0x7f => {}                          // DEL: ignored in ground
             0x80..=0xbf => p.print('\u{FFFD}'), // stray continuation byte
-            0xc0..=0xdf => self.utf8_begin(u32::from(byte & 0x1f), 1, 0x80),
-            0xe0..=0xef => self.utf8_begin(u32::from(byte & 0x0f), 2, 0x800),
-            0xf0..=0xf7 => self.utf8_begin(u32::from(byte & 0x07), 3, 0x1_0000),
-            0xf8..=0xff => p.print('\u{FFFD}'), // invalid lead byte
+            // Unicode Table 3-7, transcribed. The four narrowed ranges are the
+            // interesting rows: `E0` and `F0` exclude the overlong encodings, `ED`
+            // excludes the surrogates, and `F4` stops at U+10FFFF.
+            0xc0 | 0xc1 => p.print('\u{FFFD}'), // no non-overlong two-byte form exists
+            0xc2..=0xdf => self.utf8_begin(u32::from(byte & 0x1f), 1, (0x80, 0xbf)),
+            0xe0 => self.utf8_begin(u32::from(byte & 0x0f), 2, (0xa0, 0xbf)),
+            0xe1..=0xec => self.utf8_begin(u32::from(byte & 0x0f), 2, (0x80, 0xbf)),
+            0xed => self.utf8_begin(u32::from(byte & 0x0f), 2, (0x80, 0x9f)),
+            0xee | 0xef => self.utf8_begin(u32::from(byte & 0x0f), 2, (0x80, 0xbf)),
+            0xf0 => self.utf8_begin(u32::from(byte & 0x07), 3, (0x90, 0xbf)),
+            0xf1..=0xf3 => self.utf8_begin(u32::from(byte & 0x07), 3, (0x80, 0xbf)),
+            0xf4 => self.utf8_begin(u32::from(byte & 0x07), 3, (0x80, 0x8f)),
+            0xf5..=0xff => p.print('\u{FFFD}'), // past U+10FFFF, or not a lead at all
         }
     }
 
-    fn utf8_begin(&mut self, init: u32, remaining: u8, min: u32) {
+    fn utf8_begin(&mut self, init: u32, remaining: u8, next: (u8, u8)) {
         self.utf8_char = init;
         self.utf8_remaining = remaining;
-        self.utf8_min = min;
+        self.utf8_next = next;
     }
 
-    /// Turn a completed code point into a char, rejecting overlong encodings and
-    /// surrogates/out-of-range values as U+FFFD.
+    /// Turn a completed code point into a char.
+    ///
+    /// No overlong or surrogate check is needed here, and its absence is the point: the
+    /// per-lead ranges in `ground` mean an ill-formed value can never be accumulated in
+    /// the first place. The `unwrap_or` is unreachable and kept only because the
+    /// no-panic rule does not make exceptions for reasoning.
     fn finish_utf8(&self) -> char {
-        if self.utf8_char < self.utf8_min {
-            return '\u{FFFD}';
-        }
         char::from_u32(self.utf8_char).unwrap_or('\u{FFFD}')
     }
 
@@ -604,7 +646,10 @@ impl Parser {
         if self.param_started {
             self.push_param();
         }
-        if !self.ignore {
+        // An overflowed sequence is refused entire, not honoured up to the cap. See
+        // `Params::overflowed`: a prefix of an extended-colour introducer is not a
+        // smaller request, it is a wrong one.
+        if !self.ignore && !self.params.overflowed {
             p.csi_dispatch(
                 &self.params,
                 &self.intermediates[..self.num_intermediates],
@@ -734,6 +779,14 @@ impl Parser {
     }
 
     fn finish_dcs<P: Perform>(&mut self, p: &mut P) {
+        // Refused entire when the prologue overflowed, exactly as a CSI is: a DCS's
+        // parameters are laid out like a CSI's and carry the same hazard, and nothing
+        // reads them today only because the DCS sequences bnkterm answers happen to be
+        // identified by their intermediates and final byte alone. Leaving the asymmetry
+        // in would hand a truncated `Params` to whoever first writes one that does.
+        if self.params.overflowed {
+            return;
+        }
         p.dcs_dispatch(
             &self.params,
             &self.intermediates[..self.num_intermediates],
@@ -833,7 +886,9 @@ mod tests {
             intermediates: Vec<u8>,
             byte: u8,
         },
-        Osc(Vec<u8>),
+        /// The payload, and whether BEL (rather than ST) ended it. The terminator is
+        /// part of the sequence, so a recorder that drops it cannot round-trip.
+        Osc(Vec<u8>, bool),
     }
 
     impl Perform for Recorder {
@@ -857,8 +912,9 @@ mod tests {
                 byte,
             });
         }
-        fn osc_dispatch(&mut self, data: &[u8], _bel_terminated: bool) {
-            self.actions.push(Action::Osc(data.to_vec()));
+        fn osc_dispatch(&mut self, data: &[u8], bel_terminated: bool) {
+            self.actions
+                .push(Action::Osc(data.to_vec(), bel_terminated));
         }
         fn dcs_dispatch(&mut self, params: &Params, intermediates: &[u8], action: u8, data: &[u8]) {
             self.actions.push(Action::Dcs {
@@ -875,6 +931,132 @@ mod tests {
         let mut r = Recorder::default();
         p.advance_bytes(&mut r, bytes);
         r.actions
+    }
+
+    impl Action {
+        /// Write this action back out as the bytes that would produce it.
+        ///
+        /// The inverse of parsing, which is what makes it an oracle: see
+        /// [`round_trip`].
+        fn encode(&self, out: &mut Vec<u8>) {
+            match self {
+                Action::Print(c) => {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                }
+                Action::Execute(b) => out.push(*b),
+                Action::Csi {
+                    params,
+                    intermediates,
+                    private,
+                    action,
+                } => {
+                    out.extend_from_slice(b"\x1b[");
+                    if *private != 0 {
+                        out.push(*private);
+                    }
+                    encode_params(params, out);
+                    out.extend_from_slice(intermediates);
+                    out.push(*action);
+                }
+                Action::Esc {
+                    intermediates,
+                    byte,
+                } => {
+                    out.push(0x1b);
+                    out.extend_from_slice(intermediates);
+                    out.push(*byte);
+                }
+                Action::Osc(data, bel) => {
+                    out.extend_from_slice(b"\x1b]");
+                    out.extend_from_slice(data);
+                    if *bel {
+                        out.push(0x07);
+                    } else {
+                        out.extend_from_slice(b"\x1b\\");
+                    }
+                }
+                Action::Dcs {
+                    params,
+                    intermediates,
+                    action,
+                    data,
+                } => {
+                    out.extend_from_slice(b"\x1bP");
+                    encode_params(params, out);
+                    out.extend_from_slice(intermediates);
+                    out.push(*action);
+                    out.extend_from_slice(data);
+                    out.extend_from_slice(b"\x1b\\");
+                }
+            }
+        }
+    }
+
+    /// Parameters as they were written: sub-parameters joined by `:`, parameters by `;`.
+    fn encode_params(params: &[Vec<u16>], out: &mut Vec<u8>) {
+        for (i, p) in params.iter().enumerate() {
+            if i > 0 {
+                out.push(b';');
+            }
+            for (j, v) in p.iter().enumerate() {
+                if j > 0 {
+                    out.push(b':');
+                }
+                out.extend_from_slice(v.to_string().as_bytes());
+            }
+        }
+    }
+
+    /// Parse `src`, write the actions back out, and assert the bytes come back
+    /// identical.
+    ///
+    /// This is a **structurally different oracle** from the golden suite, and the
+    /// difference is the whole point. A golden tests `bytes → grid`, so it can only see
+    /// what the parser *kept*: parse `CSI 4:3 m` as a plain underline, drop the `3` that
+    /// says "curly", and every golden stays green because the grid has no way to show
+    /// what was thrown away. Round-tripping asks the parser to write down what it
+    /// understood, and a dropped parameter cannot survive that — the bytes come back
+    /// shorter than they went in.
+    ///
+    /// It needs no expected value at all, which is the other half of the point: the
+    /// property is internal, so there is no answer key to bless a bug into.
+    fn round_trip(src: &[u8]) -> Vec<Action> {
+        let actions = run(src);
+        let mut out = Vec::new();
+        for a in &actions {
+            a.encode(&mut out);
+        }
+        assert!(
+            out == src,
+            "round trip changed the bytes\n  in:  {:?}\n  out: {:?}\n  actions: {actions:?}",
+            String::from_utf8_lossy(src),
+            String::from_utf8_lossy(&out),
+        );
+        actions
+    }
+
+    /// A round trip that lands on `canonical` rather than back on `src`.
+    ///
+    /// Not an escape hatch for bugs: it names the places where two spellings mean the
+    /// same thing and the parser deliberately keeps only one of them. Each use is a
+    /// claim that the difference carries no meaning, and it has to be argued at the call
+    /// site — an omitted parameter *is* zero, so `CSI ;4m` and `CSI 0;4m` are the same
+    /// sequence, and only one of them can come back.
+    fn round_trip_as(src: &[u8], canonical: &[u8]) -> Vec<Action> {
+        let actions = run(src);
+        let mut out = Vec::new();
+        for a in &actions {
+            a.encode(&mut out);
+        }
+        assert!(
+            out == canonical,
+            "round trip did not canonicalize as expected\n  in:   {:?}\n  want: {:?}\n  got:  {:?}",
+            String::from_utf8_lossy(src),
+            String::from_utf8_lossy(canonical),
+            String::from_utf8_lossy(&out),
+        );
+        actions
     }
 
     /// The reference path: feed one byte at a time through `advance`, bypassing the
@@ -1105,23 +1287,31 @@ mod tests {
 
     #[test]
     fn a_flood_of_sub_parameters_is_bounded() {
-        // The child writes this. A sequence with more values than we hold must truncate
-        // and stay well-formed, never grow state and never trap.
+        // The child writes this. A sequence with more values than we hold is refused
+        // whole: it must never grow state, never trap, and never arrive truncated —
+        // a prefix of `38:2:...` is a *wrong* colour, not a smaller request.
         let mut input = b"\x1b[4".to_vec();
         for _ in 0..500 {
             input.extend_from_slice(b":9");
         }
         input.push(b'm');
-        let actions = run(&input);
-        match actions.as_slice() {
+        assert_eq!(
+            run(&input),
+            vec![],
+            "the overflowed sequence dispatched nothing"
+        );
+
+        // Right up to the cap it is still a sequence, and still says what it said.
+        let mut input = b"\x1b[4".to_vec();
+        for _ in 0..MAX_PARAMS - 1 {
+            input.extend_from_slice(b":9");
+        }
+        input.push(b'm');
+        match run(&input).as_slice() {
             [Action::Csi { params, action, .. }] => {
                 assert_eq!(*action, b'm');
                 assert_eq!(params.len(), 1, "still one parameter");
-                let values = params.first().map(Vec::len).unwrap_or(0);
-                assert!(
-                    values <= MAX_PARAMS,
-                    "{values} values, capped at {MAX_PARAMS}"
-                );
+                assert_eq!(params.first().map(Vec::len), Some(MAX_PARAMS));
                 assert_eq!(params.first().and_then(|p| p.first()), Some(&4));
             }
             other => panic!("expected one CSI, got {other:?}"),
@@ -1157,7 +1347,7 @@ mod tests {
         bytes.extend_from_slice(b"\x1b\\");
         let actions = run(&bytes);
         assert!(
-            !actions.iter().any(|a| matches!(a, Action::Osc(_))),
+            !actions.iter().any(|a| matches!(a, Action::Osc(..))),
             "an overlong OSC dispatches nothing, {actions:?}"
         );
 
@@ -1165,17 +1355,20 @@ mod tests {
         let mut ok = b"\x1b]0;".to_vec();
         ok.resize(OSC_MAX, b'a');
         ok.extend_from_slice(b"\x07");
-        assert!(run(&ok).iter().any(|a| matches!(a, Action::Osc(_))));
+        assert!(run(&ok).iter().any(|a| matches!(a, Action::Osc(..))));
     }
 
     #[test]
     fn osc_title_bel_and_st_terminated() {
         assert_eq!(
             run(b"\x1b]0;title\x07"),
-            vec![Action::Osc(b"0;title".to_vec())]
+            vec![Action::Osc(b"0;title".to_vec(), true)]
         );
         // ST (ESC \) terminates too, and is not itself an action.
-        assert_eq!(run(b"\x1b]2;hi\x1b\\"), vec![Action::Osc(b"2;hi".to_vec())]);
+        assert_eq!(
+            run(b"\x1b]2;hi\x1b\\"),
+            vec![Action::Osc(b"2;hi".to_vec(), false)]
+        );
     }
 
     #[test]
@@ -1214,8 +1407,99 @@ mod tests {
         );
         // A stray continuation byte alone.
         assert_eq!(run(&[0x80]), vec![Action::Print('\u{FFFD}')]);
-        // Overlong encoding of '/' (0x2f) is rejected.
-        assert_eq!(run(&[0xc0, 0xaf]), vec![Action::Print('\u{FFFD}')]);
+    }
+
+    /// How many U+FFFDs an ill-formed sequence becomes, transcribed from the tables that
+    /// answer it. Not a detail: the count is a *column count*, so a stream of broken
+    /// UTF-8 shifts everything after it by however many the terminal got wrong.
+    ///
+    /// Unicode 16 §3.9 defines a maximal subpart as the longest subsequence at an
+    /// unconvertible offset that is either the initial subsequence of some well-formed
+    /// sequence, or one byte. `C0` begins nothing well-formed (Table 3-7 starts at `C2`),
+    /// so it is one byte, and the `AF` after it is another — two replacements, not one
+    /// for the pair. The tables below say so in as many words.
+    #[test]
+    fn ill_formed_utf8_yields_one_replacement_per_maximal_subpart() {
+        let printed = |bytes: &[u8]| -> String {
+            run(bytes)
+                .iter()
+                .filter_map(|a| match a {
+                    Action::Print(c) => Some(*c),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Table 3-8, non-shortest (overlong) forms.
+        assert_eq!(printed(&[0xc0, 0xaf]), "\u{FFFD}\u{FFFD}");
+        assert_eq!(printed(&[0xe0, 0x80, 0xbf]), "\u{FFFD}\u{FFFD}\u{FFFD}");
+        assert_eq!(
+            printed(&[0xf0, 0x81, 0x82, 0x41]),
+            "\u{FFFD}\u{FFFD}\u{FFFD}A"
+        );
+
+        // Table 3-9, surrogates and values past U+10FFFF.
+        assert_eq!(printed(&[0xed, 0xa0, 0x80]), "\u{FFFD}\u{FFFD}\u{FFFD}");
+        assert_eq!(printed(&[0xed, 0xbf, 0xbf]), "\u{FFFD}\u{FFFD}\u{FFFD}");
+        assert_eq!(
+            printed(&[0xf4, 0x91, 0x92, 0x93, 0xff]),
+            "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}"
+        );
+        assert_eq!(printed(&[0x41, 0x80, 0xbf, 0x42]), "A\u{FFFD}\u{FFFD}B");
+
+        // Table 3-10, truncated sequences. Here a maximal subpart is *two* bytes: `E1 80`
+        // is the start of something well-formed, so it collapses to one replacement
+        // rather than two.
+        assert_eq!(
+            printed(&[0xe1, 0x80, 0xe2, 0xf0, 0x91, 0x92, 0xf1, 0xbf, 0x41]),
+            "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}A"
+        );
+
+        // And the edges of Table 3-7 itself, which is what makes the above fall out.
+        assert_eq!(
+            printed(&[0xc2, 0x80]),
+            "\u{80}",
+            "the smallest two-byte form"
+        );
+        assert_eq!(
+            printed(&[0xe0, 0xa0, 0x80]),
+            "\u{800}",
+            "the smallest three-byte"
+        );
+        assert_eq!(
+            printed(&[0xed, 0x9f, 0xbf]),
+            "\u{d7ff}",
+            "just below the surrogates"
+        );
+        assert_eq!(printed(&[0xee, 0x80, 0x80]), "\u{e000}", "just above them");
+        assert_eq!(
+            printed(&[0xf4, 0x8f, 0xbf, 0xbf]),
+            "\u{10ffff}",
+            "the last code point"
+        );
+    }
+
+    /// A sequence cut by the end of a chunk is *held*, not replaced.
+    ///
+    /// This is the one place bnkterm deliberately parts company with §3.9, which says a
+    /// truncated sequence at the end of the stream is ill-formed and becomes U+FFFD. A
+    /// terminal has no end of stream: a PTY read boundary lands wherever the kernel put
+    /// it, and the rest of the crab is in the next read. Emitting a replacement at the
+    /// chunk edge would corrupt every wide character unlucky enough to straddle one —
+    /// and would break `every_scenario_is_invariant_to_chunking`, which is the property
+    /// that says so.
+    #[test]
+    fn a_sequence_cut_by_a_chunk_boundary_waits_for_the_rest() {
+        let mut p = Parser::new();
+        let mut r = Recorder::default();
+        p.advance_bytes(&mut r, &[0xf0, 0x9f]); // half a crab
+        assert_eq!(
+            r.actions,
+            vec![],
+            "nothing is emitted for a partial sequence"
+        );
+        p.advance_bytes(&mut r, &[0xa6, 0x80]); // the other half
+        assert_eq!(r.actions, vec![Action::Print('\u{1f980}')]);
     }
 
     #[test]
@@ -1235,18 +1519,35 @@ mod tests {
 
     #[test]
     fn too_many_params_are_bounded() {
-        // Feeding far more than MAX_PARAMS separators must not grow state or panic.
+        // Feeding far more than MAX_PARAMS separators must not grow state or panic, and
+        // must not dispatch a truncated sequence either (see `Params::overflowed`).
         let mut input = b"\x1b[".to_vec();
         for _ in 0..1000 {
             input.push(b'1');
             input.push(b';');
         }
         input.push(b'm');
-        let actions = run(&input);
-        match &actions[..] {
-            [Action::Csi { params, .. }] => assert!(params.len() <= MAX_PARAMS),
-            other => panic!("expected one CSI, got {other:?}"),
-        }
+        assert_eq!(
+            run(&input),
+            vec![],
+            "the overflowed sequence dispatched nothing"
+        );
+
+        // The text after it is still text: the sequence was consumed, not leaked.
+        let mut input = input.clone();
+        input.push(b'X');
+        assert_eq!(run(&input), vec![Action::Print('X')]);
+
+        // The parser is not left poisoned: the next sequence dispatches normally.
+        let mut p = Parser::new();
+        let mut r = Recorder::default();
+        p.advance_bytes(&mut r, &input);
+        p.advance_bytes(&mut r, b"\x1b[31m");
+        assert!(
+            matches!(r.actions.last(), Some(Action::Csi { action: b'm', .. })),
+            "recovered: {:?}",
+            r.actions
+        );
     }
 
     #[test]
@@ -1324,5 +1625,131 @@ mod tests {
             }
             assert_eq!(rec.actions, reference, "chunk split {split}");
         }
+    }
+
+    /// The parser writes back exactly what it read, for every sequence bnkterm claims to
+    /// understand.
+    ///
+    /// This is the oracle the golden suite structurally cannot be. A golden watches
+    /// `bytes -> grid`, so it only ever sees what the parser *kept*: drop the `3` from
+    /// `CSI 4:3 m` and the cell is still underlined, every golden is still green, and the
+    /// curly underline an LSP asked for is silently straight forever. Here the bytes come
+    /// back short and it fails immediately.
+    #[test]
+    fn every_sequence_round_trips() {
+        // Text and C0.
+        round_trip(b"hello");
+        round_trip(b"a\r\nb\tc\x08d");
+        round_trip("wide \u{4e00} mark e\u{301} crab \u{1f980}".as_bytes());
+
+        // CSI: no parameters, one, several, and a private marker.
+        round_trip(b"\x1b[m");
+        round_trip(b"\x1b[0m");
+        round_trip(b"\x1b[1;31m");
+        round_trip(b"\x1b[H");
+        round_trip(b"\x1b[1;2H");
+        round_trip(b"\x1b[?25h");
+        round_trip(b"\x1b[?1049l");
+        round_trip(b"\x1b[3J");
+        round_trip(b"\x1b[2K");
+        round_trip(b"\x1b[10X");
+        round_trip(b"\x1b[5P");
+        round_trip(b"\x1b[1;10r");
+
+        // Sub-parameters: the whole reason a parameter is a list and not a number.
+        round_trip(b"\x1b[4:3m");
+        round_trip(b"\x1b[4:0m");
+        round_trip(b"\x1b[58:2:0:255:0:255m");
+        round_trip(b"\x1b[38;2;1;2;3m");
+        round_trip(b"\x1b[38;5;196m");
+        round_trip_as(b"\x1b[0;32;58:2::1:2:3;3m", b"\x1b[0;32;58:2:0:1:2:3;3m");
+
+        // Intermediates.
+        round_trip(b"\x1b[1 q");
+        round_trip(b"\x1b[?2026$p");
+
+        // ESC, including the charset designators.
+        round_trip(b"\x1b7");
+        round_trip(b"\x1b8");
+        round_trip(b"\x1bM");
+        round_trip(b"\x1bD");
+        round_trip(b"\x1bE");
+        round_trip(b"\x1bc");
+        round_trip(b"\x1b(0");
+        round_trip(b"\x1b(B");
+        round_trip(b"\x1b)0");
+        round_trip(b"\x1b#8");
+
+        // OSC, both terminators. The terminator is part of the sequence: a client that
+        // sent BEL may only be listening for BEL.
+        round_trip(b"\x1b]0;a title\x07");
+        round_trip(b"\x1b]2;a title\x1b\\");
+        round_trip(b"\x1b]8;id=x;http://example.com/\x1b\\");
+        round_trip(b"\x1b]11;?\x07");
+
+        // DCS.
+        round_trip(b"\x1bP$qm\x1b\\");
+        round_trip(b"\x1bP$qr\x1b\\");
+        round_trip(b"\x1bP+q544e\x1b\\");
+
+        // A realistic mixed stream.
+        round_trip(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[1;32mok\x1b[0m\r\n\x1b[?25l");
+    }
+
+    /// The three places where two spellings mean one thing, and the parser keeps one.
+    ///
+    /// Each is a claim that the difference carries no meaning, and each is argued rather
+    /// than accepted: this is the escape hatch that would quietly swallow a real bug if
+    /// it were used to make a failure go away.
+    #[test]
+    fn round_trips_that_canonicalize_say_why() {
+        // An omitted parameter *is* zero (ECMA-48: an empty parameter takes its default,
+        // and SGR's default is 0). `CSI ;4m` and `CSI 0;4m` are the same sequence, so
+        // only one of them can come back.
+        round_trip_as(b"\x1b[;4m", b"\x1b[0;4m");
+        round_trip_as(b"\x1b[1;;2m", b"\x1b[1;0;2m");
+
+        // The same rule one level down: the empty colour-space slot in the colon form of
+        // truecolour is an omitted sub-parameter, which is zero.
+        round_trip_as(b"\x1b[38:2::1:2:3m", b"\x1b[38:2:0:1:2:3m");
+
+        // A parameter is a number, and numbers do not remember how they were written.
+        round_trip_as(b"\x1b[00003;2H", b"\x1b[3;2H");
+        round_trip_as(b"\x1b[0007m", b"\x1b[7m");
+    }
+
+    /// The oracle's own guard: a parser that drops a sub-parameter must fail this, and
+    /// the assertion below is what proves the test can tell.
+    ///
+    /// Without this, `every_sequence_round_trips` could be vacuous — passing because the
+    /// encoder faithfully re-encodes whatever the parser produced, however wrong.
+    #[test]
+    fn a_dropped_sub_parameter_cannot_survive_a_round_trip() {
+        // What the parser actually does: keeps both, so the bytes return intact.
+        let actions = round_trip(b"\x1b[4:3m");
+        let Some(Action::Csi { params, .. }) = actions.first() else {
+            panic!("expected a CSI, got {actions:?}");
+        };
+        assert_eq!(
+            params,
+            &vec![vec![4, 3]],
+            "the sub-parameter survived parsing"
+        );
+
+        // What a parser that dropped the `3` would produce, and what it would encode back
+        // to: `CSI 4m`, which is four bytes where five went in.
+        let dropped = Action::Csi {
+            params: vec![vec![4]],
+            intermediates: vec![],
+            private: 0,
+            action: b'm',
+        };
+        let mut out = Vec::new();
+        dropped.encode(&mut out);
+        assert_eq!(out, b"\x1b[4m", "the loss is visible in the bytes");
+        assert_ne!(
+            out, b"\x1b[4:3m",
+            "which is exactly what the round trip catches"
+        );
     }
 }

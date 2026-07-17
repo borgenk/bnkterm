@@ -332,20 +332,38 @@ mod tests {
         }
     }
 
+    /// What we write is what a client sends back at us, so the two must agree — for
+    /// every colour, not for the handful someone thought to list.
+    ///
+    /// Exhaustive rather than sampled, and it costs nothing to be: the codec treats the
+    /// three channels independently, so sweeping all 256 byte values through each
+    /// position in turn covers every one of the 16.7M colours the pair can carry. A
+    /// self-oracle — no expected string is written down, so none can be written wrong.
     #[test]
     fn a_color_reply_round_trips_through_its_own_format() {
-        // What we write is what a client sends back at us, so the two must agree.
-        for color in [
-            Rgb::new(0, 0, 0),
-            Rgb::new(255, 255, 255),
-            Rgb::new(0x28, 0x2c, 0x34),
-            Rgb::new(1, 2, 3),
-        ] {
-            let mut out = Vec::new();
-            write_x11_color(color, &mut out);
-            assert_eq!(parse_x11_color(&out), Some(color), "{out:?}");
-        }
         let mut out = Vec::new();
+        for v in 0..=255u8 {
+            for color in [
+                Rgb::new(v, 0, 0),
+                Rgb::new(0, v, 0),
+                Rgb::new(0, 0, v),
+                Rgb::new(v, v, v),
+                Rgb::new(v, 255 - v, v / 2),
+            ] {
+                out.clear();
+                write_x11_color(color, &mut out);
+                assert_eq!(
+                    parse_x11_color(&out),
+                    Some(color),
+                    "{color:?} wrote as {:?}",
+                    String::from_utf8_lossy(&out)
+                );
+            }
+        }
+
+        // The exact wire form, pinned once: a client is entitled to the doubled-byte
+        // 16-bit spelling xterm emits, not merely something we can read back ourselves.
+        out.clear();
         write_x11_color(Rgb::new(0x28, 0x2c, 0x34), &mut out);
         assert_eq!(out, b"rgb:2828/2c2c/3434");
     }
