@@ -21,7 +21,7 @@
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
-use super::message::{PointerEvent, ToTerminal, ToWindow};
+use crate::app::message::{PointerEvent, Side, ToTerminal, ToWindow};
 use crate::color::Theme;
 use crate::config::TabBarConfig;
 use crate::error::Result;
@@ -60,34 +60,96 @@ const BELL_FLASH: Duration = Duration::from_millis(120);
 /// when the wheel falls back to arrow keys on the alt screen.
 const WHEEL_LINES: usize = 3;
 
-/// The granularity a selection drag extends by, chosen from the press's click
-/// count: a single click selects by character, a double-click by word, a
-/// triple-click by whole (soft-wrapped) line.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SelectMode {
-    Char,
-    Word,
-    Line,
+/// A vertical cell edge: edge `col` on `row` sits just before cell `col`, so `col`
+/// runs `0..=cols` with the last edge the row's right margin. A character drag's
+/// endpoints are edges, not cells: the pointer rounds to the nearer edge of the
+/// cell it is over (see [`Edge::nearest`]), and the drag selects exactly the cells
+/// with both edges inside it. Ordered row-major, like the cells between.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct Edge {
+    row: AbsRow,
+    col: usize,
+}
+
+impl Edge {
+    /// The edge of cell `(row, col)` nearer the pointer: the cell's own start from
+    /// its left half, the next cell's start from its right. This rounding is what
+    /// forgives a near-miss press — landing in the trailing half of the blank
+    /// before a word anchors the selection at the word, not the blank — the same
+    /// forgiveness alacritty (at the midline) and ghostty (at 60%) apply.
+    fn nearest(row: AbsRow, col: usize, side: Side) -> Edge {
+        Edge {
+            row,
+            col: col.saturating_add((side == Side::Right) as usize),
+        }
+    }
+}
+
+/// The granularity a selection drag extends by and the anchor it pivots around,
+/// chosen from the press's click count: a single click drags by character around
+/// the pressed cell's nearer [`Edge`]; a double-click drags by word and a
+/// triple-click by whole (soft-wrapped) line, each around the clicked unit's
+/// inclusive cell range so the anchored unit always stays selected.
+#[derive(Clone, Copy)]
+enum DragMode {
+    Char(Edge),
+    Word(((AbsRow, usize), (AbsRow, usize))),
+    Line(((AbsRow, usize), (AbsRow, usize))),
+}
+
+impl DragMode {
+    /// The last row the anchor names: once it has aged off the front of the ring,
+    /// everything the anchor named is behind the oldest line still held, and the
+    /// prune drops the drag (see [`TerminalCore::prune_selection`]).
+    fn last_row(self) -> AbsRow {
+        match self {
+            DragMode::Char(edge) => edge.row,
+            DragMode::Word(unit) | DragMode::Line(unit) => unit.1 .0,
+        }
+    }
 }
 
 /// A left-drag in progress: everything the pointer needs to keep extending it.
 ///
-/// One value rather than three fields, because they are only meaningful together. In
+/// One value rather than two fields, because they are only meaningful together. In
 /// particular the `epoch`: a character drag deliberately paints *no* selection until it
-/// leaves the cell it started in (so a plain click never flashes), yet it is already
-/// pinned to an anchor. If the grid renumbers its rows in that window — a resize, an
+/// crosses a cell midline (so a plain click never flashes), yet it is already pinned
+/// to an anchor. If the grid renumbers its rows in that window — a resize, an
 /// alt-screen switch, a `clear`, a region scroll — the anchor names nothing, and the drag
 /// has to be cancelled rather than resumed against whatever row inherited the id. Kept
 /// beside the anchor it qualifies, there is no way to check one and forget the other.
 #[derive(Clone, Copy)]
 struct Drag {
-    /// The granularity the drag extends by, from the press's click count.
-    mode: SelectMode,
-    /// The clicked unit's inclusive cell range (a character, word, or line), the pivot a
-    /// drag extends around so the anchored unit always stays selected.
-    anchor: ((AbsRow, usize), (AbsRow, usize)),
+    /// The granularity the drag extends by and the anchor it pivots around.
+    mode: DragMode,
     /// The identity regime the anchor's rows were minted in.
     epoch: RowEpoch,
+}
+
+/// The inclusive cell range a character drag between edges `a` and `b` covers (in
+/// either order), or `None` when it covers no whole cell: a press-and-wiggle that
+/// crossed no midline, or a drag from one cell's trailing half to the next cell's
+/// leading half, which rounds both endpoints to the same edge. The end rounds
+/// exactly like the start, so a cell the drag reaches less than halfway into
+/// stays out at either end.
+///
+/// An edge at `cols` is the row's right margin, the same boundary as the next
+/// row's edge 0; the arithmetic steps across that seam in both directions (a
+/// start on the margin begins on the row below, an end on edge 0 stops at the
+/// row above). At the ends of the id space the step has nowhere to go and the
+/// range is empty.
+fn char_range(a: Edge, b: Edge, cols: usize) -> Option<((AbsRow, usize), (AbsRow, usize))> {
+    let (s, e) = if a <= b { (a, b) } else { (b, a) };
+    let start = if s.col >= cols {
+        (s.row.next()?, 0)
+    } else {
+        (s.row, s.col)
+    };
+    let end = match e.col.checked_sub(1) {
+        Some(col) => (e.row, col),
+        None => (e.row.prev()?, cols.checked_sub(1)?),
+    };
+    (start <= end).then_some((start, end))
 }
 
 /// What one budgeted pass over a core's gather queue observed. The tab manager
@@ -580,6 +642,7 @@ impl TerminalCore {
                 col,
                 row,
                 count,
+                side,
             } => {
                 if reporting {
                     self.mouse_held = pressed.then_some(button);
@@ -601,7 +664,7 @@ impl TerminalCore {
                     // (character/word/line), a release ends the drag and offers the
                     // text to the clipboard and primary selection.
                     if pressed {
-                        self.begin_selection(row, col, count);
+                        self.begin_selection(row, col, side, count);
                     } else {
                         self.drag = None;
                         self.finish_selection();
@@ -614,9 +677,9 @@ impl TerminalCore {
                     self.outbox.push(ToWindow::PastePrimary);
                 }
             }
-            PointerEvent::Motion { col, row } => {
+            PointerEvent::Motion { col, row, side } => {
                 if self.drag.is_some() {
-                    self.extend_selection(row, col);
+                    self.extend_selection(row, col, side);
                 } else if reporting {
                     // Report motion to a program that asked for it (drag under ?1002,
                     // any move under ?1003).
@@ -820,25 +883,28 @@ impl TerminalCore {
     /// Begin a selection at display `(row, col)` with the granularity the click
     /// `count` picks: one click a character, two the word, three the whole
     /// (soft-wrapped) line. The clicked unit is the anchor a drag pivots around. A
-    /// plain click paints nothing yet (its selection appears only once the drag
-    /// leaves the cell, see [`Self::extend_selection`]), so a single click never
-    /// flashes the cell under it; a word/line click is a real selection at once.
-    fn begin_selection(&mut self, row: usize, col: usize, count: usize) {
+    /// plain click paints nothing yet (a character drag's selection appears only
+    /// once it crosses a cell midline, see [`Self::extend_selection`]), so a single
+    /// click never flashes the cell under it; a word/line click is a real selection
+    /// at once.
+    fn begin_selection(&mut self, row: usize, col: usize, side: Side, count: usize) {
         let abs = self.screen.abs_row(row);
-        let (mode, anchor) = match count {
-            2 => (SelectMode::Word, self.screen.word_at(abs, col)),
-            n if n >= 3 => (SelectMode::Line, self.screen.line_at(abs)),
-            _ => (SelectMode::Char, ((abs, col), (abs, col))),
+        let (mode, unit) = match count {
+            2 => {
+                let unit = self.screen.word_at(abs, col);
+                (DragMode::Word(unit), Some(unit))
+            }
+            n if n >= 3 => {
+                let unit = self.screen.line_at(abs);
+                (DragMode::Line(unit), Some(unit))
+            }
+            _ => (DragMode::Char(Edge::nearest(abs, col, side)), None),
         };
         let epoch = self.screen.row_epoch();
-        self.drag = Some(Drag {
-            mode,
+        self.drag = Some(Drag { mode, epoch });
+        self.selection = unit.map(|(anchor, head)| Selection {
             anchor,
-            epoch,
-        });
-        self.selection = (mode != SelectMode::Char).then_some(Selection {
-            anchor: anchor.0,
-            head: anchor.1,
+            head,
             epoch,
         });
     }
@@ -846,20 +912,29 @@ impl TerminalCore {
     /// Extend the in-progress drag to display `(row, col)`, snapped to its
     /// granularity: the span runs from the anchored unit to the unit under the
     /// pointer, so a word/line drag never splits a word or line. A character drag
-    /// that has not yet left the anchor cell stays empty, so it reads as a click.
-    fn extend_selection(&mut self, row: usize, col: usize) {
+    /// selects the cells between its two rounded edges (see [`char_range`]), so it
+    /// stays empty — and reads as a click — until it first crosses a midline, and
+    /// a cell at either end joins only once the pointer is over half-way into it.
+    fn extend_selection(&mut self, row: usize, col: usize, side: Side) {
         let Some(drag) = self.drag else {
             return;
         };
         let abs = self.screen.abs_row(row);
-        let unit = match drag.mode {
-            SelectMode::Char => ((abs, col), (abs, col)),
-            SelectMode::Word => self.screen.word_at(abs, col),
-            SelectMode::Line => self.screen.line_at(abs),
+        let range = match drag.mode {
+            DragMode::Char(anchor) => {
+                let cols = self.screen.dimensions().0;
+                char_range(anchor, Edge::nearest(abs, col, side), cols)
+            }
+            DragMode::Word(anchor) => {
+                let unit = self.screen.word_at(abs, col);
+                Some((anchor.0.min(unit.0), anchor.1.max(unit.1)))
+            }
+            DragMode::Line(anchor) => {
+                let unit = self.screen.line_at(abs);
+                Some((anchor.0.min(unit.0), anchor.1.max(unit.1)))
+            }
         };
-        let start = drag.anchor.0.min(unit.0);
-        let end = drag.anchor.1.max(unit.1);
-        let sel = (drag.mode != SelectMode::Char || start != end).then_some(Selection {
+        let sel = range.map(|(start, end)| Selection {
             anchor: start,
             head: end,
             epoch: drag.epoch,
@@ -1072,7 +1147,7 @@ impl TerminalCore {
     /// there, and scrolling back reveals it, as in xterm.
     ///
     /// The drag is checked separately from the selection, and must be: a character drag
-    /// that has not yet left the cell it started in has an anchor but no selection to
+    /// that has not yet crossed a cell midline has an anchor but no selection to
     /// speak for it, and resuming it against a renumbered grid would drag out a span from
     /// a row the user never touched.
     ///
@@ -1081,17 +1156,16 @@ impl TerminalCore {
     /// whatever those cells hold when you ask for them.
     fn prune_selection(&mut self) {
         let epoch = self.screen.row_epoch();
-        let live_rows = |cell: (AbsRow, usize)| self.screen.row_exists(cell.0);
 
         if self
             .drag
-            .is_some_and(|d| d.epoch != epoch || !live_rows(d.anchor.1))
+            .is_some_and(|d| d.epoch != epoch || !self.screen.row_exists(d.mode.last_row()))
         {
             self.drag = None;
         }
         let stale = self
             .selection
-            .is_some_and(|sel| sel.epoch != epoch || !live_rows(sel.ordered().1));
+            .is_some_and(|sel| sel.epoch != epoch || !self.screen.row_exists(sel.ordered().1 .0));
         if stale {
             self.selection = None;
             self.drag = None;
@@ -1917,8 +1991,15 @@ mod tests {
         TerminalCore::new(true, 80, 24, metrics, 80 * 8, 24 * 16, 0)
     }
 
+    /// The plain helpers stay in the cell's left half, whose nearer edge is the
+    /// cell's own start — the classic floor mapping; `press_in`/`drag_in` pick a
+    /// half explicitly for the edge-rounding cases.
     fn press(core: &mut TerminalCore, button: MouseButton, pressed: bool, col: usize, row: usize) {
-        click(core, button, pressed, col, row, 1);
+        click(core, button, pressed, col, row, 1, Side::Left);
+    }
+
+    fn press_in(core: &mut TerminalCore, col: usize, row: usize, side: Side) {
+        click(core, MouseButton::Left, true, col, row, 1, side);
     }
 
     fn click(
@@ -1928,6 +2009,7 @@ mod tests {
         col: usize,
         row: usize,
         count: usize,
+        side: Side,
     ) {
         core.apply(ToTerminal::Pointer {
             event: PointerEvent::Button {
@@ -1936,6 +2018,7 @@ mod tests {
                 col,
                 row,
                 count,
+                side,
             },
             mods: input::Mods::NONE,
         })
@@ -1943,8 +2026,12 @@ mod tests {
     }
 
     fn drag_to(core: &mut TerminalCore, col: usize, row: usize) {
+        drag_in(core, col, row, Side::Left);
+    }
+
+    fn drag_in(core: &mut TerminalCore, col: usize, row: usize, side: Side) {
         core.apply(ToTerminal::Pointer {
-            event: PointerEvent::Motion { col, row },
+            event: PointerEvent::Motion { col, row, side },
             mods: input::Mods::NONE,
         })
         .unwrap();
@@ -1979,7 +2066,11 @@ mod tests {
     /// Move the pointer to a cell with a modifier chord held.
     fn hover_at(core: &mut TerminalCore, col: usize, row: usize, mods: input::Mods) {
         core.apply(ToTerminal::Pointer {
-            event: PointerEvent::Motion { col, row },
+            event: PointerEvent::Motion {
+                col,
+                row,
+                side: Side::Left,
+            },
             mods,
         })
         .unwrap();
@@ -2000,6 +2091,7 @@ mod tests {
                 col,
                 row,
                 count: 1,
+                side: Side::Left,
             },
             mods,
         })
@@ -2186,7 +2278,7 @@ mod tests {
         // middle-click both paste it.
         let mut core = pointer_core();
         press(&mut core, MouseButton::Left, true, 0, 0);
-        drag_to(&mut core, 3, 0);
+        drag_in(&mut core, 3, 0, Side::Right); // past col 3's midline, so its cell joins
         press(&mut core, MouseButton::Left, false, 3, 0);
         let out = core.take_outbox();
         let primary = out.iter().find_map(|m| match m {
@@ -2206,8 +2298,8 @@ mod tests {
         // A double-click inside "bnkterm" selects the whole word, bounded by the
         // trailing space, with no drag needed.
         let mut core = pointer_core();
-        click(&mut core, MouseButton::Left, true, 2, 0, 2);
-        click(&mut core, MouseButton::Left, false, 2, 0, 1);
+        click(&mut core, MouseButton::Left, true, 2, 0, 2, Side::Left);
+        click(&mut core, MouseButton::Left, false, 2, 0, 1, Side::Left);
         assert_eq!(primary_offer(&mut core).as_deref(), Some("bnkterm"));
     }
 
@@ -2218,8 +2310,8 @@ mod tests {
         let mut core = pointer_core();
         let row = core.screen.abs_row(0);
         let expected = core.screen.selection_text((row, 0), (row, 79));
-        click(&mut core, MouseButton::Left, true, 5, 0, 3);
-        click(&mut core, MouseButton::Left, false, 5, 0, 1);
+        click(&mut core, MouseButton::Left, true, 5, 0, 3, Side::Left);
+        click(&mut core, MouseButton::Left, false, 5, 0, 1, Side::Left);
         let offered = primary_offer(&mut core);
         assert_eq!(offered.as_deref(), Some(expected.as_str()));
         assert!(
@@ -2239,8 +2331,8 @@ mod tests {
 
     /// Double-click the word at display `(row, col)` and leave it selected.
     fn select_word(core: &mut TerminalCore, col: usize, row: usize) {
-        click(core, MouseButton::Left, true, col, row, 2);
-        click(core, MouseButton::Left, false, col, row, 1);
+        click(core, MouseButton::Left, true, col, row, 2, Side::Left);
+        click(core, MouseButton::Left, false, col, row, 1, Side::Left);
         core.take_outbox();
     }
 
@@ -2276,12 +2368,12 @@ mod tests {
         // display-row anchor would still be pinned at row 5 and would drag out three rows
         // of the wrong text; an absolute one is still on the line the user grabbed.
         let mut core = core_showing("\x1b[6;1Halpha beta"); // display row 5
-        click(&mut core, MouseButton::Left, true, 0, 5, 1); // press on "alpha"
+        click(&mut core, MouseButton::Left, true, 0, 5, 1, Side::Left); // press on "alpha"
 
         core.feed_test_bytes(b"\x1b[24;1H\r\n\r\n\r\n"); // three rows into history
 
-        drag_to(&mut core, 9, 2); // the same line, now three rows higher
-        click(&mut core, MouseButton::Left, false, 9, 2, 1);
+        drag_in(&mut core, 9, 2, Side::Right); // the same line, now three rows higher
+        click(&mut core, MouseButton::Left, false, 9, 2, 1, Side::Left);
         assert_eq!(copied(&mut core).as_deref(), Some("alpha beta"));
     }
 
@@ -2351,20 +2443,20 @@ mod tests {
 
     #[test]
     fn a_pending_character_drag_is_cancelled_when_its_anchor_dies() {
-        // A single click pins an anchor but paints no selection until the drag leaves the
-        // cell (so a plain click never flashes). That leaves a window in which the drag
-        // holds row ids that nothing else speaks for: if the grid renumbers in it, the
-        // drag has to die too, or the next motion resumes from an anchor that now names a
-        // row the user never touched and drags out a span of it.
+        // A single click pins an anchor but paints no selection until the drag crosses
+        // a cell midline (so a plain click never flashes). That leaves a window in which
+        // the drag holds row ids that nothing else speaks for: if the grid renumbers in
+        // it, the drag has to die too, or the next motion resumes from an anchor that now
+        // names a row the user never touched and drags out a span of it.
         let mut core = core_showing("alpha beta");
-        click(&mut core, MouseButton::Left, true, 0, 0, 1); // press: anchor, no selection
+        click(&mut core, MouseButton::Left, true, 0, 0, 1, Side::Left); // press: anchor, no selection
         assert!(core.selection.is_none());
         assert!(core.drag.is_some());
 
         core.feed_test_bytes(b"\x1b[?1049h"); // alt screen: every id minted is void
 
         drag_to(&mut core, 5, 3);
-        click(&mut core, MouseButton::Left, false, 5, 3, 1);
+        click(&mut core, MouseButton::Left, false, 5, 3, 1, Side::Left);
         assert!(
             core.selection.is_none(),
             "the drag did not resume from a dead anchor"
@@ -2392,15 +2484,97 @@ mod tests {
     #[test]
     fn a_click_never_highlights_the_clicked_cell() {
         // The single-click "blink": a plain click, even with sub-cell motion that
-        // stays in the same cell, must never create a selection, so the clicked cell
-        // does not flash the selection colour.
+        // stays on the press's side of the cell's midline, must never create a
+        // selection, so the clicked cell does not flash the selection colour.
         let mut core = pointer_core();
         press(&mut core, MouseButton::Left, true, 2, 0);
         assert!(core.selection.is_none(), "the press alone shows nothing");
-        drag_to(&mut core, 2, 0); // motion that does not leave the cell
-        assert!(core.selection.is_none(), "same-cell motion shows nothing");
+        drag_to(&mut core, 2, 0); // motion that crosses no midline
+        assert!(core.selection.is_none(), "same-half motion shows nothing");
         press(&mut core, MouseButton::Left, false, 2, 0);
         assert!(core.selection.is_none(), "and the release leaves nothing");
+    }
+
+    #[test]
+    fn a_press_in_the_trailing_half_leaves_the_blank_out() {
+        // The rounding this exists for: aiming at "authentication" and landing a few
+        // pixels early, on the blank before it. The press is in the blank's trailing
+        // half, so the anchor rounds forward and the copy starts at the 'a'.
+        let mut core = core_showing("run authentication");
+        press_in(&mut core, 3, 0, Side::Right); // the blank before 'a', right half
+        drag_in(&mut core, 6, 0, Side::Right); // past 't's midline
+        press(&mut core, MouseButton::Left, false, 6, 0);
+        assert_eq!(primary_offer(&mut core).as_deref(), Some("aut"));
+    }
+
+    #[test]
+    fn a_cell_joins_the_selection_only_past_its_midline() {
+        // Both ends round: entering a cell's near half leaves it out, crossing its
+        // midline pulls it in. So a drag can pick exactly one character — which the
+        // old inclusive-cell drag could not do at all.
+        let mut core = core_showing("abc");
+        press_in(&mut core, 1, 0, Side::Left);
+        drag_in(&mut core, 1, 0, Side::Right); // across 'b' alone
+        assert_eq!(copied(&mut core).as_deref(), Some("b"));
+
+        // Backing off to the near half again empties it.
+        drag_in(&mut core, 1, 0, Side::Left);
+        assert!(core.selection.is_none());
+    }
+
+    #[test]
+    fn a_drag_between_two_midlines_selects_nothing() {
+        // From one cell's trailing half to the next cell's leading half: both
+        // endpoints round to the same edge, no whole cell is covered, and the
+        // release offers nothing.
+        let mut core = core_showing("run authentication");
+        press_in(&mut core, 3, 0, Side::Right);
+        drag_in(&mut core, 4, 0, Side::Left);
+        assert!(core.selection.is_none());
+        press(&mut core, MouseButton::Left, false, 4, 0);
+        assert_eq!(primary_offer(&mut core), None);
+    }
+
+    #[test]
+    fn a_backward_drag_rounds_at_both_ends_too() {
+        // Symmetric, unlike ghostty's 60/40 split: dragging right-to-left, the same
+        // two edges select the same cells. From before 'd' back past 'b' covers
+        // only 'c'.
+        let mut core = core_showing("abcde");
+        press_in(&mut core, 3, 0, Side::Left);
+        drag_in(&mut core, 1, 0, Side::Right);
+        assert_eq!(copied(&mut core).as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn a_press_past_the_last_midline_starts_on_the_next_row() {
+        // A row's right margin and the next row's edge 0 are the same boundary:
+        // anchoring in the last column's trailing half starts the selection at the
+        // top of the row below, not on the last cell of the row pressed.
+        let mut core = core_showing("top\r\nsecond");
+        press_in(&mut core, 79, 0, Side::Right);
+        drag_in(&mut core, 5, 1, Side::Right);
+        assert_eq!(copied(&mut core).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn a_drag_to_a_rows_first_edge_stops_at_the_row_above() {
+        // The mirror seam: ending on a row's edge 0 covers none of that row, so the
+        // selection runs to the end of the row above instead.
+        let mut core = core_showing("top\r\nsecond");
+        press_in(&mut core, 1, 0, Side::Left);
+        drag_in(&mut core, 0, 1, Side::Left);
+        assert_eq!(copied(&mut core).as_deref(), Some("op"));
+    }
+
+    #[test]
+    fn a_double_click_in_the_trailing_half_still_takes_the_whole_word() {
+        // Edge rounding is a character-drag affair: word (and line) clicks stay
+        // greedy, a click anywhere on a word means that word.
+        let mut core = pointer_core();
+        click(&mut core, MouseButton::Left, true, 2, 0, 2, Side::Right);
+        click(&mut core, MouseButton::Left, false, 2, 0, 1, Side::Right);
+        assert_eq!(primary_offer(&mut core).as_deref(), Some("bnkterm"));
     }
 
     #[test]

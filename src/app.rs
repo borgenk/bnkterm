@@ -35,7 +35,7 @@ use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use self::clipboard::SelectionState;
-use self::message::{PointerEvent, ToTerminal, ToWindow};
+use self::message::{PointerEvent, Side, ToTerminal, ToWindow};
 use self::present::GpuPresentation;
 use self::tabs::{Reorder, Tabs};
 use self::terminal::TerminalCore;
@@ -1482,8 +1482,11 @@ impl State {
         )
     }
 
-    /// The cell under the pointer, clamped into the grid. Used for mouse reports.
-    fn pointer_cell(&self) -> (usize, usize) {
+    /// The cell under the pointer, clamped into the grid, plus which [`Side`] of
+    /// that cell's midline the pointer falls on. Mouse reports, hovers, and
+    /// multi-click identity use the cell alone; a character selection also reads
+    /// the side to round each endpoint to the nearer cell edge.
+    fn pointer_cell(&self) -> (usize, usize, Side) {
         let (cols, rows) = self.grid_dims;
         // Pointer coordinates are logical (surface-local); the grid is device
         // pixels, so scale up first. The grid is then inset by the (device) padding;
@@ -1492,12 +1495,9 @@ impl State {
         let pad = self.device_pad() as f32;
         let px = (self.pointer_x * scale - pad).max(0.0);
         let py = (self.pointer_y * scale - self.grid_origin_y as f32).max(0.0);
-        let col = (px / self.metrics.w as f32) as usize;
-        let row = (py / self.metrics.h as f32) as usize;
-        (
-            col.min(cols.saturating_sub(1)),
-            row.min(rows.saturating_sub(1)),
-        )
+        let (col, side) = column_under(px, self.metrics.w, cols);
+        let row = ((py / self.metrics.h as f32) as usize).min(rows.saturating_sub(1));
+        (col, row, side)
     }
 
     /// Whether the latest pointer position is inside the device-pixel tab strip.
@@ -1649,10 +1649,10 @@ impl State {
                     // The bar only lights and grows here; the grid still gets the move,
                     // because the bar is an overlay and a live text drag runs under it.
                     self.tabs.active_mut().track_scrollbar(Some((px, py)));
-                    let (col, row) = self.pointer_cell();
+                    let (col, row, side) = self.pointer_cell();
                     let mods = self.current_mods();
                     self.tabs.active_mut().apply(ToTerminal::Pointer {
-                        event: PointerEvent::Motion { col, row },
+                        event: PointerEvent::Motion { col, row, side },
                         mods,
                     })?;
                 }
@@ -1721,7 +1721,7 @@ impl State {
                 // has since crossed into the bar.
                 // Map the raw Wayland button to ours (window-side); ignore unmapped.
                 if let Some(button) = mapped {
-                    let (col, row) = self.pointer_cell();
+                    let (col, row, side) = self.pointer_cell();
                     // A left press carries its click multiplicity (word/line select);
                     // any other event is a plain single.
                     let count = if button == MouseButton::Left && pressed {
@@ -1737,6 +1737,7 @@ impl State {
                             col,
                             row,
                             count,
+                            side,
                         },
                         mods,
                     })?;
@@ -1770,7 +1771,7 @@ impl State {
             return Ok(());
         }
         self.axis_accum -= notches as f32 * step;
-        let (col, row) = self.pointer_cell();
+        let (col, row, _) = self.pointer_cell();
         let mods = self.current_mods();
         self.tabs.active_mut().apply(ToTerminal::Pointer {
             event: PointerEvent::Wheel {
@@ -2041,6 +2042,22 @@ fn open_url(url: &str) {
 /// Map a Wayland pointer button (a `linux/input-event-codes.h` code) to the
 /// logical button the mouse encoder speaks. Unknown buttons (side buttons) are
 /// ignored.
+/// Map a grid-local device x (already inset past the padding, floored at zero) to
+/// the column under it, clamped into the grid, and the [`Side`] of that column's
+/// midline it falls on. The side is measured against the *clamped* column, so a
+/// pointer past the last column reads as its right half and a selection dragged
+/// off the edge runs to the end of the row rather than stopping a cell short.
+fn column_under(px: f32, cell_w: i32, cols: usize) -> (usize, Side) {
+    let x = px / cell_w as f32;
+    let col = (x as usize).min(cols.saturating_sub(1));
+    let side = if x - col as f32 >= 0.5 {
+        Side::Right
+    } else {
+        Side::Left
+    };
+    (col, side)
+}
+
 fn pointer_button(code: u32) -> Option<MouseButton> {
     match code {
         protocol::wl_pointer::BTN_LEFT => Some(MouseButton::Left),
@@ -2062,6 +2079,28 @@ mod tests {
         reporting: false,
         shift: false,
     };
+
+    #[test]
+    fn a_pointer_rounds_to_the_nearer_cell_edge() {
+        // Cell width 8: x 0..4 is the left half of column 0, 4..8 the right, and
+        // the dead-center pixel rounds forward like a text caret.
+        assert_eq!(column_under(0.0, 8, 80), (0, Side::Left));
+        assert_eq!(column_under(3.9, 8, 80), (0, Side::Left));
+        assert_eq!(column_under(4.0, 8, 80), (0, Side::Right));
+        assert_eq!(column_under(7.9, 8, 80), (0, Side::Right));
+        assert_eq!(column_under(8.0, 8, 80), (1, Side::Left));
+    }
+
+    #[test]
+    fn a_pointer_past_the_grid_clamps_to_the_last_column_right_half() {
+        // Beyond the last column the clamp keeps the cell and the side reads
+        // right, so a drag off the edge reaches the end of the row rather than
+        // stopping a cell short.
+        assert_eq!(column_under(640.0, 8, 80), (79, Side::Right));
+        assert_eq!(column_under(9999.0, 8, 80), (79, Side::Right));
+        // A degenerate grid clamps too, never panics.
+        assert_eq!(column_under(5.0, 8, 0), (0, Side::Right));
+    }
 
     #[test]
     fn a_plain_grid_offers_the_i_beam() {

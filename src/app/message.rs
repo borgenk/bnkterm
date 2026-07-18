@@ -12,20 +12,35 @@ use crate::mouse::MouseButton;
 use crate::platform::geom::Scale;
 use crate::term_render::CellMetrics;
 
+/// Which half of its cell the pointer sits in, against the cell's vertical midline.
+/// A character selection reads it to round each endpoint to the nearer cell edge —
+/// the forgiveness alacritty and ghostty both apply — so a press that lands a few
+/// pixels early, in the trailing half of the blank before a word, starts the copy
+/// at the word rather than dragging the blank in. Mouse reports and hovers ignore
+/// it: a program is told the cell under the pointer, as xterm reports it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Side {
+    Left,
+    Right,
+}
+
 /// A pointer event, already mapped to a grid cell by the window (it holds the scale,
 /// padding, and metrics to hit-test). The terminal interprets it: a mouse report
 /// (using its mouse mode), a local text selection, or a scrollback scroll.
 pub enum PointerEvent {
-    /// The pointer moved to a cell (a selection drag, or a motion report).
-    Motion { col: usize, row: usize },
+    /// The pointer moved to a cell (a selection drag, or a motion report). `side`
+    /// matters only to a local character drag.
+    Motion { col: usize, row: usize, side: Side },
     /// A mapped button pressed or released at a cell. `count` is the multi-click
     /// count on a left press (1 character, 2 word, 3 line); it is 1 otherwise.
+    /// `side` matters only to the character selection a single left press anchors.
     Button {
         button: MouseButton,
         pressed: bool,
         col: usize,
         row: usize,
         count: usize,
+        side: Side,
     },
     /// Whole vertical wheel notches at a cell (the window coalesced the fractional
     /// axis deltas). `down` is the scroll direction.

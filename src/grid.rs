@@ -80,12 +80,12 @@ pub struct AbsRow(u64);
 impl AbsRow {
     /// The line after this one. `None` only at the end of the id space, which a
     /// terminal printing a line per nanosecond would reach in about six hundred years.
-    fn next(self) -> Option<Self> {
+    pub fn next(self) -> Option<Self> {
         self.0.checked_add(1).map(AbsRow)
     }
 
     /// The line before this one, or `None` at the very start of the stream.
-    fn prev(self) -> Option<Self> {
+    pub fn prev(self) -> Option<Self> {
         self.0.checked_sub(1).map(AbsRow)
     }
 }
