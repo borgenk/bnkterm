@@ -16,6 +16,11 @@
 //!                    readline's beginning-of-line is still reachable).
 //! ```
 //!
+//! Holding Ctrl through a command key is the same as releasing it first: `Ctrl+A
+//! Ctrl+C` opens a tab exactly as `Ctrl+A c` does. Typing the sequence fast is how
+//! it is typed in practice, and a lagging Ctrl release must not turn a command into
+//! a silent cancel.
+//!
 //! The whole thing is two pure functions with no window or PTY: [`advance`] is the
 //! `(mode, key, mods) -> (mode, disposition)` transition, unit-tested as a table;
 //! [`paint_overlay`] appends the indicator to a display list, diffed and presented
@@ -78,11 +83,17 @@ fn is_leader(key: Key, mods: Mods) -> bool {
     matches!(key, Key::Char { typed, .. } if typed.eq_ignore_ascii_case(&'a')) && mods == Mods::CTRL
 }
 
-/// The lowercase letter a plain key press carries, or `None` when Ctrl/Alt is held
-/// (those are chords, not letters) or the key is not a character. Shift is folded
-/// away so `W` and `w` are the same command.
+/// The lowercase letter a leader command key carries, or `None` when the key is not
+/// a character. Shift is folded away so `W` and `w` are the same command, and so is
+/// Ctrl: typing the sequence quickly means the leader's Ctrl is still down when the
+/// command key lands, so `Ctrl+A Ctrl+C` has to mean what `Ctrl+A c` means. GNU
+/// screen binds both spellings of every command for this reason. Alt is not folded —
+/// it is nobody's stuck modifier, and leaving it out keeps Alt chords unclaimed.
+///
+/// The leader itself is matched before this runs, so folding Ctrl here does not
+/// swallow the `Ctrl+A Ctrl+A` escape hatch.
 fn command_letter(key: Key, mods: Mods) -> Option<char> {
-    if mods.contains(Mods::CTRL) || mods.contains(Mods::ALT) {
+    if mods.contains(Mods::ALT) {
         return None;
     }
     match key {
@@ -318,6 +329,28 @@ mod tests {
                 Disposition::Consumed(Some(TabAction::Close))
             )
         );
+        // Ctrl is folded away too: a command typed before the leader's Ctrl comes
+        // back up is the same command.
+        assert_eq!(
+            advance(KeyMode::Leader, Key::plain('c'), Mods::CTRL),
+            (KeyMode::Normal, Disposition::Consumed(Some(TabAction::New)))
+        );
+        assert_eq!(
+            advance(KeyMode::Leader, Key::plain('x'), Mods::CTRL),
+            (
+                KeyMode::Normal,
+                Disposition::Consumed(Some(TabAction::Close))
+            )
+        );
+        assert_eq!(
+            advance(KeyMode::Leader, Key::plain('w'), Mods::CTRL),
+            (KeyMode::Tabs, Disposition::Consumed(None))
+        );
+        // Alt is not folded, so an Alt chord still cancels rather than commanding.
+        assert_eq!(
+            advance(KeyMode::Leader, Key::plain('c'), Mods::ALT),
+            (KeyMode::Normal, Disposition::Consumed(None))
+        );
         // Escape and unbound keys cancel the one-shot leader, swallowing the key.
         assert_eq!(
             advance(KeyMode::Leader, Key::Escape, Mods::NONE),
@@ -327,6 +360,29 @@ mod tests {
             advance(KeyMode::Leader, Key::plain('z'), Mods::NONE),
             (KeyMode::Normal, Disposition::Consumed(None))
         );
+    }
+
+    /// Typed fast, `Ctrl+A c` twice is really `Ctrl` down, `a`, `c`, `a`, `c`, `Ctrl`
+    /// up: the hand never lets the modifier go between the rounds. Both rounds must
+    /// still open a tab, and the leader must stay reachable from Leader mode itself
+    /// so the second `a` re-arms rather than cancelling.
+    #[test]
+    fn a_held_ctrl_across_the_whole_sequence_opens_both_tabs() {
+        let mut mode = KeyMode::Normal;
+        let mut opened = 0;
+        for key in ['a', 'c', 'a', 'c'] {
+            let (next, disposition) = advance(mode, Key::plain(key), Mods::CTRL);
+            mode = next;
+            if let Disposition::Consumed(Some(TabAction::New)) = disposition {
+                opened += 1;
+            }
+            assert!(
+                !matches!(disposition, Disposition::Passthrough),
+                "{key} leaked to the child"
+            );
+        }
+        assert_eq!(opened, 2, "both rounds open a tab");
+        assert_eq!(mode, KeyMode::Normal);
     }
 
     #[test]
