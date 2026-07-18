@@ -669,6 +669,15 @@ impl State {
             // fairness-budgeted gather pump left batches queued, so the wait below
             // must not block.
             let more_pty = self.tabs.pump_all(self.window_focused)?;
+            // The pump reaps a child that has exited, so the last shell exiting empties
+            // the tab list right here. The window is over, and every step below sizes,
+            // shapes, or paints around a visible terminal that no longer exists, so the
+            // turn ends now — the same invariant `handle` keeps for Wayland messages
+            // that were already queued when the last tab went away.
+            if self.tabs.is_empty() {
+                self.closed = true;
+                return Ok(());
+            }
             // Opening/closing (including a child exiting during the pump) can
             // make the bar appear or disappear without a compositor configure.
             self.resize_to(self.width, self.height);

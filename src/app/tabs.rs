@@ -860,6 +860,46 @@ mod tests {
             .any(|message| matches!(message, ToWindow::Closed)));
     }
 
+    /// Typing `exit` in the only tab ends its child, and the pump is where that is
+    /// noticed. The pump must reap the tab and leave the list empty, because the event
+    /// loop reads exactly that to end the turn before it sizes, shapes, or paints a
+    /// window with no terminal left in it. A real child on a real PTY, no mocks; skipped
+    /// where fork/exec is unavailable so it can never flake.
+    #[test]
+    fn the_last_child_exiting_empties_the_tabs_through_the_pump() {
+        std::env::set_var("SHELL", "/bin/true");
+        let mut core = core(false, 80, 24);
+        if core.spawn_shell().is_err() {
+            eprintln!("fork/exec unavailable here; skipping the child-exit pump test");
+            return;
+        }
+        let mut tabs = Tabs::new(core, TabBarConfig::default());
+        assert!(!tabs.is_empty());
+
+        // The child exits at once, but the gather thread still has to see the EOF, so
+        // pump until it lands rather than assuming a single turn catches it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tabs.is_empty() && Instant::now() < deadline {
+            tabs.pump_all(true).expect("pump");
+        }
+
+        assert!(
+            tabs.is_empty(),
+            "the exited child's tab was never reaped by the pump"
+        );
+        assert!(
+            tabs.take_outbox()
+                .into_iter()
+                .any(|message| matches!(message, ToWindow::Closed)),
+            "emptying the tab list must signal the window closed"
+        );
+        // The loop calls these on its way out; none of them may touch the missing tab.
+        assert!(!tabs.needs_frame());
+        assert!(!tabs.shows_bar());
+        assert_eq!(tabs.active_id(), None);
+        assert!(tabs.gather_fds().next().is_none());
+    }
+
     #[test]
     fn next_and_previous_wrap() {
         let mut tabs = demo_tabs(3);
