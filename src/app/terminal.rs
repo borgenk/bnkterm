@@ -26,7 +26,9 @@ use crate::color::Theme;
 use crate::config::TabBarConfig;
 use crate::error::Result;
 use crate::gather::{GatherEnd, Gatherer};
-use crate::grid::{AbsRow, ClipboardTarget, CursorStyle, LinkProbe, RowEpoch, Screen};
+use crate::grid::{
+    AbsRow, ClipboardTarget, CursorStyle, LinkProbe, ResizeEffect, RowEpoch, Screen,
+};
 use crate::input;
 use crate::mouse::{self, MouseButton, MouseKind};
 use crate::platform::browser;
@@ -55,6 +57,27 @@ const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 /// seen while unfocused (see [`TerminalCore::after_output`]), so it is genuinely an "over here"
 /// nudge, never feedback on your own keystrokes.
 const BELL_FLASH: Duration = Duration::from_millis(120);
+
+/// Default settle time before a resize is delivered to the child (`TIOCSWINSZ` →
+/// `SIGWINCH`). The grid reflows on every configure for smooth visual feedback, but the
+/// child is told only once the drag settles: telling it mid-drag makes it redraw and
+/// re-emit its OSC 133 prompt marks faster than the reflow can consume them, and the freeze
+/// then protects stale rows — the mush. So this is a *debounce*, not a throttle; lowering it
+/// makes the prompt snap sooner after the drag, but it must stay above the compositor's
+/// configure interval (~16 ms at 60 Hz) or a continuous drag would leak an update through.
+/// Override with `BNKTERM_RESIZE_SETTLE_MS` to tune it live.
+const WINSIZE_SETTLE_DEFAULT: Duration = Duration::from_millis(30);
+
+/// The settle time in force, from `BNKTERM_RESIZE_SETTLE_MS` or [`WINSIZE_SETTLE_DEFAULT`],
+/// clamped to a range that still coalesces a drag at the low end and cannot strand the
+/// child at the high end. Read once when a core is built.
+fn resize_settle() -> Duration {
+    std::env::var("BNKTERM_RESIZE_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|ms| Duration::from_millis(ms.clamp(10, 1000)))
+        .unwrap_or(WINSIZE_SETTLE_DEFAULT)
+}
 
 /// Lines the scrollback view moves per wheel notch, and arrows sent per notch
 /// when the wheel falls back to arrow keys on the alt screen.
@@ -189,6 +212,12 @@ pub(super) struct TerminalCore {
     /// when not blinking, e.g. unfocused). Activity resets it to on.
     blink_on: bool,
     blink_at: Option<Instant>,
+    /// When a settled resize should be pushed to the child (`TIOCSWINSZ`), or `None` when
+    /// none is pending. The grid is already reflowed; this debounces only the child's
+    /// `SIGWINCH` so a drag does not flood it. See [`resize_settle`].
+    winsize_at: Option<Instant>,
+    /// The settle interval this core debounces resizes by, resolved once at construction.
+    winsize_settle: Duration,
     /// When the current synchronized-output lock gives up and we present regardless.
     /// `None` when the child is not holding a frame.
     sync_until: Option<Instant>,
@@ -286,6 +315,8 @@ impl TerminalCore {
             focused: false,
             blink_on: true,
             blink_at: None,
+            winsize_at: None,
+            winsize_settle: resize_settle(),
             sync_until: None,
             bell_until: None,
             tty_mode: TtyMode::Cooked,
@@ -564,21 +595,22 @@ impl TerminalCore {
                     self.selection = None;
                     self.drag = None;
                 } else {
-                    // A resize re-indexes rows and ends their epoch, which is what the
-                    // prune below reads to drop a selection that no longer means
-                    // anything. It is checked here and not only after output because a
-                    // resize need not be followed by any.
-                    self.screen.resize(cols, rows);
-                    if let Some(pty) = &self.pty {
-                        let _ = pty.resize(cols, rows);
-                    }
-                    // `?2048`: the same news in band, for the child that asked. SIGWINCH
-                    // reaches only this side of the pty, so a program behind ssh or tmux
-                    // hears nothing from it. Silent unless it was asked for.
+                    // A width reflow re-wraps the grid and renumbers its rows; the returned
+                    // effect says how to carry the selection over that (a height change leaves
+                    // ids alone). An in-progress drag cannot survive — the button is held on a
+                    // window that is being resized — so it goes regardless.
+                    let effect = self.screen.resize(cols, rows);
+                    self.drag = None;
+                    self.selection = self.carry_selection(effect);
                     self.screen.set_pixel_size(width, height);
-                    self.screen.report_size();
-                    self.flush_responses()?;
+                    // Reflow the grid now (above) for smooth visuals, but debounce the child's
+                    // winsize: telling the shell on every configure floods it with prompt
+                    // redraws that mush together under a drag. `flush_winsize_if_due` pushes
+                    // `TIOCSWINSZ` (and the in-band `?2048` report) once it settles.
+                    self.winsize_at = Some(Instant::now() + self.winsize_settle);
                 }
+                // Prune catches the leftover cases the carry does not: a kept selection whose
+                // end row a shrink dropped off the screen.
                 self.prune_selection();
                 self.dirty = true;
                 Ok(false)
@@ -1092,6 +1124,29 @@ impl TerminalCore {
         self.bell_until
     }
 
+    /// Push the debounced resize to the child once it has settled: `TIOCSWINSZ`
+    /// (→ `SIGWINCH`) at the grid's current size, plus the in-band `?2048` report for the
+    /// child that asked. Best-effort — a resize on a dead child just surfaces as EOF on the
+    /// next read. The grid was already reflowed when the resize arrived; this is only the
+    /// child notification, held back so a drag does not flood it. See [`WINSIZE_DEBOUNCE`].
+    pub(super) fn flush_winsize_if_due(&mut self) -> crate::error::Result<()> {
+        if self.winsize_at.is_some_and(|at| at <= Instant::now()) {
+            self.winsize_at = None;
+            let (cols, rows) = self.screen.dimensions();
+            if let Some(pty) = &self.pty {
+                let _ = pty.resize(cols, rows);
+            }
+            self.screen.report_size();
+            self.flush_responses()?;
+        }
+        Ok(())
+    }
+
+    /// When the debounced resize is due to reach the child, for the event-loop wait.
+    pub(super) fn winsize_deadline(&self) -> Option<Instant> {
+        self.winsize_at
+    }
+
     /// Hand the child's `OSC 52` clipboard writes to the window, which owns the Wayland
     /// data device. The same outbox the select-to-copy path uses: from here on it is
     /// indistinguishable from the user having copied the text themselves, which is the
@@ -1132,6 +1187,28 @@ impl TerminalCore {
     /// When to wake and present anyway, for the event loop's wait.
     pub(super) fn sync_deadline(&self) -> Option<Instant> {
         self.sync_until
+    }
+
+    /// Carry the text selection across a resize per the grid's [`ResizeEffect`]. The ids
+    /// stood still (a height change), so keep it; or the reflow renumbered but can translate,
+    /// so remap each endpoint to the cell it now names (dropping the whole selection if either
+    /// endpoint's cell was absorbed or has aged off the front); or the alt screen renumbered
+    /// under it with nothing to translate against, so drop it. A `None` selection stays `None`.
+    fn carry_selection(&self, effect: ResizeEffect) -> Option<Selection> {
+        let sel = self.selection?;
+        match effect {
+            ResizeEffect::Stable => Some(sel),
+            ResizeEffect::Reset => None,
+            ResizeEffect::Reflowed(remap) => {
+                let anchor = remap.point(sel.anchor.0, sel.anchor.1)?;
+                let head = remap.point(sel.head.0, sel.head.1)?;
+                Some(Selection {
+                    anchor,
+                    head,
+                    epoch: self.screen.row_epoch(),
+                })
+            }
+        }
     }
 
     /// Drop the selection, and any drag pinned to it, when the rows they name have
@@ -2402,12 +2479,19 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_takes_the_selection_with_it() {
-        // Rows re-index on a resize and we do not re-wrap, so an id minted before it can
-        // name a different line (or none). A resize sends no output, so this is the path
-        // that proves the prune does not depend on the child saying something.
+    fn a_resize_carries_the_selection() {
+        // A width change reflows and renumbers the rows, but the selection is translated to
+        // the cells it was made over rather than dropped: "world" stays selected across it.
+        // A resize sends no output, so this is the path that proves the carry does not depend
+        // on the child saying something.
         let mut core = core_showing("hello world");
         select_word(&mut core, 6, 0);
+        let picked = core.selection.expect("word selected");
+        assert_eq!(
+            core.screen.selection_text(picked.anchor, picked.head),
+            "world"
+        );
+
         core.apply(ToTerminal::Resize {
             cols: 40,
             rows: 12,
@@ -2419,7 +2503,38 @@ mod tests {
             scale: Scale::ONE,
         })
         .unwrap();
-        assert!(core.selection.is_none());
+
+        let sel = core
+            .selection
+            .expect("the selection was carried across the reflow");
+        assert_eq!(core.screen.selection_text(sel.anchor, sel.head), "world");
+    }
+
+    #[test]
+    fn an_alt_screen_resize_drops_the_selection() {
+        // A selection over the alt screen has no scrollback to anchor to and the alt screen
+        // only clamps (never reflows), so a resize there renumbers it out from under the
+        // selection with nothing to translate against: it goes.
+        let mut core = core_showing("hello world");
+        core.feed_test_bytes(b"\x1b[?1049h"); // enter the alt screen
+        core.feed_test_bytes(b"hello world"); // and put a word on it to select
+        select_word(&mut core, 6, 0);
+        assert!(core.selection.is_some());
+        core.apply(ToTerminal::Resize {
+            cols: 40,
+            rows: 12,
+            width: 40 * 8,
+            height: 12 * 16,
+            metrics: METRICS,
+            pad: 0,
+            origin_y: 0,
+            scale: Scale::ONE,
+        })
+        .unwrap();
+        assert!(
+            core.selection.is_none(),
+            "an alt-screen selection is dropped"
+        );
     }
 
     #[test]

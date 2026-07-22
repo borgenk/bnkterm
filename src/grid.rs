@@ -50,6 +50,14 @@ pub(crate) const DEFAULT_SCROLLBACK: usize = 10_000;
 /// Columns between default tab stops.
 const TAB_WIDTH: usize = 8;
 
+/// The widest a single logical line may grow before reflow treats the boundary as a
+/// hard break. It bounds both the intermediate buffer and the per-line rewrap cost
+/// against a child that prints megabytes with no newline: a line longer than this is
+/// rewrapped in independent blocks that never re-join across the seam. wezterm uses the
+/// same 1024; the visible cost is a seam every 1024 columns on such a line, invisible on
+/// any real output. See [`Buffer::reflow`].
+const MAX_LOGICAL_COLS: usize = 1024;
+
 /// The index of a line in the unbounded stream of everything the child has printed:
 /// history first (oldest at 0), then the live screen. Unlike a display row it does not
 /// move when the screen scrolls — output pushes a row up out of the live screen and
@@ -721,6 +729,158 @@ impl Row {
             self.cells.resize(new_cols, Cell::BLANK);
         }
     }
+
+    /// Refill this row in place from `cells` (at most `cols` of them), padding to `cols`
+    /// with blanks, and set the soft-wrap link. Reuses the existing cell allocation so a
+    /// reflow recycles rows instead of allocating fresh. Combining marks are cleared; the
+    /// caller re-adds any the new columns carry.
+    fn refill(&mut self, cols: usize, cells: &[Cell], wrapped: bool) {
+        self.cells.clear();
+        self.cells.extend_from_slice(cells);
+        self.cells.resize(cols, Cell::BLANK);
+        self.combining.clear();
+        self.wrapped = wrapped;
+    }
+}
+
+/// A logical line reassembled from a run of soft-wrapped physical rows: the flat cell
+/// sequence, with its combining marks re-keyed from per-row columns to the logical
+/// column. This is reflow's intermediate — [`Buffer::reflow`] unwraps the stream into
+/// these, then rewraps them at the new width. It carries no "was this a hard newline"
+/// flag on purpose: a line ends either at a real newline or at [`MAX_LOGICAL_COLS`], and
+/// both cases rewrap the same way (the last row is `wrapped = false`), so the seam a cap
+/// break leaves behind is indistinguishable from a newline and will not re-join on a
+/// later reflow — which is exactly the bound the cap is there to keep.
+#[derive(Default)]
+struct LogicalLine {
+    cells: Vec<Cell>,
+    combining: Vec<CombiningMark>,
+}
+
+impl LogicalLine {
+    /// Drop trailing default-blank cells (and any marks that sat on them). A cell with a
+    /// non-default background or a combining mark is content, not padding, and stops the
+    /// trim: a coloured prompt bar drawn with spaces, or a marked blank, must survive a
+    /// reflow rather than be pulled up into the line above it. A wide glyph's spacer is
+    /// not `Cell::BLANK` (it carries `WIDE_SPACER`), so a trailing wide pair is never
+    /// half-trimmed.
+    fn trim_trailing_blanks(&mut self) {
+        let mut end = self.cells.len();
+        while end > 0
+            && self.cells[end - 1] == Cell::BLANK
+            && !self.combining.iter().any(|m| m.col == end - 1)
+        {
+            end -= 1;
+        }
+        self.cells.truncate(end);
+        self.combining.retain(|m| m.col < end);
+    }
+}
+
+/// Take a row from the recycle `pool` (or allocate one when it is empty) and fill it from
+/// `cells` padded to `cols`, with the given soft-wrap link and no combining marks. This is
+/// reflow's row factory: draining the old stream leaves a pool of `Row`s whose cell
+/// allocations this reuses, so a rewrap does not allocate a row per line.
+fn take_row(pool: &mut Vec<Row>, cols: usize, cells: &[Cell], wrapped: bool) -> Row {
+    let mut row = pool.pop().unwrap_or_else(|| Row::filled(cols, Cell::BLANK));
+    row.refill(cols, cells, wrapped);
+    row
+}
+
+/// Translates [`AbsRow`]-anchored positions from a buffer's geometry before a
+/// [`Buffer::reflow`] to after it, so a text selection and the OSC 133 prompt marks follow
+/// the cells they name across a rewrap. Built by `reflow`, applied by [`Screen::resize`].
+///
+/// It resolves a cell by its logical position: an old id and column name a logical line and
+/// an offset into it, and the reflow recorded which new row that offset landed on.
+pub struct RowRemap {
+    /// The buffer's evicted count when the reflow ran. Both the old and the new ids are
+    /// numbered from it (a reflow reassigns ids but keeps the oldest surviving row's), so the
+    /// arithmetic is a stream-index add on either side.
+    evicted: u64,
+    new_cols: usize,
+    /// How many logical lines the reflowed region unwrapped into. An old row whose line index
+    /// is at least this was a trailing blank the reflow absorbed, and maps to nothing.
+    lines_len: usize,
+    /// Per old stream row *in the reflowed region*: the logical line it joined and the offset
+    /// its first column sits at within that line.
+    old: Vec<(usize, usize)>,
+    /// First new stream index of each logical line; `[lines_len]` is the reflowed length.
+    line_first: Vec<usize>,
+    /// Per new stream row in the reflowed region: the logical offset of its first cell.
+    new_start: Vec<usize>,
+    /// Old stream index where the frozen live-prompt region began: rows at or below it were
+    /// clamped (one old row → one new row), not rewrapped, so the shell's SIGWINCH redraw
+    /// finds the prompt at the row count it expects. Equal to the old row count when nothing
+    /// was frozen.
+    frozen_from: usize,
+    /// New stream index the frozen region begins at (the number of rows the reflowed region
+    /// produced).
+    reflowed_len: usize,
+}
+
+impl RowRemap {
+    /// The new stream index and column of the cell at old stream index `old_idx`, column
+    /// `col`, or `None` if its row was a trailing blank the reflow absorbed.
+    fn locate(&self, old_idx: usize, col: usize) -> Option<(usize, usize)> {
+        if old_idx >= self.frozen_from {
+            // The clamped live-prompt region: one old row maps straight to one new row at the
+            // same column, only bounded to the new width.
+            let new_idx = self.reflowed_len + (old_idx - self.frozen_from);
+            return Some((new_idx, col.min(self.new_cols - 1)));
+        }
+        let (line, base) = *self.old.get(old_idx)?;
+        if line >= self.lines_len {
+            return None;
+        }
+        let off = base + col;
+        let (start, end) = (self.line_first[line], self.line_first[line + 1]);
+        // A line's rows carry contiguous offset ranges, so the last row whose start is not
+        // past `off` is the one holding it; an offset beyond the content clamps to the last.
+        let mut chosen = start;
+        for k in start..end {
+            if self.new_start[k] <= off {
+                chosen = k;
+            } else {
+                break;
+            }
+        }
+        Some((
+            chosen,
+            off.saturating_sub(self.new_start[chosen])
+                .min(self.new_cols - 1),
+        ))
+    }
+
+    /// Where the cell `(abs, col)` named before the reflow now sits, or `None` if its row was
+    /// absorbed as a trailing blank or has since aged out of history.
+    pub fn point(&self, abs: AbsRow, col: usize) -> Option<(AbsRow, usize)> {
+        let old_idx = usize::try_from(abs.0.checked_sub(self.evicted)?).ok()?;
+        let (new_idx, new_col) = self.locate(old_idx, col)?;
+        let id = self
+            .evicted
+            .saturating_add(u64::try_from(new_idx).unwrap_or(u64::MAX));
+        Some((AbsRow(id), new_col))
+    }
+
+    /// The new id of the row `abs` named, for a mark that anchors a row rather than a cell.
+    pub fn row(&self, abs: AbsRow) -> Option<AbsRow> {
+        self.point(abs, 0).map(|(r, _)| r)
+    }
+}
+
+/// What a [`Screen::resize`] did to the row ids a caller may be holding (a text selection).
+/// The grid's own prompt marks are carried internally; this tells the caller how to treat
+/// its own.
+pub enum ResizeEffect {
+    /// Ids were unchanged (a height-only change on the primary screen): keep them as they are.
+    Stable,
+    /// Ids were renumbered by a width reflow but are translatable: remap each through the
+    /// [`RowRemap`], re-stamping with the new [`Screen::row_epoch`].
+    Reflowed(RowRemap),
+    /// Ids were invalidated with no mapping (a resize on the alt screen, which only clamps):
+    /// drop the anchored state.
+    Reset,
 }
 
 /// One screen buffer: the visible rows (a ring so a scroll rotates row headers,
@@ -1027,15 +1187,18 @@ impl Buffer {
         self.scrollback.clear();
     }
 
-    /// Resize the buffer to `new_cols` x `new_rows`. Columns truncate or pad every
-    /// row (visible and scrollback); rows grow by appending blanks at the bottom
-    /// and shrink by dropping rows below the cursor first, then scrolling the top
-    /// into scrollback so the cursor stays on screen. The scroll region resets to
-    /// the full screen (as xterm does on resize) and the cursor is re-clamped.
+    /// Resize the buffer to `new_cols` x `new_rows`. Columns truncate or pad every row
+    /// (visible and scrollback); rows grow by pulling recent history back down onto the
+    /// screen (bottom stays pinned, scrollback fills the new space above) and only pad
+    /// blanks below once history runs out, and shrink by dropping rows below the cursor
+    /// first, then scrolling the top into scrollback so the cursor stays on screen. The
+    /// scroll region resets to the full screen (as xterm does on resize) and the cursor is
+    /// re-clamped.
     ///
-    /// Deliberately does NOT re-wrap soft-wrapped lines: full-screen programs
-    /// repaint on `SIGWINCH`, so what matters is a correctly sized, uncorrupted
-    /// grid, not re-flowed history. Scrollback re-wrap is a later nicety.
+    /// Deliberately does NOT re-wrap soft-wrapped lines on a width change — that is
+    /// [`Buffer::reflow`]'s job, called instead of this when the width changes. This is the
+    /// same-width path (a height change or a scale-driven metrics change), where re-wrapping
+    /// would be wasted work.
     fn resize(&mut self, new_cols: usize, new_rows: usize) {
         let new_cols = new_cols.max(1);
         let new_rows = new_rows.max(1);
@@ -1061,7 +1224,22 @@ impl Buffer {
 
         match new_rows.cmp(&self.rows) {
             Ordering::Greater => {
-                for _ in 0..(new_rows - self.rows) {
+                let mut grow = new_rows - self.rows;
+                // Growing pulls recent history back down onto the screen so the bottom line
+                // stays pinned to the window's bottom edge and the new space reveals
+                // scrollback above, as xterm and wezterm do — not blank rows shoved in below
+                // the content. The stream `scrollback ++ lines` is unchanged, only its split
+                // point moves, so every row keeps its id. Blank rows fill in below only once
+                // history runs out.
+                while grow > 0 {
+                    let Some(row) = self.scrollback.pop_back() else {
+                        break;
+                    };
+                    self.lines.push_front(row);
+                    self.cursor.row += 1;
+                    grow -= 1;
+                }
+                for _ in 0..grow {
                     self.lines.push_back(Row::filled(new_cols, Cell::BLANK));
                 }
             }
@@ -1092,6 +1270,253 @@ impl Buffer {
             self.cursor.row = new_rows - 1;
         }
         self.cursor.pending_wrap = false;
+    }
+
+    /// Reflow the buffer to `new_cols` x `new_rows`, re-wrapping soft-wrapped lines to the
+    /// new width instead of clamping them. This is the widen-rejoins / narrow-splits
+    /// behaviour: a `docker ps` line that wrapped narrow pulls back together when the
+    /// window widens, and a long line breaks cleanly when it narrows. Only the primary
+    /// buffer calls this; the alt screen keeps [`Buffer::resize`], because a full-screen
+    /// program owns that canvas and repaints on `SIGWINCH`.
+    ///
+    /// The cursor and the scrolled view are preserved by recording each as a logical
+    /// `(line, offset)` before the rewrap and locating it again after. `view_offset` is
+    /// how far the view is scrolled up into this buffer's scrollback (0 = pinned to the
+    /// live bottom); the returned value is that same view re-derived for the new geometry.
+    ///
+    /// ```text
+    ///   unwrap                      rewrap to new_cols        re-split (cursor on screen)
+    ///   physical rows ──▶ logical lines ──▶ physical rows ──▶ scrollback + live screen
+    ///        (wrapped flag              (chunks of new_cols,      (bottom new_rows are
+    ///         joins the runs)            wide glyph never split)   live; rest is history)
+    /// ```
+    ///
+    /// The cursor and the scrolled view are carried across internally. The returned
+    /// [`RowRemap`] carries everything anchored by [`AbsRow`] from the outside — a text
+    /// selection and the OSC 133 prompt marks — by translating each old id to where its cell
+    /// now sits; the caller ([`Screen::resize`]) applies it.
+    ///
+    /// `frozen_from` is the old stream index where the live prompt region begins (the last
+    /// idle shell prompt). Rows at or below it are **clamped**, not rewrapped: the shell
+    /// repaints its prompt on `SIGWINCH` and clears by its own row count, so re-wrapping a
+    /// full-width prompt bar to a different number of rows would leave the extra row as
+    /// uncleared residue above it. Pass the old row count to reflow everything (no prompt to
+    /// protect).
+    fn reflow(
+        &mut self,
+        new_cols: usize,
+        new_rows: usize,
+        view_offset: usize,
+        frozen_from: usize,
+    ) -> (usize, RowRemap) {
+        let new_cols = new_cols.max(1);
+        let new_rows = new_rows.max(1);
+        let old_evicted = self.evicted;
+        let old_scrollback = self.scrollback.len();
+
+        // Anchors, as absolute indices into the current stream (`scrollback ++ lines`).
+        // The cursor always sits on a live row; the view top matters only when scrolled.
+        let cursor_idx = self.scrollback.len() + self.cursor.row;
+        let cursor_col = self.cursor.col;
+        let track_view = view_offset > 0;
+        let view_idx = self.scrollback.len().saturating_sub(view_offset);
+
+        // Drain the whole stream into one Vec so every Row is ours to recycle.
+        let mut old_rows: Vec<Row> = Vec::with_capacity(self.scrollback.len() + self.lines.len());
+        old_rows.extend(self.scrollback.drain(..));
+        old_rows.extend(self.lines.drain(..));
+        let old_count = old_rows.len();
+        let frozen_from = frozen_from.min(old_count);
+        // Split off the live prompt region; the head is what actually reflows.
+        let frozen_rows: Vec<Row> = old_rows.split_off(frozen_from);
+
+        // --- unwrap the reflowed head: join soft-wrapped runs into logical lines, recording
+        // for every old row the logical line it joined and the offset its first column sits
+        // at (`old`), so any id can later be resolved to a logical position ---
+        let mut lines: Vec<LogicalLine> = Vec::new();
+        let mut old: Vec<(usize, usize)> = Vec::with_capacity(old_rows.len());
+        let mut cur = LogicalLine::default();
+        let mut pending = false; // `cur` has rows not yet closed into `lines`
+        for row in old_rows.iter() {
+            old.push((lines.len(), cur.cells.len()));
+            let base = cur.cells.len();
+            cur.cells.extend_from_slice(&row.cells);
+            for m in &row.combining {
+                cur.combining.push(CombiningMark {
+                    col: base + m.col,
+                    ch: m.ch,
+                });
+            }
+            pending = true;
+            // Close on a hard newline, or when the run reaches the cap (a forced seam).
+            if !row.wrapped || cur.cells.len() >= MAX_LOGICAL_COLS {
+                cur.trim_trailing_blanks();
+                lines.push(std::mem::take(&mut cur));
+                pending = false;
+            }
+        }
+        // A trailing wrapped run with no terminator cannot arise (the bottom live row is
+        // never wrapped past the screen), but close any remainder rather than lose it.
+        if pending {
+            cur.trim_trailing_blanks();
+            lines.push(cur);
+        }
+
+        // Empty rows below the cursor are screen padding, not content. Drop the trailing ones
+        // so the reflow lets the content rise to fill the screen from the bottom, instead of
+        // stranding it above blank lines (and needlessly into scrollback) when a narrow
+        // multiplies the row count. Only when nothing is frozen: with a live prompt below, the
+        // cursor is down in it and the blank rows above are the shell's own spacing.
+        if frozen_rows.is_empty() {
+            let cursor_line = old.get(cursor_idx).map(|a| a.0).unwrap_or(0);
+            let mut keep = lines.len();
+            while keep > cursor_line + 1 && lines[keep - 1].cells.is_empty() {
+                keep -= 1;
+            }
+            lines.truncate(keep);
+        }
+
+        // --- rewrap the head: lay each logical line into new_cols-wide rows, recycling the
+        // drained rows, and record each line's first new index and every new row's start ---
+        let mut pool = old_rows;
+        let mut new_stream: Vec<Row> = Vec::with_capacity(old_count);
+        let mut line_first: Vec<usize> = Vec::with_capacity(lines.len() + 1);
+        let mut new_start: Vec<usize> = Vec::with_capacity(old_count);
+
+        for line in lines.iter() {
+            line_first.push(new_stream.len());
+            let cells = &line.cells;
+            if cells.is_empty() {
+                // An empty logical line is a bare newline: it still shows one blank row.
+                new_start.push(0);
+                new_stream.push(take_row(&mut pool, new_cols, &[], false));
+            } else {
+                let mut i = 0;
+                while i < cells.len() {
+                    let mut end = (i + new_cols).min(cells.len());
+                    // Never split a wide glyph from its spacer at the wrap: if a leader
+                    // would be this row's last column with its spacer on the next, push
+                    // the whole pair down (the printer's own last-column rule).
+                    if end < cells.len() && cells[end - 1].is_wide_leader() {
+                        end -= 1;
+                    }
+                    // Degenerate new_cols == 1 against a wide glyph: place it alone rather
+                    // than loop forever.
+                    if end <= i {
+                        end = i + 1;
+                    }
+                    let wrapped = end < cells.len();
+                    let mut row = take_row(&mut pool, new_cols, &cells[i..end], wrapped);
+                    for m in &line.combining {
+                        if m.col >= i && m.col < end {
+                            row.combining.push(CombiningMark {
+                                col: m.col - i,
+                                ch: m.ch,
+                            });
+                        }
+                    }
+                    new_start.push(i);
+                    new_stream.push(row);
+                    i = end;
+                }
+            }
+        }
+        line_first.push(new_stream.len());
+
+        // The live prompt region follows, clamped to the new width one row per row so its row
+        // count is exactly what the shell's redraw expects.
+        let reflowed_len = new_stream.len();
+        for mut row in frozen_rows {
+            row.resize_cols(new_cols);
+            new_stream.push(row);
+        }
+
+        let remap = RowRemap {
+            evicted: old_evicted,
+            new_cols,
+            lines_len: lines.len(),
+            old,
+            line_first,
+            new_start,
+            frozen_from,
+            reflowed_len,
+        };
+
+        // --- re-split: the live screen is the bottom new_rows rows, the rest is history,
+        // the cursor clamped into the screen ---
+        let total = new_stream.len();
+        let (cursor_new_idx, cursor_new_col) = remap
+            .locate(cursor_idx, cursor_col)
+            .unwrap_or((total.saturating_sub(1), 0));
+        let view_new = track_view
+            .then(|| remap.locate(view_idx, 0).map(|(i, _)| i))
+            .flatten();
+        let live_top = total.saturating_sub(new_rows);
+
+        let mut lines_out: VecDeque<Row> = VecDeque::with_capacity(new_rows);
+        let mut scrollback_out: VecDeque<Row> = VecDeque::with_capacity(live_top);
+        for (idx, row) in new_stream.into_iter().enumerate() {
+            if idx < live_top {
+                scrollback_out.push_back(row);
+            } else {
+                lines_out.push_back(row);
+            }
+        }
+        while lines_out.len() < new_rows {
+            lines_out.push_back(take_row(&mut pool, new_cols, &[], false));
+        }
+
+        self.scrollback = scrollback_out;
+        self.lines = lines_out;
+        self.cols = new_cols;
+        self.rows = new_rows;
+        self.cursor.row = cursor_new_idx.saturating_sub(live_top).min(new_rows - 1);
+        self.cursor.col = cursor_new_col.min(new_cols - 1);
+        // Preserve pending-wrap only if the cursor still sits in the last column; anywhere
+        // else there is now room, so the deferred wrap no longer applies.
+        self.cursor.pending_wrap = self.cursor.pending_wrap && self.cursor.col == new_cols - 1;
+        // Carry the DECSC saved cursor across the reflow the same way. This is the piece
+        // alacritty leaves out (it only clamps the column) and the reason a shell that saves
+        // its cursor at the prompt and restores it on `SIGWINCH` — the shell-integration path
+        // — lands its redraw right instead of on a stale row. See `Screen::resize`.
+        if let Some(saved) = self.saved.as_mut() {
+            let old_idx = old_scrollback + saved.cursor.row;
+            match remap.locate(old_idx, saved.cursor.col) {
+                Some((idx, col)) => {
+                    saved.cursor.row = idx.saturating_sub(live_top).min(new_rows - 1);
+                    saved.cursor.col = col;
+                    saved.cursor.pending_wrap =
+                        saved.cursor.pending_wrap && saved.cursor.col == new_cols - 1;
+                }
+                None => {
+                    saved.cursor.row = saved.cursor.row.min(new_rows - 1);
+                    saved.cursor.col = saved.cursor.col.min(new_cols - 1);
+                }
+            }
+        }
+        self.scroll_top = 0;
+        self.scroll_bottom = new_rows - 1;
+        // Tab stops are state a program set, not geometry: a widen only mints defaults for
+        // columns that never existed, as `resize` does.
+        for c in self.tabs.len()..new_cols {
+            self.tabs.push(c % TAB_WIDTH == 0);
+        }
+
+        // The rewrap can multiply the row count past the ring's cap (narrowing); evict the
+        // oldest, as `push_history` does, so scrollback stays bounded.
+        while self.scrollback.len() > self.scrollback_limit {
+            self.scrollback.pop_front();
+            self.evicted = self.evicted.saturating_add(1);
+        }
+
+        // The view anchor named content by logical position; place it back at display row
+        // 0. If the rewrap pulled it down into the live screen, pin to the bottom.
+        let scrollback_len = self.scrollback.len();
+        let new_view = match view_new {
+            Some(idx) => live_top.saturating_sub(idx).min(scrollback_len),
+            None => 0,
+        };
+        (new_view, remap)
     }
 
     /// Overwrite every cell of `row` with `fill` (a blank for the erases, an 'E' for
@@ -3348,20 +3773,78 @@ impl Screen {
         b.cursor.pending_wrap = false;
     }
 
-    /// Resize both screens to `cols` x `rows` (clamped to at least 1x1). The app
-    /// calls this when the window's pixel size divided by the cell size yields a
-    /// new grid; it then sends the child the matching `TIOCSWINSZ`. Content is
-    /// preserved and re-clamped, not re-wrapped (see [`Buffer::resize`]).
-    pub fn resize(&mut self, cols: usize, rows: usize) {
+    /// Resize both screens to `cols` x `rows` (clamped to at least 1x1). The app calls
+    /// this when the window's pixel size divided by the cell size yields a new grid; it
+    /// then sends the child the matching `TIOCSWINSZ`.
+    ///
+    /// A width change re-wraps the primary screen and its scrollback ([`Buffer::reflow`]),
+    /// so a widened window pulls soft-wrapped lines back together and a narrowed one breaks
+    /// them; the cursor and a scrolled-up view are carried across. A height-only change
+    /// keeps the cheap path — no rewrap is needed when the width is the same, and it grows by
+    /// pulling history back onto the screen. The alt screen never reflows: a full-screen
+    /// program owns it and repaints on `SIGWINCH`.
+    ///
+    /// Anchored state follows the text where it can. The primary's own OSC 133 prompt marks
+    /// are translated internally; the returned [`ResizeEffect`] tells the caller how to carry
+    /// its text selection (translate, keep, or drop). The row-id epoch ends on a reflow (or
+    /// any alt-screen resize), so any holder that is *not* translated is still dropped by the
+    /// usual prune — the translation is the addition, not a removal of that safety net.
+    pub fn resize(&mut self, cols: usize, rows: usize) -> ResizeEffect {
         let cols = cols.max(1);
         let rows = rows.max(1);
-        self.primary.resize(cols, rows);
+        let remap = if cols == self.primary.cols {
+            // Height-only (or a no-op): re-clamp rows (a grow pulls history back down) and
+            // re-pin the view. The primary's ids stay put, so prompts need no translation.
+            self.primary.resize(cols, rows);
+            self.view_offset = 0;
+            None
+        } else {
+            // Width changed: rewrap the primary, re-deriving the view, and translate the
+            // primary's prompt marks through the reflow.
+            //
+            // The live prompt is left for the shell to repaint: freeze from the last idle
+            // prompt mark (one with no command output yet — the input the user is sitting at)
+            // down to the bottom, never below the cursor. Everything above it, including a
+            // finished command's output, still reflows.
+            let old_count = self.primary.scrollback.len() + self.primary.rows;
+            let cursor_idx = self.primary.scrollback.len() + self.primary.cursor.row;
+            let frozen_from = self
+                .prompts
+                .iter()
+                .rev()
+                .find(|p| p.output.is_none())
+                .and_then(|p| self.primary.stream_index(p.row))
+                .map(|idx| idx.min(cursor_idx))
+                .unwrap_or(old_count);
+            let view = self.view_offset();
+            let (new_view, remap) = self.primary.reflow(cols, rows, view, frozen_from);
+            self.view_offset = new_view;
+            self.prompts.retain_mut(|p| match remap.row(p.row) {
+                Some(row) => {
+                    p.row = row;
+                    p.output = p.output.and_then(|o| remap.row(o));
+                    true
+                }
+                None => false,
+            });
+            Some(remap)
+        };
         self.alt.resize(cols, rows);
-        // Scrollback was reindexed; a stale offset would point at the wrong rows, and a
-        // row id minted against the old geometry names a row that may not exist (and,
-        // since we do not re-wrap, may hold different text at a different column).
-        self.view_offset = 0;
-        self.break_row_identity();
+
+        if self.on_alt {
+            // A selection was over the alt screen, which only clamps and renumbers: there is
+            // nothing to translate it against, so end the epoch and tell the caller to drop.
+            self.epoch = self.epoch.next();
+            ResizeEffect::Reset
+        } else if let Some(remap) = remap {
+            // Primary width reflow: the ids were renumbered but are translatable. End the
+            // epoch (the safety net for any holder not translated) and hand back the map.
+            self.epoch = self.epoch.next();
+            ResizeEffect::Reflowed(remap)
+        } else {
+            // Height-only on the primary: the ids stayed put, so a selection stands as-is.
+            ResizeEffect::Stable
+        }
     }
 
     /// OSC 0/2: set the window title.
@@ -6186,6 +6669,48 @@ mod tests {
     }
 
     #[test]
+    fn violent_resize_never_panics_and_keeps_invariants() {
+        // "Resize violently narrow -> wide -> narrow" reportedly crashed the live app. This
+        // drives the same at the grid level: thousands of resizes across the whole width/
+        // height range, a shell prompt with OSC 133 marks (so the freeze path runs), wide
+        // glyphs (so the new_cols == 1 degenerate path runs), and a shell-style redraw
+        // interleaved. Any out-of-bounds or overflow in reflow surfaces here as a panic.
+        let mut s = Screen::new(80, 24);
+        let mut p = crate::vt::Parser::new();
+        p.advance_bytes(
+            &mut s,
+            "a wide 世 line and more text to wrap around\r\n".as_bytes(),
+        );
+        p.advance_bytes(
+            &mut s,
+            b"\x1b]133;A\x07user@host ~/some/long/path  main\r\n> ",
+        );
+
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut rng = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        for _ in 0..4000 {
+            let cols = 1 + (rng() % 220) as usize;
+            let rows = 1 + (rng() % 70) as usize;
+            s.resize(cols, rows);
+            let (c, r) = s.dimensions();
+            assert_eq!((c, r), (cols, rows), "size drifted");
+            let (cr, cc) = s.cursor();
+            assert!(cr < r && cc < c, "cursor {cr},{cc} escaped {c}x{r}");
+            // Interleave a shell SIGWINCH redraw and fresh marks, as a live session would.
+            match rng() % 4 {
+                0 => p.advance_bytes(&mut s, b"\r\x1b[J\x1b]133;A\x07user@host ~/p  main\r\n> "),
+                1 => p.advance_bytes(&mut s, "wide 世世世 and text\r\n".as_bytes()),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
     fn sgr_colors_through_the_parser() {
         let mut s = Screen::new(10, 2);
         feed(&mut s, b"\x1b[1;31mhi\x1b[0mok");
@@ -6556,14 +7081,26 @@ mod tests {
     }
 
     #[test]
-    fn narrowing_truncates_and_widening_pads() {
+    fn narrowing_wraps_and_widening_rejoins() {
+        // The reflow contract, replacing the old truncate-and-pad behaviour: a line that
+        // no longer fits is wrapped into scrollback, not cut off, and widening past its
+        // length pulls it back into one row rather than padding a lost tail with blanks.
         let mut s = Screen::new(8, 1);
         feed(&mut s, b"abcdefgh");
         s.resize(4, 1);
-        assert_eq!(s.row_string(0).trim_end(), "abcd");
+        // The tail is the visible row; the head wrapped up into scrollback, nothing lost.
+        assert_eq!(s.row_string(0).trim_end(), "efgh");
+        assert_eq!(s.scrollback_len(), 1);
+        s.scroll_view_up(1);
+        assert_eq!(
+            s.view_cell(0, 0).rune,
+            'a',
+            "the head is in history, not truncated away"
+        );
+        s.scroll_view_to_bottom();
+        // Widening back rejoins the two segments into one row.
         s.resize(8, 1);
-        // Widening pads with blanks; the truncated tail is gone, not restored.
-        assert_eq!(s.cell(0, 4).rune, ' ');
+        assert_eq!(s.row_string(0).trim_end(), "abcdefgh");
         assert_eq!(s.dimensions(), (8, 1));
     }
 
@@ -6658,13 +7195,413 @@ mod tests {
     }
 
     #[test]
-    fn resize_pins_the_view_to_the_bottom() {
+    fn resize_preserves_the_scrolled_view() {
+        // A width change reflows, and the view a user has scrolled up to follows the
+        // content across the rewrap instead of snapping to the bottom: the same line stays
+        // under their eye.
         let mut s = Screen::new(5, 3);
         feed(&mut s, b"a\r\nb\r\nc\r\nd\r\ne");
         s.scroll_view_up(2);
-        assert!(s.is_scrolled());
+        assert_eq!(s.view_cell(0, 0).rune, 'a');
         s.resize(8, 4);
-        assert_eq!(s.view_offset(), 0, "a resize reindexes history and re-pins");
+        assert!(s.is_scrolled(), "the reflow kept the view scrolled");
+        assert_eq!(
+            s.view_cell(0, 0).rune,
+            'a',
+            "the same line is still at the top after the reflow"
+        );
+    }
+
+    #[test]
+    fn reflow_widen_rejoins_a_wrapped_line() {
+        let mut s = Screen::new(4, 3);
+        feed(&mut s, b"abcdef");
+        // On four columns it soft-wrapped across two rows.
+        assert_eq!(s.row_string(0).trim_end(), "abcd");
+        assert_eq!(s.row_string(1).trim_end(), "ef");
+        // Widening past the line's length pulls the two rows back into one.
+        s.resize(8, 3);
+        assert_eq!(s.row_string(0).trim_end(), "abcdef");
+        assert_eq!(s.row_string(1).trim_end(), "");
+    }
+
+    #[test]
+    fn reflow_narrow_splits_a_long_line() {
+        let mut s = Screen::new(6, 4);
+        feed(&mut s, b"hello world");
+        s.resize(4, 4);
+        // The one logical line breaks cleanly across rows, content preserved in order.
+        assert_eq!(s.row_string(0).trim_end(), "hell");
+        assert_eq!(s.row_string(1).trim_end(), "o wo");
+        assert_eq!(s.row_string(2).trim_end(), "rld");
+    }
+
+    #[test]
+    fn reflow_round_trips_through_a_narrow_width() {
+        let mut s = Screen::new(10, 4);
+        feed(&mut s, b"the quick brown fox");
+        s.resize(5, 4);
+        // Widening past the logical length recovers the original single line.
+        s.resize(20, 4);
+        assert_eq!(s.row_string(0).trim_end(), "the quick brown fox");
+    }
+
+    #[test]
+    fn reflow_keeps_the_cursor_on_its_character() {
+        let mut s = Screen::new(4, 3);
+        // "abcdef" wraps to "abcd"/"ef"; park the cursor on 'b' at row 0, col 1.
+        feed(&mut s, b"abcdef\x1b[1;2H");
+        let (r, c) = s.cursor();
+        assert_eq!(s.cell(r, c).rune, 'b');
+        s.resize(8, 3);
+        let (r, c) = s.cursor();
+        assert_eq!(
+            s.cell(r, c).rune,
+            'b',
+            "the cursor rode the reflow to its char"
+        );
+    }
+
+    #[test]
+    fn reflow_never_splits_a_wide_glyph() {
+        let mut s = Screen::new(10, 4);
+        feed(&mut s, "aかb".as_bytes()); // 'a', wide か (two columns), 'b'
+        s.resize(2, 4);
+        // The pair could not fit in the last column of row 0, so it was pushed whole onto
+        // its own row rather than split — no half glyph is ever left behind.
+        assert_eq!(s.cell(1, 0).rune, 'か');
+        assert!(s.cell(1, 0).is_wide_leader());
+        assert!(s.cell(1, 1).is_wide_spacer());
+        assert_eq!(s.cell(0, 0).rune, 'a');
+        assert!(!s.cell(0, 1).is_wide_leader() && !s.cell(0, 1).is_wide_spacer());
+    }
+
+    #[test]
+    fn reflow_carries_combining_marks() {
+        let mut s = Screen::new(6, 3);
+        // 'e' at col 4 carries a combining mark; the line is "abcdef".
+        feed(&mut s, "abcde\u{0301}f".as_bytes());
+        assert_eq!(s.marks_at(0, 4).collect::<Vec<_>>(), ['\u{0301}']);
+        s.resize(3, 3);
+        // "abc"/"def": 'e' moved to row 1, col 1, and its mark rode along.
+        assert_eq!(s.cell(1, 1).rune, 'e');
+        assert_eq!(s.marks_at(1, 1).collect::<Vec<_>>(), ['\u{0301}']);
+    }
+
+    #[test]
+    fn reflow_keeps_hyperlinks() {
+        let mut s = Screen::new(10, 3);
+        feed(
+            &mut s,
+            b"\x1b]8;;https://example.com\x1b\\linktext\x1b]8;;\x1b\\",
+        );
+        let link = s.cell(0, 0).link;
+        assert!(link.is_set(), "the text is inside an OSC 8 anchor");
+        s.resize(4, 3);
+        // The link rides on the cell, so a rewrap keeps it without any span fixups.
+        assert_eq!(s.cell(0, 0).link, link);
+    }
+
+    #[test]
+    fn reflow_trims_plain_trailing_blanks() {
+        let mut s = Screen::new(10, 3);
+        feed(&mut s, b"hi");
+        s.resize(4, 3);
+        // A short line stays one row: the trailing blanks are padding, not wrapped content.
+        assert_eq!(s.scrollback_len(), 0);
+        assert_eq!(s.row_string(0).trim_end(), "hi");
+        assert_eq!(s.row_string(1).trim_end(), "");
+    }
+
+    #[test]
+    fn reflow_keeps_coloured_trailing_cells() {
+        let mut s = Screen::new(10, 2);
+        feed(&mut s, b"\x1b[41m    \x1b[0m"); // four red-background spaces
+        s.resize(6, 2);
+        // A coloured space is content, not padding: the trim leaves it, so the bar survives.
+        assert_eq!(
+            s.cell(0, 3).bg,
+            Color::Ansi(1),
+            "the coloured cell rode the reflow"
+        );
+    }
+
+    #[test]
+    fn reflow_caps_a_giant_logical_line() {
+        // A line longer than MAX_LOGICAL_COLS is broken at the cap and never re-joins across
+        // the seam, so a very wide window cannot force an unbounded single logical line.
+        let big = vec![b'x'; 1100];
+        let mut s = Screen::new(80, 5);
+        feed(&mut s, &big);
+        s.resize(1200, 5);
+        let first = s.row_string(0).trim_end().len();
+        assert!(
+            (MAX_LOGICAL_COLS..1100).contains(&first),
+            "the first row is capped near {MAX_LOGICAL_COLS}, got {first}"
+        );
+        assert!(
+            !s.row_string(1).trim_end().is_empty(),
+            "the remainder stayed on a second row instead of collapsing to one"
+        );
+    }
+
+    #[test]
+    fn reflow_leaves_the_alt_screen_clamped() {
+        let mut s = Screen::new(8, 3);
+        feed(&mut s, b"\x1b[?1049h"); // enter the alt screen
+        feed(&mut s, b"abcdefgh");
+        s.resize(4, 3);
+        // The alt screen clamps like an ordinary resize; a full-screen program owns it and
+        // repaints on SIGWINCH, so its content must never be re-wrapped.
+        assert_eq!(s.row_string(0).trim_end(), "abcd");
+        assert_eq!(s.row_string(1).trim_end(), "");
+    }
+
+    #[test]
+    fn height_only_resize_does_not_reflow() {
+        let mut s = Screen::new(4, 3);
+        feed(&mut s, b"abcdef"); // "abcd"/"ef"
+        s.resize(4, 6); // width unchanged: the cheap path, no rewrap
+        assert_eq!(s.row_string(0).trim_end(), "abcd");
+        assert_eq!(
+            s.row_string(1).trim_end(),
+            "ef",
+            "still split, not rejoined"
+        );
+    }
+
+    #[test]
+    fn growing_height_pulls_scrollback_down() {
+        // Growing the screen keeps the bottom line pinned to the window's bottom edge and
+        // reveals history above, instead of padding blank rows below the content.
+        let mut s = Screen::new(5, 2);
+        feed(&mut s, b"a\r\nb\r\nc\r\nd"); // "a","b" in history; "c","d" live
+        assert_eq!(s.scrollback_len(), 2);
+        s.resize(5, 4); // height only, grow by two
+        assert_eq!(s.row_string(0).trim_end(), "a");
+        assert_eq!(s.row_string(1).trim_end(), "b");
+        assert_eq!(s.row_string(2).trim_end(), "c");
+        assert_eq!(s.row_string(3).trim_end(), "d");
+        assert_eq!(s.scrollback_len(), 0, "history was pulled onto the screen");
+        // The cursor rode down with its line, still on the last row.
+        assert_eq!(s.cursor().0, 3);
+    }
+
+    #[test]
+    fn growing_height_past_history_pads_below() {
+        // Only one line of history but two new rows: the one is pulled down, the last row
+        // is a blank pad below the content.
+        let mut s = Screen::new(5, 2);
+        feed(&mut s, b"a\r\nb\r\nc"); // "a" in history; "b","c" live
+        assert_eq!(s.scrollback_len(), 1);
+        s.resize(5, 4);
+        assert_eq!(s.row_string(0).trim_end(), "a");
+        assert_eq!(s.row_string(1).trim_end(), "b");
+        assert_eq!(s.row_string(2).trim_end(), "c");
+        assert_eq!(s.row_string(3).trim_end(), "");
+        assert_eq!(s.scrollback_len(), 0);
+    }
+
+    #[test]
+    fn reflow_returns_a_remap_that_tracks_a_cell() {
+        let mut s = Screen::new(4, 3);
+        feed(&mut s, b"abcdef"); // "abcd" | "ef"; 'f' is at (abs_row(1), 1)
+        let f = s.abs_row(1);
+        let ResizeEffect::Reflowed(remap) = s.resize(8, 3) else {
+            panic!("a width change reflows");
+        };
+        // After widening, "abcdef" is one row and 'f' has moved to column 5.
+        let (row, col) = remap.point(f, 1).expect("the cell survived the reflow");
+        assert_eq!(col, 5);
+        let dr = s.display_row(row).expect("its row is on screen");
+        assert_eq!(s.row_string(dr).chars().nth(col), Some('f'));
+    }
+
+    #[test]
+    fn a_height_only_resize_reports_stable_ids() {
+        let mut s = Screen::new(5, 2);
+        feed(&mut s, b"a\r\nb\r\nc\r\nd");
+        assert!(matches!(s.resize(5, 4), ResizeEffect::Stable));
+    }
+
+    #[test]
+    fn reflow_carries_prompt_marks() {
+        let mut s = Screen::new(4, 4);
+        feed(&mut s, b"\x1b]133;A\x07ab\r\n"); // a prompt "ab" on row 0
+        feed(&mut s, b"\x1b]133;C\x07cdefgh"); // output "cdefgh" wraps to "cdef" | "gh"
+        assert_eq!(s.prompts()[0].row, s.abs_row(0));
+        s.resize(8, 4); // widen: "ab" stays row 0, "cdefgh" rejoins below it
+                        // The prompt still names the row holding "ab", and its output the rejoined line.
+        let p = s.prompts()[0];
+        let prompt_row = s.display_row(p.row).expect("prompt row on screen");
+        assert_eq!(s.row_string(prompt_row).trim_end(), "ab");
+        let output_row = s
+            .display_row(p.output.expect("output marked"))
+            .expect("output row on screen");
+        assert_eq!(s.row_string(output_row).trim_end(), "cdefgh");
+    }
+
+    #[test]
+    fn reflow_leaves_the_live_prompt_for_the_shell_to_redraw() {
+        // Repro of the resize-mangles-the-zsh-prompt bug. A full-width prompt bar reflows to
+        // more rows than the shell regenerates it to on SIGWINCH. The shell redraws by moving
+        // up its OWN row count and clearing to the end of the screen; if the terminal reflowed
+        // the live prompt to more rows, the shell's clear misses the extra row and it is left
+        // as residue on the static line above (exactly the mangled `ps` line in the report).
+        // So the terminal must not reflow the current prompt region (from the last OSC 133
+        // mark to the cursor) — the shell owns it and repaints it.
+        let mut s = Screen::new(12, 4);
+        feed(&mut s, b"top\r\n"); // static output, above the prompt
+        feed(&mut s, b"second\r\n");
+        feed(&mut s, b"\x1b]133;A\x07"); // the current prompt begins here
+        feed(&mut s, b"BAR@FULLWID:\r\n"); // a bar that fills all 12 columns
+        feed(&mut s, b"> "); // the input line; the cursor rests at column 2
+
+        s.resize(8, 4); // narrow: the bar's 12 cells would reflow onto two rows
+
+        // The shell's SIGWINCH redraw: it regenerates a one-row bar for 8 columns and,
+        // believing its prompt is two rows (bar + input), moves up one from the input line,
+        // clears to the end of the screen, and repaints.
+        feed(&mut s, b"\x1b[1A\r\x1b[J"); // up one, column zero, clear to end of screen
+        feed(&mut s, b"BARSHORT\r\n> "); // the regenerated one-row bar, then the input line
+
+        // The row above the repainted bar must be the static "second", not a leftover half of
+        // the old bar that the shell's clear could not reach.
+        assert_eq!(
+            s.row_string(1).trim_end(),
+            "second",
+            "a reflowed prompt row leaked as residue above the shell's redraw"
+        );
+    }
+
+    #[test]
+    fn reflow_survives_narrow_until_wrap_then_widen() {
+        // The user's precise repro: a full screen, narrow until the prompt label wraps to a
+        // second row, then widen again. Each resize is followed by the shell's SIGWINCH
+        // redraw (move up its previous prompt height, clear to end of screen, repaint).
+        let mut s = Screen::new(8, 4);
+        feed(&mut s, b"o0\r\no1\r\n"); // output filling toward the bottom
+        feed(&mut s, b"\x1b]133;A\x07"); // the idle prompt begins
+        feed(&mut s, b"LABEL_XY"); // an 8-column-wide label (fills the row)
+        feed(&mut s, b"\r\n> "); // the input line; cursor at column 2
+
+        // Narrow to 5: the 8-cell label no longer fits on one row.
+        s.resize(5, 4);
+        // Shell redraw, previous prompt height 2 (label + input): up 1, clear, repaint.
+        feed(&mut s, b"\x1b[1A\r\x1b[J\x1b]133;A\x07LABEL_XY\r\n> ");
+
+        // Widen to 10: the label fits on one row again.
+        s.resize(10, 4);
+        // Shell redraw, previous prompt height 3 (wrapped label + input): up 2, clear, repaint.
+        feed(&mut s, b"\x1b[2A\r\x1b[J\x1b]133;A\x07LABEL_XY\r\n> ");
+
+        // The label must appear on exactly one row — no wrapped-half residue left behind.
+        let rows: Vec<String> = (0..4)
+            .map(|r| s.row_string(r).trim_end().to_string())
+            .collect();
+        let with_label = rows.iter().filter(|r| r.contains("LABEL")).count();
+        assert_eq!(
+            with_label, 1,
+            "label residue after narrow-then-widen: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn reflow_survives_narrow_then_widen_without_remarking_the_prompt() {
+        // As above, but the shell does NOT re-emit OSC 133;A on its SIGWINCH redraw (it only
+        // marks a fresh prompt, not a repaint). The mark must still track the label across the
+        // reflow, or the freeze protects the wrong rows.
+        let mut s = Screen::new(8, 4);
+        feed(&mut s, b"o0\r\no1\r\n");
+        feed(&mut s, b"\x1b]133;A\x07");
+        feed(&mut s, b"LABEL_XY");
+        feed(&mut s, b"\r\n> ");
+
+        s.resize(5, 4);
+        feed(&mut s, b"\x1b[1A\r\x1b[JLABEL_XY\r\n> "); // redraw, no OSC 133;A
+
+        s.resize(10, 4);
+        feed(&mut s, b"\x1b[2A\r\x1b[JLABEL_XY\r\n> "); // redraw, no OSC 133;A
+
+        let rows: Vec<String> = (0..4)
+            .map(|r| s.row_string(r).trim_end().to_string())
+            .collect();
+        let with_label = rows.iter().filter(|r| r.contains("LABEL")).count();
+        assert_eq!(with_label, 1, "label residue without re-marking: {rows:?}");
+    }
+
+    #[test]
+    #[ignore = "known reflow-vs-shell limit without shell integration; alacritty has it too. \
+                The fix is OSC 133 (POWERLEVEL9K_TERM_SHELL_INTEGRATION=true), covered by \
+                reflow_leaves_the_live_prompt_for_the_shell_to_redraw."]
+    fn reflow_does_not_mangle_a_prompt_without_osc133() {
+        // The real-world repro, captured from zsh 5.9 under a PTY: a full-width prompt bar,
+        // NO OSC 133 marks (most prompts do not emit them), then a resize. zsh's SIGWINCH
+        // redraw moves up its own tracked prompt height, clears to end of screen, and
+        // repaints. If the terminal reflowed the full-width bar to more rows than zsh tracked,
+        // zsh's clear misses the extra row and it survives as residue — the mangled line.
+        let mut s = Screen::new(12, 4);
+        feed(&mut s, b"o0\r\no1\r\n"); // static output above
+        feed(&mut s, b"\x1b[44mBARBARBARBAR\x1b[49m\r\n> "); // a blue full-width bar, then input
+
+        s.resize(6, 4); // narrow: the 12-cell bar no longer fits on one row
+
+        // zsh's actual redraw bytes (up one, clear to end of screen, repaint a 6-wide bar).
+        feed(&mut s, b"\r\r\x1b[A\x1b[J\x1b[44mBARBAR\x1b[49m\r\n> ");
+
+        // The bar must occupy exactly one row: no leftover half above the repaint.
+        let rows: Vec<String> = (0..4)
+            .map(|r| s.row_string(r).trim_end().to_string())
+            .collect();
+        let bars = rows.iter().filter(|r| r.contains("BAR")).count();
+        assert_eq!(
+            bars, 1,
+            "prompt-bar residue after a no-OSC133 resize: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn shell_integration_fixes_the_full_width_bar_resize() {
+        // The same full-width bar and the same real zsh redraw bytes as the ignored repro
+        // above, but WITH the OSC 133 prompt mark shell integration emits (the p10k
+        // `POWERLEVEL9K_TERM_SHELL_INTEGRATION=true` path). The bar is now frozen — clamped to
+        // one row rather than rewrapped — so it matches zsh's one-row repaint and no residue is
+        // left. This is the fix kitty ships and alacritty lacks.
+        let mut s = Screen::new(12, 4);
+        feed(&mut s, b"o0\r\no1\r\n");
+        feed(&mut s, b"\x1b]133;A\x07\x1b[44mBARBARBARBAR\x1b[49m\r\n> "); // marked prompt
+
+        s.resize(6, 4);
+        feed(&mut s, b"\r\r\x1b[A\x1b[J\x1b[44mBARBAR\x1b[49m\r\n> "); // real zsh redraw
+
+        let rows: Vec<String> = (0..4)
+            .map(|r| s.row_string(r).trim_end().to_string())
+            .collect();
+        let bars = rows.iter().filter(|r| r.contains("BAR")).count();
+        assert_eq!(
+            bars, 1,
+            "shell integration should leave no bar residue: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn reflow_still_reflows_output_above_the_idle_prompt() {
+        // Freezing the live prompt must not disable the feature: a finished command's output
+        // above the idle prompt still reflows (the whole point). "docker ps"-style — wrapped
+        // output, then a fresh idle prompt below it.
+        let mut s = Screen::new(4, 4);
+        feed(&mut s, b"\x1b]133;A\x07p\r\n"); // an earlier prompt
+        feed(&mut s, b"\x1b]133;C\x07abcdef\r\n"); // its output wraps: "abcd" | "ef"
+        feed(&mut s, b"\x1b]133;D;0\x07"); // the command finished
+        feed(&mut s, b"\x1b]133;A\x07> "); // a fresh idle prompt (no output yet)
+
+        s.resize(8, 4); // widen
+
+        // The finished output rejoined onto one row above the frozen prompt.
+        assert_eq!(s.row_string(1).trim_end(), "abcdef");
+        assert_eq!(s.row_string(2).trim_end(), ">"); // the idle prompt, clamped, left for zsh
+        let (cr, cc) = s.cursor();
+        assert_eq!((cr, cc), (2, 2), "cursor still sits in the input");
     }
 
     #[test]
@@ -7200,26 +8137,42 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_keeps_a_soft_wrapped_line_joined() {
-        // The regression that started this: the wrap link used to live on the row's
-        // last cell, so widening stranded it mid-row and narrowing truncated it away.
-        // Either way the next copy across the wrap grew a newline out of nowhere.
-        for new_cols in [4, 6, 12, 3] {
+    fn a_resize_rewraps_a_soft_wrapped_line() {
+        // Reflow re-lays a wrapped line to the new width: it wraps only while it does not
+        // fit, and rejoins onto one row once it does. (Before reflow this checked the wrap
+        // link merely survived in place; now the line actively re-flows.)
+        for new_cols in [3, 4, 6, 12] {
             let mut s = Screen::new(4, 3);
             feed(&mut s, b"abcdef"); // wraps: "abcd" | "ef"
             s.resize(new_cols, 3);
-            assert!(s.row_wraps(0), "{new_cols} cols: the wrap link survives");
+            if new_cols < 6 {
+                assert!(
+                    s.row_wraps(0),
+                    "{new_cols} cols: still too narrow, so it wraps"
+                );
+            } else {
+                assert!(!s.row_wraps(0), "{new_cols} cols: it rejoined onto one row");
+                assert_eq!(s.row_string(0).trim_end(), "abcdef");
+            }
         }
     }
 
     #[test]
     fn a_resized_wrapped_line_copies_unbroken() {
-        // The user-visible half of the same bug: drag over an old wrapped line after
-        // the window has been resized, and the clipboard must not break mid-sentence.
+        // Drag over an old wrapped line after a resize and the clipboard must not break
+        // mid-sentence. A widen rejoins it onto one row; a narrow re-wraps it; both still
+        // copy as one unbroken logical line.
         let mut s = Screen::new(4, 3);
-        feed(&mut s, b"abcdef"); // wraps: "abcd" | "ef"
-        s.resize(6, 3);
-        assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 1, 1)), "abcdef");
+        feed(&mut s, b"abcdef"); // "abcd" | "ef"
+        s.resize(6, 3); // widen: rejoins onto one row
+        assert!(!s.row_wraps(0));
+        assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 0, 5)), "abcdef");
+
+        let mut s = Screen::new(4, 3);
+        feed(&mut s, b"abcdef");
+        s.resize(3, 3); // narrow: re-wraps to "abc" | "def"
+        assert!(s.row_wraps(0));
+        assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 1, 2)), "abcdef");
     }
 
     #[test]

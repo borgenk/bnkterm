@@ -631,6 +631,25 @@ impl Tabs {
         }
     }
 
+    /// Push each child its settled resize (`TIOCSWINSZ`). Every tab, not just the visible
+    /// one: a window resize reflowed all their grids, so all of them owe their shell the
+    /// debounced winsize.
+    pub(super) fn flush_winsize_if_due(&mut self) -> crate::error::Result<()> {
+        for entry in &mut self.entries {
+            entry.core.flush_winsize_if_due()?;
+        }
+        Ok(())
+    }
+
+    /// The soonest pending debounced-resize deadline across all tabs, for the event-loop
+    /// wait: with no output coming, nothing else would wake us to deliver it.
+    pub(super) fn winsize_deadline(&self) -> Option<Instant> {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.core.winsize_deadline())
+            .min()
+    }
+
     /// Mark the visible terminal for repaint.
     pub(super) fn mark_dirty(&mut self) {
         if let Some(entry) = self.entries.get_mut(self.active) {

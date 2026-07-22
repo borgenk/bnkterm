@@ -199,6 +199,11 @@ pub fn run(verbosity: Verbosity) -> crate::error::Result<()> {
     // `grid::Screen::set_hyperlink`) — rather than impersonating a terminal on the
     // list to get the same answer.
     std::env::set_var("FORCE_HYPERLINK", "1");
+    // Auto-inject zsh shell integration (OSC 133 prompt marks) so a resize reflow does not
+    // fight the shell's prompt redraw — the reason kitty/ghostty "just work" and alacritty
+    // does not. Held for the process lifetime; dropping it removes the generated directory.
+    // Must precede any thread, like the exports above, since it mutates the environment.
+    let _shell_integration = crate::shell_integration::install();
     let mut state = State::new(false, verbosity)?;
     state.bring_up()?;
     Ok(())
@@ -735,6 +740,8 @@ impl State {
         self.tabs.tick_blink_if_due();
         self.tabs.tick_bell_if_due();
         self.tabs.tick_scrollbar();
+        // Deliver any resize that has now settled to the children (debounced SIGWINCH).
+        self.tabs.flush_winsize_if_due()?;
         if self.repeat_at.is_some_and(|at| at <= Instant::now()) {
             self.fire_repeat()?;
         }
@@ -762,6 +769,7 @@ impl State {
             scrollbar,
             self.tabs.sync_deadline(),
             self.tabs.bell_deadline(),
+            self.tabs.winsize_deadline(),
         ]
         .into_iter()
         .flatten()

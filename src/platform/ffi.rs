@@ -17,7 +17,7 @@
 //! Struct layouts (`msghdr`, `iovec`, `cmsghdr`) mirror the Linux x86_64/arm64
 //! ABI; this targets Linux/Wayland and nothing else.
 
-use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void, CStr};
+use core::ffi::{c_char, c_int, c_short, c_uint, c_ulong, c_void, CStr};
 use std::mem;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
@@ -700,6 +700,39 @@ pub fn drm_syncobj_point_to_sync_file(
     drm_syncobj_export_sync_file(drm, scratch)
 }
 
+/// One entry for [`poll`]: the fd to watch, the events wanted, the events that fired.
+#[repr(C)]
+struct PollFd {
+    fd: c_int,
+    events: c_short,
+    revents: c_short,
+}
+
+extern "C" {
+    fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
+}
+
+/// Block until `fd` — a sync file — signals its fence, or `timeout_ms` elapses; returns
+/// whether it signalled. A sync file becomes `POLLIN`-readable exactly when its fence has,
+/// so this is how the CPU waits on a GPU fence. Its one use is waiting for the compositor
+/// to release a buffer before that buffer's image is freed under it, in
+/// [`crate::app`]'s `destroy_buffers` — freeing an image the compositor is still scanning
+/// out is a GPU use-after-free. The bounded timeout keeps a compositor that never signals
+/// from hanging teardown; on `-1`/`EINTR` it reports "not signalled" and the caller falls
+/// through to the free (a vanishingly rare window against a certain leak otherwise).
+pub fn wait_sync_file(fd: RawFd, timeout_ms: c_int) -> bool {
+    const POLLIN: c_short = 0x0001;
+    let mut pfd = PollFd {
+        fd,
+        events: POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one live PollFd for the length of the call; poll reads `events` and writes
+    // `revents` only, and treats `fd` as read-only.
+    let n = unsafe { poll(&mut pfd, 1, timeout_ms) };
+    n > 0 && (pfd.revents & POLLIN) != 0
+}
+
 // ---------------------------------------------------------------------------
 // Runtime library loading.
 // ---------------------------------------------------------------------------
@@ -830,35 +863,8 @@ mod tests {
         assert_eq!(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, 0xC018_64C1);
         assert_eq!(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, 0xC018_64C2);
         assert_eq!(DRM_IOCTL_SYNCOBJ_TRANSFER, 0xC020_64CC);
-    }
-
-    // Kernel readiness check for the round-trip test below. A sync file's fd
-    // becomes POLLIN-readable exactly when its fence has signalled, so a
-    // zero-timeout poll reads the fence state without waiting. Test-only, so the
-    // binding stays here rather than widening the module's production surface.
-    const POLLIN: c_short = 0x0001;
-
-    #[repr(C)]
-    struct PollFd {
-        fd: c_int,
-        events: c_short,
-        revents: c_short,
-    }
-
-    extern "C" {
-        fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
-    }
-
-    /// Whether `fd` (a sync file) currently carries a signalled fence.
-    fn fd_is_signaled(fd: RawFd) -> bool {
-        let mut pfd = PollFd {
-            fd,
-            events: POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one live PollFd; poll reads events and writes revents only.
-        let n = unsafe { poll(&mut pfd, 1, 0) };
-        n > 0 && (pfd.revents & POLLIN) != 0
+        // `struct pollfd` (poll.h): int + short + short.
+        assert_eq!(mem::size_of::<PollFd>(), 8);
     }
 
     /// Open the first usable DRM render node, or `None` when the machine has
@@ -899,7 +905,7 @@ mod tests {
         let src = drm_syncobj_create(fd, true).expect("create signaled syncobj");
         let signalled = drm_syncobj_export_sync_file(fd, src).expect("export sync file");
         assert!(
-            fd_is_signaled(signalled.as_raw_fd()),
+            wait_sync_file(signalled.as_raw_fd(), 0),
             "a syncobj created signalled must export a signalled fence",
         );
 
@@ -915,7 +921,7 @@ mod tests {
         let round_tripped = drm_syncobj_point_to_sync_file(fd, timeline, POINT, scratch)
             .expect("read timeline point back as a sync file");
         assert!(
-            fd_is_signaled(round_tripped.as_raw_fd()),
+            wait_sync_file(round_tripped.as_raw_fd(), 0),
             "the fence must stay signalled across the timeline round-trip",
         );
         // Dropping `drm` closes the render node, freeing every syncobj on it.

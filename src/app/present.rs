@@ -35,6 +35,12 @@ use crate::render::gpu;
 use crate::render::vulkan;
 use crate::term_render;
 
+/// How long [`GpuPresentation::destroy_buffers`] waits for the compositor to release a
+/// buffer before freeing its image. Normally the release has long since signalled and the
+/// wait returns at once; this cap only bounds a compositor that never signals, so a resize
+/// can never hang on one. Two frames at 60 Hz is ~33 ms; 100 ms is comfortable slack.
+const BUFFER_RELEASE_WAIT_MS: core::ffi::c_int = 100;
+
 /// Client-owned explicit-sync state (`linux-drm-syncobj-v1`), negotiated over a
 /// live GPU backend when the compositor advertises the manager. Two DRM syncobj
 /// timelines the compositor shares: we signal `acquire` with each frame's
@@ -390,6 +396,20 @@ impl State {
     /// Destroy the current buffers and their backing GPU images. The server
     /// recycles the wl_buffer ids via `delete_id` into our free list.
     pub(super) fn destroy_buffers(&mut self) {
+        // Wait for the compositor to finish reading each buffer it may still be scanning
+        // out before its image is freed. `wait_idle` (below) drains only *our* device;
+        // under explicit sync the compositor's "done reading" signal is the buffer's
+        // release fence, and freeing an image while the compositor still reads it is a GPU
+        // use-after-free — the intermittent silent crash a rapid resize races into. A
+        // published release point that has already signalled makes this return at once;
+        // the bounded wait only bites a stuck compositor, and never hangs the resize.
+        if let Some(es) = &self.presentation.explicit_sync {
+            for idx in 0..self.presentation.buffers.len() {
+                if let Ok(Some(fence)) = es.release_fence(idx) {
+                    ffi::wait_sync_file(fence.as_raw_fd(), BUFFER_RELEASE_WAIT_MS);
+                }
+            }
+        }
         let buffers = self.presentation.buffers;
         for b in buffers {
             if b != 0 {
@@ -397,8 +417,8 @@ impl State {
             }
         }
         if let Some(gpu) = &self.presentation.backend {
-            // Nothing may be in flight while images are destroyed; resize is rare
-            // enough that a full drain is the simple correct answer.
+            // Nothing may be in flight on our device while images are destroyed; resize is
+            // rare enough that a full drain is the simple correct answer.
             gpu.wait_idle();
             for img in self.presentation.images.drain(..) {
                 gpu.destroy_image(img);

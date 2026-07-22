@@ -23,6 +23,7 @@ pub mod input;
 mod keymode;
 pub mod mouse;
 pub mod pty;
+pub mod shell_integration;
 mod tab_bar;
 pub mod term_render;
 pub mod vt;
