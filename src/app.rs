@@ -1137,6 +1137,10 @@ impl State {
                 self.presentation.busy[0] = false;
             } else if msg.object == self.presentation.buffers[1] {
                 self.presentation.busy[1] = false;
+            } else {
+                // A release for a buffer a resize retired: the compositor is done reading it,
+                // so its image can finally be freed under it safely.
+                self.release_retired(msg.object);
             }
         }
         Ok(())

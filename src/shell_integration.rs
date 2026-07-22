@@ -34,6 +34,7 @@
 //! thread starts (as [`crate::app::run`] does, beside the other capability exports).
 
 use std::ffi::OsStr;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
 
 /// Set to `0` to disable auto-injection, for a user whose exotic startup it disturbs.
@@ -68,8 +69,11 @@ pub fn install() -> Option<Session> {
     if !shell_is_zsh(std::env::var_os("SHELL").as_deref()) {
         return None;
     }
-    let dir = integration_dir();
-    write_zsh_files(&dir).ok()?;
+    let dir = create_integration_dir().ok()?;
+    if write_zsh_files(&dir).is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
 
     // Hand the child the user's current ZDOTDIR (so our .zshenv can restore it) and point
     // ZDOTDIR at our directory. `BNKTERM_INT_ZDOTDIR` is our directory, which the stages
@@ -94,24 +98,71 @@ fn shell_is_zsh(shell: Option<&OsStr>) -> bool {
         .is_some_and(|name| name == OsStr::new("zsh"))
 }
 
-/// The per-process directory the generated startup files live in. Under the temp dir, keyed
-/// by pid so two running instances never share (and a stale directory from a crashed run is
-/// harmless — it is only ever read by our own children).
-fn integration_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("bnkterm-shell-{}", std::process::id()))
+/// Create a fresh, private directory for the generated startup files and return its path.
+/// Under `$XDG_RUNTIME_DIR` when the session has one (already a per-user 0700 directory),
+/// otherwise the temp dir. Either way the name carries 128 bits from the kernel CSPRNG so it
+/// is unpredictable, and it is made with `create_dir` (not `_all`) at mode 0700, so a name an
+/// attacker raced to pre-create is rejected rather than silently reused. On a shared `/tmp`
+/// that is what stops another user from planting the files bnkterm's zsh then sources.
+fn create_integration_dir() -> std::io::Result<PathBuf> {
+    let name = format!("bnkterm-shell-{}-{}", std::process::id(), random_token()?);
+    // Prefer $XDG_RUNTIME_DIR (already a per-user 0700 dir); fall back to the temp dir when it
+    // is unset or unusable. Security does not rest on the base: the unpredictable name, the
+    // 0700 `create_dir` that fails on a pre-created name, and the O_EXCL file writes hold on a
+    // shared /tmp too.
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let bases = xdg.into_iter().chain(std::iter::once(std::env::temp_dir()));
+    let mut last_err: Option<std::io::Error> = None;
+    for base in bases {
+        let dir = base.join(&name);
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("no usable base directory")))
 }
 
-/// Write the four zsh startup shims into `dir`, creating it. The `.zprofile`/`.zlogin` pair
-/// matters only for a login shell (which bnkterm does not spawn today, but a nested one or a
-/// future launch flag might), so they are written for completeness; the load-bearing pair is
-/// `.zshenv` and `.zshrc`.
+/// 128 bits from the kernel CSPRNG, hex-encoded, for an unpredictable directory name. Read
+/// straight from `/dev/urandom` (bnkterm is Linux-only) rather than pulling in a crate.
+fn random_token() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        for nibble in [b >> 4, b & 0x0f] {
+            if let Some(c) = char::from_digit(u32::from(nibble), 16) {
+                token.push(c);
+            }
+        }
+    }
+    Ok(token)
+}
+
+/// Write the four zsh startup shims into the already-created private `dir`. The
+/// `.zprofile`/`.zlogin` pair matters only for a login shell (which bnkterm does not spawn
+/// today, but a nested one or a future launch flag might), so they are written for
+/// completeness; the load-bearing pair is `.zshenv` and `.zshrc`.
 fn write_zsh_files(dir: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    std::fs::write(dir.join(".zshenv"), ZSHENV)?;
-    std::fs::write(dir.join(".zprofile"), stage(".zprofile"))?;
-    std::fs::write(dir.join(".zshrc"), zshrc())?;
-    std::fs::write(dir.join(".zlogin"), stage(".zlogin"))?;
+    write_new(dir.join(".zshenv"), ZSHENV.as_bytes())?;
+    write_new(dir.join(".zprofile"), stage(".zprofile").as_bytes())?;
+    write_new(dir.join(".zshrc"), zshrc().as_bytes())?;
+    write_new(dir.join(".zlogin"), stage(".zlogin").as_bytes())?;
     Ok(())
+}
+
+/// Write `contents` to a brand-new file, failing if anything is already at `path`.
+/// `create_new` is `O_CREAT | O_EXCL`, so a symlink or file pre-placed at the path is never
+/// followed or truncated — the write fails instead. Mode 0600: the shims are ours alone.
+fn write_new(path: PathBuf, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(contents)
 }
 
 /// `.zshenv`: the bootstrap. It is the one stage that reads `BNKTERM_ORIG_ZDOTDIR` (the
@@ -235,7 +286,7 @@ mod tests {
 
         // Lay down the shims and point the child at them, exactly as `install` does. The
         // child inherits this environment across the fork.
-        let dir = std::env::temp_dir().join(format!("bnkterm-e2e-{}", std::process::id()));
+        let dir = create_integration_dir().expect("create dir");
         write_zsh_files(&dir).expect("write shims");
         match std::env::var_os("ZDOTDIR") {
             Some(orig) => std::env::set_var("BNKTERM_ORIG_ZDOTDIR", orig),
@@ -269,7 +320,7 @@ mod tests {
 
     #[test]
     fn writes_the_four_startup_shims() {
-        let dir = std::env::temp_dir().join(format!("bnkterm-shelltest-{}", std::process::id()));
+        let dir = create_integration_dir().expect("create dir");
         write_zsh_files(&dir).expect("write shims");
         for f in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
             assert!(dir.join(f).is_file(), "missing {f}");
@@ -282,6 +333,34 @@ mod tests {
                 "{f} drops the hand-off"
             );
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_integration_dir_is_private_and_unpredictable() {
+        use std::os::unix::fs::PermissionsExt;
+        let a = create_integration_dir().expect("dir a");
+        let b = create_integration_dir().expect("dir b");
+        // Two directories never collide, so the name cannot be guessed from the pid alone.
+        assert_ne!(a, b);
+        let mode = std::fs::metadata(&a).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the directory must be private to the user");
+        std::fs::remove_dir_all(&a).ok();
+        std::fs::remove_dir_all(&b).ok();
+    }
+
+    #[test]
+    fn write_new_refuses_to_clobber_a_pre_placed_path() {
+        // The clobbering guard: a file already at the target makes the write fail rather than
+        // truncate it (and, being O_EXCL, a symlink there is not followed either).
+        let dir = create_integration_dir().expect("create dir");
+        let target = dir.join(".zshenv");
+        std::fs::write(&target, b"pre-existing").expect("plant a file");
+        assert!(
+            write_new(target.clone(), b"overwrite").is_err(),
+            "an existing path must not be clobbered"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"pre-existing");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

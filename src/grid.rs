@@ -1337,7 +1337,7 @@ impl Buffer {
         let mut old: Vec<(usize, usize)> = Vec::with_capacity(old_rows.len());
         let mut cur = LogicalLine::default();
         let mut pending = false; // `cur` has rows not yet closed into `lines`
-        for row in old_rows.iter() {
+        for (idx, row) in old_rows.iter().enumerate() {
             old.push((lines.len(), cur.cells.len()));
             let base = cur.cells.len();
             cur.cells.extend_from_slice(&row.cells);
@@ -1346,6 +1346,19 @@ impl Buffer {
                     col: base + m.col,
                     ch: m.ch,
                 });
+            }
+            // A soft-wrapped row whose continuation begins with a wide glyph left its last
+            // column blank because the pair could not fit there (the printer's last-column
+            // rule). That blank is wrap padding, not text: drop it so a widen rejoins the glyph
+            // flush against the text before it instead of preserving it as a phantom space.
+            if row.wrapped
+                && cur.cells.last() == Some(&Cell::BLANK)
+                && old_rows
+                    .get(idx + 1)
+                    .and_then(|next| next.cells.first())
+                    .is_some_and(|c| c.is_wide_leader())
+            {
+                cur.cells.pop();
             }
             pending = true;
             // Close on a hard newline, or when the run reaches the cap (a forced seam).
@@ -1405,8 +1418,27 @@ impl Buffer {
                     if end <= i {
                         end = i + 1;
                     }
-                    let wrapped = end < cells.len();
-                    let mut row = take_row(&mut pool, new_cols, &cells[i..end], wrapped);
+                    // A wide glyph whose spacer cannot share its row (only at new_cols == 1)
+                    // is stored clipped: the leader alone with its WIDE_LEADER attr stripped,
+                    // and its spacer dropped, exactly as the printer records a wide glyph at a
+                    // single column. Leaving the leader marked would strand it without the
+                    // spacer the grid's invariant demands, and copying the spacer would orphan
+                    // it onto the next row.
+                    let clip_wide = cells[i].is_wide_leader() && end == i + 1;
+                    let next_i =
+                        if clip_wide && cells.get(i + 1).is_some_and(|c| c.is_wide_spacer()) {
+                            i + 2
+                        } else {
+                            end
+                        };
+                    let wrapped = next_i < cells.len();
+                    let mut row = if clip_wide {
+                        let mut clipped = cells[i];
+                        clipped.attrs.remove(Attrs::WIDE_LEADER);
+                        take_row(&mut pool, new_cols, &[clipped], wrapped)
+                    } else {
+                        take_row(&mut pool, new_cols, &cells[i..end], wrapped)
+                    };
                     for m in &line.combining {
                         if m.col >= i && m.col < end {
                             row.combining.push(CombiningMark {
@@ -1417,7 +1449,7 @@ impl Buffer {
                     }
                     new_start.push(i);
                     new_stream.push(row);
-                    i = end;
+                    i = next_i;
                 }
             }
         }
@@ -1451,16 +1483,24 @@ impl Buffer {
         let view_new = track_view
             .then(|| remap.locate(view_idx, 0).map(|(i, _)| i))
             .flatten();
-        let live_top = total.saturating_sub(new_rows);
+        // The live screen is a window of new_rows rows over the rewrapped stream. Pin it to the
+        // bottom so the most recent output shows, but never above the cursor: a narrow can push
+        // more rows below the cursor than fit, and the cursor must stay live because output
+        // writes there. When that happens the window slides up to the cursor and the rows below
+        // it that no longer fit are dropped, as a height shrink drops rows below the cursor to
+        // keep it on screen.
+        let live_top = total.saturating_sub(new_rows).min(cursor_new_idx);
+        let live_end = live_top.saturating_add(new_rows).min(total);
 
         let mut lines_out: VecDeque<Row> = VecDeque::with_capacity(new_rows);
         let mut scrollback_out: VecDeque<Row> = VecDeque::with_capacity(live_top);
         for (idx, row) in new_stream.into_iter().enumerate() {
             if idx < live_top {
                 scrollback_out.push_back(row);
-            } else {
+            } else if idx < live_end {
                 lines_out.push_back(row);
             }
+            // idx >= live_end: a row below the cursor the shrunk screen cannot hold; dropped.
         }
         while lines_out.len() < new_rows {
             lines_out.push_back(take_row(&mut pool, new_cols, &[], false));
@@ -6701,6 +6741,26 @@ mod tests {
             assert_eq!((c, r), (cols, rows), "size drifted");
             let (cr, cc) = s.cursor();
             assert!(cr < r && cc < c, "cursor {cr},{cc} escaped {c}x{r}");
+            // The wide-glyph invariant must survive every rewrap: a leader always keeps its
+            // spacer in the next column, and a spacer always follows its leader. A one-column
+            // reflow used to break both by splitting the pair across two rows.
+            for row in 0..r {
+                for col in 0..c {
+                    let cell = s.cell(row, col);
+                    if cell.is_wide_leader() {
+                        assert!(
+                            col + 1 < c && s.cell(row, col + 1).is_wide_spacer(),
+                            "leader at {row},{col} lost its spacer at {c}x{r}"
+                        );
+                    }
+                    if cell.is_wide_spacer() {
+                        assert!(
+                            col > 0 && s.cell(row, col - 1).is_wide_leader(),
+                            "orphan spacer at {row},{col} at {c}x{r}"
+                        );
+                    }
+                }
+            }
             // Interleave a shell SIGWINCH redraw and fresh marks, as a live session would.
             match rng() % 4 {
                 0 => p.advance_bytes(&mut s, b"\r\x1b[J\x1b]133;A\x07user@host ~/p  main\r\n> "),
@@ -7274,6 +7334,58 @@ mod tests {
         assert!(s.cell(1, 1).is_wide_spacer());
         assert_eq!(s.cell(0, 0).rune, 'a');
         assert!(!s.cell(0, 1).is_wide_leader() && !s.cell(0, 1).is_wide_spacer());
+    }
+
+    #[test]
+    fn reflow_clips_a_wide_glyph_at_a_single_column() {
+        // At one column a wide glyph has nowhere to put its spacer, so it is stored clipped —
+        // an ordinary single cell — exactly as the printer does at width one. It must never
+        // become a leader stranded without its spacer, nor an orphan spacer on its own row.
+        let mut s = Screen::new(10, 4);
+        feed(&mut s, "aか".as_bytes()); // 'a', wide か
+        s.resize(1, 4);
+        assert_eq!(s.row_string(0).trim_end(), "a");
+        assert_eq!(s.cell(1, 0).rune, 'か');
+        assert!(!s.cell(1, 0).is_wide_leader(), "clipped, not a leader");
+        assert!(!s.cell(1, 0).is_wide_spacer());
+        // No third row carrying an orphaned spacer.
+        assert_eq!(s.row_string(2).trim_end(), "");
+    }
+
+    #[test]
+    fn reflow_widen_drops_wide_glyph_wrap_padding() {
+        // "aかb" at two columns leaves a blank after 'a' because か could not fit beside it and
+        // wrapped down. That blank is wrap padding, not text: widening must rejoin the line with
+        // か flush against 'a', not preserve a phantom gap between them.
+        let mut s = Screen::new(2, 4);
+        feed(&mut s, "aかb".as_bytes());
+        s.resize(10, 4);
+        assert_eq!(s.cell(0, 0).rune, 'a');
+        assert_eq!(s.cell(0, 1).rune, 'か');
+        assert!(s.cell(0, 1).is_wide_leader());
+        assert!(s.cell(0, 2).is_wide_spacer());
+        assert_eq!(s.cell(0, 3).rune, 'b');
+    }
+
+    #[test]
+    fn reflow_keeps_the_cursor_live_when_rows_below_it_do_not_fit() {
+        // A narrow multiplies the row count. If the content below the cursor then needs more
+        // rows than the screen has, the live window must still contain the cursor (output is
+        // written there); the rows below it that no longer fit are dropped. Repro: the cursor
+        // parked high on 'b' with a full line beneath it, narrowed so they cannot all fit — the
+        // cursor used to detach onto unrelated content two rows down.
+        let mut s = Screen::new(4, 4);
+        feed(&mut s, b"abcdef\r\nWXYZ"); // "abcd"/"ef", then "WXYZ"
+        feed(&mut s, b"\x1b[1;2H"); // cursor onto 'b' at row 0, col 1
+        let (r, c) = s.cursor();
+        assert_eq!(s.cell(r, c).rune, 'b');
+        s.resize(2, 4);
+        let (r, c) = s.cursor();
+        assert_eq!(
+            s.cell(r, c).rune,
+            'b',
+            "the cursor stayed on its character instead of detaching to unrelated content"
+        );
     }
 
     #[test]

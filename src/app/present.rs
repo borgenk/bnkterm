@@ -35,11 +35,33 @@ use crate::render::gpu;
 use crate::render::vulkan;
 use crate::term_render;
 
-/// How long [`GpuPresentation::destroy_buffers`] waits for the compositor to release a
-/// buffer before freeing its image. Normally the release has long since signalled and the
-/// wait returns at once; this cap only bounds a compositor that never signals, so a resize
-/// can never hang on one. Two frames at 60 Hz is ~33 ms; 100 ms is comfortable slack.
-const BUFFER_RELEASE_WAIT_MS: core::ffi::c_int = 100;
+/// How long [`State::destroy_buffers`] waits for the compositor to release a buffer before
+/// giving up on freeing its image *now*. Normally the release has long since signalled and
+/// the wait returns at once; when it does not, the image is not freed anyway (that would be
+/// the use-after-free) but retired to be reaped once the release actually arrives, so this is
+/// only how long the fast inline free is worth waiting for. Two frames at 60 Hz is ~33 ms;
+/// this is comfortable slack over that.
+const BUFFER_RELEASE_WAIT_MS: core::ffi::c_int = 32;
+
+/// The retired-image list is only ever fed two images per resize and drained as their
+/// releases arrive, so it stays tiny. This cap is the backstop against a compositor that
+/// never signals a release at all: past it, the oldest is freed regardless (the app is
+/// already wedged, and bounded memory beats an unbounded leak). ~8 resizes' worth.
+const MAX_RETIRED_IMAGES: usize = 16;
+
+/// A swap image retired by a resize while the compositor may still be reading its wl_buffer.
+/// Freeing it then is a GPU use-after-free — the intermittent crash a rapid resize raced
+/// into — so it waits here until the release is observed and is destroyed only then. See
+/// [`State::destroy_buffers`], [`State::reap_retired`], and [`State::release_retired`].
+struct RetiredImage {
+    image: vulkan::GpuImage,
+    /// The wl_buffer this image backed, kept alive so the compositor can still signal its
+    /// `wl_buffer.release`; destroyed together with the image when reaped.
+    buffer: u32,
+    /// Explicit-sync release fence to poll (signalled means released), or `None` on the
+    /// implicit path, where the `wl_buffer.release` event is the only release signal.
+    fence: Option<OwnedFd>,
+}
 
 /// Client-owned explicit-sync state (`linux-drm-syncobj-v1`), negotiated over a
 /// live GPU backend when the compositor advertises the manager. Two DRM syncobj
@@ -141,6 +163,9 @@ pub(super) struct GpuPresentation {
     pub(super) explicit_sync: Option<ExplicitSync>,
     pub(super) buffers: [u32; 2],
     pub(super) busy: [bool; 2],
+    /// Images a resize retired that the compositor may still be reading, awaiting their
+    /// release before they are freed (see [`RetiredImage`]).
+    retired: Vec<RetiredImage>,
     pub(super) buffer_size: (u32, u32),
     /// The recycled display-list double buffer: the on-screen frame the next one is
     /// diffed against, plus a pool of run strings, so a steady frame builds the list
@@ -173,6 +198,7 @@ impl GpuPresentation {
             explicit_sync: None,
             buffers: [0, 0],
             busy: [false, false],
+            retired: Vec::new(),
             buffer_size: (0, 0),
             lists: term_render::DisplayListPool::default(),
             frame_scratch: gpu::FrameData::default(),
@@ -393,39 +419,130 @@ impl State {
         Ok(())
     }
 
-    /// Destroy the current buffers and their backing GPU images. The server
-    /// recycles the wl_buffer ids via `delete_id` into our free list.
+    /// Destroy the current buffers and their backing GPU images, or, for any the compositor
+    /// may still be reading, retire them to be freed once their release arrives.
+    ///
+    /// `wait_idle` drains only *our* device; the compositor reading a buffer for scan-out is a
+    /// separate lifetime, and freeing an image while it does is a GPU use-after-free — the
+    /// intermittent crash a rapid resize raced into. So each image is freed now only when its
+    /// buffer is known released: an explicit-sync release fence that signals within a short
+    /// bounded wait, or, on the implicit path, a slot the compositor is not marked as holding.
+    /// One that is still held is moved to the retired list (its wl_buffer kept alive so the
+    /// release can still be signalled) and reaped later by [`Self::reap_retired`] or
+    /// [`Self::release_retired`]. A timeout therefore never frees a buffer out from under the
+    /// compositor; it only defers the free.
     pub(super) fn destroy_buffers(&mut self) {
-        // Wait for the compositor to finish reading each buffer it may still be scanning
-        // out before its image is freed. `wait_idle` (below) drains only *our* device;
-        // under explicit sync the compositor's "done reading" signal is the buffer's
-        // release fence, and freeing an image while the compositor still reads it is a GPU
-        // use-after-free — the intermittent silent crash a rapid resize races into. A
-        // published release point that has already signalled makes this return at once;
-        // the bounded wait only bites a stuck compositor, and never hangs the resize.
-        if let Some(es) = &self.presentation.explicit_sync {
-            for idx in 0..self.presentation.buffers.len() {
-                if let Ok(Some(fence)) = es.release_fence(idx) {
-                    ffi::wait_sync_file(fence.as_raw_fd(), BUFFER_RELEASE_WAIT_MS);
-                }
-            }
-        }
+        // First reap anything an earlier resize retired that has since been released, so a
+        // burst of resizes cannot pile the list up.
+        self.reap_retired();
+
         let buffers = self.presentation.buffers;
-        for b in buffers {
-            if b != 0 {
-                self.conn.request(b, wl_buffer::DESTROY, &[]);
-            }
-        }
+        let busy = self.presentation.busy;
+        let images: Vec<vulkan::GpuImage> = self.presentation.images.drain(..).collect();
+        // Nothing may be in flight on *our* device while its images are touched, whether they
+        // are freed now or held for later; resize is rare enough that a full drain is the
+        // simple correct answer.
         if let Some(gpu) = &self.presentation.backend {
-            // Nothing may be in flight on our device while images are destroyed; resize is
-            // rare enough that a full drain is the simple correct answer.
             gpu.wait_idle();
-            for img in self.presentation.images.drain(..) {
-                gpu.destroy_image(img);
+        }
+        for (idx, image) in images.into_iter().enumerate() {
+            let buffer = buffers.get(idx).copied().unwrap_or(0);
+            // The compositor's "done reading" signal: the explicit-sync release fence when we
+            // have one, else the implicit busy flag the `wl_buffer.release` event clears.
+            let fence = self
+                .presentation
+                .explicit_sync
+                .as_ref()
+                .and_then(|es| es.release_fence(idx).ok().flatten());
+            let released = match &fence {
+                Some(f) => ffi::wait_sync_file(f.as_raw_fd(), BUFFER_RELEASE_WAIT_MS),
+                None => buffer == 0 || !busy.get(idx).copied().unwrap_or(false),
+            };
+            if released {
+                if buffer != 0 {
+                    self.conn.request(buffer, wl_buffer::DESTROY, &[]);
+                }
+                if let Some(gpu) = &self.presentation.backend {
+                    gpu.destroy_image(image);
+                }
+            } else {
+                self.presentation.retired.push(RetiredImage {
+                    image,
+                    buffer,
+                    fence,
+                });
             }
         }
+        self.enforce_retired_cap();
         self.presentation.buffers = [0, 0];
         self.presentation.busy = [false, false];
+    }
+
+    /// Free every retired image whose buffer the compositor has finished with: an explicit
+    /// release fence that now polls signalled (a zero timeout — a poll, never a wait). Implicit
+    /// entries carry no fence and are reaped by [`Self::release_retired`] on their
+    /// `wl_buffer.release` instead. Cheap and a no-op when the list is empty, so the frame path
+    /// can call it every frame.
+    pub(super) fn reap_retired(&mut self) {
+        let mut idx = 0;
+        while idx < self.presentation.retired.len() {
+            let released = match &self.presentation.retired[idx].fence {
+                Some(f) => ffi::wait_sync_file(f.as_raw_fd(), 0),
+                None => false,
+            };
+            if released {
+                let r = self.presentation.retired.swap_remove(idx);
+                self.free_retired(r);
+            } else {
+                idx += 1;
+            }
+        }
+    }
+
+    /// A `wl_buffer.release` arrived for a retired buffer (one a resize dropped from the active
+    /// slots): the compositor is definitively done with it, so free its image now. Returns
+    /// whether a retired entry matched. This is the only release signal on the implicit path,
+    /// and a belt-and-suspenders one under explicit sync.
+    pub(super) fn release_retired(&mut self, buffer: u32) -> bool {
+        if let Some(pos) = self
+            .presentation
+            .retired
+            .iter()
+            .position(|r| r.buffer == buffer)
+        {
+            let r = self.presentation.retired.swap_remove(pos);
+            self.free_retired(r);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Destroy a retired image and its wl_buffer. The device was drained when it was retired
+    /// and countless frames have passed since, so no in-flight work of ours references it.
+    fn free_retired(&mut self, r: RetiredImage) {
+        if r.buffer != 0 {
+            self.conn.request(r.buffer, wl_buffer::DESTROY, &[]);
+        }
+        if let Some(gpu) = &self.presentation.backend {
+            gpu.destroy_image(r.image);
+        }
+    }
+
+    /// Backstop for a compositor that never signals a release: keep the retired list bounded by
+    /// force-freeing the oldest past the cap. Reaching it means releases are not arriving at
+    /// all (the app is already wedged), where bounded memory beats an unbounded image leak.
+    fn enforce_retired_cap(&mut self) {
+        while self.presentation.retired.len() > MAX_RETIRED_IMAGES {
+            if self.verbosity.verbose() {
+                eprintln!(
+                    "bnkterm: retired-image cap reached ({} held); force-freeing the oldest",
+                    self.presentation.retired.len()
+                );
+            }
+            let r = self.presentation.retired.remove(0);
+            self.free_retired(r);
+        }
     }
 
     /// Declare the window geometry, then ack configure `serial`. The geometry is
@@ -480,6 +597,9 @@ impl State {
     /// GPU repaints the full frame every present; the *screen* damage is still
     /// just the diff.
     pub(super) fn render_frame(&mut self) -> Result<bool> {
+        // Free any image a prior resize retired that the compositor has now released. Cheap
+        // and a no-op once the list drains, which it does within a frame or two of a resize.
+        self.reap_retired();
         // Reallocate the buffers if the surface was resized since they were made;
         // deferring from every configure to the first frame after them collapses
         // an interactive resize's dmabuf churn to one reallocation per painted

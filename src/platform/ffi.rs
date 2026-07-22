@@ -20,6 +20,7 @@
 use core::ffi::{c_char, c_int, c_short, c_uint, c_ulong, c_void, CStr};
 use std::mem;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::time::{Duration, Instant};
 
 use crate::platform::error::{Error, Result};
 
@@ -713,24 +714,52 @@ extern "C" {
 }
 
 /// Block until `fd` — a sync file — signals its fence, or `timeout_ms` elapses; returns
-/// whether it signalled. A sync file becomes `POLLIN`-readable exactly when its fence has,
-/// so this is how the CPU waits on a GPU fence. Its one use is waiting for the compositor
-/// to release a buffer before that buffer's image is freed under it, in
-/// [`crate::app`]'s `destroy_buffers` — freeing an image the compositor is still scanning
-/// out is a GPU use-after-free. The bounded timeout keeps a compositor that never signals
-/// from hanging teardown; on `-1`/`EINTR` it reports "not signalled" and the caller falls
-/// through to the free (a vanishingly rare window against a certain leak otherwise).
+/// whether it signalled. `timeout_ms == 0` polls without waiting; a negative value blocks
+/// indefinitely. A sync file becomes `POLLIN`-readable exactly when its fence has, so this is
+/// how the CPU waits on a GPU fence. Its use is waiting for the compositor to release a buffer
+/// before that buffer's image is freed under it, in [`crate::app`] — freeing an image the
+/// compositor is still scanning out is a GPU use-after-free.
+///
+/// A signal delivered mid-wait interrupts `poll` with `EINTR`; this **retries** on it rather
+/// than reporting "not signalled", so a `SIGWINCH` storm during the very resize that triggers
+/// the wait cannot make it return a spurious false and free a buffer the compositor still
+/// holds. The deadline is recomputed each retry, so the total wait stays bounded by
+/// `timeout_ms`. A caller must still treat a `false` as "not known released" and defer the
+/// free rather than force it.
 pub fn wait_sync_file(fd: RawFd, timeout_ms: c_int) -> bool {
     const POLLIN: c_short = 0x0001;
-    let mut pfd = PollFd {
-        fd,
-        events: POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one live PollFd for the length of the call; poll reads `events` and writes
-    // `revents` only, and treats `fd` as read-only.
-    let n = unsafe { poll(&mut pfd, 1, timeout_ms) };
-    n > 0 && (pfd.revents & POLLIN) != 0
+    // A positive timeout gets an absolute deadline so EINTR retries do not restart the clock;
+    // zero and negative pass straight through (poll, no wait / block forever).
+    let deadline = (timeout_ms > 0)
+        .then(|| Instant::now() + Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0)));
+    loop {
+        let remaining = match deadline {
+            Some(d) => {
+                let Some(left) = d.checked_duration_since(Instant::now()) else {
+                    return false; // the bounded wait elapsed
+                };
+                c_int::try_from(left.as_millis()).unwrap_or(c_int::MAX)
+            }
+            None => timeout_ms,
+        };
+        let mut pfd = PollFd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live PollFd for the length of the call; poll reads `events` and writes
+        // `revents` only, and treats `fd` as read-only.
+        let n = unsafe { poll(&mut pfd, 1, remaining) };
+        if n < 0 {
+            // Interrupted by a signal: retry within the remaining budget. Any other error
+            // (there is no real one for a valid fd) reports "not signalled".
+            if errno() == EINTR {
+                continue;
+            }
+            return false;
+        }
+        return n > 0 && (pfd.revents & POLLIN) != 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -907,6 +936,12 @@ mod tests {
         assert!(
             wait_sync_file(signalled.as_raw_fd(), 0),
             "a syncobj created signalled must export a signalled fence",
+        );
+        // The bounded-wait path (positive timeout) must also see it at once, returning long
+        // before the deadline since the fence is already signalled.
+        assert!(
+            wait_sync_file(signalled.as_raw_fd(), 100),
+            "an already-signalled fence must return immediately from a bounded wait",
         );
 
         // Publish that fence at a timeline point, then read the point back as a
