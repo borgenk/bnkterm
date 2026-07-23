@@ -6,7 +6,7 @@
 //   ucd/emoji-data.txt
 //   ucd/DerivedCoreProperties.txt
 //
-// Sorted, non-overlapping, contiguous-merged ranges for binary search.
+// Deterministically generated; each table documents its representation.
 
 /// The Unicode version these tables were generated from.
 #[allow(dead_code)]

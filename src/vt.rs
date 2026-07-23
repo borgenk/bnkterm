@@ -83,6 +83,41 @@ fn printable_run_len(bytes: &[u8]) -> usize {
     i
 }
 
+/// Whether the first UTF-8 lead is still capable of completing validly with the
+/// bytes already present. A missing continuation is not invalid—the next PTY
+/// chunk may provide it—but a present out-of-range continuation keeps the
+/// malformed sequence on the scalar oracle instead of opening a batch.
+fn utf8_prefix_may_complete(bytes: &[u8]) -> bool {
+    let Some(&lead) = bytes.first() else {
+        return false;
+    };
+    let (length, lo, hi) = match lead {
+        0xc2..=0xdf => (2usize, 0x80, 0xbf),
+        0xe0 => (3, 0xa0, 0xbf),
+        0xe1..=0xec | 0xee | 0xef => (3, 0x80, 0xbf),
+        0xed => (3, 0x80, 0x9f),
+        0xf0 => (4, 0x90, 0xbf),
+        0xf1..=0xf3 => (4, 0x80, 0xbf),
+        0xf4 => (4, 0x80, 0x8f),
+        _ => return false,
+    };
+    let Some(&second) = bytes.get(1) else {
+        return true;
+    };
+    if !(lo..=hi).contains(&second) {
+        return false;
+    }
+    for index in 2..length {
+        let Some(&continuation) = bytes.get(index) else {
+            return true;
+        };
+        if !(0x80..=0xbf).contains(&continuation) {
+            return false;
+        }
+    }
+    true
+}
+
 /// The actions the parser emits. A consumer implements this to interpret the
 /// stream; `grid::Screen` does so to drive the terminal, and tests do so to
 /// record the action sequence. Kept low-level (raw params, not pre-interpreted
@@ -91,6 +126,14 @@ fn printable_run_len(bytes: &[u8]) -> usize {
 pub trait Perform {
     /// A printable character (already UTF-8 decoded).
     fn print(&mut self, c: char);
+    /// A bounded run of already-decoded printable scalars. The default preserves
+    /// the scalar action contract exactly; consumers such as the grid may
+    /// override it when one run is a more useful unit of work.
+    fn print_run(&mut self, chars: &[char]) {
+        for &c in chars {
+            self.print(c);
+        }
+    }
     /// A run of printable ASCII bytes (each `0x20..=0x7e`, width 1), in order. The
     /// default prints them one at a time, so an implementor need not handle it; one
     /// that can write cells in bulk (`grid::Screen`) overrides this to skip the
@@ -146,6 +189,50 @@ enum State {
     /// SOS/PM/APC: recognized and swallowed until ST. Nothing we implement rides on them
     /// (APC is the kitty graphics transport, and we draw no images).
     StringIgnore,
+}
+
+/// Scalars buffered between the parser and a [`Perform`] consumer. A fixed
+/// initialized array keeps the hot path allocation-free without adding an
+/// `unsafe` uninitialized-storage boundary. The capacity is an experiment knob,
+/// not a terminal semantic limit: a full run is flushed and immediately resumed.
+const TEXT_RUN_CAP: usize = 128;
+/// A substantial ASCII suffix returns to the established SWAR + byte-grid path.
+/// Short spaces and punctuation stay in their surrounding Unicode run; source
+/// identifiers and prose words keep the faster ASCII specialization.
+const ASCII_HANDOFF: usize = 8;
+
+struct TextRun {
+    chars: [char; TEXT_RUN_CAP],
+    len: usize,
+}
+
+impl TextRun {
+    fn new() -> Self {
+        TextRun {
+            chars: ['\0'; TEXT_RUN_CAP],
+            len: 0,
+        }
+    }
+
+    fn push<P: Perform>(&mut self, performer: &mut P, c: char) {
+        if self.len >= self.chars.len() {
+            self.flush(performer);
+        }
+        if let Some(slot) = self.chars.get_mut(self.len) {
+            *slot = c;
+            self.len += 1;
+        }
+    }
+
+    fn flush<P: Perform>(&mut self, performer: &mut P) {
+        if self.len == 0 {
+            return;
+        }
+        if let Some(chars) = self.chars.get(..self.len) {
+            performer.print_run(chars);
+        }
+        self.len = 0;
+    }
 }
 
 /// The parameters of a CSI sequence.
@@ -370,30 +457,47 @@ impl Parser {
     /// Feed a chunk of bytes. Reading the PTY in large chunks and handing the
     /// parser a slice (not a byte at a time) is the ingestion fast path.
     ///
-    /// The bulk of a terminal stream is plain text, and in `Ground` a printable
-    /// ASCII byte prints one char and changes no state. So when we are in `Ground`
-    /// with no partial UTF-8 pending, we scan the whole run of printable ASCII with
-    /// a SWAR sweep ([`printable_run_len`]) and print it directly, skipping the
-    /// per-byte state-machine dispatch. Every other byte still goes through the full
-    /// [`advance`](Self::advance) path, so behavior is byte-for-byte identical, this
-    /// is purely a faster road for the common case (guarded by the golden suite and
-    /// the 2M-byte fuzz test, which must stay green).
+    /// The bulk of a terminal stream is plain text. Ground-state printable ASCII
+    /// keeps its established SWAR scan and byte-run callback. A multibyte scalar
+    /// starts a bounded decoded run that may include following printable ASCII and
+    /// ends at a control byte or input boundary. That run is decoded exactly once:
+    /// no `str` validation pass precedes it.
+    ///
+    /// Controls and every non-ground byte still go through [`advance`](Self::advance),
+    /// keeping the escape state machine physically separate from the larger text
+    /// decoder. The scalar callback remains the run callback's default oracle, and
+    /// the golden, split-invariance, and fuzz suites require both roads to agree.
     pub fn advance_bytes<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) {
         let mut rest = bytes;
+        let mut text_run = None;
         while let Some(&first) = rest.first() {
-            if self.state == State::Ground
-                && self.utf8_remaining == 0
-                && first.wrapping_sub(0x20) <= 0x5e
-            {
-                // `first` is printable, so the run is at least one byte; `rest`
-                // strictly shrinks and the loop terminates.
-                let n = printable_run_len(rest);
-                performer.print_ascii(&rest[..n]);
-                rest = &rest[n..];
-            } else {
-                self.advance(performer, first);
-                rest = &rest[1..];
+            if self.state == State::Ground {
+                if self.utf8_remaining == 0 && first.wrapping_sub(0x20) <= 0x5e {
+                    // `first` is printable, so the run is at least one byte; `rest`
+                    // strictly shrinks and the loop terminates.
+                    let n = printable_run_len(rest);
+                    if let Some(run) = rest.get(..n) {
+                        performer.print_ascii(run);
+                    }
+                    rest = rest.get(n..).unwrap_or_default();
+                    continue;
+                }
+                let continuation = self.utf8_remaining > 0
+                    && (self.utf8_next.0..=self.utf8_next.1).contains(&first);
+                if continuation || utf8_prefix_may_complete(rest) {
+                    let run = text_run.get_or_insert_with(TextRun::new);
+                    let consumed = self.advance_text_run(performer, rest, run);
+                    if consumed > 0 {
+                        rest = rest.get(consumed..).unwrap_or_default();
+                    }
+                    // A zero-byte result can still have emitted U+FFFD for a
+                    // partial sequence. Retrying the same byte lets the ordinary
+                    // ASCII/control branch own it with the corrected UTF-8 state.
+                    continue;
+                }
             }
+            self.advance(performer, first);
+            rest = rest.get(1..).unwrap_or_default();
         }
     }
 
@@ -486,6 +590,78 @@ impl Parser {
     }
 
     // ---- ground / UTF-8 -----------------------------------------------------
+
+    /// Decode one ground-state text run into `run`, stopping before a C0
+    /// control. A malformed continuation emits the replacement for the partial
+    /// sequence, then reprocesses the offending byte exactly as [`advance`] does.
+    ///
+    /// `#[inline(never)]` keeps this larger loop out of the escape dispatcher:
+    /// the escape-heavy benchmark is sensitive to code layout even when a text
+    /// branch never executes.
+    #[inline(never)]
+    fn advance_text_run<P: Perform>(
+        &mut self,
+        performer: &mut P,
+        bytes: &[u8],
+        run: &mut TextRun,
+    ) -> usize {
+        let mut consumed = 0usize;
+        while let Some(&byte) = bytes.get(consumed) {
+            if self.utf8_remaining > 0 {
+                let (lo, hi) = self.utf8_next;
+                if (lo..=hi).contains(&byte) {
+                    self.utf8_char = (self.utf8_char << 6) | u32::from(byte & 0x3f);
+                    self.utf8_remaining -= 1;
+                    self.utf8_next = (0x80, 0xbf);
+                    consumed += 1;
+                    if self.utf8_remaining == 0 {
+                        let decoded = self.finish_utf8();
+                        run.push(performer, decoded);
+                    }
+                    continue;
+                }
+                self.utf8_remaining = 0;
+                run.push(performer, '\u{fffd}');
+                // Stop before `byte`: it was not part of the malformed sequence,
+                // and the scalar oracle should own the ill-formed boundary.
+                break;
+            }
+
+            if byte.wrapping_sub(0x20) <= 0x5e {
+                let tail = bytes.get(consumed..).unwrap_or_default();
+                let ascii = printable_run_len(tail);
+                if ascii >= ASCII_HANDOFF {
+                    break;
+                }
+                if let Some(short) = tail.get(..ascii) {
+                    for &value in short {
+                        run.push(performer, char::from(value));
+                    }
+                }
+                consumed = consumed.saturating_add(ascii);
+                continue;
+            }
+
+            match byte {
+                0x00..=0x1f => break,
+                // Caught by the ASCII handoff above; retained for exhaustiveness.
+                0x20..=0x7e => run.push(performer, char::from(byte)),
+                0x7f => {} // DEL is ignored without breaking adjacent text.
+                0x80..=0xbf | 0xc0 | 0xc1 | 0xf5..=0xff => run.push(performer, '\u{fffd}'),
+                0xc2..=0xdf => self.utf8_begin(u32::from(byte & 0x1f), 1, (0x80, 0xbf)),
+                0xe0 => self.utf8_begin(u32::from(byte & 0x0f), 2, (0xa0, 0xbf)),
+                0xe1..=0xec => self.utf8_begin(u32::from(byte & 0x0f), 2, (0x80, 0xbf)),
+                0xed => self.utf8_begin(u32::from(byte & 0x0f), 2, (0x80, 0x9f)),
+                0xee | 0xef => self.utf8_begin(u32::from(byte & 0x0f), 2, (0x80, 0xbf)),
+                0xf0 => self.utf8_begin(u32::from(byte & 0x07), 3, (0x90, 0xbf)),
+                0xf1..=0xf3 => self.utf8_begin(u32::from(byte & 0x07), 3, (0x80, 0xbf)),
+                0xf4 => self.utf8_begin(u32::from(byte & 0x07), 3, (0x80, 0x8f)),
+            }
+            consumed += 1;
+        }
+        run.flush(performer);
+        consumed
+    }
 
     fn ground<P: Perform>(&mut self, p: &mut P, byte: u8) {
         match byte {
@@ -886,6 +1062,7 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         actions: Vec<Action>,
+        decoded_runs: Vec<Vec<char>>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -917,6 +1094,12 @@ mod tests {
     impl Perform for Recorder {
         fn print(&mut self, c: char) {
             self.actions.push(Action::Print(c));
+        }
+        fn print_run(&mut self, chars: &[char]) {
+            self.decoded_runs.push(chars.to_vec());
+            for &c in chars {
+                self.print(c);
+            }
         }
         fn execute(&mut self, byte: u8) {
             self.actions.push(Action::Execute(byte));
@@ -1635,6 +1818,65 @@ mod tests {
         assert_eq!(printable_run_len(b"abcdefghij\nkl"), 10);
         // A run spanning several words.
         assert_eq!(printable_run_len(&[b'x'; 100]), 100);
+    }
+
+    #[test]
+    fn multibyte_text_is_one_bounded_decoded_run() {
+        let mut parser = Parser::new();
+        let mut recorder = Recorder::default();
+        parser.advance_bytes(&mut recorder, "é = 日本\x1b[31mafter".as_bytes());
+        assert_eq!(
+            recorder.decoded_runs,
+            [vec!['é', ' ', '=', ' ', '日', '本']]
+        );
+        assert_eq!(
+            recorder.actions,
+            [
+                Action::Print('é'),
+                Action::Print(' '),
+                Action::Print('='),
+                Action::Print(' '),
+                Action::Print('日'),
+                Action::Print('本'),
+                Action::Csi {
+                    params: vec![vec![31]],
+                    intermediates: Vec::new(),
+                    private: 0,
+                    action: b'm',
+                },
+                Action::Print('a'),
+                Action::Print('f'),
+                Action::Print('t'),
+                Action::Print('e'),
+                Action::Print('r'),
+            ]
+        );
+    }
+
+    #[test]
+    fn decoded_run_resumes_a_scalar_split_across_input_chunks() {
+        let crab = "🦀!";
+        let mut parser = Parser::new();
+        let mut recorder = Recorder::default();
+        parser.advance_bytes(&mut recorder, &crab.as_bytes()[..2]);
+        assert!(recorder.decoded_runs.is_empty());
+        parser.advance_bytes(&mut recorder, &crab.as_bytes()[2..]);
+        assert_eq!(recorder.decoded_runs, [vec!['🦀', '!']]);
+    }
+
+    #[test]
+    fn decoded_run_capacity_is_a_flush_not_a_semantic_limit() {
+        let text = "é".repeat(TEXT_RUN_CAP + 17);
+        let mut parser = Parser::new();
+        let mut recorder = Recorder::default();
+        parser.advance_bytes(&mut recorder, text.as_bytes());
+        assert_eq!(recorder.decoded_runs.len(), 2);
+        assert_eq!(
+            recorder.decoded_runs.first().map(Vec::len),
+            Some(TEXT_RUN_CAP)
+        );
+        assert_eq!(recorder.decoded_runs.get(1).map(Vec::len), Some(17));
+        assert_eq!(recorder.actions.len(), TEXT_RUN_CAP + 17);
     }
 
     #[test]

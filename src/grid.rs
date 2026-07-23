@@ -1079,6 +1079,82 @@ impl Buffer {
         }
     }
 
+    /// Fill one row segment from decoded width-1/2 scalars. Widths were already
+    /// classified by [`Screen::print_text_run`], and the caller guarantees the
+    /// complete segment fits on this row. Like [`Self::fill_ascii_run`], this
+    /// resolves the row once, repairs only wide pairs straddling the two edges,
+    /// and removes combining marks under the whole overwritten interval once.
+    fn fill_text_run(
+        &mut self,
+        row: usize,
+        start_col: usize,
+        chars: &[char],
+        widths: &[u8],
+        pen: Pen,
+    ) {
+        let columns = widths
+            .iter()
+            .fold(0usize, |sum, width| sum.saturating_add(usize::from(*width)));
+        let end_col = start_col.saturating_add(columns).min(self.cols);
+        let Some(r) = self.lines.get_mut(row) else {
+            return;
+        };
+        if start_col > 0
+            && r.cells
+                .get(start_col)
+                .is_some_and(|cell| cell.is_wide_spacer())
+        {
+            if let Some(slot) = r.cells.get_mut(start_col - 1) {
+                *slot = Cell::BLANK;
+            }
+            r.clear_marks(start_col - 1);
+        }
+        if end_col < r.cells.len()
+            && r.cells
+                .get(end_col.saturating_sub(1))
+                .is_some_and(|cell| cell.is_wide_leader())
+        {
+            if let Some(slot) = r.cells.get_mut(end_col) {
+                *slot = Cell::BLANK;
+            }
+        }
+
+        let mut col = start_col;
+        for (&c, &cell_width) in chars.iter().zip(widths) {
+            let wide = cell_width == 2 && col.saturating_add(1) < r.cells.len();
+            if let Some(slot) = r.cells.get_mut(col) {
+                *slot = Cell {
+                    rune: c,
+                    fg: pen.fg,
+                    bg: pen.bg,
+                    attrs: if wide {
+                        pen.attrs | Attrs::WIDE_LEADER
+                    } else {
+                        pen.attrs
+                    },
+                    link: pen.link,
+                };
+            }
+            if wide {
+                if let Some(slot) = r.cells.get_mut(col.saturating_add(1)) {
+                    *slot = Cell {
+                        rune: ' ',
+                        fg: pen.fg,
+                        bg: pen.bg,
+                        attrs: pen.attrs | Attrs::WIDE_SPACER,
+                        link: pen.link,
+                    };
+                }
+            }
+            col = col.saturating_add(usize::from(cell_width));
+        }
+        r.combining
+            .retain(|mark| mark.col < start_col || mark.col >= end_col);
+        if end_col >= r.cells.len() {
+            r.wrapped = false;
+        }
+    }
+
     /// Scroll `[top, bottom]` up by `n`, feeding `blank` rows in at the bottom.
     /// When `to_scrollback` and the region reaches the top of the screen, the
     /// rows leaving the top are retained in scrollback; otherwise they are
@@ -2703,7 +2779,12 @@ impl Screen {
         if self.grapheme_clustering && self.extend_cluster(c) {
             return;
         }
-        let cw = usize::from(width(c));
+        self.print_width(c, usize::from(width(c)));
+    }
+
+    /// Place one scalar whose width is already known. Decoded batches use this
+    /// for complex fallbacks so width-table searches are never repeated.
+    fn print_width(&mut self, c: char, cw: usize) {
         if cw == 0 {
             self.put_combining(c);
             return;
@@ -2854,6 +2935,138 @@ impl Screen {
         }
         // REP repeats the last character printed, and the bulk path prints too.
         self.last_printed = bytes.last().map(|&b| char::from(b));
+    }
+
+    /// Consume already-decoded text in bounded pieces, classifying every scalar
+    /// once and writing maximal positive-width prefixes a row at a time. Width-0
+    /// marks and awkward right-edge wide glyphs go through [`Self::print`], which
+    /// remains the semantic oracle for complex placement.
+    ///
+    /// The scratch widths are fixed and initialized: no allocation and no
+    /// uninitialized-memory `unsafe`. Its capacity is only a work quantum;
+    /// callers may supply an arbitrarily long slice without changing semantics.
+    fn print_text_run(&mut self, chars: &[char]) {
+        const BATCH: usize = 128;
+
+        let mut rest = chars;
+        let mut widths = [0u8; BATCH];
+        while !rest.is_empty() {
+            let take = rest.len().min(BATCH);
+            let Some(chunk) = rest.get(..take) else {
+                return;
+            };
+            let Some(chunk_widths) = widths.get_mut(..take) else {
+                return;
+            };
+            let Some(&first) = chunk.first() else {
+                return;
+            };
+            let first_width = width(first);
+            if first_width == 0 {
+                self.print_scalar_partitioned_run(chunk);
+                rest = rest.get(take..).unwrap_or_default();
+                continue;
+            }
+            if let Some(slot) = chunk_widths.first_mut() {
+                *slot = first_width;
+            }
+            for (slot, &c) in chunk_widths.iter_mut().skip(1).zip(chunk.iter().skip(1)) {
+                *slot = width(c);
+            }
+            let zero_width = chunk_widths
+                .iter()
+                .filter(|&&cell_width| cell_width == 0)
+                .count();
+            if zero_width.saturating_mul(2) >= chunk.len() {
+                self.print_scalar_partitioned_run(chunk);
+            } else {
+                self.print_classified_run(chunk, chunk_widths);
+            }
+            rest = rest.get(take..).unwrap_or_default();
+        }
+    }
+
+    /// Preserve the established shape for a run dominated by complex marks:
+    /// non-ASCII scalars use the scalar oracle, while each printable ASCII scalar
+    /// retains the same byte-style callback the parser used before batching.
+    /// Mark-heavy text normally alternates one base with one or more marks, so
+    /// collecting spans here only adds a second scan and a scratch copy.
+    fn print_scalar_partitioned_run(&mut self, chars: &[char]) {
+        for &c in chars {
+            if c.is_ascii() {
+                let byte = u8::try_from(u32::from(c)).unwrap_or(b'?');
+                self.print_ascii_run(std::slice::from_ref(&byte));
+            } else {
+                self.print_width(c, usize::from(width(c)));
+            }
+        }
+    }
+
+    fn print_classified_run(&mut self, chars: &[char], widths: &[u8]) {
+        let mut at = 0usize;
+        while let (Some(&c), Some(&classified)) = (chars.get(at), widths.get(at)) {
+            if classified == 0 {
+                self.print_width(c, 0);
+                at += 1;
+                continue;
+            }
+            let cols = self.active().cols;
+            if cols == 0 {
+                return;
+            }
+            if self.active().cursor.pending_wrap {
+                self.wrap_line();
+            }
+            let (row, start_col) = {
+                let cursor = self.active().cursor;
+                (cursor.row, cursor.col)
+            };
+            let room = cols.saturating_sub(start_col);
+            let mut end = at;
+            let mut columns = 0usize;
+            while let Some(&cell_width) = widths.get(end) {
+                if cell_width == 0 {
+                    break;
+                }
+                let next = columns.saturating_add(usize::from(cell_width));
+                if next > room {
+                    break;
+                }
+                columns = next;
+                end += 1;
+            }
+
+            // A two-cell glyph with one column remaining needs the full scalar
+            // edge policy (wrap first, or back up under no-autowrap).
+            if end == at {
+                self.print_width(c, usize::from(classified));
+                at += 1;
+                continue;
+            }
+
+            let Some(segment) = chars.get(at..end) else {
+                return;
+            };
+            let Some(segment_widths) = widths.get(at..end) else {
+                return;
+            };
+            let pen = self.pen;
+            self.active_mut()
+                .fill_text_run(row, start_col, segment, segment_widths, pen);
+
+            let end_col = start_col.saturating_add(columns);
+            let autowrap = self.autowrap;
+            let buffer = self.active_mut();
+            if end_col >= cols {
+                buffer.cursor.col = cols.saturating_sub(1);
+                buffer.cursor.pending_wrap = autowrap;
+            } else {
+                buffer.cursor.col = end_col;
+                buffer.cursor.pending_wrap = false;
+            }
+            self.last_printed = segment.last().copied();
+            at = end;
+        }
     }
 
     /// Try to join `c` onto the grapheme cluster already in the cell behind the cursor.
@@ -5050,6 +5263,17 @@ impl Perform for Screen {
         self.print(mapped);
     }
 
+    fn print_run(&mut self, chars: &[char]) {
+        if self.insert_mode || self.grapheme_clustering || self.active_charset() != Charset::Ascii {
+            for &c in chars {
+                let mapped = self.map_glyph(c);
+                self.print(mapped);
+            }
+            return;
+        }
+        self.print_text_run(chars);
+    }
+
     fn print_ascii(&mut self, bytes: &[u8]) {
         // The bulk write assumes each byte is its own glyph placed one column
         // apart. That holds only under the identity (ASCII) charset, outside
@@ -7088,6 +7312,25 @@ mod tests {
         assert_bulk_equiv(20, 3, b"ab\tcd\re\x08fgh");
         // Cursor addressing lands the cursor mid-row before a run.
         assert_bulk_equiv(20, 4, b"\x1b[2;5Hplaced here and wrapping onward");
+    }
+
+    #[test]
+    fn decoded_text_run_equivalence_targeted() {
+        assert_bulk_equiv(
+            10,
+            4,
+            "é and 日本語 mixed with ASCII across rows".as_bytes(),
+        );
+        assert_bulk_equiv(8, 4, "a\u{301}b界\u{302}c café".as_bytes());
+        // Wide glyphs immediately before, on, and after the right edge.
+        assert_bulk_equiv(5, 4, "abc界x\r\nabcd界y\r\nabcde界z".as_bytes());
+        // The no-autowrap edge backs a wide glyph up over the final two cells.
+        assert_bulk_equiv(5, 3, "\x1b[?7labcd界日本".as_bytes());
+        // Modes whose semantics are intentionally scalar still pass through the
+        // same run callback and must map/shift/cluster exactly as before.
+        assert_bulk_equiv(12, 3, "\x1b[4hAé界".as_bytes());
+        assert_bulk_equiv(12, 3, "\x1b(0qéx\x1b(B日本".as_bytes());
+        assert_bulk_equiv(12, 3, "\x1b[?2027h#\u{fe0f}\u{20e3} 日本".as_bytes());
     }
 
     #[test]

@@ -13,14 +13,16 @@
 //!      columns (a WIDE_LEADER cell plus a WIDE_SPACER placeholder in the grid).
 //! ```
 //!
-//! The ranges are generated from the Unicode Character Database (vendored in
-//! `ucd/`) into `width_tables.rs` (committed, never
-//! fetched at build or test time) and binary-searched here. Control characters
-//! never reach `width`: the parser
+//! A generated two-level table maps each scalar to a width. Unicode is divided
+//! into 256-scalar pages and identical pages share one body, keeping lookup to
+//! two indexed loads without carrying a 1.1 MiB flat table. The generator also
+//! retains the source ranges in test builds as an exhaustive correctness oracle.
+//! Control characters never reach `width`: the parser
 //! dispatches C0/C1 as actions, so only printable scalar values are measured.
 //! xterm is the reference for the two wcwidth tweaks the generator bakes in
 //! (SOFT HYPHEN is width 1, not 0; the Hangul jamo are width 0 though not marks).
 
+#[cfg(test)]
 use core::cmp::Ordering;
 
 /// Columns `c` occupies when printed: 0, 1, or 2. Zero-width wins over wide, so a
@@ -58,16 +60,24 @@ pub fn cluster_width(cluster: &str) -> u8 {
 
 pub fn width(c: char) -> u8 {
     let cp = u32::from(c);
-    if in_ranges(ZERO_WIDTH_RANGES, cp) {
-        0
-    } else if in_ranges(WIDE_RANGES, cp) {
-        2
-    } else {
-        1
-    }
+    let page_number = usize::try_from(cp >> WIDTH_PAGE_SHIFT).unwrap_or_default();
+    let page = WIDTH_PAGE_INDEX
+        .get(page_number)
+        .copied()
+        .map(usize::from)
+        .and_then(|index| WIDTH_PAGES.get(index));
+    let page_mask = 1_u32
+        .checked_shl(WIDTH_PAGE_SHIFT)
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let offset = usize::try_from(cp & page_mask).unwrap_or_default();
+    page.and_then(|values| values.get(offset))
+        .copied()
+        .unwrap_or(1)
 }
 
 /// Whether `cp` falls inside one of the sorted, non-overlapping `ranges`.
+#[cfg(test)]
 fn in_ranges(ranges: &[(u32, u32)], cp: u32) -> bool {
     ranges
         .binary_search_by(|&(lo, hi)| {
@@ -80,6 +90,18 @@ fn in_ranges(ranges: &[(u32, u32)], cp: u32) -> bool {
             }
         })
         .is_ok()
+}
+
+#[cfg(test)]
+fn range_width(c: char) -> u8 {
+    let cp = u32::from(c);
+    if in_ranges(ZERO_WIDTH_RANGES, cp) {
+        0
+    } else if in_ranges(WIDE_RANGES, cp) {
+        2
+    } else {
+        1
+    }
 }
 
 include!("width_tables.rs");
@@ -160,11 +182,13 @@ mod tests {
 
     #[test]
     fn width_never_panics_over_all_scalar_values() {
-        // The standing no-panic guarantee, exhaustive over every char.
+        // Exhaustive equivalence makes the retained ranges an oracle for every
+        // generated page entry as well as pinning the no-panic guarantee.
         for cp in 0..=0x10FFFFu32 {
             if let Some(c) = char::from_u32(cp) {
                 let w = width(c);
                 assert!(w <= 2);
+                assert_eq!(w, range_width(c), "page lookup differs at U+{cp:04X}");
             }
         }
     }
