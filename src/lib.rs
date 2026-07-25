@@ -9,6 +9,8 @@
 //! `color` is the shared vocabulary the grid and the eventual renderer both
 //! speak; `error` is the terminal-agnostic foundation.
 
+#![allow(rustdoc::private_intra_doc_links)]
+
 pub mod app;
 pub mod color;
 pub mod config;
