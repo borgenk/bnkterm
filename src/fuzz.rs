@@ -60,7 +60,7 @@ impl Rng {
     }
 }
 
-/// The CSI final bytes `grid.rs` actually dispatches, plus a few it does not.
+/// The CSI final bytes the grid actually dispatches, plus a few it does not.
 ///
 /// Drawn from the real dispatch table on purpose: a generator that emits finals nothing
 /// handles is testing the ignore path over and over. Most of these are handled — `c` and
