@@ -23,6 +23,8 @@
 //! a panic. DCS/SOS/PM/APC strings are recognized and safely swallowed; bnkterm
 //! implements no DCS in v1.
 
+use crate::platform::bytes;
+
 /// Maximum CSI parameters retained. Bounded so hostile input cannot grow state;
 /// extra parameters past this are dropped, not an error. (The plan floated 16;
 /// 32 gives headroom for long combined-SGR sequences real apps emit.)
@@ -38,50 +40,6 @@ const OSC_MAX: usize = 4096;
 /// Cap on a DCS payload. The sequences we answer (DECRQSS, XTGETTCAP) carry a handful of
 /// bytes; anything approaching this is not one of them.
 const DCS_MAX: usize = 4096;
-
-/// Length of the leading run of printable ASCII (`0x20..=0x7e`) in `bytes`.
-///
-/// A byte `b` is printable iff `b.wrapping_sub(0x20) <= 0x5e`: one unsigned compare
-/// that rejects `b < 0x20` (wraps high), `b == 0x7f` (DEL, `0x5f`), and `b >= 0x80`
-/// (`>= 0x60`) at once. We sweep eight bytes at a time with SWAR and fall to that
-/// scalar test at the first word that isn't all-printable (and for the < 8-byte
-/// tail). Within a word, a byte is non-printable iff it is `>= 0x80` (`& HI`), or
-/// `< 0x20` (subtracting `0x20` borrows a high bit — a valid existence test once the
-/// high bits are known clear), or `== 0x7f` (adding one carries into the high bit,
-/// and cannot cross a byte boundary while every byte is `< 0x80`). The three terms
-/// are OR-ed: the word is all-printable iff the result is zero. Endianness does not
-/// matter, each byte is tested independently, so a native-order load is fine.
-fn printable_run_len(bytes: &[u8]) -> usize {
-    const LO: u64 = 0x0101_0101_0101_0101;
-    const HI: u64 = 0x8080_8080_8080_8080;
-    const LO_0X20: u64 = 0x2020_2020_2020_2020; // LO * 0x20
-
-    let mut i = 0;
-    while i + 8 <= bytes.len() {
-        // `get`/`try_from` cannot fail here (the window is exactly eight bytes); the
-        // `else` arms just keep the hot path panic-free.
-        let Some(chunk) = bytes.get(i..i + 8) else {
-            break;
-        };
-        let Ok(word) = <[u8; 8]>::try_from(chunk) else {
-            break;
-        };
-        let x = u64::from_ne_bytes(word);
-        let nonprintable = (x & HI) | (x.wrapping_sub(LO_0X20) & HI) | (x.wrapping_add(LO) & HI);
-        if nonprintable != 0 {
-            break;
-        }
-        i += 8;
-    }
-    // The word the SWAR loop stopped on, plus any tail shorter than eight bytes.
-    while let Some(&b) = bytes.get(i) {
-        if b.wrapping_sub(0x20) > 0x5e {
-            break;
-        }
-        i += 1;
-    }
-    i
-}
 
 /// Whether the first UTF-8 lead is still capable of completing validly with the
 /// bytes already present. A missing continuation is not invalid—the next PTY
@@ -475,7 +433,7 @@ impl Parser {
                 if self.utf8_remaining == 0 && first.wrapping_sub(0x20) <= 0x5e {
                     // `first` is printable, so the run is at least one byte; `rest`
                     // strictly shrinks and the loop terminates.
-                    let n = printable_run_len(rest);
+                    let n = bytes::printable_run_len(rest);
                     if let Some(run) = rest.get(..n) {
                         performer.print_ascii(run);
                     }
@@ -629,7 +587,7 @@ impl Parser {
 
             if byte.wrapping_sub(0x20) <= 0x5e {
                 let tail = bytes.get(consumed..).unwrap_or_default();
-                let ascii = printable_run_len(tail);
+                let ascii = bytes::printable_run_len(tail);
                 if ascii >= ASCII_HANDOFF {
                     break;
                 }
@@ -1797,27 +1755,6 @@ mod tests {
             // Keep the recorder from growing without bound over the whole run.
             r.actions.clear();
         }
-    }
-
-    #[test]
-    fn printable_run_len_finds_ascii_runs() {
-        assert_eq!(printable_run_len(b""), 0);
-        assert_eq!(printable_run_len(b"hello"), 5);
-        assert_eq!(printable_run_len(b"\nabc"), 0); // first byte non-printable
-        assert_eq!(printable_run_len(b"hi\nthere"), 2); // LF stops the run
-        assert_eq!(printable_run_len(b"ab\x7fcd"), 2); // DEL stops it
-        assert_eq!(printable_run_len(b"ab\x1fcd"), 2); // a C0 control stops it
-        assert_eq!(printable_run_len(b"ab\x80"), 2); // a UTF-8 high byte stops it
-                                                     // The inclusive boundaries space (0x20) and tilde (0x7e) are printable.
-        assert_eq!(printable_run_len(&[0x20, 0x7e]), 2);
-        // Exactly one SWAR word, all printable.
-        assert_eq!(printable_run_len(b"abcdefgh"), 8);
-        // A non-printable exactly at the word boundary: the SWAR loop must stop at 8.
-        assert_eq!(printable_run_len(b"abcdefgh\nij"), 8);
-        // A control in the second word: 10 printable, then LF.
-        assert_eq!(printable_run_len(b"abcdefghij\nkl"), 10);
-        // A run spanning several words.
-        assert_eq!(printable_run_len(&[b'x'; 100]), 100);
     }
 
     #[test]

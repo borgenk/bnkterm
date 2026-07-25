@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 
+use crate::platform::bytes;
 use crate::platform::freetype::{Face, FaceKey, Fonts};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
@@ -1022,8 +1023,20 @@ fn center_in_cell(packed: PackedGlyph, cell_w: i32) -> PackedGlyph {
 ///
 /// So the segmenter and the emoji probe cost a per-cell string hash to confirm what
 /// this scan already knows.
+///
+/// The scan itself is [`bytes::all_printable`], eight bytes per word: a 120x80 frame
+/// asks it about ~13 KB of run text, which a byte-at-a-time `all` walked at roughly
+/// seven times the cost.
+///
+/// It is outlined deliberately, and that is worth as much as the wider scan. Let the
+/// word loop inline and it lands inside [`build_frame_into`], already one of the
+/// largest functions here, where it *lost* 5% of the frame — more than the scan saves.
+/// Outlined it wins 3.5%, and outlining the old byte loop was itself worth 2%, so the
+/// cost was never the scan alone but what a second loop nest does to this function's
+/// layout.
+#[inline(never)]
 fn is_plain_ascii(text: &str) -> bool {
-    text.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+    bytes::all_printable(text.as_bytes())
 }
 
 /// The lone box/block scalar in `cluster`, or `None` if the cluster is not
