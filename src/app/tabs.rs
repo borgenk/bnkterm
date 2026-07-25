@@ -886,9 +886,12 @@ mod tests {
     /// where fork/exec is unavailable so it can never flake.
     #[test]
     fn the_last_child_exiting_empties_the_tabs_through_the_pump() {
-        std::env::set_var("SHELL", "/bin/true");
         let mut core = core(false, 80, 24);
-        if core.spawn_shell().is_err() {
+        // `/bin/true` by name, not through `$SHELL`: this is the one test in the suite
+        // that wants a child which exits *immediately*, and routing that through a
+        // process-global let any concurrently-spawning test substitute a `cat` that
+        // never exits — whereupon this waited out its five-second deadline and failed.
+        if core.spawn_program(&["/bin/true"]).is_err() {
             eprintln!("fork/exec unavailable here; skipping the child-exit pump test");
             return;
         }
@@ -1276,9 +1279,13 @@ mod tests {
 
     #[test]
     fn two_live_pty_streams_land_on_their_own_grids() {
+        // The second tab comes up through `Tabs::open`, which spawns `$SHELL` by design,
+        // so this one test does still set it. Safe because it is now the only writer left
+        // in the suite: every other test names its program (see the reap test above), so
+        // there is no longer a second value to race against.
         std::env::set_var("SHELL", "/bin/cat");
         let mut first = core(false, 40, 10);
-        if first.spawn_shell().is_err() {
+        if first.spawn_program(&["/bin/cat"]).is_err() {
             eprintln!("fork/exec unavailable; skipping multi-tab PTY test");
             return;
         }

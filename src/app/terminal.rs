@@ -349,7 +349,28 @@ impl TerminalCore {
     /// shell startup fails cleanly rather than limping on.
     pub(super) fn spawn_shell(&mut self) -> Result<(usize, usize)> {
         let (cols, rows) = self.screen.dimensions();
-        let pty = Pty::spawn(cols, rows)?;
+        self.spawn_pty(Pty::spawn(cols, rows)?)
+    }
+
+    /// [`spawn_shell`](Self::spawn_shell) against an explicitly named program instead of
+    /// `$SHELL`.
+    ///
+    /// Test-only, and it exists to keep the child out of the environment. `$SHELL` is
+    /// process-global, so tests that reached for it were racing each other under the
+    /// parallel runner: whichever set it last decided what *every* concurrently spawning
+    /// test got, and a test wanting a child that exits at once would silently spawn one
+    /// that never does. Naming the program is the fix the house rule already asks for —
+    /// pass the state, do not stash it in a global.
+    #[cfg(test)]
+    pub(super) fn spawn_program(&mut self, argv: &[&str]) -> Result<(usize, usize)> {
+        let (cols, rows) = self.screen.dimensions();
+        self.spawn_pty(Pty::spawn_command(cols, rows, argv)?)
+    }
+
+    /// Attach an already-forked child: start its gather thread and seed the directory
+    /// label. Shared by the live path and the tests, so both bring a tab up identically.
+    fn spawn_pty(&mut self, pty: Pty) -> Result<(usize, usize)> {
+        let (cols, rows) = self.screen.dimensions();
         let gatherer = match Gatherer::start(pty.fd()) {
             Ok(gatherer) => gatherer,
             Err(error) => {
@@ -1128,7 +1149,7 @@ impl TerminalCore {
     /// (→ `SIGWINCH`) at the grid's current size, plus the in-band `?2048` report for the
     /// child that asked. Best-effort — a resize on a dead child just surfaces as EOF on the
     /// next read. The grid was already reflowed when the resize arrived; this is only the
-    /// child notification, held back so a drag does not flood it. See [`WINSIZE_DEBOUNCE`].
+    /// child notification, held back so a drag does not flood it. See [`resize_settle`].
     pub(super) fn flush_winsize_if_due(&mut self) -> crate::error::Result<()> {
         if self.winsize_at.is_some_and(|at| at <= Instant::now()) {
             self.winsize_at = None;
@@ -1217,7 +1238,7 @@ impl TerminalCore {
     /// Two ways that happens, and only two. The grid can end the identity regime those
     /// rows were minted in — a reset, a resize, an alt-screen switch, a full-display
     /// erase, or a scroll that renumbered the stream (see
-    /// [`RowEpoch`](crate::grid::RowEpoch)). Or the ring can simply outrun them: once the
+    /// [`RowEpoch`]). Or the ring can simply outrun them: once the
     /// *last* row of a selection has aged off the front of history, the whole thing is
     /// behind the oldest line the terminal still holds, and there is nothing left to copy.
     /// A selection that has merely scrolled out of *sight* is not pruned — it is still
@@ -1701,9 +1722,8 @@ mod tests {
         // discipline: PTY -> refresh_tty_mode -> the frame the window pulls. Only the
         // one-line call from `Tabs::note_settle` is left out, and that is the same hook
         // the cwd/foreground refresh already rides.
-        std::env::set_var("SHELL", "/bin/cat");
         let mut core = TerminalCore::new(false, 40, 10, METRICS, 320, 160, 0);
-        if core.spawn_shell().is_err() {
+        if core.spawn_program(&["/bin/cat"]).is_err() {
             eprintln!("fork/exec unavailable; skipping the live tty-mode test");
             return;
         }

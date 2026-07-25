@@ -735,8 +735,7 @@ mod tests {
     fn tty_mode_decodes_every_line_discipline_state() {
         // Against a real pty and the kernel's real line discipline (no mocks): drive
         // the two bits through all four combinations and check each classification.
-        std::env::set_var("SHELL", "/bin/cat");
-        let Ok(pty) = Pty::spawn(80, 24) else {
+        let Ok(pty) = Pty::spawn_command(80, 24, &["/bin/cat"]) else {
             eprintln!("pty spawn unavailable in this environment; skipping");
             return;
         };
@@ -772,8 +771,7 @@ mod tests {
         // were not the same line discipline the master reads, no amount of polling
         // would ever see a password prompt. Prove it by doing precisely what sudo does
         // -- open the slave and clear ECHO on it -- and reading the master.
-        std::env::set_var("SHELL", "/bin/cat");
-        let Ok(pty) = Pty::spawn(80, 24) else {
+        let Ok(pty) = Pty::spawn_command(80, 24, &["/bin/cat"]) else {
             eprintln!("pty spawn unavailable in this environment; skipping");
             return;
         };
@@ -797,8 +795,7 @@ mod tests {
         // End-to-end against a real child (no mocks): run `cat`, which echoes its
         // input back, and confirm the bytes make the round trip through the PTY.
         // Skipped where fork/exec is unavailable (a locked-down sandbox).
-        std::env::set_var("SHELL", "/bin/cat");
-        let Ok(pty) = Pty::spawn(80, 24) else {
+        let Ok(pty) = Pty::spawn_command(80, 24, &["/bin/cat"]) else {
             eprintln!("pty spawn unavailable in this environment; skipping");
             return;
         };
@@ -827,8 +824,7 @@ mod tests {
 
     #[test]
     fn resize_after_spawn_is_accepted() {
-        std::env::set_var("SHELL", "/bin/cat");
-        let Ok(pty) = Pty::spawn(80, 24) else {
+        let Ok(pty) = Pty::spawn_command(80, 24, &["/bin/cat"]) else {
             return; // sandbox without fork/exec
         };
         pty.resize(120, 40).expect("TIOCSWINSZ on a live pty");
@@ -836,8 +832,7 @@ mod tests {
 
     #[test]
     fn into_zombie_eventually_reaps_after_hangup() {
-        std::env::set_var("SHELL", "/bin/cat");
-        let Ok(pty) = Pty::spawn(80, 24) else {
+        let Ok(pty) = Pty::spawn_command(80, 24, &["/bin/cat"]) else {
             return; // sandbox without fork/exec
         };
         let child = pty.into_zombie();
