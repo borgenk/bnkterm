@@ -147,7 +147,7 @@ pub struct CellMetrics {
     /// Cell height: the baseline-to-baseline line height.
     pub h: i32,
     /// Pixels from the top of a cell down to the baseline: where the text sits in
-    /// the cell. This is *not* the ascent (see [`Metrics`]) — the font's line gap
+    /// the cell. This is *not* the ascent (see [`Metrics`](crate::platform::freetype::Metrics)) — the font's line gap
     /// lies between the two, and mistaking one for the other rides the text up
     /// against the cell's top edge.
     pub baseline: i32,
@@ -525,6 +525,24 @@ impl DisplayListPool {
     }
 }
 
+/// What a fixed-pitch run is uniform in: its resolved foreground, the face it draws
+/// in, and the two rules the painter lays over it. Built by [`Painter::run_style`],
+/// which says why both the run's extent and its decorations come from this one value.
+///
+/// Two fields, and both are cheap on purpose: the painter compares this once per cell in
+/// the run scan, so it is a colour and one masked `u16` rather than a set of unpacked
+/// flags. Building the unpacked form here cost the frame 14% on the gate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RunStyle {
+    /// The resolved foreground the run's glyphs and rules are drawn in (reverse and dim
+    /// already applied, which is why neither bit appears in `key`).
+    fg: Rgb,
+    /// The face and rule bits, masked and normalised by [`Attrs::run_key`]. Kept packed
+    /// rather than unpacked because this is the per-cell comparison; the rules are read
+    /// back out of it once per run, in [`Painter::push_decorations`].
+    key: Attrs,
+}
+
 /// The per-frame builder: the shared inputs plus the list being appended to. One
 /// method per concern keeps [`build_display_list`] readable.
 struct Painter<'a> {
@@ -687,10 +705,8 @@ impl Painter<'_> {
         // The run breaks on foreground, not background, so the first cell's background
         // stands in for the run when weighting the glyph anti-aliasing; a same-fg run
         // over a mixed background is rare (reverse video and selection tint uniformly).
-        let (fg, bg) = self.resolve(first, false);
-        let style = style_of(first);
-        let underline = first.attrs.contains(Attrs::UNDERLINE);
-        let strike = first.attrs.contains(Attrs::STRIKE);
+        let (_, bg) = self.resolve(first, false);
+        let run = self.run_style(first);
         // A run cannot outlast its row, so ask the pool for that much and let every
         // run settle on one capacity: the pool probes from the back for the first
         // buffer that fits, and uniform sizes are what make that probe hit first try.
@@ -710,16 +726,12 @@ impl Painter<'_> {
                 self.cell(row, end)
             };
             if end > col {
-                // A wide glyph or an astral rune stands alone, and a change of colour,
-                // style, or rule ends the run: past here is a different command.
+                // A wide glyph or an astral rune stands alone, and anything the run can
+                // only draw one of ends it: past here is a different command.
                 if cell.is_wide_leader() || cell.is_wide_spacer() || !cells_safe(cell.rune) {
                     break;
                 }
-                if self.cell_fg(cell) != fg
-                    || style_of(cell) != style
-                    || cell.attrs.contains(Attrs::UNDERLINE) != underline
-                    || cell.attrs.contains(Attrs::STRIKE) != strike
-                {
+                if self.run_style(cell) != run {
                     break;
                 }
             }
@@ -747,9 +759,9 @@ impl Painter<'_> {
                 m,
                 FaceKey::Prose {
                     size: m.size,
-                    style,
+                    style: style_of(run.key),
                 },
-                fg.to_u32(),
+                run.fg.to_u32(),
                 bg.to_u32(),
             );
         } else {
@@ -761,8 +773,24 @@ impl Painter<'_> {
             text.clear();
             self.strings.push(text);
         }
-        self.push_decorations(first, x, (end - col) as i32 * m.w, baseline, fg);
+        self.push_decorations(run, x, (end - col) as i32 * m.w, baseline);
         end
+    }
+
+    /// Everything about a cell that the painter's per-run output depends on, and so
+    /// everything a run may not batch across.
+    ///
+    /// One value serves both questions — where the run ends, and what its single set of
+    /// decorations is drawn from — because deriving them separately is how a run comes to
+    /// batch across a difference it cannot then draw. What is deliberately *not* here is
+    /// what a run can absorb: a cell's background (a run is one span of glyphs over
+    /// whatever ground the background pass laid down) and its `HIDDEN` bit (a concealed
+    /// cell goes into the text as a space and keeps the run going).
+    fn run_style(&self, cell: Cell) -> RunStyle {
+        RunStyle {
+            fg: self.cell_fg(cell),
+            key: cell.attrs.run_key(),
+        }
     }
 
     /// One underline, in the shape the cell asked for (`SGR 4:n`).
@@ -780,7 +808,7 @@ impl Painter<'_> {
     fn push_underline(&mut self, style: UnderlineStyle, x: i32, w: i32, baseline: i32, fg: Rgb) {
         let m = self.metrics;
         let color = fg.to_u32();
-        let thickness = (m.size as i32 / 12).max(1);
+        let thickness = self.rule_thickness();
         let base = self.underline_rect(x, w, baseline);
 
         match style {
@@ -858,34 +886,38 @@ impl Painter<'_> {
     /// Shared by the SGR underline and the hovered link's rule, so the two can never
     /// end up at different heights.
     fn underline_rect(&self, x: i32, w: i32, baseline: i32) -> Rect {
-        let m = self.metrics;
         Rect {
             x,
-            y: baseline + (m.descent / 2).max(1),
+            y: baseline + (self.metrics.descent / 2).max(1),
             w,
-            h: (m.size as i32 / 12).max(1),
+            h: self.rule_thickness(),
         }
     }
 
     /// The underline and strike rules for a run, drawn as solid fills spanning the
     /// run's width in the run's foreground colour.
-    fn push_decorations(&mut self, cell: Cell, x: i32, run_w: i32, baseline: i32, fg: Rgb) {
-        let m = self.metrics;
-        let thickness = (m.size as i32 / 12).max(1);
-        if cell.attrs.contains(Attrs::UNDERLINE) {
-            self.push_underline(cell.attrs.underline_style(), x, run_w, baseline, fg);
+    fn push_decorations(&mut self, run: RunStyle, x: i32, run_w: i32, baseline: i32) {
+        if run.key.contains(Attrs::UNDERLINE) {
+            self.push_underline(run.key.underline_style(), x, run_w, baseline, run.fg);
         }
-        if cell.attrs.contains(Attrs::STRIKE) {
+        if run.key.contains(Attrs::STRIKE) {
             self.list.push(DrawCmd::Fill {
                 rect: Rect {
                     x,
-                    y: baseline - m.ascent / 3,
+                    y: baseline - self.metrics.ascent / 3,
                     w: run_w,
-                    h: thickness,
+                    h: self.rule_thickness(),
                 },
-                color: fg.to_u32(),
+                color: run.fg.to_u32(),
             });
         }
+    }
+
+    /// How thick a decoration rule is drawn, from the font size. Every rule the painter
+    /// draws — underline, strike, the hovered link's — asks here, so they cannot come out
+    /// at different weights on the same text.
+    fn rule_thickness(&self) -> i32 {
+        (self.metrics.size as i32 / 12).max(1)
     }
 
     /// One cell's glyph as a standalone [`DrawCmd::Text`] at its exact column,
@@ -910,7 +942,7 @@ impl Painter<'_> {
                 baseline,
                 face: FaceKey::Prose {
                     size: m.size,
-                    style: style_of(cell),
+                    style: style_of(cell.attrs),
                 },
                 color: fg.to_u32(),
                 bg: bg.to_u32(),
@@ -921,7 +953,8 @@ impl Painter<'_> {
         // A wide glyph is drawn standalone, so it never rides a run's rule; without
         // this it would be the one gap in an underlined span (an SGR 4 CJK character,
         // or a hovered link with one in its path).
-        self.push_decorations(cell, x, width_cells * m.w, baseline, fg);
+        let run = self.run_style(cell);
+        self.push_decorations(run, x, width_cells * m.w, baseline);
     }
 
     /// The cursor, drawn last so it stacks over the cell it sits on. Nothing is
@@ -1084,7 +1117,7 @@ impl Painter<'_> {
             baseline,
             face: FaceKey::Prose {
                 size: m.size,
-                style: style_of(cell),
+                style: style_of(cell.attrs),
             },
             color: ink.to_u32(),
             bg: self.theme.cursor.to_u32(),
@@ -1216,17 +1249,38 @@ impl Painter<'_> {
     /// consumes it O(1), and both things the painter overlays — the selection band and
     /// the hovered link's rule — are this same shape.
     fn span_cols(&self, span: CellSpan, row: usize) -> Option<(usize, usize)> {
-        if row < span.start.0 || row > span.end.0 {
+        self.row_in_span(
+            row >= span.start.0 && row <= span.end.0,
+            row == span.start.0,
+            row == span.end.0,
+            span.start.1,
+            span.end.1,
+        )
+    }
+
+    /// One row's inclusive column range inside a reading-order span: from the start
+    /// column on the row the span opens on, to the end column on the row it closes on,
+    /// edge to edge on every row between. `None` when the row is outside it.
+    ///
+    /// Takes the three row comparisons already made rather than the span itself, because
+    /// the painter's two overlays index rows differently — the hovered link by display
+    /// row, the selection by [`AbsRow`], since it must not drift when the child prints —
+    /// and only the comparisons differ. The clamping rule is the part that must not, so
+    /// it lives here once.
+    fn row_in_span(
+        &self,
+        inside: bool,
+        at_start: bool,
+        at_end: bool,
+        start_col: usize,
+        end_col: usize,
+    ) -> Option<(usize, usize)> {
+        if !inside {
             return None;
         }
         let last_col = self.screen.dimensions().0.saturating_sub(1);
-        let first = if row == span.start.0 { span.start.1 } else { 0 };
-        let last = if row == span.end.0 {
-            span.end.1
-        } else {
-            last_col
-        }
-        .min(last_col);
+        let first = if at_start { start_col } else { 0 };
+        let last = if at_end { end_col } else { last_col }.min(last_col);
         Some((first, last))
     }
 
@@ -1243,13 +1297,13 @@ impl Painter<'_> {
     fn selection_cols(&self, row: usize) -> Option<(usize, usize)> {
         let (start, end) = self.selection?.ordered();
         let abs = self.screen.abs_row(row);
-        if abs < start.0 || abs > end.0 {
-            return None;
-        }
-        let last_col = self.screen.dimensions().0.saturating_sub(1);
-        let first = if abs == start.0 { start.1 } else { 0 };
-        let last = if abs == end.0 { end.1 } else { last_col }.min(last_col);
-        Some((first, last))
+        self.row_in_span(
+            abs >= start.0 && abs <= end.0,
+            abs == start.0,
+            abs == end.0,
+            start.1,
+            end.1,
+        )
     }
 
     /// The underline under the hovered hyperlink where it crosses `row`, drawn as one
@@ -1356,35 +1410,43 @@ pub(crate) fn push_cell_text(
     color: u32,
     bg: u32,
 ) {
-    let mut pen_cells = 0usize;
-    let mut run_start = 0usize;
-    let mut run_cells = 0usize;
-    let mut run: Option<String> = None;
+    /// The run being accumulated: where it starts, how many cells it covers, and the
+    /// pooled buffer its text is going into. One value rather than a `Option<String>`
+    /// beside a counter, so "there is a run" and "the run has storage" cannot disagree.
+    struct Pending {
+        start_cell: usize,
+        cells: usize,
+        text: String,
+    }
+    let flush = |out: &mut DisplayList, run: Pending| {
+        push_owned_cells(
+            out,
+            run.text,
+            x + run.start_cell as i32 * metrics.w,
+            baseline,
+            run.cells,
+            metrics,
+            face,
+            color,
+            bg,
+        );
+    };
 
+    let mut pen_cells = 0usize;
+    let mut run: Option<Pending> = None;
     for (_, cluster) in grapheme::graphemes(text) {
         let width = display_cluster_width(cluster).max(1);
-        let safe = width == 1 && cluster.chars().all(|c| (c as u32) <= 0xffff);
-        if safe {
-            if run_cells == 0 {
-                run_start = pen_cells;
-                run = Some(take_string_with_capacity(strings, text.len()));
-            }
-            run.as_mut().expect("run starts above").push_str(cluster);
-            run_cells += 1;
+        if width == 1 && cluster.chars().all(cells_safe) {
+            let pending = run.get_or_insert_with(|| Pending {
+                start_cell: pen_cells,
+                cells: 0,
+                text: take_string_with_capacity(strings, text.len()),
+            });
+            pending.text.push_str(cluster);
+            pending.cells += 1;
         } else {
-            if run_cells > 0 {
-                push_owned_cells(
-                    out,
-                    run.take().expect("nonempty run has storage"),
-                    x + run_start as i32 * metrics.w,
-                    baseline,
-                    run_cells,
-                    metrics,
-                    face,
-                    color,
-                    bg,
-                );
-                run_cells = 0;
+            if let Some(pending) = run.take() {
+                flush(out, pending);
             }
             let mut glyph = take_string_with_capacity(strings, cluster.len());
             glyph.push_str(cluster);
@@ -1402,18 +1464,8 @@ pub(crate) fn push_cell_text(
         }
         pen_cells += width;
     }
-    if run_cells > 0 {
-        push_owned_cells(
-            out,
-            run.expect("nonempty run has storage"),
-            x + run_start as i32 * metrics.w,
-            baseline,
-            run_cells,
-            metrics,
-            face,
-            color,
-            bg,
-        );
+    if let Some(pending) = run.take() {
+        flush(out, pending);
     }
 }
 
@@ -1499,12 +1551,11 @@ fn cells_safe(rune: char) -> bool {
     (rune as u32) <= 0xFFFF
 }
 
-/// The font style a cell's bold/italic attributes select.
-fn style_of(cell: Cell) -> FontStyle {
-    match (
-        cell.attrs.contains(Attrs::BOLD),
-        cell.attrs.contains(Attrs::ITALIC),
-    ) {
+/// The font style a cell's bold/italic attributes select. Takes the attributes rather
+/// than the cell so a run can ask it of its own [`Attrs::run_key`], which is where the
+/// two bits it reads are preserved.
+fn style_of(attrs: Attrs) -> FontStyle {
+    match (attrs.contains(Attrs::BOLD), attrs.contains(Attrs::ITALIC)) {
         (true, true) => FontStyle::BoldItalic,
         (true, false) => FontStyle::Bold,
         (false, true) => FontStyle::Italic,
@@ -1946,6 +1997,53 @@ mod tests {
         // And the cost stays bounded: a squiggle under two cells is a handful of rects,
         // not one per pixel. The damage diff walks this list every painted frame.
         assert!(curly.len() <= 8, "{} rects for two cells", curly.len());
+    }
+
+    #[test]
+    fn a_change_of_underline_shape_ends_the_run() {
+        // Two diagnostics of different kinds side by side: an error squiggled curly, a hint
+        // dotted. A run carries *one* set of decorations, drawn from its first cell, so a
+        // run that batches across a change of shape draws the whole span in the first
+        // shape and the hint comes out squiggled. Same fg, same face, both underlined —
+        // every other reason to break the run is absent, which is exactly why the shape has
+        // to be one of them.
+        let mut s = Screen::new(6, 1);
+        feed(&mut s, b"\x1b[4:3maa\x1b[4:4mbb");
+        let list = list_of(&s);
+        assert_eq!(
+            cells_runs(&list)
+                .iter()
+                .map(|(x, _, text)| (*x, text.clone()))
+                .collect::<Vec<_>>(),
+            vec![(0, "aa".to_string()), (2 * M.w, "bb".to_string())],
+            "the run ends where the shape changes"
+        );
+
+        // And the two halves really are drawn as different shapes.
+        let t = Theme::default();
+        let rules: Vec<Rect> = fills(&list)
+            .into_iter()
+            .filter(|(r, c)| r.y > M.baseline && *c == t.fg.to_u32())
+            .map(|(r, _)| r)
+            .collect();
+        let curly: Vec<i32> = rules
+            .iter()
+            .filter(|r| r.x < 2 * M.w)
+            .map(|r| r.y)
+            .collect();
+        let dotted: Vec<i32> = rules
+            .iter()
+            .filter(|r| r.x >= 2 * M.w)
+            .map(|r| r.y)
+            .collect();
+        assert!(
+            curly.len() > 2 && curly.windows(2).all(|w| w[0] != w[1]),
+            "the error stays a squiggle: {curly:?}"
+        );
+        assert!(
+            dotted.len() > 1 && dotted.iter().all(|y| *y == dotted[0]),
+            "and the hint stays flat: {dotted:?}"
+        );
     }
 
     #[test]
