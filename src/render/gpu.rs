@@ -1086,7 +1086,7 @@ fn coverage_exponent(fg: u32, bg: u32, gamma: TextGamma) -> f32 {
 
 /// Rec. 709 relative luminance of a `0x00RRGGBB` colour in `[0, 1]`, taken in the
 /// gamma-encoded byte space as a perceptual stand-in (enough to pick the contrast
-/// direction and a soft strength; see [`contrast_factor`]).
+/// direction and a soft strength; see [`coverage_exponent`]).
 fn luma(color: u32) -> f32 {
     let r = ((color >> 16) & 0xff) as f32;
     let g = ((color >> 8) & 0xff) as f32;

@@ -1,5 +1,5 @@
 //! The GPU/dmabuf presentation half of the app: negotiating the buffers, sync,
-//! and per-frame submit that turn a [`DisplayList`] into pixels on the
+//! and per-frame submit that turn a [`crate::render::display::DisplayList`] into pixels on the
 //! compositor's surface. This is bnkterm's image-free render path (a terminal
 //! decodes no images, so the atlas, batch, and Vulkan pipeline carry glyphs and
 //! solid quads only).

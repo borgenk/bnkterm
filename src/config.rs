@@ -203,7 +203,7 @@ pub struct TabBarConfig {
     /// rather than clipping the label.
     pub height_px: u32,
     /// Breathing room between the strip and the grid, in *logical* pixels (the same
-    /// unit as [`height_px`], DPI-scaled at use). Reserved from the grid on the
+    /// unit as [`Self::height_px`], DPI-scaled at use). Reserved from the grid on the
     /// side the strip lives, so the chrome never butts against the terminal text.
     /// Only applied while the strip is visible.
     pub gap_px: u32,

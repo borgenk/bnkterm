@@ -593,7 +593,7 @@ impl Parser {
 
     /// Decode one ground-state text run into `run`, stopping before a C0
     /// control. A malformed continuation emits the replacement for the partial
-    /// sequence, then reprocesses the offending byte exactly as [`advance`] does.
+    /// sequence, then reprocesses the offending byte exactly as [`Self::advance`] does.
     ///
     /// `#[inline(never)]` keeps this larger loop out of the escape dispatcher:
     /// the escape-heavy benchmark is sensitive to code layout even when a text

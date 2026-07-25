@@ -1438,7 +1438,7 @@ impl State {
     /// The window half of a key press: resolve `keycode` to an [`input::Key`] via
     /// the keymap (a named key by its keycode, else its layout character), or `None`
     /// for a bare modifier / unresolved key. xkb belongs with the Wayland keyboard,
-    /// so this stays window-side; the terminal half is [`apply`](Self::apply).
+    /// so this stays window-side; the terminal half is [`TerminalCore::apply`](terminal::TerminalCore::apply).
     fn resolve_key(&self, keycode: u32) -> Option<input::Key> {
         if let Some(named) = input::key_from_keycode(keycode) {
             return Some(named);

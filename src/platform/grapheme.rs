@@ -103,7 +103,7 @@ impl BreakState {
     /// state either way.
     ///
     /// `false` for the very first scalar it ever sees: there is no cluster in front of it
-    /// to be broken away from. A caller starting a fresh run of text calls [`reset`] and
+    /// to be broken away from. A caller starting a fresh run of text calls [`Self::reset`] and
     /// gets that behaviour again.
     pub fn breaks_before(&mut self, c: char) -> bool {
         let g = gcb(c);

@@ -47,7 +47,7 @@ pub(crate) fn wants_emoji(cluster: &str, mono_has: impl Fn(char) -> bool) -> boo
 }
 
 /// A rasterized emoji cluster at display size: straight (unpremultiplied)
-/// `0xAARRGGBB` pixels, row-major, plus the same pen metrics [`Glyph`] carries.
+/// `0xAARRGGBB` pixels, row-major, plus the same pen metrics [`Glyph`](crate::platform::freetype::Glyph) carries.
 /// Owned and cached by [`EmojiFont`]; the blitter draws straight out of it.
 pub struct ColorGlyph {
     /// Horizontal offset from the pen to the bitmap's left edge.

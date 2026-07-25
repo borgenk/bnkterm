@@ -1,11 +1,11 @@
 //! Text measurement and cluster shaping.
 //!
 //! [`text_advance`] measures a run's pen advance from cached per-glyph metrics
-//! (no rasterization), which is how layout places the caret and hit-tests
-//! clicks. It routes ASCII and simple clusters straight to the per-character
-//! caches; only a multi-scalar emoji cluster reaches the shaper below.
+//! (no rasterization). It routes ASCII and simple clusters straight to the
+//! per-character caches; only a multi-scalar emoji cluster reaches the shaper
+//! below.
 //!
-//! The shaper is backed by the system HarfBuzz (libharfbuzz.so). The editor
+//! The shaper is backed by the system HarfBuzz (libharfbuzz.so). A terminal
 //! renders almost all text one glyph per Unicode scalar and never touches it;
 //! shaping is reserved for the one case that genuinely needs it: resolving a
 //! multi-scalar emoji cluster (a ZWJ family, a flag's regional-indicator pair, a
@@ -28,12 +28,17 @@ use crate::platform::grapheme;
 
 /// Total pen advance of `text` at the face's current pixel size, in pixels.
 /// Measures with metrics only (no rasterization), matching how the renderer
-/// advances the pen, so the caret lands where the next glyph would be drawn.
-/// [`crate::layout`] uses this to place the caret and hit-test clicks.
+/// advances the pen, so a measured width and the drawn glyphs agree.
 ///
-/// ASCII skips cluster segmentation entirely (architecture notes 3b); other
-/// text measures per grapheme cluster so an emoji cluster gets its color
-/// glyph's advance, routed identically to how the renderer draws it.
+/// This is the *proportional* measure, for text placed by its own advances rather
+/// than on the grid's fixed pitch — a chrome label, never terminal text, which is
+/// measured by [`crate::width`] and placed a cell at a time. `render::gpu`'s glyph
+/// routing deliberately mirrors this one, so anything measured here draws where it
+/// was measured.
+///
+/// ASCII skips cluster segmentation entirely; other text measures per grapheme
+/// cluster so an emoji cluster gets its color glyph's advance, routed identically
+/// to how the renderer draws it.
 pub fn text_advance(face: &Face, text: &str) -> f32 {
     if text.is_ascii() {
         return text.chars().map(|c| face.advance(c)).sum();

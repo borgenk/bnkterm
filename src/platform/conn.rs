@@ -52,7 +52,7 @@ pub struct Connection {
     /// How many bytes at the front of `in_buf` have already been consumed by
     /// [`Connection::next_message_into`]. Each parsed message advances this cursor
     /// (cheap) instead of draining the front (O(remaining) per message, O(N^2)
-    /// over a burst); the consumed prefix is compacted away once per [`fill`].
+    /// over a burst); the consumed prefix is compacted away once per [`Self::fill`].
     in_pos: usize,
     fds: VecDeque<OwnedFd>,
 }
@@ -171,7 +171,7 @@ impl Connection {
 
     /// Wait up to `timeout` (or forever if `None`) for more bytes from the
     /// compositor. Any fds received as ancillary data (the keyboard keymap, a
-    /// clipboard transfer fd) are queued for [`take_fd`]. A `TimedOut` result
+    /// clipboard transfer fd) are queued for [`Self::take_fd`]. A `TimedOut` result
     /// lets the caller service key repeats while the socket is idle.
     pub fn fill(&mut self, timeout: Option<Duration>) -> Result<Fill> {
         // Drop the messages consumed since the last fill in one shift, rather

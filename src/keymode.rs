@@ -50,7 +50,7 @@ pub(crate) enum KeyMode {
 }
 
 /// A tab-bar operation a leader key resolves to. The app maps these onto the
-/// [`crate::app::tabs::Tabs`] manager; keeping them a plain enum lets the state
+/// `app::tabs::Tabs` manager; keeping them a plain enum lets the state
 /// machine stay free of the manager and stay testable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TabAction {

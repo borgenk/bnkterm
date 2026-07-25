@@ -4,7 +4,7 @@
 //! bitmap, handling hinting, scan conversion, and per-size metrics. This is the
 //! thin FFI layer over it: a small extern block, one struct owning the C-side
 //! handles, a Drop impl, and methods returning owned data. The font file is read
-//! into a Vec the Face borrows, rather than mmapped, and coverage is a Vec<u8>.
+//! into a Vec the Face borrows, rather than mmapped, and coverage is a `Vec<u8>`.
 //!
 //! FreeType exposes glyph data as struct fields reached from the Face pointer
 //! (face->glyph->bitmap, face->size->metrics), not accessors. The repr(C)
@@ -122,11 +122,14 @@ impl FontConfig {
     }
 }
 
-/// Which variant of the font family a run renders in. Body text and syntax
-/// markers use [`FontStyle::Regular`]; emphasis selects a heavier or slanted
-/// file. Kept distinct from [`crate::markdown::Emphasis`] so this font layer
-/// stays independent of the markdown vocabulary: an inline code span is its own
-/// emphasis but still renders in the regular monospace face.
+/// Which variant of the font family a run renders in: one open font file each.
+/// Ordinary output is [`FontStyle::Regular`]; a cell's `SGR 1`/`SGR 3` bits select a
+/// heavier or slanted file (`term_render::style_of` does the mapping).
+///
+/// Kept distinct from [`crate::grid::Attrs`] so this font layer stays independent of
+/// the terminal's vocabulary. It knows four files, not what made a run bold — which is
+/// what lets the tab bar's chrome text ask for the same four without pretending to
+/// carry a rendition.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum FontStyle {
     Regular,
@@ -598,7 +601,8 @@ impl Face {
 
     /// Rasterize a character at the current pixel size, copying the coverage
     /// out. A load failure or glyphless character yields an empty glyph. The
-    /// render path goes through [`Self::with_glyph`], which caches the result;
+    /// render path goes through [`Face::with_cluster_glyph`](Self::with_cluster_glyph), which
+    /// caches the result;
     /// this is the uncached primitive behind it.
     pub fn rasterize(&self, ch: char) -> Glyph {
         // SAFETY: face is valid; FT_Load_Char renders into the face's shared
