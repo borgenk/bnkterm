@@ -538,9 +538,9 @@ impl Parser {
             State::CsiIntermediate => self.csi_intermediate(p, byte),
             State::CsiIgnore => self.csi_ignore(byte),
             State::OscString => self.osc_string(p, byte),
-            State::DcsEntry => self.dcs_entry(byte),
-            State::DcsParam => self.dcs_param(byte),
-            State::DcsIntermediate => self.dcs_intermediate(byte),
+            State::DcsEntry => self.dcs_entry(p, byte),
+            State::DcsParam => self.dcs_param(p, byte),
+            State::DcsIntermediate => self.dcs_intermediate(p, byte),
             State::DcsPassthrough => self.dcs_passthrough(byte),
             State::DcsIgnore => {}
             State::StringIgnore => {}
@@ -745,8 +745,12 @@ impl Parser {
                 self.state = State::CsiParam;
             }
             0x40..=0x7e => self.csi_dispatch(p, byte),
+            // xterm's `csi_table` maps 7F to `CASE_IGNORE`: skip the byte and stay
+            // exactly where we are. Dropping the whole sequence instead means a stray DEL
+            // anywhere inside `CSI 1;5H` costs the cursor move, and a program that pads
+            // its output never finds out.
+            0x7f => {}
             _ => {
-                // 0x7f (DEL) has no meaning inside a sequence; drop it.
                 self.ignore = true;
                 self.state = State::CsiIgnore;
             }
@@ -767,9 +771,11 @@ impl Parser {
                 self.state = State::CsiIntermediate;
             }
             0x40..=0x7e => self.csi_dispatch(p, byte),
+            // DEL is skipped rather than fatal; see `csi_entry`.
+            0x7f => {}
             _ => {
-                // A private marker is only legal as the first byte after `[`, and DEL
-                // is never legal: the sequence is malformed, so drop it.
+                // A private marker is only legal as the first byte after `[`, so a
+                // sequence carrying one here is malformed and is dropped.
                 self.ignore = true;
                 self.state = State::CsiIgnore;
             }
@@ -784,6 +790,8 @@ impl Parser {
         match byte {
             0x20..=0x2f => self.collect_intermediate(byte),
             0x40..=0x7e => self.csi_dispatch(p, byte),
+            // DEL is skipped rather than fatal; see `csi_entry`.
+            0x7f => {}
             _ => {
                 // A parameter byte after an intermediate is malformed.
                 self.ignore = true;
@@ -859,8 +867,20 @@ impl Parser {
     // The prologue is parsed exactly like a CSI's — same parameters, same intermediates —
     // and the final byte names the sequence rather than performing it, because what
     // follows is the argument. `DCS $ q m ST` is "what are the current SGR settings?".
+    //
+    // "Exactly like a CSI's" includes the C0 rule: a control byte arriving mid-prologue is
+    // executed and the sequence carries on. These states abort on one, which is both a
+    // divergence from xterm and an inconsistency with the CSI states three screens up —
+    // and it is invisible, because the only symptom is that a program which pads a
+    // DECRQSS waits out its own timeout for a reply that was never going to come. The
+    // payload state (`dcs_passthrough`) is different and already correct: there a C0 is
+    // data.
 
-    fn dcs_entry(&mut self, byte: u8) {
+    fn dcs_entry<P: Perform>(&mut self, p: &mut P, byte: u8) {
+        if is_c0(byte) {
+            p.execute(byte);
+            return;
+        }
         match byte {
             0x20..=0x2f => {
                 self.collect_intermediate(byte);
@@ -883,11 +903,16 @@ impl Parser {
                 self.state = State::DcsParam;
             }
             0x40..=0x7e => self.dcs_hook(byte),
+            0x7f => {}
             _ => self.state = State::DcsIgnore,
         }
     }
 
-    fn dcs_param(&mut self, byte: u8) {
+    fn dcs_param<P: Perform>(&mut self, p: &mut P, byte: u8) {
+        if is_c0(byte) {
+            p.execute(byte);
+            return;
+        }
         match byte {
             0x30..=0x39 => self.param_digit(byte),
             0x3a => self.subparam_next(),
@@ -897,14 +922,20 @@ impl Parser {
                 self.state = State::DcsIntermediate;
             }
             0x40..=0x7e => self.dcs_hook(byte),
+            0x7f => {}
             _ => self.state = State::DcsIgnore,
         }
     }
 
-    fn dcs_intermediate(&mut self, byte: u8) {
+    fn dcs_intermediate<P: Perform>(&mut self, p: &mut P, byte: u8) {
+        if is_c0(byte) {
+            p.execute(byte);
+            return;
+        }
         match byte {
             0x20..=0x2f => self.collect_intermediate(byte),
             0x40..=0x7e => self.dcs_hook(byte),
+            0x7f => {}
             _ => self.state = State::DcsIgnore,
         }
     }
@@ -1851,6 +1882,138 @@ mod tests {
                 p.advance_bytes(&mut rec, chunk);
             }
             assert_eq!(rec.actions, reference, "chunk split {split}");
+        }
+    }
+
+    #[test]
+    fn del_is_skipped_inside_a_sequence_not_fatal_to_it() {
+        // xterm's `csi_table` maps 7F to `CASE_IGNORE`: consume the byte, stay in state.
+        // Dropping the whole sequence instead costs a program its cursor move for a stray
+        // pad byte, and it never finds out.
+        let mut r = Recorder::default();
+        Parser::new().advance_bytes(&mut r, b"\x1b[1\x7f;5H");
+        assert_eq!(
+            r.actions,
+            [Action::Csi {
+                params: vec![vec![1], vec![5]],
+                intermediates: Vec::new(),
+                private: 0,
+                action: b'H',
+            }],
+            "DEL mid-parameter must not eat the sequence"
+        );
+
+        // Every prologue state, since each had its own arm: after the introducer, after a
+        // private marker, and after an intermediate.
+        for seq in [
+            b"\x1b[\x7f2J".as_slice(),
+            b"\x1b[?\x7f25h",
+            b"\x1b[1 \x7fq",
+            b"\x1b[1;\x7f5H",
+        ] {
+            let mut r = Recorder::default();
+            Parser::new().advance_bytes(&mut r, seq);
+            assert!(
+                matches!(r.actions.first(), Some(Action::Csi { .. })),
+                "{:?} was dropped: {:?}",
+                String::from_utf8_lossy(seq),
+                r.actions
+            );
+        }
+    }
+
+    #[test]
+    fn a_c0_in_a_dcs_prologue_executes_and_the_sequence_continues() {
+        // The CSI states deliberately execute a C0 mid-sequence and carry on; the
+        // structurally identical DCS prologue states aborted instead. The symptom is
+        // invisible: a program that pads a DECRQSS waits out its own timeout for a reply
+        // that was never coming.
+        let unpadded = {
+            let mut r = Recorder::default();
+            Parser::new().advance_bytes(&mut r, b"\x1bP$qm\x1b\\");
+            r.actions
+        };
+        assert!(
+            !unpadded.is_empty(),
+            "the control: an unpadded DECRQSS is answered"
+        );
+
+        // A C0 in each of the three prologue states must leave the same sequence behind.
+        for seq in [
+            b"\x1bP\x00$qm\x1b\\".as_slice(), // DcsEntry
+            b"\x1bP1\x00$qm\x1b\\",           // DcsParam
+            b"\x1bP$\x00qm\x1b\\",            // DcsIntermediate
+        ] {
+            let mut r = Recorder::default();
+            Parser::new().advance_bytes(&mut r, seq);
+            let answered = r.actions.iter().any(|a| matches!(a, Action::Dcs { .. }));
+            assert!(
+                answered,
+                "{:?} killed the sequence: {:?}",
+                String::from_utf8_lossy(seq),
+                r.actions
+            );
+        }
+
+        // And the C0 itself is delivered, not swallowed: that is the "execute and carry
+        // on" half of the rule.
+        let mut r = Recorder::default();
+        Parser::new().advance_bytes(&mut r, b"\x1bP$\rqm\x1b\\");
+        assert!(
+            r.actions
+                .iter()
+                .any(|a| matches!(a, Action::Execute(b'\r'))),
+            "the CR was not executed: {:?}",
+            r.actions
+        );
+    }
+
+    #[test]
+    fn can_and_sub_abort_whatever_is_in_flight() {
+        // The most cross-cutting rule in the parser, and it had no test at all: correct,
+        // but unpinned. What could regress silently is moving the CAN/SUB arm below the
+        // `match self.state` block, at which point a CAN inside an OSC is appended to the
+        // title instead of ending it.
+        for abort in [0x18u8, 0x1a] {
+            // A CSI dies and its tail becomes text.
+            let mut r = Recorder::default();
+            Parser::new().advance_bytes(&mut r, &[b'\x1b', b'[', b'1', abort, b'H', b'i']);
+            assert_eq!(
+                r.actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::Csi { .. }))
+                    .count(),
+                0,
+                "{abort:#04x}: the CSI was dispatched anyway"
+            );
+            assert!(
+                r.actions.contains(&Action::Print('H')) && r.actions.contains(&Action::Print('i')),
+                "{abort:#04x}: the tail should be text: {:?}",
+                r.actions
+            );
+
+            // An OSC dies without dispatching, and without printing its payload.
+            let mut r = Recorder::default();
+            Parser::new().advance_bytes(&mut r, &[b'\x1b', b']', b'0', b';', b'a', abort]);
+            assert!(
+                !r.actions.iter().any(|a| matches!(a, Action::Osc(_, _))),
+                "{abort:#04x}: the OSC was dispatched: {:?}",
+                r.actions
+            );
+            assert!(
+                !r.actions.contains(&Action::Print('a')),
+                "{abort:#04x}: the payload leaked as text: {:?}",
+                r.actions
+            );
+
+            // A DCS dies without being answered.
+            let mut r = Recorder::default();
+            Parser::new().advance_bytes(&mut r, &[b'\x1b', b'P', b'$', b'q', abort, b'm']);
+            assert!(
+                !r.actions.iter().any(|a| matches!(a, Action::Dcs { .. })),
+                "{abort:#04x}: the DCS hooked: {:?}",
+                r.actions
+            );
         }
     }
 

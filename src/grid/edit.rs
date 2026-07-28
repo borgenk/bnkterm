@@ -208,7 +208,15 @@ impl Screen {
     }
 
     /// EL: erase in line. 0 = cursor to end, 1 = start to cursor, 2 = whole line.
+    ///
+    /// Any other parameter does nothing, matching xterm's `default:` arm. Falling back to
+    /// mode 0 would turn a sequence the program did not mean into an erase, which is the
+    /// wrong direction to guess in: a terminal that erases too little shows stale text
+    /// until the next repaint, one that erases too much has destroyed it.
     pub fn erase_line(&mut self, mode: u16) {
+        if !matches!(mode, 0..=2) {
+            return;
+        }
         let blank = self.blank_cell();
         let b = self.active_mut();
         let (row, col, cols) = (b.cursor.row, b.cursor.col, b.cols);
@@ -221,9 +229,29 @@ impl Screen {
         b.cursor.pending_wrap = false;
     }
 
-    /// ED: erase in display. 0 = cursor to end, 1 = start to cursor, 2 = all,
-    /// 3 = all plus scrollback.
+    /// ED: erase in display. 0 = cursor to end, 1 = start to cursor, 2 = the display,
+    /// 3 = the scrollback, and *only* the scrollback.
+    ///
+    /// Mode 3 is xterm's Erase Saved Lines, and it leaves the visible display exactly as
+    /// it found it. This is not a fine distinction: `clear(1)` is defined as `\033[H\033[2J`
+    /// followed by `\033[3J`, and a `3` that also wiped the screen would make the pair
+    /// redundant rather than complementary. kitty, alacritty and ghostty all agree.
+    ///
+    /// Any other parameter does nothing at all, matching xterm's `default:` arm. Treating
+    /// an unknown mode as 0 turns a sequence the program did not mean into an erase.
     pub fn erase_display(&mut self, mode: u16) {
+        if mode == 3 {
+            self.active_mut().clear_history();
+            // The rows the view was scrolled back into no longer exist, so an offset into
+            // them is not a view of anything. The *live* rows keep their identities: their
+            // `AbsRow`s are absolute, so dropping history renumbers nothing and a
+            // selection on screen is still over the text it was made on.
+            self.view_offset = 0;
+            return;
+        }
+        if !matches!(mode, 0..=2) {
+            return;
+        }
         let blank = self.blank_cell();
         let b = self.active_mut();
         let (row, col, rows, cols) = (b.cursor.row, b.cursor.col, b.rows, b.cols);
@@ -234,12 +262,7 @@ impl Screen {
                 }
                 b.clear_line_range(row, 0, col + 1, blank);
             }
-            2 | 3 => {
-                b.clear_all(blank);
-                if mode == 3 {
-                    b.clear_history();
-                }
-            }
+            2 => b.clear_all(blank),
             _ => {
                 b.clear_line_range(row, col, cols, blank);
                 for r in (row + 1)..rows {
@@ -248,14 +271,9 @@ impl Screen {
             }
         }
         b.cursor.pending_wrap = false;
-        if mode == 2 || mode == 3 {
+        if mode == 2 {
             // The display the user was looking at (and may have selected) is gone.
             self.break_row_identity();
-        }
-        if mode == 3 {
-            // The history the view was scrolled into no longer exists, and an offset
-            // pointing past the end of an empty ring is not a view of anything.
-            self.view_offset = 0;
         }
     }
 
@@ -333,19 +351,23 @@ impl Screen {
         self.after_scroll(scrolled);
     }
 
-    /// DECSTBM: set the scroll region to `[top, bottom]` (0-based, inclusive).
-    /// An empty or inverted region resets to the full screen. Homes the cursor.
+    /// DECSTBM: set the scroll region to `[top, bottom]` (0-based, inclusive), and home
+    /// the cursor.
+    ///
+    /// An empty or inverted region is *refused whole*: xterm's `CASE_DECSTBM` acts only
+    /// `if (bottom > top)`, so a bad request leaves the margins **and the cursor** exactly
+    /// where they were. alacritty and ghostty agree. Resetting to the full screen instead
+    /// hands hostile or corrupted input a way to silently drop a program's scroll region
+    /// and move its cursor, which the program has no way to notice.
     pub fn set_scroll_region(&mut self, top: usize, bottom: usize) {
         {
             let b = self.active_mut();
             let bottom = bottom.min(b.rows - 1);
-            if top < bottom {
-                b.scroll_top = top;
-                b.scroll_bottom = bottom;
-            } else {
-                b.scroll_top = 0;
-                b.scroll_bottom = b.rows - 1;
+            if top >= bottom {
+                return;
             }
+            b.scroll_top = top;
+            b.scroll_bottom = bottom;
         }
         self.move_to(0, 0);
     }
@@ -478,7 +500,15 @@ impl Screen {
                 7 => self.pen.attrs.insert(Attrs::REVERSE),
                 8 => self.pen.attrs.insert(Attrs::HIDDEN),
                 9 => self.pen.attrs.insert(Attrs::STRIKE),
-                21 => self.pen.attrs.remove(Attrs::BOLD),
+                // ECMA-48 and xterm ctlseqs: "Ps = 21 -> Doubly-underlined". Not "bold
+                // off" — that is 22, which this already handles. kitty, foot, wezterm and
+                // alacritty all agree, and the grid can already carry and report the
+                // style, so nothing but this arm stood between a program asking for a
+                // double underline and getting one.
+                21 => {
+                    self.pen.attrs.insert(Attrs::UNDERLINE);
+                    self.pen.attrs.set_underline_style(UnderlineStyle::Double);
+                }
                 22 => self.pen.attrs.remove(Attrs::BOLD | Attrs::DIM),
                 23 => self.pen.attrs.remove(Attrs::ITALIC),
                 24 => {
@@ -540,6 +570,11 @@ impl Screen {
             7 => self.autowrap,
             25 => self.cursor_visible,
             47 | 1047 | 1049 => self.on_alt,
+            // `?1048` has no mode state of its own — it is DECSC/DECRC spelled as a mode
+            // — so xterm reports whether a cursor is currently saved, and so does this.
+            // Reporting 0 instead would say "I do not know that mode" about one we
+            // implement, which is the discouragement `report_mode` exists to avoid.
+            1048 => self.active().saved.is_some(),
             1000 => self.mouse.protocol == MouseProtocol::Press,
             1002 => self.mouse.protocol == MouseProtocol::ButtonEvent,
             1003 => self.mouse.protocol == MouseProtocol::AnyEvent,
@@ -566,13 +601,23 @@ impl Screen {
                 }
                 7 => self.autowrap = enable,
                 25 => self.cursor_visible = enable,
-                47 | 1047 => self.switch_alt(enable),
+                47 | 1047 => self.switch_alt(enable, false),
+                // `?1048` is DECSC/DECRC on its own, and `?1049` is defined as `?1047`
+                // plus `?1048` plus a clear. A program emitting the pre-1049 pair got the
+                // screen switch and silently no cursor save.
+                1048 => {
+                    if enable {
+                        self.save_cursor();
+                    } else {
+                        self.restore_cursor();
+                    }
+                }
                 1049 => {
                     if enable {
                         self.save_cursor();
-                        self.switch_alt(true);
+                        self.switch_alt(true, true);
                     } else {
-                        self.switch_alt(false);
+                        self.switch_alt(false, false);
                         self.restore_cursor();
                     }
                 }
@@ -631,7 +676,7 @@ impl Screen {
     /// Enter or leave the alternate screen. Entering clears it and carries the cursor
     /// across unchanged (it is one cursor shared by both buffers, see below); the
     /// primary buffer is untouched, so leaving reveals it intact.
-    fn switch_alt(&mut self, enable: bool) {
+    fn switch_alt(&mut self, enable: bool, clear_on_entry: bool) {
         if enable == self.on_alt {
             return;
         }
@@ -648,7 +693,16 @@ impl Screen {
             // that then restores expects to land where it started, not at the origin.
             // The deferred-wrap flag rides along with it for the same reason.
             let cursor = self.active().cursor;
-            self.alt.clear_all(blank);
+            // Only `?1049h` clears on the way in. Per xterm, `?47h` and `?1047h` switch
+            // to whatever the alt screen already held — `?1047` clears on *exit*, and
+            // `?1049` is `?1047` plus `?1048` plus the entry clear. The net observable is
+            // identical for a 1047/1049 cycle, so this only shows for a program that
+            // leaves and re-enters through `?47`, which is nearly extinct; it is here
+            // because "the modes differ only in ways nobody can see" is a claim that stops
+            // being true the moment someone uses the one you skipped.
+            if clear_on_entry {
+                self.alt.clear_all(blank);
+            }
             self.alt.cursor = cursor;
             self.alt.scroll_top = 0;
             self.alt.scroll_bottom = self.alt.rows - 1;

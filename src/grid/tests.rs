@@ -2783,6 +2783,149 @@ fn dl_at_the_top_of_the_screen_discards_rather_than_retains() {
 }
 
 #[test]
+fn ed_3_erases_the_scrollback_and_nothing_else() {
+    // `CSI 3 J` is xterm's Erase Saved Lines. It is why `clear(1)` sends both `2J` and
+    // `3J`: the pair is complementary, not redundant, so a `3` that also wiped the screen
+    // would make the `2` pointless. kitty, alacritty and ghostty all agree.
+    let mut s = Screen::new(6, 3);
+    feed(&mut s, b"old1\r\nold2\r\nkeep1\r\nkeep2\r\nkeep3");
+    assert!(s.scrollback_len() > 0, "there is history to erase");
+    let before: Vec<String> = (0..3).map(|r| s.row_string(r)).collect();
+    let cursor = s.cursor();
+
+    feed(&mut s, b"\x1b[3J");
+
+    assert_eq!(s.scrollback_len(), 0, "the history is gone");
+    let after: Vec<String> = (0..3).map(|r| s.row_string(r)).collect();
+    assert_eq!(after, before, "and the display is byte-identical");
+    assert_eq!(s.cursor(), cursor, "the cursor did not move either");
+}
+
+#[test]
+fn an_unknown_erase_parameter_erases_nothing() {
+    // xterm's ED and EL switches hit `default:` and do nothing. Falling back to mode 0
+    // turns a sequence the program never meant into an erase, and the wrong guess is
+    // destructive: too little erased shows stale text until the next repaint, too much
+    // has already destroyed it.
+    for seq in [b"\x1b[7J".as_slice(), b"\x1b[9J", b"\x1b[4K", b"\x1b[99K"] {
+        let mut s = Screen::new(6, 3);
+        feed(&mut s, b"abcdef\r\nghijkl\r\nmnopqr\x1b[2;3H");
+        let before: Vec<String> = (0..3).map(|r| s.row_string(r)).collect();
+        let cursor = s.cursor();
+        feed(&mut s, seq);
+        let after: Vec<String> = (0..3).map(|r| s.row_string(r)).collect();
+        assert_eq!(
+            after,
+            before,
+            "{:?} erased something",
+            String::from_utf8_lossy(seq)
+        );
+        assert_eq!(s.cursor(), cursor);
+    }
+}
+
+#[test]
+fn sgr_21_draws_a_double_underline_and_leaves_bold_alone() {
+    // ECMA-48 and xterm ctlseqs: "Ps = 21 -> Doubly-underlined". Turning bold *off* is
+    // 22. The grid could already carry and report the style, so this arm was the only
+    // thing between a program asking for a double underline and getting one.
+    let mut s = Screen::new(4, 1);
+    feed(&mut s, b"\x1b[1;21mX");
+    let cell = s.cell(0, 0);
+    assert!(cell.attrs.contains(Attrs::BOLD), "21 is not 'bold off'");
+    assert!(cell.attrs.contains(Attrs::UNDERLINE));
+    assert_eq!(cell.attrs.underline_style(), UnderlineStyle::Double);
+
+    // And 22 still is bold off, which is the arm 21 was doing the job of.
+    feed(&mut s, b"\x1b[22mY");
+    assert!(!s.cell(0, 1).attrs.contains(Attrs::BOLD));
+
+    // The style survives a DECRQSS round trip, since that is how a program restores it.
+    feed(&mut s, b"\x1b[0m\x1b[21m\x1bP$qm\x1b\\");
+    let reply = String::from_utf8_lossy(s.responses()).into_owned();
+    assert!(
+        reply.contains("4:2"),
+        "DECRQSS reports the shape: {reply:?}"
+    );
+}
+
+#[test]
+fn mode_1048_saves_and_restores_the_cursor() {
+    // `?1049` is defined as `?1047` plus `?1048` plus a clear, so a program emitting the
+    // pre-1049 pair got the screen switch and silently no cursor save.
+    let mut s = Screen::new(10, 5);
+    feed(&mut s, b"\x1b[3;4H\x1b[?1048h"); // park, then save
+    assert_eq!(s.cursor(), (2, 3));
+    feed(&mut s, b"\x1b[1;1H");
+    assert_eq!(s.cursor(), (0, 0));
+    feed(&mut s, b"\x1b[?1048l"); // restore
+    assert_eq!(s.cursor(), (2, 3), "the saved cursor came back");
+
+    // And it reports honestly, because a mode that answers "unrecognised" is a mode
+    // nobody will use. xterm reports whether a cursor is currently saved.
+    let mut s = Screen::new(10, 5);
+    feed(&mut s, b"\x1b[?1048$p");
+    assert_eq!(s.take_responses(), b"\x1b[?1048;2$y", "nothing saved yet");
+    feed(&mut s, b"\x1b[?1048h\x1b[?1048$p");
+    assert_eq!(s.take_responses(), b"\x1b[?1048;1$y", "now there is");
+}
+
+#[test]
+fn an_invalid_scroll_region_is_refused_whole() {
+    // xterm's `CASE_DECSTBM` acts only `if (bottom > top)`, so a bad request leaves the
+    // margins *and the cursor* exactly as they were; alacritty and ghostty agree.
+    // Resetting to the full screen instead hands hostile or corrupted input a way to
+    // silently drop a program's scroll region and move its cursor.
+    for bad in [b"\x1b[5;5r".as_slice(), b"\x1b[6;3r", b"\x1b[9;9r"] {
+        let mut s = Screen::new(10, 8);
+        feed(&mut s, b"\x1b[2;6r\x1b[3;7H"); // a real region, cursor parked inside it
+        let region = (s.active().scroll_top, s.active().scroll_bottom);
+        let cursor = s.cursor();
+        feed(&mut s, bad);
+        assert_eq!(
+            (s.active().scroll_top, s.active().scroll_bottom),
+            region,
+            "{:?} dropped the region",
+            String::from_utf8_lossy(bad)
+        );
+        assert_eq!(
+            s.cursor(),
+            cursor,
+            "{:?} moved the cursor",
+            String::from_utf8_lossy(bad)
+        );
+    }
+
+    // A valid one still applies, and still homes the cursor.
+    let mut s = Screen::new(10, 8);
+    feed(&mut s, b"\x1b[4;4H\x1b[2;6r");
+    assert_eq!((s.active().scroll_top, s.active().scroll_bottom), (1, 5));
+    assert_eq!(s.cursor(), (0, 0), "a valid DECSTBM homes the cursor");
+}
+
+#[test]
+fn mode_47_does_not_clear_the_alt_screen_on_entry() {
+    // Per xterm, `?47h` and `?1047h` switch to whatever the alt screen already held;
+    // `?1047` clears on *exit* and `?1049` on entry. The net observable is identical for
+    // a 1047/1049 cycle, which is exactly why this went unnoticed.
+    let mut s = Screen::new(12, 3);
+    feed(&mut s, b"\x1b[?47h"); // enter
+    feed(&mut s, b"\x1b[1;1HALTCONTENT");
+    feed(&mut s, b"\x1b[?47l"); // leave; `?47` does not clear on exit either
+    feed(&mut s, b"\x1b[?47h"); // and back
+    assert_eq!(
+        s.row_string(0).trim_end(),
+        "ALTCONTENT",
+        "?47 re-entered the screen it left, rather than a blank one"
+    );
+
+    // `?1049h` is the one that clears on entry, and still does.
+    let mut s = Screen::new(12, 3);
+    feed(&mut s, b"\x1b[?1049h\x1b[1;1HALT\x1b[?1049l\x1b[?1049h");
+    assert_eq!(s.row_string(0).trim_end(), "", "?1049h clears on entry");
+}
+
+#[test]
 fn erasing_the_scrollback_returns_the_view_to_the_bottom() {
     // ED 3 (what `clear` and `tput reset` emit) drops the history the view was
     // showing. An offset left pointing into an empty ring is a view of nothing.
