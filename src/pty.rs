@@ -3,7 +3,8 @@
 //! the user's key bytes; this module is the pipe between them and the child process.
 //!
 //! ```text
-//!   Pty::spawn ─▶ posix_openpt ─▶ fork ─┬─ child: setsid, TIOCSCTTY, dup2, exec $SHELL
+//!   Pty::spawn ─▶ posix_openpt ─▶ fork ─┬─ child: signals, setsid, TIOCSCTTY, dup2,
+//!                                        │         exec $SHELL
 //!                                        └─ parent: master fd (non-blocking) ── read/write
 //! ```
 //!
@@ -476,6 +477,12 @@ const F_SETFL: c_int = 4;
 // tty ioctls (Linux).
 const TIOCSCTTY: c_ulong = 0x540E;
 const TIOCSWINSZ: c_ulong = 0x5414;
+/// `SIGPIPE` and the `SIG_DFL` disposition, plus the `sigprocmask` "replace the whole
+/// mask" op. The child restores both before exec (see [`fork_child_in_pty`]); the
+/// numbers are the Linux generic ABI and are pinned in the tests.
+const SIGPIPE: c_int = 13;
+const SIG_DFL: usize = 0;
+const SIG_SETMASK: c_int = 2;
 
 /// `IUTF8` (`termios.h` `c_iflag`): marks tty input as UTF-8 so a cooked-mode ERASE
 /// deletes a whole multibyte character rather than one byte (see [`enable_iutf8`]).
@@ -521,6 +528,16 @@ struct Pollfd {
     revents: c_short,
 }
 
+/// `sigset_t` (`signal.h`), Linux generic ABI: a flat 1024-bit mask, declared by the C
+/// header as an array of `unsigned long`. Only the all-zero value is ever built here,
+/// so no `sigemptyset` call is needed and the child stays free of anything that could
+/// allocate. The size is pinned in the tests, because handing `sigprocmask` a mask
+/// smaller than it expects would let it read past the end of ours.
+#[repr(C)]
+struct SigSet {
+    words: [c_ulong; 16],
+}
+
 /// `struct termios` (`termios.h`), Linux generic ABI: four flag words, the line
 /// discipline byte, the control-char array, and the two speeds. Mirrored field for
 /// field only to read the current settings, set `IUTF8` in `c_iflag`, and write
@@ -544,6 +561,8 @@ extern "C" {
     fn ptsname_r(fd: c_int, buf: *mut c_char, buflen: usize) -> c_int;
     fn fork() -> c_int;
     fn setsid() -> c_int;
+    fn signal(signum: c_int, handler: usize) -> usize;
+    fn sigprocmask(how: c_int, set: *const SigSet, oldset: *mut SigSet) -> c_int;
     fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
     fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
     fn close(fd: c_int) -> c_int;
@@ -654,6 +673,20 @@ unsafe fn fork_child_in_pty(
         return pid; // parent (or -1); nothing else to do here
     }
     // --- child: async-signal-safe only, _exit on any failure ---
+    //
+    // Signals first, because `exec` will not undo either of these for us. It resets
+    // *caught* dispositions to the default but deliberately preserves *ignored* ones,
+    // and it does not touch the signal mask at all, so whatever we leave here is what
+    // the shell and everything the shell ever runs inherits.
+    //
+    // The Rust runtime sets `SIGPIPE` to `SIG_IGN` process-wide at startup, which the
+    // parent needs (serving a clipboard selection wants `EPIPE` when the paster goes
+    // away, not death) and the child must not have: a shell whose children ignore it has
+    // no working pipelines, because `yes | head -1` never gets the signal that is
+    // supposed to stop it and prints a write error instead.
+    signal(SIGPIPE, SIG_DFL);
+    let empty = SigSet { words: [0; 16] };
+    sigprocmask(SIG_SETMASK, &empty as *const SigSet, core::ptr::null_mut());
     setsid();
     let slave = open(slave_path, O_RDWR);
     if slave < 0 {
@@ -681,6 +714,59 @@ mod tests {
         // These mirror C structs the kernel writes/reads; pin their sizes.
         assert_eq!(std::mem::size_of::<Winsize>(), 8);
         assert_eq!(std::mem::size_of::<Pollfd>(), 8);
+        // sigset_t is 1024 bits on Linux. Handing `sigprocmask` a smaller one would
+        // have it read past the end of ours, and the compiler cannot catch that
+        // through an `extern` declaration we wrote ourselves.
+        assert_eq!(std::mem::size_of::<SigSet>(), 128);
+    }
+
+    #[test]
+    fn the_signal_numbers_match_the_c_abi() {
+        // `SIGPIPE` is 13 and the Rust runtime ignores it: both read straight out of the
+        // kernel's own view of this process, because the two facts together are the
+        // entire premise of the child's restore. Read rather than probed with `signal`:
+        // swapping the disposition and putting it back leaves a window in which a stray
+        // EPIPE anywhere else in the parallel suite would kill the test binary.
+        let status = std::fs::read_to_string("/proc/self/status").expect("procfs");
+        let ignored = status_mask(&status, "SigIgn:").expect("SigIgn");
+        assert_ne!(
+            ignored & (1 << (SIGPIPE - 1)),
+            0,
+            "SIGPIPE is not {SIGPIPE}, or the Rust runtime no longer ignores it (SigIgn \
+             {ignored:#x}); either way the child's restore is aimed at the wrong thing"
+        );
+
+        // SIG_SETMASK *replaces* the mask rather than adding to it, which is what the
+        // child wants: it is starting a shell, not amending an inherited state. An empty
+        // set cannot tell the three ops apart (all three are then no-ops), so prove it
+        // with a real bit: block one signal, read it back, and clear it again.
+        const SIGUSR1: c_int = 10;
+        let mut one = SigSet { words: [0; 16] };
+        one.words[0] = 1 << (SIGUSR1 - 1);
+        let empty = SigSet { words: [0; 16] };
+        let mut old = SigSet { words: [0; 16] };
+        // SAFETY: every mask passed is a live, correctly-sized `SigSet` for the duration
+        // of its call. This thread's mask is left exactly as found (empty).
+        unsafe {
+            assert_eq!(
+                sigprocmask(SIG_SETMASK, &one as *const SigSet, core::ptr::null_mut()),
+                0
+            );
+            assert_eq!(
+                sigprocmask(
+                    SIG_SETMASK,
+                    &empty as *const SigSet,
+                    &mut old as *mut SigSet
+                ),
+                0
+            );
+        }
+        assert_eq!(
+            old.words[0],
+            1 << (SIGUSR1 - 1),
+            "SIG_SETMASK did not install the mask it was given"
+        );
+        assert_eq!(old.words[1..], [0; 15], "and nothing else came with it");
     }
 
     #[test]
@@ -820,6 +906,89 @@ mod tests {
             }
         }
         panic!("the child never echoed the input back: got {got:?}");
+    }
+
+    /// Run `argv` on a real PTY and collect everything it writes before it exits.
+    /// Returns `None` where fork/exec is unavailable (a locked-down sandbox), so the
+    /// callers skip rather than fail. The child is expected to be short-lived; the
+    /// deadline only stops a wedged one from hanging the suite.
+    fn output_of(argv: &[&str]) -> Option<String> {
+        let pty = Pty::spawn_command(80, 24, argv).ok()?;
+        let mut poll_set = PollSet::new();
+        poll_set.add(pty.fd());
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match pty.read(&mut buf).expect("read from the child") {
+                ReadOutcome::Data(n) => got.extend_from_slice(&buf[..n]),
+                ReadOutcome::WouldBlock => {
+                    let _ = poll_set.wait(Some(Duration::from_millis(50)));
+                }
+                ReadOutcome::Eof => break,
+            }
+        }
+        Some(String::from_utf8_lossy(&got).into_owned())
+    }
+
+    /// The value of a `/proc/<pid>/status` signal-mask line, as the 64-bit mask it
+    /// spells in hex. `None` if the line is absent.
+    fn status_mask(status: &str, field: &str) -> Option<u64> {
+        let line = status.lines().find(|l| l.starts_with(field))?;
+        let hex = line.split_whitespace().nth(1)?;
+        u64::from_str_radix(hex, 16).ok()
+    }
+
+    #[test]
+    fn the_child_does_not_inherit_the_runtimes_ignored_sigpipe() {
+        // The Rust runtime sets SIGPIPE to SIG_IGN process-wide, and exec preserves
+        // *ignored* dispositions where it would reset a caught one. So unless the child
+        // restores it by hand, every shell this terminal ever runs -- and everything
+        // those shells run -- has broken pipelines. Ask the kernel directly rather than
+        // inferring it from behaviour.
+        let Some(out) = output_of(&["/bin/sh", "-c", "cat /proc/self/status"]) else {
+            eprintln!("pty spawn unavailable in this environment; skipping");
+            return;
+        };
+        let Some(ignored) = status_mask(&out, "SigIgn:") else {
+            eprintln!("no SigIgn in /proc/self/status; skipping");
+            return;
+        };
+        // Signal N occupies bit N-1, so SIGPIPE (13) is bit 12.
+        assert_eq!(
+            ignored & (1 << (SIGPIPE - 1)),
+            0,
+            "the child still ignores SIGPIPE (SigIgn {ignored:#x}); `yes | head` would \
+             never die and every pipeline in every tab misbehaves"
+        );
+        // The mask is empty in this process today, so this pins that it stays that way
+        // through the fork rather than proving the sigprocmask did work.
+        assert_eq!(
+            status_mask(&out, "SigBlk:"),
+            Some(0),
+            "the child starts with signals blocked"
+        );
+    }
+
+    #[test]
+    fn a_pipeline_in_the_child_ends_without_a_write_error() {
+        // The user-visible half of the same defect, through a real shell: `head` exits
+        // after one line, `yes` writes into the closed pipe. With SIGPIPE defaulted it
+        // dies silently, which is what every pipeline in the world assumes; with it
+        // ignored the write returns EPIPE and `yes` complains to stderr instead.
+        let Some(out) = output_of(&["/bin/sh", "-c", "yes | head -1"]) else {
+            eprintln!("pty spawn unavailable in this environment; skipping");
+            return;
+        };
+        if out.contains("not found") {
+            eprintln!("yes/head unavailable in this environment; skipping");
+            return;
+        }
+        assert!(out.contains('y'), "the pipeline produced nothing: {out:?}");
+        assert!(
+            !out.to_ascii_lowercase().contains("broken pipe"),
+            "the child reported a write error instead of taking the signal: {out:?}"
+        );
     }
 
     #[test]
