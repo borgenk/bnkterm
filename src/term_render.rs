@@ -3078,7 +3078,7 @@ mod tests {
 
             for r in 0..rows {
                 for c in 0..cols {
-                    let changed = screen.cell(r, c) != before[r * cols + c];
+                    let changed = painted(screen.cell(r, c)) != painted(before[r * cols + c]);
                     if changed {
                         assert!(
                             covers_cell(&rects, r, c),

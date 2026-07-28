@@ -1902,39 +1902,57 @@ fn decoded_text_run_equivalence_targeted() {
     assert_bulk_equiv(12, 3, "\x1b[?2027h#\u{fe0f}\u{20e3} 日本".as_bytes());
 }
 
-#[test]
-fn bulk_ascii_matches_per_char_under_fuzz() {
-    // A small grid so runs cross rows often, driven by a deterministic stream
-    // dense with ASCII runs but salted with the full byte range (ESC sequences,
-    // controls, high/UTF-8 bytes). Every 4 KiB block must leave both screens
-    // identical — the strongest guard that the bulk path changed nothing.
+/// Drive `bytes` through both the bulk and the per-char path and require the two screens
+/// to stay identical, block by block. A small grid so runs cross rows often.
+fn assert_bulk_equiv_over(bytes: &[u8], label: &str) {
     let mut bulk = Screen::new(8, 4);
     let mut per = Screen::new(8, 4);
     let mut pb = crate::vt::Parser::new();
     let mut pc = crate::vt::Parser::new();
-    let mut seed: u64 = 0x0BAD_C0DE_1234_5678;
-    let mut buf = [0u8; 4096];
-    for block in 0..300 {
-        for b in buf.iter_mut() {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let r = (seed >> 33) as u32;
-            // ~1 in 6 bytes is full-range (keeps escapes/controls/UTF-8 in the
-            // mix); the rest are printable ASCII, so runs are long enough to wrap.
-            *b = if r.is_multiple_of(6) {
-                (r >> 8) as u8
-            } else {
-                0x20 + ((r >> 8) % 0x5f) as u8
-            };
-        }
-        pb.advance_bytes(&mut bulk, &buf);
-        for &byte in buf.iter() {
+    for (block, chunk) in bytes.chunks(4096).enumerate() {
+        pb.advance_bytes(&mut bulk, chunk);
+        for &byte in chunk {
             pc.advance(&mut per, byte);
         }
-        assert_eq!(bulk.snapshot(), per.snapshot(), "block {block} snapshot");
-        assert_eq!(bulk.cursor(), per.cursor(), "block {block} cursor");
+        assert_eq!(
+            bulk.snapshot(),
+            per.snapshot(),
+            "{label} block {block} snapshot"
+        );
+        assert_eq!(bulk.cursor(), per.cursor(), "{label} block {block} cursor");
     }
+}
+
+#[test]
+fn bulk_ascii_matches_per_char_under_fuzz() {
+    // Two corpora, because they find different things and neither subsumes the other.
+    //
+    // The uniform one is dense with long ASCII runs salted with full-range bytes, which
+    // is what puts run boundaries and SWAR word edges in awkward places. It is also
+    // nearly blind to the escape machinery: it reaches insert mode about once per 1.2 MB
+    // and `?2027` never, and those are exactly the modes that take the printer *off* its
+    // bulk path — so on its own it was comparing two fast paths to each other.
+    let mut uniform = Vec::with_capacity(300 * 4096);
+    let mut seed: u64 = 0x0BAD_C0DE_1234_5678;
+    for _ in 0..300 * 4096 {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let r = (seed >> 33) as u32;
+        // ~1 in 6 bytes is full-range (keeps escapes/controls/UTF-8 in the
+        // mix); the rest are printable ASCII, so runs are long enough to wrap.
+        uniform.push(if r.is_multiple_of(6) {
+            (r >> 8) as u8
+        } else {
+            0x20 + ((r >> 8) % 0x5f) as u8
+        });
+    }
+    assert_bulk_equiv_over(&uniform, "uniform");
+
+    // The structured one sets the modes, walks the DCS states, and interrupts sequences
+    // mid-flight, so the comparison actually spans the slow paths.
+    let structured = crate::fuzz::Stream::new(0x5EED_1234_ABCD_0001).bytes(300 * 4096);
+    assert_bulk_equiv_over(&structured, "structured");
 }
 
 #[test]

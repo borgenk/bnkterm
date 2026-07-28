@@ -76,7 +76,47 @@ const ESC_FINALS: &[u8] = b"78MDEHc=>";
 
 /// Bytes that mean something on their own, weighted into the stream because a terminal
 /// stream is mostly these and text.
-const C0: &[u8] = b"\r\n\t\x08\x0b\x0c\x0e\x0f";
+///
+/// `NUL`, `CAN`, `SUB` and `DEL` are here because leaving them out is what hid a class of
+/// bug: they are the bytes whose whole job is to interact with a sequence in flight, so a
+/// corpus without them exercises the parser's most cross-cutting rules zero times.
+const C0: &[u8] = b"\r\n\t\x08\x0b\x0c\x0e\x0f\x00\x18\x1a\x7f";
+
+/// Private modes worth toggling, because each one switches a *different* path on. Drawn
+/// by name rather than from the generic parameter range, which tops out well below them:
+/// a uniform generator emits `?2027` never, so the cluster-promotion path it enables was
+/// unreachable no matter how many bytes were thrown at it.
+const PRIVATE_MODES: &[u16] = &[
+    1, 6, 7, 12, 25, 47, 1000, 1002, 1003, 1004, 1006, 1047, 1048, 1049, 2004, 2026, 2027, 2048,
+];
+
+/// The ANSI (unprefixed) modes worth toggling. IRM, insert mode, is the one that earns
+/// the list: it takes the printer off its bulk path, so a corpus that never sets it
+/// leaves the shifting path almost untested.
+const ANSI_MODES: &[u16] = &[4, 20];
+
+/// Sequence prologues to interrupt mid-flight. Each stops somewhere a parser has to hold
+/// state — after an introducer, mid-parameter, after an intermediate — so that whatever
+/// follows lands *inside* a sequence rather than between two.
+const PROLOGUES: &[&[u8]] = &[
+    b"\x1b[",
+    b"\x1b[1",
+    b"\x1b[?",
+    b"\x1b[1;",
+    b"\x1b[1 ",
+    b"\x1bP",
+    b"\x1bP$",
+    b"\x1bP1;2",
+    b"\x1bP+",
+    b"\x1b]0;ab",
+    b"\x1b(",
+];
+
+/// Bytes that interrupt a sequence, and the reason [`PROLOGUES`] exists. CAN and SUB
+/// abort, `DEL` is skipped mid-sequence by xterm, `NUL` is ignored, and `ESC` restarts —
+/// four different rules, each of which a corpus can only test by landing one of these
+/// between an introducer and its final byte.
+const INTERRUPTERS: &[u8] = b"\x18\x1a\x7f\x00\x1b\r\n\x07";
 
 /// A generator of plausible terminal output.
 ///
@@ -102,16 +142,93 @@ impl Stream {
     fn step(&mut self, out: &mut Vec<u8>) {
         match self.0.below(100) {
             // Text: the bulk of any real stream, and the bulk of this one.
-            0..=44 => {
+            0..=41 => {
                 let n = 1 + self.0.below(12);
                 for _ in 0..n {
                     out.push(0x20 + self.0.byte() % 0x5f);
                 }
             }
-            45..=59 => out.push(C0[self.0.below(C0.len() as u32) as usize]),
+            42..=53 => out.push(C0[self.0.below(C0.len() as u32) as usize]),
+            // A named private mode on or off. Each switches a different path on, and
+            // several of them (insert mode, charset shifts, `?2027`) are what take the
+            // grid *off* its bulk paths, so the slow paths only get tested at all when a
+            // mode has been set first.
+            54..=57 => {
+                out.extend_from_slice(b"\x1b[");
+                let mode = if self.0.below(4) == 0 {
+                    // The ANSI modes, unprefixed. IRM (insert) is the one that matters:
+                    // it takes the printer off its bulk path, so a corpus that never sets
+                    // it barely tests the shifting path at all.
+                    ANSI_MODES[self.0.below(ANSI_MODES.len() as u32) as usize]
+                } else {
+                    out.push(b'?');
+                    PRIVATE_MODES[self.0.below(PRIVATE_MODES.len() as u32) as usize]
+                };
+                out.extend_from_slice(mode.to_string().as_bytes());
+                out.push(if self.0.below(2) == 0 { b'h' } else { b'l' });
+            }
+            // A sequence cut off partway through by a byte that means something there.
+            // The whole point is to land the interrupter *inside* a sequence: every other
+            // arm emits a complete one, so the abort, skip and restart rules — the most
+            // cross-cutting in the parser — were otherwise reached only by accident.
+            58..=60 => {
+                let p = PROLOGUES[self.0.below(PROLOGUES.len() as u32) as usize];
+                out.extend_from_slice(p);
+                out.push(INTERRUPTERS[self.0.below(INTERRUPTERS.len() as u32) as usize]);
+                // Sometimes let the tail run on, so the parser has to decide whether the
+                // sequence survived its interruption.
+                if self.0.below(2) == 0 {
+                    out.push(CSI_FINALS[self.0.below(CSI_FINALS.len() as u32) as usize]);
+                }
+            }
+            // DCS: five parser states (`DcsEntry`, `DcsParam`, `DcsIntermediate`,
+            // `DcsPassthrough`, `DcsIgnore`) that no other arm can enter. Both real users
+            // are here — DECRQSS asking what a setting is, XTGETTCAP asking what terminfo
+            // says — plus payloads that are neither.
+            61..=64 => {
+                out.extend_from_slice(b"\x1bP");
+                match self.0.below(4) {
+                    0 => {
+                        out.extend_from_slice(b"$q");
+                        out.extend_from_slice(match self.0.below(4) {
+                            0 => b"m".as_slice(),
+                            1 => b"r",
+                            2 => b" q",
+                            _ => b"\"p",
+                        });
+                    }
+                    1 => {
+                        out.extend_from_slice(b"+q");
+                        for _ in 0..2 + self.0.below(6) {
+                            out.push(b"0123456789abcdef"[self.0.below(16) as usize]);
+                        }
+                    }
+                    2 => {
+                        // Parameters and an intermediate, so the prologue states are
+                        // walked rather than jumped over.
+                        out.extend_from_slice(self.0.below(4).to_string().as_bytes());
+                        out.push(b';');
+                        out.extend_from_slice(self.0.below(4).to_string().as_bytes());
+                        out.push(b'$');
+                        out.push(b'q');
+                    }
+                    _ => {
+                        for _ in 0..self.0.below(6) {
+                            out.push(0x20 + self.0.byte() % 0x5f);
+                        }
+                    }
+                }
+                // Terminated properly, with a bare BEL, or not at all: an unterminated DCS
+                // must stay bounded and must never leak its payload as text.
+                match self.0.below(4) {
+                    0 | 1 => out.extend_from_slice(b"\x1b\\"),
+                    2 => out.push(0x07),
+                    _ => {}
+                }
+            }
             // A well-formed CSI with small parameters. Small on purpose: the interesting
             // arithmetic is at the edges of the grid, not at 60000.
-            60..=84 => {
+            65..=84 => {
                 out.extend_from_slice(b"\x1b[");
                 if self.0.below(8) == 0 {
                     out.push(b'?');
@@ -272,7 +389,7 @@ pub(crate) fn as_byte_literal(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::fuzz::{as_byte_literal, shrink, Rng, Stream};
+    use crate::fuzz::{as_byte_literal, shrink, Rng, Stream, INTERRUPTERS};
 
     /// The stream has to replay exactly, or a seed in a failure report is worthless.
     #[test]
@@ -404,6 +521,50 @@ mod tests {
         assert!(has(b"\x1b]"), "OSC is reachable");
         assert!(has("\u{4e00}".as_bytes()), "wide glyphs are reachable");
         assert!(has("\u{301}".as_bytes()), "combining marks are reachable");
+    }
+
+    /// The states a corpus can miss entirely while still looking thorough.
+    ///
+    /// Every assertion here was once a zero. Measured over the exact stream the grid fuzz
+    /// uses, the generator emitted no `ESC P` at all, so five DCS parser states were never
+    /// entered; no `?2027`, so the cluster-promotion path was unreachable; and none of
+    /// NUL, CAN, SUB or DEL, so the parser's most cross-cutting rules — abort, skip,
+    /// restart — went untested. Three real bugs were sitting behind those gaps.
+    ///
+    /// A count, not a boolean, because "reached once in 1.2 MB" is not coverage: it is a
+    /// state the shrinker will almost never re-find.
+    #[test]
+    fn the_stream_reaches_the_states_a_uniform_corpus_never_would() {
+        let bytes = Stream::new(0xDEAD_BEEF_CAFE_1234).bytes(300 * 4096);
+        let count = |needle: &[u8]| bytes.windows(needle.len()).filter(|w| *w == needle).count();
+        let byte_count = |b: u8| bytes.iter().filter(|&&x| x == b).count();
+
+        // DCS: `DcsEntry`, `DcsParam`, `DcsIntermediate`, `DcsPassthrough`, `DcsIgnore`.
+        assert!(count(b"\x1bP") > 500, "DCS: {}", count(b"\x1bP"));
+        assert!(count(b"$q") > 100, "DECRQSS: {}", count(b"$q"));
+        assert!(count(b"+q") > 100, "XTGETTCAP: {}", count(b"+q"));
+
+        // The modes that switch the grid off its bulk paths.
+        assert!(count(b"2027") > 20, "?2027: {}", count(b"2027"));
+        assert!(count(b"\x1b[4h") > 5, "insert mode: {}", count(b"\x1b[4h"));
+
+        // The bytes whose entire job is to interact with a sequence in flight.
+        for (name, b) in [("NUL", 0x00), ("CAN", 0x18), ("SUB", 0x1a), ("DEL", 0x7f)] {
+            assert!(byte_count(b) > 100, "{name}: {}", byte_count(b));
+        }
+
+        // And they have to land *inside* a sequence, not merely appear. Count the ones
+        // that follow an introducer with no final byte between.
+        let interrupted = bytes
+            .windows(3)
+            .filter(|w| {
+                w[0] == 0x1b && (w[1] == b'[' || w[1] == b'P') && INTERRUPTERS.contains(&w[2])
+            })
+            .count();
+        assert!(
+            interrupted > 100,
+            "sequences interrupted before their final byte: {interrupted}"
+        );
     }
 
     #[test]

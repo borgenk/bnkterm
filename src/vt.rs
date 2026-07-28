@@ -1870,18 +1870,30 @@ mod tests {
             };
             bytes.push(b);
         }
-        // Whole slice at once.
-        assert_eq!(run(&bytes), run_per_byte(&bytes));
-        // And across arbitrary chunk splits: the PTY delivers arbitrary chunks, and
-        // a run / escape sequence / multibyte char can straddle any boundary.
-        let reference = run_per_byte(&bytes);
+        check_batched_matches_scalar(&bytes, "salted");
+
+        // And the structured corpus, which the salted one above cannot reach: it walks
+        // the DCS states, sets the modes, and lands abort/skip/restart bytes *inside*
+        // sequences rather than between them. Without it this compared the two roads
+        // almost entirely on text and well-formed CSI.
+        let structured = crate::fuzz::Stream::new(0x5EED_1234_ABCD_0002).bytes(200_000);
+        check_batched_matches_scalar(&structured, "structured");
+    }
+
+    /// Both roads through the parser must produce the same actions for `bytes`: the whole
+    /// slice at once, and across arbitrary chunk splits, because the PTY delivers
+    /// arbitrary chunks and a run, escape sequence or multibyte char can straddle any
+    /// boundary.
+    fn check_batched_matches_scalar(bytes: &[u8], label: &str) {
+        let reference = run_per_byte(bytes);
+        assert_eq!(run(bytes), reference, "{label}: whole slice");
         for split in [1usize, 7, 8, 9, 63, 64, 100, 4096] {
             let mut p = Parser::new();
             let mut rec = Recorder::default();
             for chunk in bytes.chunks(split) {
                 p.advance_bytes(&mut rec, chunk);
             }
-            assert_eq!(rec.actions, reference, "chunk split {split}");
+            assert_eq!(rec.actions, reference, "{label}: chunk split {split}");
         }
     }
 
