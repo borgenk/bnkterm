@@ -82,6 +82,23 @@ pub enum Ground {
 }
 
 impl Color {
+    /// This colour as one `u32`: a two-bit tag above its payload, distinct for every
+    /// distinct colour and never colliding across variants.
+    ///
+    /// It exists so a rendition can reach a hasher as a machine word instead of as a
+    /// discriminant plus a trickle of payload bytes (see `impl Hash for Style`). Not a
+    /// serialisation format and not stored anywhere: nothing reads it back.
+    pub(crate) fn key(self) -> u32 {
+        match self {
+            Color::Default => 0,
+            Color::Ansi(n) => (1 << 24) | u32::from(n),
+            Color::Indexed(n) => (2 << 24) | u32::from(n),
+            Color::Rgb(r, g, b) => {
+                (3 << 24) | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+            }
+        }
+    }
+
     /// Resolve to concrete pixels against a theme. Never panics: an out-of-range
     /// `Ansi` index is masked into `0..16` rather than trapping, keeping the
     /// no-panic rule intact even on a color the parser should never emit.

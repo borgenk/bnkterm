@@ -125,6 +125,15 @@ pub(super) struct Pen {
 }
 
 impl Pen {
+    /// The rendition half of the pen, which is what gets interned into a [`StyleId`].
+    pub(super) fn style(&self) -> Style {
+        Style {
+            fg: self.fg,
+            bg: self.bg,
+            attrs: self.attrs,
+        }
+    }
+
     /// SGR 0: default colors, no attributes, and the hyperlink left exactly as it was.
     /// See the type's header for why the link survives a rendition reset — a colored
     /// `ls --hyperlink` listing emits `SGR 0` between entries *inside* an open anchor,
@@ -192,7 +201,7 @@ pub(super) struct CombiningMark {
 /// common all-single-codepoint row.
 #[derive(Clone, Debug)]
 pub(super) struct Row {
-    pub(super) cells: Vec<Cell>,
+    pub(super) cells: Vec<PackedCell>,
     /// The row's combining marks, flattened: one `(col, ch)` pair per mark rather
     /// than an owned `Vec<char>` per marked cell. Flattening keeps the side table a
     /// single heap buffer that [`Row::reset`] clears in place, so a recycled scroll
@@ -216,7 +225,7 @@ pub(super) struct Row {
 }
 
 impl Row {
-    pub(super) fn filled(cols: usize, cell: Cell) -> Self {
+    pub(super) fn filled(cols: usize, cell: PackedCell) -> Self {
         Row {
             cells: vec![cell; cols],
             combining: Vec::new(),
@@ -228,7 +237,7 @@ impl Row {
     /// allocation so a recycled scroll row never allocates. The wrap link goes with
     /// the content: a recycled row must not inherit one and glue two unrelated lines
     /// together.
-    pub(super) fn reset(&mut self, cols: usize, blank: Cell) {
+    pub(super) fn reset(&mut self, cols: usize, blank: PackedCell) {
         if self.cells.len() == cols {
             self.cells.iter_mut().for_each(|c| *c = blank);
         } else {
@@ -244,7 +253,7 @@ impl Row {
     /// A recycled row keeps both allocations by design (see [`Row::reset`]), so the
     /// difference is the whole point of measuring it.
     pub(super) fn storage_bytes(&self) -> usize {
-        self.cells.capacity() * std::mem::size_of::<Cell>()
+        self.cells.capacity() * std::mem::size_of::<PackedCell>()
             + self.combining.capacity() * std::mem::size_of::<CombiningMark>()
     }
 
@@ -265,7 +274,7 @@ impl Row {
     /// Every shift is a pair of cuts (see [`Buffer::insert_blanks`] and
     /// [`Buffer::delete_chars`]), which is why this is stated once here rather than
     /// open-coded per operation: each one gets it independently wrong otherwise.
-    pub(super) fn split_wide_at(&mut self, col: usize, blank: Cell) {
+    pub(super) fn split_wide_at(&mut self, col: usize, blank: PackedCell) {
         if !self.cells.get(col).is_some_and(|c| c.is_wide_spacer()) {
             return;
         }
@@ -323,11 +332,11 @@ impl Row {
             self.combining.retain(|m| m.col < new_cols);
             if let Some(last) = self.cells.last_mut() {
                 if last.is_wide_leader() {
-                    *last = Cell::BLANK;
+                    *last = PackedCell::BLANK;
                 }
             }
         } else if new_cols > old {
-            self.cells.resize(new_cols, Cell::BLANK);
+            self.cells.resize(new_cols, PackedCell::BLANK);
         }
     }
 
@@ -335,10 +344,10 @@ impl Row {
     /// with blanks, and set the soft-wrap link. Reuses the existing cell allocation so a
     /// reflow recycles rows instead of allocating fresh. Combining marks are cleared; the
     /// caller re-adds any the new columns carry.
-    pub(super) fn refill(&mut self, cols: usize, cells: &[Cell], wrapped: bool) {
+    pub(super) fn refill(&mut self, cols: usize, cells: &[PackedCell], wrapped: bool) {
         self.cells.clear();
         self.cells.extend_from_slice(cells);
-        self.cells.resize(cols, Cell::BLANK);
+        self.cells.resize(cols, PackedCell::BLANK);
         self.combining.clear();
         self.wrapped = wrapped;
     }
@@ -354,7 +363,7 @@ impl Row {
 /// later reflow — which is exactly the bound the cap is there to keep.
 #[derive(Default)]
 pub(super) struct LogicalLine {
-    pub(super) cells: Vec<Cell>,
+    pub(super) cells: Vec<PackedCell>,
     pub(super) combining: Vec<CombiningMark>,
 }
 
@@ -363,12 +372,12 @@ impl LogicalLine {
     /// non-default background or a combining mark is content, not padding, and stops the
     /// trim: a coloured prompt bar drawn with spaces, or a marked blank, must survive a
     /// reflow rather than be pulled up into the line above it. A wide glyph's spacer is
-    /// not `Cell::BLANK` (it carries `WIDE_SPACER`), so a trailing wide pair is never
+    /// not `PackedCell::BLANK` (it carries `WIDE_SPACER`), so a trailing wide pair is never
     /// half-trimmed.
     pub(super) fn trim_trailing_blanks(&mut self) {
         let mut end = self.cells.len();
         while end > 0
-            && self.cells[end - 1] == Cell::BLANK
+            && self.cells[end - 1] == PackedCell::BLANK
             && !self.combining.iter().any(|m| m.col == end - 1)
         {
             end -= 1;
@@ -382,8 +391,15 @@ impl LogicalLine {
 /// `cells` padded to `cols`, with the given soft-wrap link and no combining marks. This is
 /// reflow's row factory: draining the old stream leaves a pool of `Row`s whose cell
 /// allocations this reuses, so a rewrap does not allocate a row per line.
-pub(super) fn take_row(pool: &mut Vec<Row>, cols: usize, cells: &[Cell], wrapped: bool) -> Row {
-    let mut row = pool.pop().unwrap_or_else(|| Row::filled(cols, Cell::BLANK));
+pub(super) fn take_row(
+    pool: &mut Vec<Row>,
+    cols: usize,
+    cells: &[PackedCell],
+    wrapped: bool,
+) -> Row {
+    let mut row = pool
+        .pop()
+        .unwrap_or_else(|| Row::filled(cols, PackedCell::BLANK));
     row.refill(cols, cells, wrapped);
     row
 }
@@ -423,7 +439,7 @@ impl Buffer {
         let rows = rows.max(1);
         let mut lines = VecDeque::with_capacity(rows);
         for _ in 0..rows {
-            lines.push_back(Row::filled(cols, Cell::BLANK));
+            lines.push_back(Row::filled(cols, PackedCell::BLANK));
         }
         Buffer {
             cols,
@@ -444,12 +460,12 @@ impl Buffer {
         self.lines.get(row)
     }
 
-    pub(super) fn cell(&self, row: usize, col: usize) -> Cell {
+    pub(super) fn cell(&self, row: usize, col: usize) -> PackedCell {
         self.lines
             .get(row)
             .and_then(|r| r.cells.get(col))
             .copied()
-            .unwrap_or(Cell::BLANK)
+            .unwrap_or(PackedCell::BLANK)
     }
 
     /// The heap this buffer holds: every row's cells and marks, the two ring
@@ -515,7 +531,7 @@ impl Buffer {
     /// Replacing a row's final cell replaces the text that wrapped out of it, so the
     /// line stops there: the wrap link goes (autowrap sets it again if the new text
     /// wraps in its turn).
-    pub(super) fn set_raw(&mut self, row: usize, col: usize, cell: Cell) {
+    pub(super) fn set_raw(&mut self, row: usize, col: usize, cell: PackedCell) {
         let Some(r) = self.lines.get_mut(row) else {
             return;
         };
@@ -531,12 +547,12 @@ impl Buffer {
     /// Write `cell` at (row, col), first breaking any wide pair it straddles so a
     /// half-overwritten wide glyph never leaves an orphan on screen, and dropping
     /// any combining marks the overwritten cell carried.
-    pub(super) fn write_cell(&mut self, row: usize, col: usize, cell: Cell) {
+    pub(super) fn write_cell(&mut self, row: usize, col: usize, cell: PackedCell) {
         let existing = self.cell(row, col);
         if existing.is_wide_leader() {
-            self.set_raw(row, col + 1, Cell::BLANK);
+            self.set_raw(row, col + 1, PackedCell::BLANK);
         } else if existing.is_wide_spacer() && col > 0 {
-            self.set_raw(row, col - 1, Cell::BLANK);
+            self.set_raw(row, col - 1, PackedCell::BLANK);
             if let Some(r) = self.lines.get_mut(row) {
                 r.clear_marks(col - 1);
             }
@@ -560,7 +576,13 @@ impl Buffer {
     /// its spacer to the right. Combining marks under the run drop in a single
     /// retain. The `bulk_ascii_matches_per_char_under_fuzz` test pins this against
     /// the byte-at-a-time path.
-    pub(super) fn fill_ascii_run(&mut self, row: usize, start_col: usize, run: &[u8], pen: Pen) {
+    pub(super) fn fill_ascii_run(
+        &mut self,
+        row: usize,
+        start_col: usize,
+        run: &[u8],
+        pen: PackedPen,
+    ) {
         let cols = self.cols;
         let end_col = start_col + run.len();
         let Some(r) = self.lines.get_mut(row) else {
@@ -569,25 +591,19 @@ impl Buffer {
         // Left edge: overwriting a wide spacer orphans its leader one cell left.
         if start_col > 0 && r.cells.get(start_col).is_some_and(|c| c.is_wide_spacer()) {
             if let Some(slot) = r.cells.get_mut(start_col - 1) {
-                *slot = Cell::BLANK;
+                *slot = PackedCell::BLANK;
             }
             r.clear_marks(start_col - 1);
         }
         // Right edge: overwriting a wide leader orphans its spacer one cell right.
         if end_col < cols && r.cells.get(end_col - 1).is_some_and(|c| c.is_wide_leader()) {
             if let Some(slot) = r.cells.get_mut(end_col) {
-                *slot = Cell::BLANK;
+                *slot = PackedCell::BLANK;
             }
         }
         for (k, &byte) in run.iter().enumerate() {
             if let Some(slot) = r.cells.get_mut(start_col + k) {
-                *slot = Cell {
-                    rune: char::from(byte),
-                    fg: pen.fg,
-                    bg: pen.bg,
-                    attrs: pen.attrs,
-                    link: pen.link,
-                };
+                *slot = PackedCell::new(char::from(byte), CellWidth::Narrow, pen.style, pen.link);
             }
         }
         r.combining
@@ -610,7 +626,7 @@ impl Buffer {
         start_col: usize,
         chars: &[char],
         widths: &[u8],
-        pen: Pen,
+        pen: PackedPen,
     ) {
         let columns = widths
             .iter()
@@ -625,7 +641,7 @@ impl Buffer {
                 .is_some_and(|cell| cell.is_wide_spacer())
         {
             if let Some(slot) = r.cells.get_mut(start_col - 1) {
-                *slot = Cell::BLANK;
+                *slot = PackedCell::BLANK;
             }
             r.clear_marks(start_col - 1);
         }
@@ -635,7 +651,7 @@ impl Buffer {
                 .is_some_and(|cell| cell.is_wide_leader())
         {
             if let Some(slot) = r.cells.get_mut(end_col) {
-                *slot = Cell::BLANK;
+                *slot = PackedCell::BLANK;
             }
         }
 
@@ -643,27 +659,16 @@ impl Buffer {
         for (&c, &cell_width) in chars.iter().zip(widths) {
             let wide = cell_width == 2 && col.saturating_add(1) < r.cells.len();
             if let Some(slot) = r.cells.get_mut(col) {
-                *slot = Cell {
-                    rune: c,
-                    fg: pen.fg,
-                    bg: pen.bg,
-                    attrs: if wide {
-                        pen.attrs | Attrs::WIDE_LEADER
-                    } else {
-                        pen.attrs
-                    },
-                    link: pen.link,
+                let width = if wide {
+                    CellWidth::Leader
+                } else {
+                    CellWidth::Narrow
                 };
+                *slot = PackedCell::new(c, width, pen.style, pen.link);
             }
             if wide {
                 if let Some(slot) = r.cells.get_mut(col.saturating_add(1)) {
-                    *slot = Cell {
-                        rune: ' ',
-                        fg: pen.fg,
-                        bg: pen.bg,
-                        attrs: pen.attrs | Attrs::WIDE_SPACER,
-                        link: pen.link,
-                    };
+                    *slot = PackedCell::new(' ', CellWidth::Spacer, pen.style, pen.link);
                 }
             }
             col = col.saturating_add(usize::from(cell_width));
@@ -739,7 +744,7 @@ impl Buffer {
         top: usize,
         bottom: usize,
         n: usize,
-        blank: Cell,
+        blank: PackedCell,
         to_scrollback: bool,
     ) -> Scrolled {
         let mut out = Scrolled::default();
@@ -794,7 +799,7 @@ impl Buffer {
         top: usize,
         bottom: usize,
         n: usize,
-        blank: Cell,
+        blank: PackedCell,
     ) -> Scrolled {
         let mut out = Scrolled::default();
         if top > bottom || bottom >= self.rows {
@@ -884,7 +889,8 @@ impl Buffer {
                     grow -= 1;
                 }
                 for _ in 0..grow {
-                    self.lines.push_back(Row::filled(new_cols, Cell::BLANK));
+                    self.lines
+                        .push_back(Row::filled(new_cols, PackedCell::BLANK));
                 }
             }
             Ordering::Less => {
@@ -996,7 +1002,7 @@ impl Buffer {
             // rule). That blank is wrap padding, not text: drop it so a widen rejoins the glyph
             // flush against the text before it instead of preserving it as a phantom space.
             if row.wrapped
-                && cur.cells.last() == Some(&Cell::BLANK)
+                && cur.cells.last() == Some(&PackedCell::BLANK)
                 && old_rows
                     .get(idx + 1)
                     .and_then(|next| next.cells.first())
@@ -1077,9 +1083,12 @@ impl Buffer {
                         };
                     let wrapped = next_i < cells.len();
                     let mut row = if clip_wide {
-                        let mut clipped = cells[i];
-                        clipped.attrs.remove(Attrs::WIDE_LEADER);
-                        take_row(&mut pool, new_cols, &[clipped], wrapped)
+                        take_row(
+                            &mut pool,
+                            new_cols,
+                            &[cells[i].with_width(CellWidth::Narrow)],
+                            wrapped,
+                        )
                     } else {
                         take_row(&mut pool, new_cols, &cells[i..end], wrapped)
                     };
@@ -1206,7 +1215,7 @@ impl Buffer {
 
     /// Overwrite every cell of `row` with `fill` (a blank for the erases, an 'E' for
     /// DECALN), dropping its marks and its wrap link.
-    pub(super) fn clear_line_full(&mut self, row: usize, fill: Cell) {
+    pub(super) fn clear_line_full(&mut self, row: usize, fill: PackedCell) {
         if let Some(r) = self.lines.get_mut(row) {
             r.cells.iter_mut().for_each(|c| *c = fill);
             r.combining.clear();
@@ -1233,7 +1242,13 @@ impl Buffer {
     /// ```
     ///
     /// So landing on a spacer takes its leader, and ending on a leader takes its spacer.
-    pub(super) fn clear_line_range(&mut self, row: usize, start: usize, end: usize, blank: Cell) {
+    pub(super) fn clear_line_range(
+        &mut self,
+        row: usize,
+        start: usize,
+        end: usize,
+        blank: PackedCell,
+    ) {
         let Some(r) = self.lines.get_mut(row) else {
             return;
         };
@@ -1264,7 +1279,7 @@ impl Buffer {
     /// The shift cuts the row twice — at the cursor, where the move begins, and at the
     /// last cell that survives it, where the right edge eats the rest — and a wide glyph
     /// straddling either cut would lose half of itself (see [`Row::split_wide_at`]).
-    pub(super) fn insert_blanks(&mut self, row: usize, col: usize, n: usize, blank: Cell) {
+    pub(super) fn insert_blanks(&mut self, row: usize, col: usize, n: usize, blank: PackedCell) {
         if let Some(r) = self.lines.get_mut(row) {
             let len = r.cells.len();
             if col >= len {
@@ -1292,7 +1307,7 @@ impl Buffer {
     ///
     /// Two cuts again, mirroring ICH's: at the cursor, where the deletion begins, and at
     /// the first cell pulled in over it (see [`Row::split_wide_at`]).
-    pub(super) fn delete_chars(&mut self, row: usize, col: usize, n: usize, blank: Cell) {
+    pub(super) fn delete_chars(&mut self, row: usize, col: usize, n: usize, blank: PackedCell) {
         if let Some(r) = self.lines.get_mut(row) {
             let len = r.cells.len();
             if col >= len {
@@ -1315,7 +1330,7 @@ impl Buffer {
         }
     }
 
-    pub(super) fn clear_all(&mut self, fill: Cell) {
+    pub(super) fn clear_all(&mut self, fill: PackedCell) {
         for row in 0..self.rows {
             self.clear_line_full(row, fill);
         }

@@ -30,9 +30,10 @@
 //! respected everywhere:
 //!
 //!   * Wide characters (CJK, most emoji) occupy two columns. The left column carries the
-//!     rune and the [`Attrs::WIDE_LEADER`] attr; the right column is a
-//!     [`Attrs::WIDE_SPACER`] placeholder the cursor steps over and the renderer skips.
-//!     Overwriting either half cleans up its orphaned partner.
+//!     rune and [`CellWidth::Leader`]; the right column is a [`CellWidth::Spacer`]
+//!     placeholder the cursor steps over and the renderer skips. Overwriting either half
+//!     cleans up its orphaned partner. The role is *layout*, not rendition, which is why
+//!     it sits on the cell rather than in [`Attrs`]: both halves share one [`Style`].
 //!
 //!   * Combining marks (an accent after its base, a Hangul jamo stack) are rare, so a
 //!     [`Cell`] stores only the base rune inline and extra marks overflow into a small
@@ -172,22 +173,17 @@ impl Attrs {
     /// SGR 8 (conceal): the cell keeps its rune but the renderer draws it in the
     /// background color, so it is invisible yet still selectable and copyable.
     pub const HIDDEN: Attrs = Attrs(1 << 6);
-    /// The left half of a wide (2-column) character; carries the rune.
-    pub const WIDE_LEADER: Attrs = Attrs(1 << 7);
-    /// The right half of a wide character; a placeholder the cursor skips.
-    pub const WIDE_SPACER: Attrs = Attrs(1 << 8);
 
-    /// Bits 9-11: how the underline is drawn ([`UnderlineStyle`]), not *whether* it is —
+    /// Bits 7-9: how the underline is drawn ([`UnderlineStyle`]), not *whether* it is —
     /// that is still [`UNDERLINE`](Self::UNDERLINE), and the style only means anything
     /// alongside it.
     ///
     /// It lives in the bitfield's spare bits because it *fits*, and that is the whole
-    /// design decision: a `Cell` is 16 bytes and the damage diff compares two screenfuls
-    /// of them every painted frame, so carrying the style in a new field would have cost
-    /// the entire grid 25% to decorate the handful of cells an editor squiggles. The
-    /// underline *colour* (SGR 58) does not fit, which is exactly why it is still parsed,
-    /// consumed and dropped rather than stored.
-    const UNDERLINE_STYLE_SHIFT: u16 = 9;
+    /// design decision: carrying the shape in a field of its own would have widened every
+    /// cell in the grid to decorate the handful an editor squiggles. The underline
+    /// *colour* (SGR 58) does not fit, which is exactly why it is still parsed, consumed
+    /// and dropped rather than stored.
+    const UNDERLINE_STYLE_SHIFT: u16 = 7;
     const UNDERLINE_STYLE_MASK: u16 = 0b111 << Attrs::UNDERLINE_STYLE_SHIFT;
 
     /// How the underline on this cell is drawn. Meaningless without
@@ -215,7 +211,7 @@ impl Attrs {
     }
 
     /// All flags, in bit order, with their names, for `Debug` and for tests.
-    const ALL: [(Attrs, &'static str); 9] = [
+    const ALL: [(Attrs, &'static str); 7] = [
         (Attrs::BOLD, "BOLD"),
         (Attrs::DIM, "DIM"),
         (Attrs::ITALIC, "ITALIC"),
@@ -223,8 +219,6 @@ impl Attrs {
         (Attrs::REVERSE, "REVERSE"),
         (Attrs::STRIKE, "STRIKE"),
         (Attrs::HIDDEN, "HIDDEN"),
-        (Attrs::WIDE_LEADER, "WIDE_LEADER"),
-        (Attrs::WIDE_SPACER, "WIDE_SPACER"),
     ];
 
     pub const fn empty() -> Self {
@@ -266,9 +260,10 @@ impl Attrs {
     /// strike).
     ///
     /// What is left out is as deliberate as what is in. `REVERSE` and `DIM` are folded
-    /// into the resolved colour, which the painter compares separately; `HIDDEN` draws
-    /// as a space and so leaves a run intact; the wide-pair bits break a run by standing
-    /// a glyph alone, before any of this is asked.
+    /// into the resolved colour, which the painter compares separately, and `HIDDEN`
+    /// draws as a space and so leaves a run intact. The wide-pair state is not here at
+    /// all any more — it is [`CellWidth`], on the cell rather than in the rendition —
+    /// and it breaks a run by standing a glyph alone, before any of this is asked.
     const RUN_MASK: u16 = Attrs::BOLD.0
         | Attrs::ITALIC.0
         | Attrs::UNDERLINE.0
@@ -357,8 +352,14 @@ const LINK_URL_MAX: usize = 2048;
 ///
 /// [`LINK_URL_MAX`] alone leaves the worst case at 65534 × 2 KB × 2 ≈ 260 MB, which is
 /// still out of proportion to a terminal, so the table carries a byte budget as well as
-/// a count. The number is chosen against what the *text* costs: a full scrollback is
-/// ~13 MB of cells, so links are allowed to cost roughly half of that.
+/// a count. The number is chosen against what the *text* costs: a full scrollback was
+/// ~13 MB of cells when this was set, so links were allowed roughly half of that.
+///
+/// Packing the cell to 8 bytes has since taken that yardstick to ~9.9 MiB, so the same
+/// 8 MB is now roughly *all* of what the cells cost rather than half. Left where it is
+/// deliberately — it is still generous rather than tight, which is the property that
+/// matters (see below), and shrinking it would newly turn away sessions that fit before.
+/// Worth revisiting if the cells shrink again.
 ///
 /// It is generous rather than tight, and deliberately: at a realistic ~60-byte file URI
 /// this still admits the entire id space (65534 × 60 × 2 ≈ 7.9 MB), so no legitimate
@@ -510,10 +511,303 @@ impl LinkTable {
     }
 }
 
-/// One grid cell: the base rune of its grapheme cluster, its foreground and
-/// background colors, its rendition attributes, and the hyperlink it belongs to.
-/// Small, `Copy`, and `Eq` so the per-frame damage diff can compare two screenfuls
-/// cheaply.
+/// How a cell sits in a wide (2-column) character, which is a fact about *layout*
+/// rather than about rendition.
+///
+/// It used to be two bits in [`Attrs`], and moving it out is what lets a rendition be
+/// interned: the two halves of a wide glyph share one SGR style but are not the same
+/// cell, so leaving the pair bits in the style would have split every style in three
+/// and made the wide checks — which the cursor asks constantly — a table lookup.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum CellWidth {
+    /// One column, the overwhelming majority.
+    #[default]
+    Narrow,
+    /// The left half of a wide character; carries the rune.
+    Leader,
+    /// The right half of a wide character; a placeholder the cursor skips.
+    Spacer,
+}
+
+/// A cell's rendition: the colours and attributes an SGR sequence sets, and nothing
+/// that varies per cell within a run.
+///
+/// This is the unit that gets interned. It is deliberately *not* on the stored cell:
+/// most cells are unstyled, and where there is styling it is overwhelmingly shared, so
+/// a screenful of coloured `ls` output resolves to a handful of these.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Style {
+    pub fg: Color,
+    pub bg: Color,
+    pub attrs: Attrs,
+}
+
+/// Hashed as two machine words rather than field by field, which is worth the manual
+/// impl: this runs once per SGR sequence, and escape-dense output (a coloured `ls`, an
+/// `htop` redraw) is nothing *but* SGR sequences.
+///
+/// The derived impl walks the structure — a discriminant plus up to three payload bytes
+/// per [`Color`], then the attributes — so a rendition arrives at the hasher as nine
+/// separate writes. Packing each colour into the `u32` it already fits in turns that
+/// into two, and measurably: it is the difference between the interning showing up in
+/// `parse_escape` and not.
+///
+/// Deliberately still the default (SipHash) hasher underneath. A `Style` is built from
+/// bytes the child chooses, so the map is keyed by attacker-controlled input, exactly
+/// like [`LinkTable`]'s. Swapping in a fast non-cryptographic hash here would trade a
+/// bounded, measured cost for an unbounded collision attack on the parse path.
+impl std::hash::Hash for Style {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(u64::from(self.fg.key()) << 32 | u64::from(self.bg.key()));
+        state.write_u16(self.attrs.0);
+    }
+}
+
+/// A rendition interned in the screen's [`StyleTable`], or [`StyleId::DEFAULT`] for the
+/// unstyled cells that are most of any grid.
+///
+/// The same trade [`LinkId`] makes, for the same reason and with the same machinery: a
+/// stored cell holds two bytes naming a rendition instead of ten bytes spelling one
+/// out, which is what takes the grid from 16 bytes a cell to 8. Zero is the default
+/// rendition, so a blank cell is unstyled without anyone saying so, and the table never
+/// has to hold an entry for the commonest case.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct StyleId(u16);
+
+impl StyleId {
+    /// Default colours, no attributes. Never stored in the table.
+    pub const DEFAULT: StyleId = StyleId(0);
+}
+
+/// How many distinct renditions one screen can hold at once, beyond the default. The
+/// id space is a `u16` with zero reserved, so this is all of it; running out is not
+/// fatal (see [`Screen::collect_styles`]).
+const STYLE_LIMIT: usize = u16::MAX as usize - 1;
+
+/// The renditions the grid's cells cite by [`StyleId`].
+///
+/// Reclaimed by mark-and-sweep rather than reference counting, which is the same call
+/// [`LinkTable`] makes and for a sharper version of the same reason. A refcount would
+/// tax *every cell write* — the hottest path there is — to reclaim a `u16` id space
+/// that a real session never comes close to exhausting; a sweep costs one walk over
+/// the grid, once, on the rare occasion the table actually fills. Emacs reaches the
+/// same conclusion about realized faces, and for the same reason declines to track
+/// dependencies at all: it flushes the cache wholesale instead.
+///
+/// The cost of choosing sweep is that the table is a high-water mark between sweeps
+/// rather than a live count. Bounded at [`STYLE_LIMIT`] entries, which is small against
+/// what the cells themselves cost.
+#[derive(Default)]
+struct StyleTable {
+    /// Interned renditions; `styles[i]` is `StyleId(i + 1)`, since zero is the default.
+    styles: Vec<Style>,
+    index: HashMap<Style, StyleId>,
+    /// Where the grid was the last time a sweep reclaimed nothing, exactly as
+    /// [`LinkTable::swept_dry_at`] and for the same reason: a full table of *live*
+    /// styles must not buy a fresh walk over every cell with each new rendition.
+    swept_dry_at: Option<(RowEpoch, u64)>,
+}
+
+impl StyleTable {
+    /// The id for `style`, interning it if it is new. `None` when the table is full,
+    /// which is the caller's cue to sweep and try once more.
+    fn intern(&mut self, style: Style) -> Option<StyleId> {
+        if style == Style::default() {
+            return Some(StyleId::DEFAULT);
+        }
+        if let Some(&id) = self.index.get(&style) {
+            return Some(id);
+        }
+        if self.styles.len() >= STYLE_LIMIT {
+            return None;
+        }
+        // Ids are 1-based and the table is capped below `u16::MAX`, so this fits.
+        let id = StyleId(u16::try_from(self.styles.len() + 1).ok()?);
+        self.styles.push(style);
+        self.index.insert(style, id);
+        Some(id)
+    }
+
+    /// The rendition behind `id`. An id this table does not hold resolves to the
+    /// default rather than trapping, which keeps every cell read total.
+    fn get(&self, id: StyleId) -> Style {
+        match usize::from(id.0).checked_sub(1) {
+            Some(slot) => self.styles.get(slot).copied().unwrap_or_default(),
+            None => Style::default(),
+        }
+    }
+
+    /// Drop every rendition `live` does not mark and renumber the survivors, returning
+    /// the old-id → new-id map (indexed by the old id's raw value) the caller must then
+    /// apply to every cell it kept. Slot zero is [`StyleId::DEFAULT`] and maps to itself.
+    fn compact(&mut self, live: &[bool]) -> Vec<StyleId> {
+        let mut remap = vec![StyleId::DEFAULT; self.styles.len() + 1];
+        let old = std::mem::take(&mut self.styles);
+        self.index.clear();
+        // Counts only survivors, so it is bounded by the table we came in with and
+        // cannot pass `STYLE_LIMIT`, let alone wrap.
+        let mut next: u16 = 0;
+        for (slot, style) in old.into_iter().enumerate() {
+            if live.get(slot + 1) != Some(&true) {
+                continue;
+            }
+            next += 1;
+            let id = StyleId(next);
+            if let Some(entry) = remap.get_mut(slot + 1) {
+                *entry = id;
+            }
+            self.index.insert(style, id);
+            self.styles.push(style);
+        }
+        remap
+    }
+
+    /// The heap this table holds: the interned renditions and the lookup index.
+    fn storage_bytes(&self) -> usize {
+        self.styles.capacity() * std::mem::size_of::<Style>()
+            + self.index.capacity()
+                * (std::mem::size_of::<Style>() + std::mem::size_of::<StyleId>())
+    }
+}
+
+/// A cell as it is **stored**: eight bytes, which is what a screenful plus ten thousand
+/// rows of scrollback is actually made of.
+///
+/// ```text
+///   packed: u32                      style: u16   link: u16
+///   ┌──────────────────────┬───────┐  ┌────────┐  ┌────────┐
+///   │ scalar (bits 0..21)  │ w 2b  │  │ StyleId│  │ LinkId │
+///   └──────────────────────┴───────┘  └────────┘  └────────┘
+/// ```
+///
+/// The rune and the wide-pair state share a `u32` because a Unicode scalar needs only
+/// 21 of its bits, so [`CellWidth`] rides in the space `char` was already wasting and
+/// costs the grid nothing. The rendition is two bytes naming an entry in the screen's
+/// [`StyleTable`] instead of ten bytes spelling one out.
+///
+/// Reading one back out needs the table, so the grid hands callers a resolved [`Cell`]
+/// and keeps this type to itself.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct PackedCell {
+    packed: u32,
+    style: StyleId,
+    pub(super) link: LinkId,
+}
+
+impl PackedCell {
+    const SCALAR_MASK: u32 = (1 << 21) - 1;
+    const WIDTH_SHIFT: u32 = 21;
+
+    /// The blank cell: a space in the default rendition. The grid's initial fill; an
+    /// erase writes a space in the *current* bg, which is a different cell.
+    pub(super) const BLANK: PackedCell = PackedCell {
+        packed: ' ' as u32,
+        style: StyleId::DEFAULT,
+        link: LinkId::NONE,
+    };
+
+    pub(super) fn new(rune: char, width: CellWidth, style: StyleId, link: LinkId) -> Self {
+        let w = match width {
+            CellWidth::Narrow => 0,
+            CellWidth::Leader => 1,
+            CellWidth::Spacer => 2,
+        };
+        PackedCell {
+            packed: (rune as u32 & PackedCell::SCALAR_MASK) | (w << PackedCell::WIDTH_SHIFT),
+            style,
+            link,
+        }
+    }
+
+    /// A single-column cell carrying `rune` in the default rendition and no link.
+    pub(super) fn plain(rune: char) -> Self {
+        PackedCell::new(rune, CellWidth::Narrow, StyleId::DEFAULT, LinkId::NONE)
+    }
+
+    /// The base rune. Total by construction: the scalar was a valid `char` when it was
+    /// packed and the mask cannot turn it into a surrogate, but an unconvertible value
+    /// yields a space rather than trapping, because no grid read may panic.
+    pub(super) fn rune(self) -> char {
+        char::from_u32(self.packed & PackedCell::SCALAR_MASK).unwrap_or(' ')
+    }
+
+    pub(super) fn width(self) -> CellWidth {
+        match self.packed >> PackedCell::WIDTH_SHIFT {
+            1 => CellWidth::Leader,
+            2 => CellWidth::Spacer,
+            _ => CellWidth::Narrow,
+        }
+    }
+
+    pub(super) fn style_id(self) -> StyleId {
+        self.style
+    }
+
+    /// This cell moved to a different place in a wide pair, keeping its rune and
+    /// rendition. Reflow demotes a leader whose partner no longer fits beside it; a
+    /// grapheme cluster growing from one column to two promotes one the other way.
+    pub(super) fn with_width(self, width: CellWidth) -> Self {
+        PackedCell::new(self.rune(), width, self.style, self.link)
+    }
+
+    pub(super) fn set_style_id(&mut self, id: StyleId) {
+        self.style = id;
+    }
+
+    /// Whether this cell is the right-half placeholder of a wide character.
+    pub(super) fn is_wide_spacer(self) -> bool {
+        matches!(self.width(), CellWidth::Spacer)
+    }
+
+    /// Whether this cell is the left half (the rune) of a wide character.
+    pub(super) fn is_wide_leader(self) -> bool {
+        matches!(self.width(), CellWidth::Leader)
+    }
+}
+
+/// The pen as a stored cell carries it: the rendition already interned, and the
+/// hyperlink. What the write paths need and all they need.
+///
+/// It exists so interning happens **once per run** rather than once per cell. `Buffer`
+/// holds no [`StyleTable`] (the table is the `Screen`'s, shared across both buffers),
+/// so resolving inside the fill loop would not even be possible without handing the
+/// table down into the storage layer, which is exactly the coupling the split avoids.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct PackedPen {
+    pub(super) style: StyleId,
+    pub(super) link: LinkId,
+}
+
+impl Default for PackedCell {
+    fn default() -> Self {
+        PackedCell::BLANK
+    }
+}
+
+impl fmt::Debug for PackedCell {
+    /// Unpacked, because the packed `u32` is unreadable in a failure message and the
+    /// whole point of the type is that nobody has to think in it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PackedCell({:?}, style={}", self.rune(), self.style.0)?;
+        if !matches!(self.width(), CellWidth::Narrow) {
+            write!(f, ", {:?}", self.width())?;
+        }
+        if self.link.is_set() {
+            write!(f, ", link={}", self.link.0)?;
+        }
+        f.write_str(")")
+    }
+}
+
+/// One grid cell, **resolved**: the base rune of its grapheme cluster, its foreground
+/// and background colours, its rendition attributes, its place in a wide pair, and the
+/// hyperlink it belongs to.
+///
+/// This is the shape the grid answers questions in, not the shape it stores (see
+/// [`PackedCell`], which is half the size and names its rendition by id). Resolving on
+/// the way out keeps every reader — the painter, the selection, the tests — working in
+/// the terms it actually cares about, and keeps the interning table a detail of the
+/// grid rather than something every caller has to hold.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Cell {
     /// The base rune. Combining marks, when present, live in the `Row`'s side
@@ -522,6 +816,8 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub attrs: Attrs,
+    /// Where this cell sits in a wide character, if it is in one at all.
+    pub width: CellWidth,
     /// The OSC 8 hyperlink this cell is inside, [`LinkId::NONE`] for most cells.
     /// Carried per cell rather than as a span so that every operation that moves or
     /// overwrites a cell (insert, delete, scroll, erase) keeps the link right for
@@ -537,6 +833,7 @@ impl Cell {
         fg: Color::Default,
         bg: Color::Default,
         attrs: Attrs::empty(),
+        width: CellWidth::Narrow,
         link: LinkId::NONE,
     };
 
@@ -549,14 +846,23 @@ impl Cell {
         }
     }
 
+    /// The rendition half of this cell, which is what gets interned.
+    pub fn style(self) -> Style {
+        Style {
+            fg: self.fg,
+            bg: self.bg,
+            attrs: self.attrs,
+        }
+    }
+
     /// Whether this cell is the right-half placeholder of a wide character.
     pub fn is_wide_spacer(self) -> bool {
-        self.attrs.contains(Attrs::WIDE_SPACER)
+        matches!(self.width, CellWidth::Spacer)
     }
 
     /// Whether this cell is the left half (the rune) of a wide character.
     pub fn is_wide_leader(self) -> bool {
-        self.attrs.contains(Attrs::WIDE_LEADER)
+        matches!(self.width, CellWidth::Leader)
     }
 }
 
@@ -573,6 +879,9 @@ impl fmt::Debug for Cell {
             "Cell({:?}, fg={:?}, bg={:?}, {:?}",
             self.rune, self.fg, self.bg, self.attrs
         )?;
+        if !matches!(self.width, CellWidth::Narrow) {
+            write!(f, ", {:?}", self.width)?;
+        }
         // Only when there is one, so the overwhelmingly common linkless cell reads
         // exactly as it always has.
         if self.link.is_set() {
@@ -803,6 +1112,18 @@ pub struct Screen {
     /// its own link namespace, so an id means the same thing whichever buffer holds it
     /// and switching buffers costs nothing.
     links: LinkTable,
+    /// The renditions the grid's cells cite by [`StyleId`]. Shared by both buffers for
+    /// exactly the reason [`Self::links`] is, and swept the same way.
+    styles: StyleTable,
+    /// The pen's rendition and its interned id, so printing a run does not hash a
+    /// rendition per cell.
+    ///
+    /// Validated rather than invalidated: [`Screen::pen_style_id`] compares the pen's
+    /// current rendition against the one cached here instead of relying on every one of
+    /// the many places SGR writes the pen to remember to clear a flag. A stale-by-
+    /// omission cache would paint text in the previous colour, which is precisely the
+    /// class of bug that is invisible in tests and obvious on screen.
+    pen_style: (Style, StyleId),
     /// The kitty keyboard protocol's flag stacks, **one per screen**. It is a stack
     /// because a full-screen program pushes the flags it wants on entry and pops them on
     /// exit, so it cannot strand the terminal in a mode the shell underneath it does not
@@ -980,6 +1301,8 @@ impl Screen {
             cursor_appearance: CursorAppearance::default(),
             responses: Vec::new(),
             links: LinkTable::default(),
+            styles: StyleTable::default(),
+            pen_style: (Style::default(), StyleId::DEFAULT),
             kitty_primary: Vec::new(),
             kitty_alt: Vec::new(),
             modify_other_keys: ModifyOtherKeys::default(),
@@ -1052,13 +1375,122 @@ impl Screen {
     /// link are likewise outside it, which is what splits the run the hover probe
     /// walks — exactly the behaviour you want, since the text either side of the gap
     /// is no longer one label.
-    fn blank_cell(&self) -> Cell {
-        Cell {
-            rune: ' ',
+    fn blank_cell(&mut self) -> PackedCell {
+        let style = Style {
             fg: Color::Default,
             bg: self.pen.bg,
             attrs: Attrs::empty(),
-            link: LinkId::NONE,
+        };
+        PackedCell::new(
+            ' ',
+            CellWidth::Narrow,
+            self.intern_style(style),
+            LinkId::NONE,
+        )
+    }
+
+    /// The pen in the form the write paths store: rendition interned once, ready to be
+    /// stamped into every cell of a run.
+    pub(super) fn packed_pen(&mut self) -> PackedPen {
+        PackedPen {
+            style: self.pen_style_id(),
+            link: self.pen.link,
         }
+    }
+
+    /// Resolve a stored cell into the shape every reader outside the grid works in.
+    pub(super) fn resolve(&self, cell: PackedCell) -> Cell {
+        let style = self.styles.get(cell.style_id());
+        Cell {
+            rune: cell.rune(),
+            fg: style.fg,
+            bg: style.bg,
+            attrs: style.attrs,
+            width: cell.width(),
+            link: cell.link,
+        }
+    }
+
+    /// The id for `style`, interning it and sweeping for room if it is new.
+    ///
+    /// Falls back to [`StyleId::DEFAULT`] when the table is full and a sweep cannot
+    /// free anything, which degrades exactly as a spent [`LinkId`] space does: the text
+    /// is still there and still correct, it just draws unstyled. Sixty-five thousand
+    /// *simultaneously live* renditions is not a state any real program reaches.
+    fn intern_style(&mut self, style: Style) -> StyleId {
+        if let Some(id) = self.styles.intern(style) {
+            return id;
+        }
+        // A sweep is worth doing once, and worth *not* repeating until something could
+        // have died since. See [`StyleTable::swept_dry_at`].
+        let grid_at = (self.epoch, self.primary.evicted);
+        if self.styles.swept_dry_at == Some(grid_at) {
+            return StyleId::DEFAULT;
+        }
+        self.collect_styles();
+        match self.styles.intern(style) {
+            Some(id) => id,
+            None => {
+                self.styles.swept_dry_at = Some(grid_at);
+                StyleId::DEFAULT
+            }
+        }
+    }
+
+    /// Reclaim the ids of renditions no cell carries any more.
+    ///
+    /// A textbook mark-and-sweep, run only when [`StyleTable::intern`] reports the table
+    /// full, so the walk over every cell is an *event* rather than a per-frame cost. The
+    /// roots are every cell in both buffers plus the pen and both saved cursors, because
+    /// a rendition can be set with nothing printed under it yet.
+    ///
+    /// Deliberately not reference counted: see [`StyleTable`].
+    fn collect_styles(&mut self) {
+        // `live[i]` speaks for `StyleId(i)`; slot 0 is the default and is never stored.
+        let mut live = vec![false; self.styles.styles.len() + 1];
+        let mark = |id: StyleId, live: &mut Vec<bool>| {
+            if let Some(slot) = live.get_mut(usize::from(id.0)) {
+                *slot = true;
+            }
+        };
+        for buf in [&self.primary, &self.alt] {
+            for row in buf.scrollback.iter().chain(buf.lines.iter()) {
+                for cell in &row.cells {
+                    mark(cell.style_id(), &mut live);
+                }
+            }
+        }
+        // The pen's own cached id. A saved cursor (DECSC) is *not* a root: it stores the
+        // rendition unpacked, so restoring re-interns rather than citing a table entry.
+        mark(self.pen_style.1, &mut live);
+
+        let remap = self.styles.compact(&live);
+        let renumber = |id: StyleId| {
+            remap
+                .get(usize::from(id.0))
+                .copied()
+                .unwrap_or(StyleId::DEFAULT)
+        };
+        for buf in [&mut self.primary, &mut self.alt] {
+            for row in buf.scrollback.iter_mut().chain(buf.lines.iter_mut()) {
+                for cell in &mut row.cells {
+                    let id = cell.style_id();
+                    cell.set_style_id(renumber(id));
+                }
+            }
+        }
+        self.pen_style.1 = renumber(self.pen_style.1);
+    }
+
+    /// The pen's rendition, interned, re-using the cached id while the pen has not
+    /// changed. The check is a comparison of the rendition itself (ten bytes) rather
+    /// than a flag someone has to remember to clear, so the cache cannot go stale.
+    fn pen_style_id(&mut self) -> StyleId {
+        let style = self.pen.style();
+        if self.pen_style.0 != style {
+            let id = self.intern_style(style);
+            self.pen_style = (style, id);
+        }
+        self.pen_style.1
     }
 }

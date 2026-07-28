@@ -897,7 +897,7 @@ impl Screen {
     /// would scroll inside it.
     pub fn decaln(&mut self) {
         let b = self.active_mut();
-        b.clear_all(Cell::new('E'));
+        b.clear_all(PackedCell::plain('E'));
         b.scroll_top = 0;
         b.scroll_bottom = b.rows.saturating_sub(1);
         b.cursor = Cursor::default();

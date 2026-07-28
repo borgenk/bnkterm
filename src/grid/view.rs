@@ -72,7 +72,7 @@ impl Screen {
 
     /// The cell at visible `(row, col)`; a blank cell if out of range.
     pub fn cell(&self, row: usize, col: usize) -> Cell {
-        self.active().cell(row, col)
+        self.resolve(self.active().cell(row, col))
     }
 
     /// Combining marks attached to visible `(row, col)`, in arrival order; empty if
@@ -118,7 +118,10 @@ impl Screen {
     /// reply queue, the prompt and kitty stacks — which are bounded by construction and
     /// would only add a constant to every reading.
     pub fn storage_bytes(&self) -> usize {
-        self.primary.storage_bytes() + self.alt.storage_bytes() + self.links.storage_bytes()
+        self.primary.storage_bytes()
+            + self.alt.storage_bytes()
+            + self.links.storage_bytes()
+            + self.styles.storage_bytes()
     }
 
     /// Lines of history the *view* can scroll through: the primary's scrollback, or none
@@ -311,11 +314,13 @@ impl Screen {
     /// the selection's view of the grid: it reads the content the user picked, whatever
     /// the viewport has since done.
     pub(super) fn abs_cell(&self, row: AbsRow, col: usize) -> Cell {
-        self.active()
+        let packed = self
+            .active()
             .abs_row(row)
             .and_then(|r| r.cells.get(col))
             .copied()
-            .unwrap_or(Cell::BLANK)
+            .unwrap_or(PackedCell::BLANK);
+        self.resolve(packed)
     }
 
     /// Combining marks at absolute `(row, col)`.
@@ -330,14 +335,16 @@ impl Screen {
     /// cell when pinned to the bottom, else the scrollback row scrolled into view.
     pub fn view_cell(&self, row: usize, col: usize) -> Cell {
         let off = self.view_offset();
-        if off == 0 {
-            return self.active().cell(row, col);
-        }
-        self.active()
-            .view_row(row, off)
-            .and_then(|r| r.cells.get(col))
-            .copied()
-            .unwrap_or(Cell::BLANK)
+        let packed = if off == 0 {
+            self.active().cell(row, col)
+        } else {
+            self.active()
+                .view_row(row, off)
+                .and_then(|r| r.cells.get(col))
+                .copied()
+                .unwrap_or(PackedCell::BLANK)
+        };
+        self.resolve(packed)
     }
 
     /// Combining marks at display `(row, col)` honouring the scroll offset, in
@@ -631,7 +638,7 @@ impl Screen {
             if cell.is_wide_spacer() {
                 continue;
             }
-            s.push(cell.rune);
+            s.push(cell.rune());
             s.extend(r.marks(col));
         }
         s
@@ -693,12 +700,19 @@ impl Screen {
         for r in 0..rows {
             for c in 0..cols {
                 let cell = self.cell(r, c);
-                if cell.fg != Color::Default || cell.bg != Color::Default || !cell.attrs.is_empty()
-                {
+                // The wide-pair role is listed alongside the rendition even though it is
+                // not part of one: it is invisible in the grid text above (a spacer is
+                // skipped, a leader prints as its glyph), so without it a golden could
+                // not tell a correctly paired wide glyph from an orphaned half.
+                let plain = cell.fg == Color::Default
+                    && cell.bg == Color::Default
+                    && cell.attrs.is_empty()
+                    && matches!(cell.width, CellWidth::Narrow);
+                if !plain {
                     let _ = writeln!(
                         out,
-                        "r{r}c{c} {:?} fg={:?} bg={:?} {:?}",
-                        cell.rune, cell.fg, cell.bg, cell.attrs
+                        "r{r}c{c} {:?} fg={:?} bg={:?} {:?} {:?}",
+                        cell.rune, cell.fg, cell.bg, cell.attrs, cell.width
                     );
                 }
             }

@@ -8,15 +8,39 @@ use crate::color::{Ground, Rgb};
 
 #[test]
 fn cell_layout_is_pinned() {
-    // A screenful plus scrollback is a lot of cells; growth is a decision,
-    // not an accident. char(4) + Color(4) + Color(4) + Attrs(2) + LinkId(2),
-    // aligned to char's 4 bytes, is exactly 16 — the hyperlink id was fitted into
-    // the two bytes the cell was already padding away, so OSC 8 cost the grid
-    // nothing. Anything that pushes this to 20 has to justify a 25% bigger grid.
-    assert_eq!(std::mem::size_of::<Attrs>(), 2);
+    // A screenful plus scrollback is a lot of cells; growth is a decision, not an
+    // accident. The stored cell is exactly eight bytes and every one is spoken for:
+    // a `u32` holding the scalar in 21 bits with `CellWidth` in the two the scalar
+    // could never use, then two bytes naming a rendition and two naming a hyperlink.
+    // Anything that pushes this to 12 costs the grid 50%.
+    assert_eq!(std::mem::size_of::<PackedCell>(), 8);
+    assert_eq!(std::mem::align_of::<PackedCell>(), 4);
+    assert_eq!(std::mem::size_of::<StyleId>(), 2);
     assert_eq!(std::mem::size_of::<LinkId>(), 2);
-    assert_eq!(std::mem::size_of::<Cell>(), 16);
-    assert_eq!(std::mem::align_of::<Cell>(), 4);
+    assert_eq!(std::mem::size_of::<Attrs>(), 2);
+
+    // The resolved `Cell` is the shape callers work in, not the shape stored, so it is
+    // free to be comfortable. It is pinned only so that nobody mistakes it for the one
+    // the grid is made of.
+    assert_eq!(std::mem::size_of::<Cell>(), 20);
+}
+
+#[test]
+fn a_packed_cell_round_trips_every_field() {
+    // The packing is bit manipulation on the hottest type in the codebase, so it is
+    // worth proving rather than eyeballing: the scalar and the width share a `u32` and
+    // must not bleed into each other at either end of the range.
+    for rune in ['\0', ' ', 'a', '世', '\u{10FFFF}', '\u{FFFF}'] {
+        for width in [CellWidth::Narrow, CellWidth::Leader, CellWidth::Spacer] {
+            let c = PackedCell::new(rune, width, StyleId::DEFAULT, LinkId::NONE);
+            assert_eq!(c.rune(), rune, "rune survives {width:?}");
+            assert_eq!(c.width(), width, "width survives {rune:?}");
+        }
+    }
+    // The blank is a space in the default rendition, and is what an empty grid is full of.
+    assert_eq!(PackedCell::BLANK.rune(), ' ');
+    assert_eq!(PackedCell::BLANK.width(), CellWidth::Narrow);
+    assert_eq!(PackedCell::BLANK.style_id(), StyleId::DEFAULT);
 }
 
 #[test]
@@ -52,8 +76,8 @@ fn a_full_scrollback_ring_never_outgrows_its_limit() {
 fn a_full_grid_holds_exactly_the_bytes_it_should() {
     // The footprint gate compares this number exactly, so it is worth
     // knowing here that every byte of it is accounted for rather than merely stable.
-    // A grid is its rows and nothing else: cells, one `Row` header per row in each
-    // ring, and the tab table.
+    // A grid is its rows and nothing else: cells at 16 bytes, one `Row` header per row
+    // in each ring, and the tab table.
     const COLS: usize = 20;
     const ROWS: usize = 4;
     const LIMIT: usize = 64;
@@ -63,7 +87,9 @@ fn a_full_grid_holds_exactly_the_bytes_it_should() {
     }
     assert_eq!(s.scrollback_len(), LIMIT);
 
-    let cell = std::mem::size_of::<Cell>();
+    // The *stored* cell, not the resolved one callers see: the grid is made of packed
+    // cells, and using the wrong one here is exactly the confusion the split invites.
+    let cell = std::mem::size_of::<PackedCell>();
     let row = std::mem::size_of::<buffer::Row>();
     let tabs = buffer::default_tabs(COLS).capacity();
     // Both buffers: the primary's full ring plus live screen, and the alt screen's
@@ -72,6 +98,91 @@ fn a_full_grid_holds_exactly_the_bytes_it_should() {
         (LIMIT + ROWS) * COLS * cell + buffer::scrollback_capacity(LIMIT) * row + ROWS * row + tabs;
     let alt = ROWS * COLS * cell + buffer::scrollback_capacity(0) * row + ROWS * row + tabs;
     assert_eq!(s.storage_bytes(), primary + alt);
+}
+
+#[test]
+fn dead_styles_are_collected_and_the_grid_keeps_its_colours() {
+    // The mark-and-sweep, end to end. A screen that churns through renditions must not
+    // burn out the id space, and the sweep must renumber every surviving cell to match
+    // the compacted table — a sweep that reclaimed ids but forgot to renumber would
+    // repaint the whole screen in someone else's colours.
+    let mut s = Screen::with_scrollback(8, 2, 0);
+
+    // Fill the visible screen with one distinctive rendition, then scroll far more
+    // renditions than the screen can hold past it, so almost all of them die.
+    feed(&mut s, b"\x1b[38;5;99mkeep\r\n");
+    for i in 0..300u16 {
+        feed(&mut s, format!("\x1b[38;5;{}mx\r\n", i % 256).as_bytes());
+    }
+    // With no scrollback, everything but the last two rows is gone, so the table must
+    // not have grown to hold the ~256 renditions that passed through it.
+    s.collect_styles();
+    assert!(
+        s.styles.styles.len() <= 4,
+        "sweep kept {} renditions for a 2-row screen",
+        s.styles.styles.len()
+    );
+
+    // And the cells that survived still resolve to what they were written with.
+    feed(&mut s, b"\x1b[38;5;42mAB");
+    let before = s.cell(1, 0);
+    assert_eq!(before.fg, Color::Indexed(42));
+    s.collect_styles();
+    assert_eq!(s.cell(1, 0), before, "a swept cell kept its rendition");
+    assert_eq!(s.cell(1, 1).fg, Color::Indexed(42));
+}
+
+#[test]
+fn a_spent_style_table_degrades_without_losing_text() {
+    // The id space is a `u16`, so a child printing nothing but distinct truecolour
+    // renditions can exhaust it. The rule is then the one a spent `LinkId` space
+    // follows: the text is still there and still correct, it just draws unstyled.
+    let mut table = StyleTable::default();
+    let style_for = |i: usize| Style {
+        fg: Color::Rgb((i >> 16) as u8, (i >> 8) as u8, i as u8),
+        ..Style::default()
+    };
+    for i in 0..STYLE_LIMIT {
+        assert!(table.intern(style_for(i)).is_some(), "id {i} should fit");
+    }
+    assert_eq!(table.styles.len(), STYLE_LIMIT);
+    // One past the end fails rather than wrapping an id or growing past the u16.
+    assert_eq!(table.intern(style_for(STYLE_LIMIT)), None);
+    // The default costs no id at all, so it is still available on a full table — which
+    // is exactly what makes "draw it unstyled" a safe thing to fall back to.
+    assert_eq!(table.intern(Style::default()), Some(StyleId::DEFAULT));
+
+    // And a screen whose table is spent still prints, in the default rendition.
+    //
+    // "Spent" means more than "full": a full table normally triggers a sweep, and a
+    // sweep that frees anything makes room. The state the fallback is for is a table
+    // full of *live* renditions, which the guard records so a child printing SGR into
+    // one does not buy a walk over every cell with each sequence.
+    let mut s = Screen::new(4, 2);
+    s.styles = table;
+    s.styles.swept_dry_at = Some((s.epoch, s.primary.evicted));
+    s.pen.fg = Color::Rgb(1, 2, 3);
+    assert_eq!(s.pen_style_id(), StyleId::DEFAULT);
+    feed(&mut s, b"ok");
+    assert_eq!(s.cell(0, 0).rune, 'o');
+    assert_eq!(s.cell(0, 1).rune, 'k');
+    assert_eq!(s.cell(0, 0).fg, Color::Default, "unstyled, not miscoloured");
+}
+
+#[test]
+fn a_style_sweep_reclaims_the_whole_id_space() {
+    // The sweep is what stops the exhaustion above from being permanent. Nothing here
+    // is printed, so every rendition that churned through is dead and all of it comes
+    // back — the property that lets a long-lived session keep recolouring forever.
+    let mut s = Screen::new(4, 2);
+    for i in 0..STYLE_LIMIT {
+        s.pen.fg = Color::Rgb((i >> 16) as u8, (i >> 8) as u8, i as u8);
+        let _ = s.pen_style_id();
+    }
+    assert_eq!(s.styles.styles.len(), STYLE_LIMIT);
+    s.collect_styles();
+    // Only the pen's own current rendition survives: it is a root even unprinted.
+    assert_eq!(s.styles.styles.len(), 1);
 }
 
 #[test]
@@ -122,15 +233,25 @@ fn attrs_debug_lists_flags() {
 
 #[test]
 fn wide_halves_report_their_role() {
-    let mut leader = Cell::new('世');
-    leader.attrs.insert(Attrs::WIDE_LEADER);
+    let leader = Cell {
+        width: CellWidth::Leader,
+        ..Cell::new('世')
+    };
     assert!(leader.is_wide_leader());
     assert!(!leader.is_wide_spacer());
 
-    let mut spacer = Cell::BLANK;
-    spacer.attrs.insert(Attrs::WIDE_SPACER);
+    let spacer = Cell {
+        width: CellWidth::Spacer,
+        ..Cell::BLANK
+    };
     assert!(spacer.is_wide_spacer());
     assert!(!spacer.is_wide_leader());
+
+    // The role is layout, not rendition: both halves of a wide glyph share one style,
+    // which is exactly why it had to leave `Attrs` before a style could be interned.
+    assert_eq!(leader.style(), Cell::new('世').style());
+    assert!(!Cell::BLANK.is_wide_leader());
+    assert!(!Cell::BLANK.is_wide_spacer());
 }
 
 // ---- Screen ------------------------------------------------------------
@@ -1366,11 +1487,14 @@ fn a_curly_underline_no_longer_swallows_the_colours_with_it() {
 
 #[test]
 fn an_underline_carries_its_style_without_growing_a_cell() {
-    // The design decision, pinned. A `Cell` is 16 bytes and the damage diff compares
-    // two screenfuls of them every painted frame; the style rides in the spare bits of
-    // the attribute bitfield precisely so squiggling one diagnostic does not cost the
-    // whole grid 25%. If this test starts failing, someone has paid that price.
-    assert_eq!(std::mem::size_of::<Cell>(), 16);
+    // The design decision, pinned. The underline shape rides in the spare bits of the
+    // attribute bitfield rather than in a field of its own, so squiggling one
+    // diagnostic costs the grid nothing at all. Now that the rendition is interned it
+    // costs even less than it used to — a shape is a property of a `Style` that a
+    // thousand cells can share — but `Attrs` still has to fit in its two bytes, because
+    // widening it widens every interned rendition.
+    assert_eq!(std::mem::size_of::<Attrs>(), 2);
+    assert_eq!(std::mem::size_of::<PackedCell>(), 8);
 
     let mut s = Screen::new(10, 1);
     feed(&mut s, b"\x1b[4:3max"); // the curly underline nvim marks an error with
@@ -1872,7 +1996,7 @@ fn invariant_break(bytes: &[u8], cols: usize, rows: usize) -> Option<String> {
 /// Where a row's wide-glyph pairing is broken, or `None`. A leader must be followed by
 /// a spacer, and a spacer must be preceded by a leader; either half standing alone is
 /// an orphan that draws as garbage.
-fn wide_pair_break(row: &[Cell]) -> Option<String> {
+fn wide_pair_break(row: &[PackedCell]) -> Option<String> {
     for (i, cell) in row.iter().enumerate() {
         if cell.is_wide_leader() && !row.get(i + 1).is_some_and(|c| c.is_wide_spacer()) {
             return Some(format!("wide leader at col {i} has no spacer to its right"));

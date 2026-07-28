@@ -60,7 +60,7 @@ impl Screen {
             }
         }
 
-        let pen = self.pen;
+        let pen = self.packed_pen();
         let insert = self.insert_mode;
         let (row, col) = {
             let cur = self.active().cursor;
@@ -77,30 +77,19 @@ impl Screen {
         // spacer that cannot exist. It goes in as an ordinary cell instead: clipped, and
         // structurally sound.
         let fits_wide = cw == 2 && col + 1 < cols;
-        let leader = Cell {
-            rune: c,
-            fg: pen.fg,
-            bg: pen.bg,
-            attrs: if fits_wide {
-                pen.attrs | Attrs::WIDE_LEADER
-            } else {
-                pen.attrs
-            },
-            link: pen.link,
+        let width = if fits_wide {
+            CellWidth::Leader
+        } else {
+            CellWidth::Narrow
         };
+        let leader = PackedCell::new(c, width, pen.style, pen.link);
         {
             let b = self.active_mut();
             b.write_cell(row, col, leader);
             if fits_wide {
                 // The spacer carries the link too, so the run the hover probe walks
                 // never breaks in the middle of a wide glyph.
-                let spacer = Cell {
-                    rune: ' ',
-                    fg: pen.fg,
-                    bg: pen.bg,
-                    attrs: pen.attrs | Attrs::WIDE_SPACER,
-                    link: pen.link,
-                };
+                let spacer = PackedCell::new(' ', CellWidth::Spacer, pen.style, pen.link);
                 b.write_cell(row, col + 1, spacer);
             }
         }
@@ -147,7 +136,7 @@ impl Screen {
         if cols == 0 {
             return;
         }
-        let pen = self.pen;
+        let pen = self.packed_pen();
         let autowrap = self.autowrap;
 
         let mut rest = bytes;
@@ -286,7 +275,7 @@ impl Screen {
             let Some(segment_widths) = widths.get(at..end) else {
                 return;
             };
-            let pen = self.pen;
+            let pen = self.packed_pen();
             self.active_mut()
                 .fill_text_run(row, start_col, segment, segment_widths, pen);
 
@@ -380,13 +369,7 @@ impl Screen {
         // learn a new one.
         if before < 2 && after == 2 && col + 1 < cols {
             let leader = self.active().cell(row, col);
-            let spacer = Cell {
-                rune: ' ',
-                fg: leader.fg,
-                bg: leader.bg,
-                attrs: leader.attrs | Attrs::WIDE_SPACER,
-                link: leader.link,
-            };
+            let spacer = PackedCell::new(' ', CellWidth::Spacer, leader.style_id(), leader.link);
             let b = self.active_mut();
             // The column being grown into is not empty just because the cluster was
             // narrow: it may hold the leader of the *next* wide pair, whose spacer would
@@ -396,14 +379,7 @@ impl Screen {
             // `col` when the neighbour is a spacer, and the promotion below writes the
             // cluster back over it.
             b.write_cell(row, col + 1, spacer);
-            b.set_raw(
-                row,
-                col,
-                Cell {
-                    attrs: leader.attrs | Attrs::WIDE_LEADER,
-                    ..leader
-                },
-            );
+            b.set_raw(row, col, leader.with_width(CellWidth::Leader));
             b.cursor.col = (col + 2).min(cols.saturating_sub(1));
             b.cursor.pending_wrap = col + 2 >= cols;
         }
@@ -422,7 +398,7 @@ impl Screen {
     pub(super) fn cluster_text(&self, row: usize, col: usize) -> String {
         let mut out = String::new();
         let b = self.active();
-        out.push(b.cell(row, col).rune);
+        out.push(b.cell(row, col).rune());
         if let Some(r) = b.line(row) {
             out.extend(r.marks(col));
         }
