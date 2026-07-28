@@ -393,6 +393,21 @@ pub struct GlyphCache {
     /// the defended map underneath.
     ascii_slots: Vec<AsciiRow>,
     scalar_slots: HashMap<(FaceKey, char), PackedGlyph>,
+    /// Procedurally-drawn box/block rasters, held apart from the font ones.
+    ///
+    /// A separate map rather than a shared key, because the same character genuinely has
+    /// two different rasters and both are correct in their place: on the grid `─` is drawn
+    /// by [`boxdraw`] to fill the cell edge to edge and tile with its neighbours, while in
+    /// a tab title it is prose and comes from the font at the font's own bearing and
+    /// advance. Keying them together made whichever arrived first win for the rest of the
+    /// process's life — a `DrawCmd::Text` carrying one box char was enough to leave every
+    /// box glyph on the grid drawn at font metrics, tofu or hairline seams where the
+    /// drawing should tile. It was a comment asserting "a given char is always a box glyph
+    /// or never one"; now it is two maps, and no path can reach the other's entry.
+    ///
+    /// Bounded by construction: [`boxdraw::is_glyph`] is 160 codepoints, so this holds at
+    /// most `160 * faces` and needs no cap of its own.
+    box_slots: HashMap<(FaceKey, char), PackedGlyph>,
     /// Nested so lookups borrow the cluster as `&str` (no per-frame `String`).
     /// A `None` value records a cluster that is not color emoji, so a
     /// steady-state frame takes the per-character path without re-consulting
@@ -407,6 +422,7 @@ impl GlyphCache {
             emoji: Atlas::new(4),
             ascii_slots: Vec::new(),
             scalar_slots: HashMap::new(),
+            box_slots: HashMap::new(),
             cluster_slots: HashMap::new(),
         }
     }
@@ -430,6 +446,8 @@ impl GlyphCache {
     fn reset_for(&mut self, glyphs_gen: u32, emoji_gen: u32) {
         if self.glyphs.generation != glyphs_gen {
             self.scalar_slots.clear();
+            // Box rasters live in the same atlas, so a wipe takes them with it.
+            self.box_slots.clear();
             // The direct-mapped rows hold atlas coordinates too; a wipe invalidates
             // them exactly as it does the map, and forgetting them here would leave
             // every ASCII glyph pointing into a dead slot.
@@ -849,10 +867,11 @@ impl Batcher<'_> {
     /// FreeType raster, and it is anchored at `left = 0, top = baseline_offset` (the
     /// metrics' baseline, i.e. the distance from the cell's top edge down to the
     /// baseline) so the bitmap fills the cell box `[pen, pen + w) x [baseline -
-    /// baseline_offset, + h)` exactly, tiling with its neighbours. Cached in the same
-    /// `scalar_slots` map as a font glyph: the `(face_key, ch)` key stays unique
-    /// because a given char is always a box glyph or never one, and the cell size is
-    /// fixed by the size the key carries.
+    /// baseline_offset, + h)` exactly, tiling with its neighbours. Cached in
+    /// [`GlyphCache::box_slots`], which is a *different* map from the font rasters: the
+    /// same character has both a box raster and a font raster, so one key for both meant
+    /// whichever path saw it first decided how it drew everywhere. The cell size is fixed
+    /// by the size the key carries, so `(face_key, ch)` is a complete key within this map.
     fn packed_box(
         &mut self,
         face_key: FaceKey,
@@ -862,7 +881,7 @@ impl Batcher<'_> {
         baseline_offset: i32,
     ) -> PackedGlyph {
         let primary = self.fonts.face_for(face_key);
-        if let Some(&packed) = self.cache.scalar_slots.get(&(face_key, ch)) {
+        if let Some(&packed) = self.cache.box_slots.get(&(face_key, ch)) {
             primary.record_glyph_hit();
             return packed;
         }
@@ -877,7 +896,10 @@ impl Batcher<'_> {
             top: baseline_offset,
             advance: w as f32,
         };
-        self.cache.cache_scalar((face_key, ch), packed);
+        // Not `cache_scalar`: that routes ASCII into the direct-mapped rows and caps the
+        // font map, neither of which applies here (box glyphs are U+2500..=U+259F, a
+        // closed set of 160).
+        self.cache.box_slots.insert((face_key, ch), packed);
         packed
     }
 
@@ -1641,6 +1663,93 @@ mod tests {
                 (baseline - baseline_offset + cell_h) as f32
             ],
             "bottom-right fills the whole cell, so the glyph tiles"
+        );
+    }
+
+    #[test]
+    fn a_box_char_drawn_as_prose_does_not_poison_the_grid_raster() {
+        // `─` has two right answers, and they are not interchangeable: on the grid it is
+        // drawn by `render::boxdraw` to fill the cell edge to edge and tile with its
+        // neighbours, and as prose it comes from the font at the font's own bearing and
+        // advance. Cached under one key, whichever arrived first decided how `─` drew
+        // everywhere for the rest of the process's life. Reaching the prose path with one
+        // was never hypothetical: the cursor's inverted stamp emits `DrawCmd::Text`, so a
+        // single box char under the cursor left every box glyph on the grid at font
+        // metrics — tofu, or hairline seams where the drawing should tile.
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let mut cache = GlyphCache::new();
+        let face = FaceKey::Prose {
+            size: 16,
+            style: crate::platform::freetype::FontStyle::Regular,
+        };
+        let m = fonts.metrics(16);
+        let (baseline_offset, cell_h) = (m.baseline, m.line_height.max(1));
+        let cell_w = 11;
+        let (x, baseline) = (0, 16);
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 40,
+        };
+
+        // Prose first, so the font's raster is the one already in the cache.
+        build_frame(
+            &fonts,
+            &[DrawCmd::Text {
+                bounds,
+                x,
+                baseline,
+                face,
+                color: 0x00ff_ffff,
+                bg: 0,
+                fade: None,
+                text: "\u{2500}".to_string(),
+            }],
+            &mut cache,
+            GAMMA,
+        );
+
+        // Then the same character on the grid, under the same face key.
+        let f = build_frame(
+            &fonts,
+            &[DrawCmd::Cells {
+                bounds,
+                x,
+                baseline,
+                cell_w,
+                face,
+                color: 0x00ff_ffff,
+                bg: 0,
+                text: "\u{2500}".to_string(),
+            }],
+            &mut cache,
+            GAMMA,
+        );
+
+        assert_eq!(f.vertices.len(), 6, "one quad for the cell");
+        assert_eq!(
+            f.vertices[0].pos,
+            [x as f32, (baseline - baseline_offset) as f32],
+            "the grid still seats the box raster at the cell origin"
+        );
+        assert_eq!(
+            f.vertices[4].pos,
+            [
+                (x + cell_w) as f32,
+                (baseline - baseline_offset + cell_h) as f32
+            ],
+            "and it still fills the whole cell, so it still tiles"
+        );
+
+        // Both rasters exist, in their own maps. One key holding one of them is the bug.
+        assert!(
+            cache.scalar_slots.contains_key(&(face, '\u{2500}')),
+            "the prose raster was cached"
+        );
+        assert!(
+            cache.box_slots.contains_key(&(face, '\u{2500}')),
+            "and the box raster separately"
         );
     }
 

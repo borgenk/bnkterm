@@ -543,6 +543,37 @@ struct RunStyle {
     key: Attrs,
 }
 
+/// What one cell actually shows: the rune to draw, whether its combining marks go with
+/// it, and whether any of that is ink.
+///
+/// The painter draws a cell's glyph from three places — the batched run, the standalone
+/// glyph, and the cursor's inverted stamp — and every one of them has to conceal an
+/// `SGR 8` cell identically. Three copies of that rule is exactly how the third came to
+/// be missing it: a TUI masking a password with `SGR 8` rather than tty echo-off showed
+/// the most recently typed character under the cursor, one keystroke at a time.
+///
+/// So it is stated once and asked for twice — by [`Painter::push_glyph`] and
+/// [`Painter::stamp_inverted_glyph`], the two that build a one-cell string. The batched
+/// run keeps the rule spelled out flat instead, and that exception is measured rather
+/// than assumed: constructing this per cell in the run scan cost `frame_tabbar` +3-6%,
+/// unmoved by `#[inline(always)]`. The comment at that loop says so, and
+/// `a_concealed_cell_is_still_concealed_under_the_cursor` compares whole display lists,
+/// so both copies are pinned by one test.
+///
+/// Built by [`Painter::shown`], which is where the marks lookup happens.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Shown {
+    /// The rune to draw. A concealed cell shows a space, whatever it holds.
+    rune: char,
+    /// Whether the cell's combining marks are drawn with it. A concealed cell's are not:
+    /// an accent surviving the conceal would leak which character is under it.
+    marks: bool,
+    /// Whether any ink lands at all. A blank cell with no marks draws nothing, and
+    /// neither does a concealed one — but the cell still takes its decorations, since an
+    /// underline runs beneath cells whether or not they carry ink.
+    inked: bool,
+}
+
 /// The per-frame builder: the shared inputs plus the list being appended to. One
 /// method per concern keeps [`build_display_list`] readable.
 struct Painter<'a> {
@@ -735,6 +766,15 @@ impl Painter<'_> {
                     break;
                 }
             }
+            // The one glyph path that does **not** go through [`Shown`], and the reason
+            // is measured: building it per cell in this scan cost `frame_tabbar`
+            // 11.8 → 12.2-12.6 µs (+3-6%), stable across runs and unmoved by
+            // `#[inline(always)]`. This is the same loop the `RunStyle` tombstone is
+            // about — per-cell struct construction here does not survive contact with
+            // the run scan's code layout. So the rule is spelled out flat, and it is
+            // `Shown`'s rule to the letter: a concealed cell contributes a space and
+            // none of its marks. `a_concealed_cell_is_still_concealed_under_the_cursor`
+            // compares whole display lists, so it pins this copy as well as that one.
             let hidden = cell.attrs.contains(Attrs::HIDDEN);
             text.push(if hidden { ' ' } else { cell.rune });
             let has_marks = !hidden && !self.marks_empty(row, end);
@@ -775,6 +815,27 @@ impl Painter<'_> {
         }
         self.push_decorations(run, x, (end - col) as i32 * m.w, baseline);
         end
+    }
+
+    /// What a cell shows once `SGR 8` has had its say. See [`Shown`] for why this is one
+    /// function rather than a rule each drawing path restates.
+    ///
+    /// The concealed arm returns without consulting the marks side table, which is what
+    /// keeps this the same single lookup per cell that the run scan already paid for.
+    fn shown(&self, row: usize, col: usize, cell: Cell) -> Shown {
+        if cell.attrs.contains(Attrs::HIDDEN) {
+            return Shown {
+                rune: ' ',
+                marks: false,
+                inked: false,
+            };
+        }
+        let marks = !self.marks_empty(row, col);
+        Shown {
+            rune: cell.rune,
+            marks,
+            inked: cell.rune != ' ' || marks,
+        }
     }
 
     /// Everything about a cell that the painter's per-run output depends on, and so
@@ -930,12 +991,13 @@ impl Painter<'_> {
         let x = self.cell_x(col);
         let width_cells = if cell.is_wide_leader() { 2 } else { 1 };
         let (fg, bg) = self.resolve(cell, false);
-        let inked = !cell.attrs.contains(Attrs::HIDDEN)
-            && (cell.rune != ' ' || !self.marks_empty(row, col));
-        if inked {
+        let shown = self.shown(row, col, cell);
+        if shown.inked {
             let mut text = self.take_string();
-            text.push(cell.rune);
-            text.extend(self.marks(row, col));
+            text.push(shown.rune);
+            if shown.marks {
+                text.extend(self.marks(row, col));
+            }
             self.list.push(DrawCmd::Text {
                 bounds: text_bounds(x, baseline, width_cells * m.w, m),
                 x,
@@ -1096,16 +1158,24 @@ impl Painter<'_> {
 
     /// Re-draw the glyph beneath a focused block cursor in the cell's background
     /// colour, so the character shows as a cutout in the cursor block.
+    ///
+    /// A concealed cell has no glyph to cut out: [`Shown`] returns a space with no ink,
+    /// and this draws nothing. That is the point of asking rather than reading the cell
+    /// directly — the cursor is the one place a masked field is guaranteed to have a
+    /// freshly typed character sitting under it.
     fn stamp_inverted_glyph(&mut self, row: usize, col: usize, cell: Cell, width_cells: i32) {
-        if cell.rune == ' ' && self.marks_empty(row, col) {
+        let shown = self.shown(row, col, cell);
+        if !shown.inked {
             return;
         }
         let m = self.metrics;
         let x = self.cell_x(col);
         let baseline = self.baseline(row);
         let mut text = self.take_string();
-        text.push(cell.rune);
-        text.extend(self.marks(row, col));
+        text.push(shown.rune);
+        if shown.marks {
+            text.extend(self.marks(row, col));
+        }
         // The inverted glyph takes the cell's own background (reverse honoured),
         // ignoring any selection so the cursor stays legible over a selection. It is
         // stamped over the cursor block, so that colour is the background the glyph
@@ -2163,6 +2233,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_concealed_cell_is_still_concealed_under_the_cursor() {
+        // `SGR 8` is what a TUI masking a password field sends when it will not or cannot
+        // use tty echo-off, and the cursor is the one cell of such a field that is
+        // *guaranteed* to hold a character the user just typed. A cursor path reading the
+        // cell's rune directly therefore leaks the password back onto the screen at one
+        // character per keypress — the conceal holding everywhere except the place it
+        // matters most.
+        //
+        // Stated as an indistinguishability: two concealed cells differing only in what
+        // they conceal must paint identically. That catches a leak through any command,
+        // not just the inverted stamp this was found in.
+        let t = Theme::default();
+        let frame = |rune: &[u8]| {
+            let mut s = Screen::new(4, 1);
+            feed(&mut s, b"\x1b[8m");
+            feed(&mut s, rune);
+            s.move_to(0, 0);
+            build_display_list(&FrameInputs {
+                cursor: CursorRender::default(), // visible, focused: the block that inverts
+                ..inputs(&s, &t)
+            })
+        };
+
+        let secret = frame(b"s");
+        assert_eq!(
+            secret,
+            frame(b" "),
+            "a concealed 's' painted differently from a concealed space"
+        );
+        assert!(
+            !secret.iter().any(|c| matches!(
+                c,
+                DrawCmd::Text { text, .. } | DrawCmd::Cells { text, .. } if text.contains('s')
+            )),
+            "the concealed character reached the display list: {secret:?}"
+        );
+
+        // And the conceal is not a blanket "draw nothing under the cursor": an ordinary
+        // cell still gets its glyph inverted out of the block.
+        let mut plain = Screen::new(4, 1);
+        feed(&mut plain, b"s");
+        plain.move_to(0, 0);
+        let list = build_display_list(&FrameInputs {
+            cursor: CursorRender::default(),
+            ..inputs(&plain, &t)
+        });
+        assert!(
+            matches!(list.last(), Some(DrawCmd::Text { text, .. }) if text == "s"),
+            "an unconcealed cell still stamps: {list:?}"
+        );
+    }
+
     /// A `Lock` cursor over a cell holding 'X', at `metrics`. Returns the display list.
     fn lock_frame(metrics: CellMetrics, t: &Theme) -> DisplayList {
         let mut s = Screen::new(4, 1);
@@ -3017,20 +3140,18 @@ mod tests {
             .unwrap_or(0) as i32
     }
 
-    /// The damage never lies by omission: whatever changed on the grid is covered.
-    ///
-    /// A property rather than a case list — it compares the damage against the cells
-    /// that actually differ, over a structured stream, so it holds for operations nobody
-    /// thought to write a case for. Under-damage is the failure that leaves the window
-    /// showing something the terminal no longer believes.
     /// A cell reduced to what the painter can actually show.
     ///
-    /// The painter's own rule (`push_run`, `push_glyph`): a `HIDDEN` cell is drawn as a
-    /// space and is never inked, so its rune cannot be observed and neither can its
-    /// foreground — unless `REVERSE` is also set, which swaps the foreground into the
-    /// *background* and makes it visible again. `SGR 8` is what a program masking a
-    /// password field sends, and two such cells differing only in the character they
-    /// conceal are, correctly, the same picture.
+    /// A concealed cell is drawn as a space and is never inked, so neither its rune nor
+    /// its foreground can be observed — unless `REVERSE` is also set, which swaps the
+    /// foreground into the *background* and makes it visible again. `SGR 8` is what a
+    /// program masking a password field sends, and two such cells differing only in the
+    /// character they conceal are, correctly, the same picture.
+    ///
+    /// Deliberately an independent restatement of [`Shown`] rather than a call to it: a
+    /// property that derives its expectation from the code under test proves only that the
+    /// code agrees with itself. It has to be kept in step by hand, and the day the two
+    /// disagree is a question worth being asked.
     ///
     /// Nothing else is normalised. The point of the property is to catch damage that
     /// omits a real change, so anything that might be visible stays in the comparison.
@@ -3055,6 +3176,12 @@ mod tests {
         }
     }
 
+    /// The damage never lies by omission: whatever changed on the grid is covered.
+    ///
+    /// A property rather than a case list — it compares the damage against the cells that
+    /// actually differ, over a structured stream, so it holds for operations nobody
+    /// thought to write a case for. Under-damage is the failure that leaves the window
+    /// showing something the terminal no longer believes.
     #[test]
     fn damage_covers_every_cell_that_changed() {
         let theme = Theme::default();
