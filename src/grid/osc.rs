@@ -71,11 +71,31 @@ impl Screen {
     /// and in scrollback at once, at which point the newest simply is not clickable —
     /// a degradation, never a failure, and the text still reads.
     pub(super) fn intern_link(&mut self, url: &str) -> LinkId {
+        // Too long to ever store: turned away here rather than in the table, because
+        // failing there would send us through a full mark-and-sweep over every cell in
+        // both buffers to make room that no amount of collecting can make.
+        if url.len() > LINK_URL_MAX {
+            return LinkId::NONE;
+        }
         if let Some(id) = self.links.intern(url) {
             return id;
         }
+        // The table is full, of ids or of bytes. A sweep is worth doing once — and worth
+        // *not* repeating until something could have died since, or a child printing
+        // anchors into a full table buys a walk over every cell in both buffers with
+        // each one. See `LinkTable::swept_dry_at`.
+        let grid_at = (self.epoch, self.primary.evicted);
+        if self.links.swept_dry_at == Some(grid_at) {
+            return LinkId::NONE;
+        }
         self.collect_links();
-        self.links.intern(url).unwrap_or(LinkId::NONE)
+        match self.links.intern(url) {
+            Some(id) => id,
+            None => {
+                self.links.swept_dry_at = Some(grid_at);
+                LinkId::NONE
+            }
+        }
     }
 
     /// Reclaim the ids of hyperlinks no cell carries any more.

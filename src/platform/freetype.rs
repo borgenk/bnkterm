@@ -823,6 +823,23 @@ impl Drop for Face {
     }
 }
 
+/// How many characters [`SizedFaces::discovered`] memoizes before it is dropped whole.
+///
+/// It is keyed on scalars the child chooses, and nothing ever evicted: `cat`ing a file
+/// that sweeps the unassigned code points walks it toward ~1.1 M entries (~35 MB) and
+/// leaves them there for the life of the process. Cheap per miss, so it is growth rather
+/// than a stall — which is exactly the kind that goes unnoticed.
+///
+/// Generous, because the real working set is small. `discover` is only reached by a
+/// scalar the keyed face *and* the pinned fallback list both fail to draw, so what
+/// accumulates is scripts rather than characters: a session mixing Latin, CJK, Cyrillic
+/// and a symbol font stays in the low hundreds.
+///
+/// Dropped whole rather than evicted entry by entry, the same policy as the glyph cache's
+/// `MAX_GLYPH_CACHE` and for the same reason: a miss costs one fontconfig query, so
+/// rebuilding is a bounded burst and an LRU's bookkeeping would cost more than it saves.
+const MAX_DISCOVERED: usize = 4096;
+
 /// The faces for one pixel size: the regular face (always present) plus any
 /// bold/italic/bold-italic variants the family ships, the distinct code face (if
 /// a separate code family is installed), and the cached line metrics. Metrics
@@ -860,6 +877,9 @@ struct SizedFaces {
     /// character. `None` records a character fontconfig could not place either, so a
     /// glyph nothing on the machine has is asked about once and then remembered —
     /// otherwise a screenful of an unavailable character would re-query per cell.
+    ///
+    /// Capped at [`MAX_DISCOVERED`]: the keys come from the child, so this is
+    /// attacker-growable like every other child-keyed map here.
     discovered: RefCell<HashMap<char, Option<Rc<Face>>>>,
     /// The faces behind `discovered`, keyed by the file they came from, so a font that
     /// answers for twenty characters is opened once and shared. This is why the faces
@@ -899,7 +919,11 @@ impl SizedFaces {
         let found = fc
             .and_then(|fc| fc.font_for_char(ch))
             .and_then(|file| self.open_discovered(file));
-        self.discovered.borrow_mut().insert(ch, found.clone());
+        let mut memo = self.discovered.borrow_mut();
+        if memo.len() >= MAX_DISCOVERED {
+            memo.clear();
+        }
+        memo.insert(ch, found.clone());
         found
     }
 
@@ -1645,6 +1669,34 @@ mod tests {
             "the same character resolved twice to two different faces"
         );
         assert!(fonts.fc.get().is_some(), "discovery never woke the system");
+    }
+
+    #[test]
+    fn the_discovered_memo_stays_bounded_when_the_child_sweeps_unknown_characters() {
+        // `discovered` is keyed on scalars the child chooses and nothing ever evicted, so
+        // `cat`ing a file that sweeps the unassigned code points walked it toward ~1.1 M
+        // entries (~35 MB) and left them there for the life of the process. Cheap per
+        // miss, which is why it is growth rather than a stall — and why nobody notices.
+        //
+        // Plane 4 is entirely unassigned, so nothing installed draws any of these: every
+        // character is a fresh miss that memoizes a `None`, which is the worst case.
+        let fonts = Fonts::new(&[16]).expect("a default font");
+        let key = FaceKey::Prose {
+            size: 16,
+            style: FontStyle::Regular,
+        };
+        let sweep = MAX_DISCOVERED as u32 + MAX_DISCOVERED as u32 / 2;
+        for cp in 0x4_0000..0x4_0000 + sweep {
+            if let Some(ch) = char::from_u32(cp) {
+                let _ = fonts.glyph_face(key, ch);
+            }
+        }
+        let held = fonts.entry(16).discovered.borrow().len();
+        assert!(
+            held <= MAX_DISCOVERED,
+            "the memo held {held} entries, past its {MAX_DISCOVERED} cap"
+        );
+        assert!(held > 0, "and it is still a cache, not a disabled one");
     }
 
     #[test]

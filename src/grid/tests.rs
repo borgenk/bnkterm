@@ -3278,6 +3278,62 @@ fn a_full_link_table_collects_dead_ids_and_keeps_linking() {
     );
 }
 
+#[test]
+fn the_link_table_is_bounded_in_bytes_and_not_only_in_count() {
+    // Capping the *count* is not a bound on memory, because the child picks the length
+    // too. A URL's only other limit is `OSC_MAX` (4096), and each is stored twice, so
+    // 65534 distinct ~4 KB URIs — one anchored cell each, all live, nothing for
+    // `collect_links` to reclaim — pin roughly 537 MB. That is forty times what the
+    // scrollback's own cells cost, from a child that merely prints.
+    let mut s = Screen::new(20, 2);
+
+    // A URL past the per-URL cap is not clickable, and does not grow the table at all.
+    let huge = format!("https://e.com/{}", "a".repeat(LINK_URL_MAX));
+    feed(&mut s, &anchor(&huge, "x"));
+    assert!(s.links.urls.is_empty(), "nothing was interned");
+    let mut probe = LinkProbe::default();
+    assert_eq!(s.link_at(0, 0, &mut probe), None, "and the cell is plain");
+    assert_eq!(s.cell(0, 0).rune, 'x', "the text still reads, as always");
+
+    // One byte under it still works, so the cap is where it says it is.
+    let big = format!("https://e.com/{}", "a".repeat(LINK_URL_MAX - 15));
+    assert_eq!(big.len(), LINK_URL_MAX - 1);
+    feed(&mut s, &anchor(&big, "y"));
+    assert_eq!(s.links.urls.len(), 1);
+    assert_eq!(s.link_at(0, 1, &mut probe), Some(((0, 1), (0, 1))));
+    assert_eq!(probe.url(), big);
+
+    // And the table's own byte budget holds against a stream of distinct long URLs,
+    // whatever the id space says. Every one of these is live (each has a cell, and the
+    // 2-row screen keeps scrolling them into a 10k-line history), so a sweep frees
+    // nothing and the budget is the only thing standing between the child and memory.
+    let mut s = Screen::new(20, 2);
+    let filler = "b".repeat(LINK_URL_MAX - 32);
+    for i in 0..4000 {
+        feed(&mut s, &anchor(&format!("https://e.com/{i}/{filler}"), "z"));
+        feed(&mut s, b"\r\n");
+    }
+    assert!(
+        s.links.bytes <= LINK_BYTES_MAX,
+        "the table held {} bytes, past its {LINK_BYTES_MAX} budget",
+        s.links.bytes
+    );
+    assert!(
+        s.links.urls.len() < 4000,
+        "the budget, not the id space, is what stopped it"
+    );
+
+    // And a full table does not buy a mark-and-sweep per anchor. Every intern past the
+    // budget fails, and each failure used to ask for a walk over every cell in both
+    // buffers — 800k cells, per 2 KB of child output. The guard records that a sweep
+    // came back empty and declines to repeat it until a row has aged out or the epoch
+    // has broken.
+    assert!(
+        s.links.swept_dry_at.is_some(),
+        "the table filled without the fruitless-sweep guard ever engaging"
+    );
+}
+
 /// The absolute cell under display `(row, col)`, which is what a pointer resolves to.
 fn at(s: &Screen, row: usize, col: usize) -> (AbsRow, usize) {
     (s.abs_row(row), col)

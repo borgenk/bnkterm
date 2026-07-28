@@ -341,6 +341,32 @@ impl fmt::Debug for Attrs {
 /// fatal (see [`Screen::collect_links`]).
 const LINK_LIMIT: usize = u16::MAX as usize - 1;
 
+/// The longest URL that can be interned. foot and wezterm both settle around 2 KB, and
+/// nothing a human clicks is close: the OSC 8 anchors real tools emit (`ls --hyperlink`,
+/// `gcc`'s diagnostics, `delta`) are file URIs of a few dozen to a couple of hundred
+/// bytes.
+///
+/// A cap is needed because the only other bound on one URL is `OSC_MAX` (4096), and
+/// **count** was the only thing capped. 65534 distinct 4 KB URIs, one anchored cell each,
+/// pins about 537 MB that `collect_links` can never reclaim — because each one is stored
+/// twice (once in `urls`, once as the `index` key) and every one is live. That is forty
+/// times what the scrollback's own cells cost, from a child that merely prints.
+const LINK_URL_MAX: usize = 2048;
+
+/// The most bytes of URL text the table may hold, counting **both** stored copies.
+///
+/// [`LINK_URL_MAX`] alone leaves the worst case at 65534 × 2 KB × 2 ≈ 260 MB, which is
+/// still out of proportion to a terminal, so the table carries a byte budget as well as
+/// a count. The number is chosen against what the *text* costs: a full scrollback is
+/// ~13 MB of cells, so links are allowed to cost roughly half of that.
+///
+/// It is generous rather than tight, and deliberately: at a realistic ~60-byte file URI
+/// this still admits the entire id space (65534 × 60 × 2 ≈ 7.9 MB), so no legitimate
+/// session reaches it. Only a stream of long distinct URIs does, and that one degrades
+/// exactly as a spent id space does — the newest link is not clickable, the text still
+/// reads.
+const LINK_BYTES_MAX: usize = 8 * 1024 * 1024;
+
 /// How many bytes of query replies may accumulate before further answers are dropped
 /// (see [`Screen::respond`]). Sized far above any real conversation: the chattiest
 /// startup handshake in the wild is nvim's, a few hundred bytes, and this is two
@@ -377,19 +403,45 @@ impl LinkId {
 /// Ids are 1-based, so `urls[i]` is the URL of `LinkId(i + 1)` and zero is free to
 /// mean "no link". The URL is stored twice — once in `urls` to go id → URL in O(1)
 /// for the hover probe, once as the `index` key to go URL → id on intern so a link
-/// printed a thousand times is interned once. That duplication is bounded (the id
-/// space caps the table at [`LINK_LIMIT`] entries) and buys both directions their
-/// natural cost, which a single structure could not.
+/// printed a thousand times is interned once. That duplication buys both directions
+/// their natural cost, which a single structure could not — and it is why the table is
+/// bounded three ways rather than one: by count ([`LINK_LIMIT`], the id space), by the
+/// length of any single URL ([`LINK_URL_MAX`]), and by total stored bytes
+/// ([`LINK_BYTES_MAX`]). Count alone was not a bound on memory, because the child picks
+/// the length too.
 #[derive(Default)]
 struct LinkTable {
     urls: Vec<String>,
     index: HashMap<String, LinkId>,
+    /// Bytes of URL text held, counting both copies. Tracked rather than summed so the
+    /// budget check stays O(1) on a path a child can drive.
+    bytes: usize,
+    /// Where the grid was the last time a sweep reclaimed nothing: `(epoch, evicted)`.
+    ///
+    /// A sweep walks every cell in both buffers plus the whole scrollback, which is fine
+    /// once but ruinous per anchor — and "per anchor" is exactly where a full table of
+    /// *live* links lands, because every subsequent intern fails and asks for another
+    /// sweep. That was always true of a spent id space; adding a byte budget made the
+    /// same state reachable thirty times sooner, so it stops being theoretical.
+    ///
+    /// Links die when the cells citing them die, and the two things that kill them in
+    /// bulk are a row aging out of history (`evicted`) and the row epoch breaking (an
+    /// alt-screen switch, `ED 2`, a reset). Neither has moved means nothing worth
+    /// sweeping for has happened. A narrower death — one `EL` freeing one link — is
+    /// missed until then, which is a degradation of a state that is already a
+    /// degradation.
+    swept_dry_at: Option<(RowEpoch, u64)>,
 }
 
 impl LinkTable {
     /// The id for `url`, interning it if this is the first time we have seen it.
-    /// `None` when the id space is exhausted, which is the caller's cue to collect the
-    /// dead ids and try once more ([`Screen::intern_link`]).
+    /// `None` when the table is full — of ids or of bytes — which is the caller's cue to
+    /// collect the dead ids and try once more ([`Screen::intern_link`]). A sweep can free
+    /// either, so both failures are worth retrying after one.
+    ///
+    /// A URL longer than [`LINK_URL_MAX`] never reaches here: [`Screen::intern_link`]
+    /// turns it away first, because no amount of collecting would make room for it and
+    /// the sweep walks every cell in both buffers.
     fn intern(&mut self, url: &str) -> Option<LinkId> {
         if let Some(&id) = self.index.get(url) {
             return Some(id);
@@ -397,10 +449,15 @@ impl LinkTable {
         if self.urls.len() >= LINK_LIMIT {
             return None;
         }
+        let cost = url.len().checked_mul(2)?;
+        if self.bytes.saturating_add(cost) > LINK_BYTES_MAX {
+            return None;
+        }
         // Ids are 1-based and the table is capped below `u16::MAX`, so this fits.
         let id = LinkId(u16::try_from(self.urls.len() + 1).ok()?);
         self.urls.push(url.to_string());
         self.index.insert(url.to_string(), id);
+        self.bytes = self.bytes.saturating_add(cost);
         Some(id)
     }
 
@@ -419,6 +476,9 @@ impl LinkTable {
         let mut remap = vec![LinkId::NONE; self.urls.len() + 1];
         let old = std::mem::take(&mut self.urls);
         self.index.clear();
+        // Rebuilt from the survivors below, so the byte budget frees exactly what the
+        // sweep dropped.
+        self.bytes = 0;
         // Counts only survivors, so it is bounded by the table we came in with and
         // cannot pass `LINK_LIMIT`, let alone wrap.
         let mut next: u16 = 0;
@@ -431,6 +491,7 @@ impl LinkTable {
             if let Some(entry) = remap.get_mut(slot + 1) {
                 *entry = id;
             }
+            self.bytes = self.bytes.saturating_add(url.len().saturating_mul(2));
             self.index.insert(url.clone(), id);
             self.urls.push(url);
         }
