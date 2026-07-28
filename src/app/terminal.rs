@@ -52,6 +52,23 @@ const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 /// far shorter than a user notices something is wrong.
 const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 
+/// How many bytes may sit queued for a child that is not reading.
+///
+/// The queue exists so a full PTY input buffer costs latency instead of the window (see
+/// [`TerminalCore::pump_writes`]), but an unbounded queue just moves the failure from
+/// "frozen" to "out of memory". A child can mint outbound bytes on its own — every
+/// `\x1b[c` in its output is a device-attributes query the terminal answers — so this has
+/// to be bounded by something other than the user's patience. 1 MiB is far past anything
+/// legitimate: the largest real payload is a paste, and a paste to a child that is
+/// actually reading never accumulates at all.
+const OUT_QUEUE_MAX: usize = 1024 * 1024;
+
+/// How much written prefix accumulates before the queue reclaims it. Compaction is a
+/// memmove of what is left, so doing it per partial write would be quadratic against a
+/// child that reads a few bytes at a time; doing it never would grow the buffer without
+/// bound. 64 KiB bounds the waste and the copying at once.
+const OUT_COMPACT_AT: usize = 64 * 1024;
+
 /// How long the visual bell lasts. Long enough to catch the eye, short enough that a
 /// program ringing the bell in a loop reads as a flicker and not a strobe. Only ever
 /// seen while unfocused (see [`TerminalCore::after_output`]), so it is genuinely an "over here"
@@ -205,6 +222,12 @@ pub(super) struct TerminalCore {
     demo: bool,
     /// Reused key-encoding buffer (allocated once, not per key press).
     key_buf: Vec<u8>,
+    /// Bytes owed to the child that the kernel would not take yet, and how far into them
+    /// it has got. Everything bound for the PTY goes through here (see
+    /// [`Self::pump_writes`]); in the steady state it is written and emptied in the
+    /// same call and never holds anything.
+    out_buf: Vec<u8>,
+    out_head: usize,
     /// Whether the surface holds keyboard focus, so the cursor draws solid when
     /// focused and hollow when not.
     focused: bool,
@@ -312,6 +335,8 @@ impl TerminalCore {
             pty: None,
             demo,
             key_buf: Vec::new(),
+            out_buf: Vec::new(),
+            out_head: 0,
             focused: false,
             blink_on: true,
             blink_at: None,
@@ -579,9 +604,7 @@ impl TerminalCore {
                     self.dirty = true;
                 }
                 self.bump_cursor(); // keep the cursor solid while typing
-                if let Some(pty) = &self.pty {
-                    pty.write_all(&self.key_buf)?;
-                }
+                self.send_key_buf()?;
                 Ok(true)
             }
             ToTerminal::Pointer { event, mods } => {
@@ -674,9 +697,7 @@ impl TerminalCore {
                     self.screen.scroll_view_to_bottom();
                     self.dirty = true;
                 }
-                if let Some(pty) = &self.pty {
-                    pty.write_all(&self.key_buf)?;
-                }
+                self.send_key_buf()?;
                 Ok(true)
             }
         }
@@ -704,7 +725,7 @@ impl TerminalCore {
                     } else {
                         MouseKind::Release
                     };
-                    self.write_mouse(button, kind, col, row, mods)?;
+                    self.write_mouse(button, kind, col, row, mods, 1)?;
                 } else if button == MouseButton::Left {
                     // Ctrl+click follows a hyperlink instead of starting a selection.
                     // It sits inside the local branch because a program grabbing the
@@ -737,7 +758,7 @@ impl TerminalCore {
                     // Report motion to a program that asked for it (drag under ?1002,
                     // any move under ?1003).
                     let button = self.mouse_held.unwrap_or(MouseButton::None);
-                    self.write_mouse(button, MouseKind::Motion, col, row, mods)?;
+                    self.write_mouse(button, MouseKind::Motion, col, row, mods, 1)?;
                 }
                 // A hover is live only when the gesture is not already spoken for: a
                 // drag is a selection, and a grabbed mouse belongs to the program.
@@ -756,9 +777,7 @@ impl TerminalCore {
                     } else {
                         MouseButton::WheelUp
                     };
-                    for _ in 0..notches {
-                        self.write_mouse(button, MouseKind::Press, col, row, mods)?;
-                    }
+                    self.write_mouse(button, MouseKind::Press, col, row, mods, notches)?;
                 } else if !self.screen.is_alt() {
                     let lines = notches as usize * WHEEL_LINES;
                     if down {
@@ -780,13 +799,15 @@ impl TerminalCore {
                         input::Key::Up
                     };
                     let modes = input::Modes::from_screen(&self.screen);
+                    // Encoded into one buffer and sent once. A touchpad flick coalesces
+                    // to several notches, and each notch is several lines, so the naive
+                    // shape is a dozen three-byte writes where one does; over ssh that is
+                    // a dozen round trips.
+                    self.key_buf.clear();
                     for _ in 0..(notches as usize * WHEEL_LINES) {
-                        self.key_buf.clear();
                         input::encode(key, input::Mods::NONE, modes, &mut self.key_buf);
-                        if let Some(pty) = &self.pty {
-                            pty.write_all(&self.key_buf)?;
-                        }
                     }
+                    self.send_key_buf()?;
                 }
             }
         }
@@ -858,6 +879,9 @@ impl TerminalCore {
 
     /// Encode one mouse event under the current mouse mode and write it to the child
     /// (nothing when the mode produces no bytes for it).
+    /// `times` is for the wheel, which reports one press per notch and can arrive
+    /// several notches at a time from a touchpad flick: they encode into one buffer and
+    /// leave as one hand-off rather than one write each.
     fn write_mouse(
         &mut self,
         button: MouseButton,
@@ -865,13 +889,16 @@ impl TerminalCore {
         col: usize,
         row: usize,
         mods: input::Mods,
+        times: u32,
     ) -> Result<()> {
         let mode = self.screen.mouse_mode();
         self.key_buf.clear();
-        if mouse::encode(mode, button, kind, col, row, mods, &mut self.key_buf) {
-            if let Some(pty) = &self.pty {
-                pty.write_all(&self.key_buf)?;
-            }
+        let mut encoded = false;
+        for _ in 0..times {
+            encoded |= mouse::encode(mode, button, kind, col, row, mods, &mut self.key_buf);
+        }
+        if encoded {
+            self.send_key_buf()?;
         }
         Ok(())
     }
@@ -1083,16 +1110,92 @@ impl TerminalCore {
         })
     }
 
-    /// Write back any query replies (DA/DSR) the grid queued while parsing, through
-    /// the main PTY handle (writes stay on this thread).
-    fn flush_responses(&mut self) -> Result<()> {
-        if !self.screen.responses().is_empty() {
-            if let Some(pty) = &self.pty {
-                pty.write_all(self.screen.responses())?;
-            }
+    /// Send whatever the encoders just built in `key_buf`: a keystroke, a paste, a mouse
+    /// report, a scroll. One hand-off, whether it is three bytes or a megabyte.
+    fn send_key_buf(&mut self) -> Result<()> {
+        if self.key_buf.is_empty() {
+            return Ok(());
         }
-        self.screen.clear_responses();
+        enqueue(&mut self.out_buf, self.out_head, &self.key_buf);
+        self.pump_writes()
+    }
+
+    /// Push as much of the outbound queue as the child will take, right now.
+    ///
+    /// **This never blocks, and that is the whole design.** It used to, and that was a
+    /// way to freeze the entire window from bytes alone. The write happens on the one
+    /// thread that also renders, dispatches Wayland and delivers keys, so waiting for a
+    /// full input buffer to drain stops all four — and nothing guarantees it ever
+    /// drains, because the thing that has to read is the child. A child that is not
+    /// reading (`sleep 60`, anything compute-bound, `cat` pouring out a file) plus enough
+    /// bytes to fill the ~4 KB the line discipline holds was a dead terminal: no repaint,
+    /// no keystrokes, no Ctrl+C (key delivery is on this thread too), and no
+    /// `xdg_wm_base.pong`, so the compositor greyed the window out as unresponsive. The
+    /// gather thread could not rescue it either, because free buffers return to its pool
+    /// only through `Batch::drop`, which runs here.
+    ///
+    /// Reaching that state needed nothing from the user. Replies are queued while parsing
+    /// and flushed from inside the drain loop, so a file full of `\x1b[c` mints its own
+    /// outbound flood (each one a device-attributes query we answer) while the `cat`
+    /// printing it never reads stdin, so nothing drains it. Hence also [`OUT_QUEUE_MAX`]:
+    /// not blocking is only half the fix if the queue can grow forever instead.
+    ///
+    /// Called for every tab that owes bytes on every turn, whether or not `poll` named
+    /// it. The write is a single syscall that returns `EAGAIN` when there is no room,
+    /// which is cheaper than threading poll slots back to their tabs.
+    pub(super) fn pump_writes(&mut self) -> Result<()> {
+        let Some(pty) = &self.pty else {
+            // Demo mode, or a tab whose child is gone: there is nobody to write to, and
+            // holding the bytes would keep the fd registered for a wake that never comes.
+            self.out_buf.clear();
+            self.out_head = 0;
+            return Ok(());
+        };
+        while self.out_head < self.out_buf.len() {
+            let n = pty.write_some(&self.out_buf[self.out_head..])?;
+            if n == 0 {
+                break; // EAGAIN: the child's input buffer is full
+            }
+            self.out_head += n;
+        }
+        if self.out_head == self.out_buf.len() {
+            self.out_buf.clear();
+            self.out_head = 0;
+        } else if self.out_head >= OUT_COMPACT_AT {
+            // Reclaim the written prefix. Deferred to a threshold so a stalled child
+            // costs one memmove per that many bytes, not one per partial write.
+            self.out_buf.drain(..self.out_head);
+            self.out_head = 0;
+        }
         Ok(())
+    }
+
+    /// Whether this tab still owes the child bytes, so the event loop should watch its
+    /// master for `POLLOUT` and come back.
+    pub(super) fn wants_write(&self) -> bool {
+        self.out_head < self.out_buf.len()
+    }
+
+    /// The master fd to watch for writability, for a tab that owes bytes.
+    pub(super) fn write_fd(&self) -> Option<RawFd> {
+        if !self.wants_write() {
+            return None;
+        }
+        self.pty.as_ref().map(Pty::fd)
+    }
+
+    /// Queue any query replies (DA/DSR) the grid produced while parsing.
+    ///
+    /// Appended straight from the grid's own buffer rather than copied out: that keeps
+    /// the reply buffer and its capacity, which is the point of `clear_responses` over
+    /// taking it, and [`enqueue`] is a free function precisely so the borrow works.
+    fn flush_responses(&mut self) -> Result<()> {
+        if self.screen.responses().is_empty() {
+            return Ok(());
+        }
+        enqueue(&mut self.out_buf, self.out_head, self.screen.responses());
+        self.screen.clear_responses();
+        self.pump_writes()
     }
 
     /// The bookkeeping every burst of child output triggers: drop the selection if the
@@ -1572,6 +1675,23 @@ fn cursor_shape(style: CursorStyle, tty: TtyMode) -> CursorShape {
     }
 }
 
+/// Append `bytes` to a tab's outbound queue, dropping whatever would take it past
+/// [`OUT_QUEUE_MAX`]. `head` is how far the queue has already been written.
+///
+/// Overflow drops the *new* bytes rather than the old ones. The old ones are further
+/// along a byte stream the child is still parsing, and cutting from the middle of that
+/// would hand it a truncated escape sequence; losing the tail is the only lossy choice
+/// that leaves what does arrive well-formed.
+///
+/// A free function rather than a method so the caller can pass a slice borrowed from
+/// another of its own fields (the grid's reply buffer) without the borrow checker
+/// seeing a conflict.
+fn enqueue(out: &mut Vec<u8>, head: usize, bytes: &[u8]) {
+    let queued = out.len() - head;
+    let room = OUT_QUEUE_MAX.saturating_sub(queued);
+    out.extend_from_slice(&bytes[..bytes.len().min(room)]);
+}
+
 /// Append `text` to `out` with every line ending folded to a single carriage
 /// return: a pasted newline reaches the child as CR, so a bare LF becomes CR and a
 /// CRLF collapses to one CR (its LF swallowed) rather than arriving doubled; a lone
@@ -1693,6 +1813,82 @@ mod tests {
         out.clear();
         fold_paste_newlines(&mut out, "héllo 日本");
         assert_eq!(out, "héllo 日本".as_bytes());
+    }
+
+    #[test]
+    fn a_child_that_never_reads_cannot_freeze_the_terminal() {
+        // The freeze, reproduced against a real non-reading child. `sleep` never touches
+        // its stdin, so the ~4 KB the line discipline holds fills and stays full. The old
+        // write blocked here with an infinite `poll(POLLOUT)` on the one thread that also
+        // renders, dispatches Wayland and delivers keys: no repaint, no Ctrl+C, and no
+        // `pong`, so the compositor greyed the window out too.
+        let mut core = TerminalCore::new(false, 80, 24, METRICS, 640, 384, 0);
+        if core.spawn_program(&["/bin/sleep", "30"]).is_err() {
+            eprintln!("pty spawn unavailable in this environment; skipping");
+            return;
+        }
+
+        // Pastes far larger than any input buffer. Each call must *return*; the bug is
+        // that it did not, so the failure mode being guarded against is this test hanging
+        // rather than failing. Several of them, because how much the line discipline
+        // swallows before it pushes back is the kernel's business, not ours.
+        let big = "x".repeat(256 * 1024);
+        let start = Instant::now();
+        for _ in 0..24 {
+            core.apply(ToTerminal::Paste(big.clone().into_bytes()))
+                .expect("paste");
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a paste blocked on a child that will never read"
+        );
+
+        // Whatever the child would not take is owed, not lost, and never unbounded.
+        assert!(
+            core.out_buf.len() - core.out_head <= OUT_QUEUE_MAX,
+            "the queue is capped at {OUT_QUEUE_MAX}, holding {}",
+            core.out_buf.len() - core.out_head
+        );
+        assert_eq!(
+            core.wants_write(),
+            core.write_fd().is_some(),
+            "a tab that owes bytes names the fd to watch, and one that does not, does not"
+        );
+
+        // And the terminal is still live: it accepts and acts on an event, which is
+        // precisely what the frozen version could not do.
+        core.dirty = false;
+        core.apply(ToTerminal::Focus(true)).expect("focus");
+        assert!(core.dirty, "the window still responds");
+    }
+
+    #[test]
+    fn the_outbound_queue_drops_the_tail_rather_than_growing_without_bound() {
+        // The cap's semantics on their own, with no kernel in the way. Overflow drops the
+        // *new* bytes: the old ones are further along a byte stream the child is still
+        // parsing, and cutting from the middle would hand it a truncated escape sequence,
+        // so losing the tail is the only lossy choice that leaves what does arrive
+        // well-formed.
+        let mut out = Vec::new();
+        enqueue(&mut out, 0, &vec![b'a'; OUT_QUEUE_MAX - 4]);
+        assert_eq!(out.len(), OUT_QUEUE_MAX - 4);
+
+        enqueue(&mut out, 0, b"bbbbbbbb");
+        assert_eq!(out.len(), OUT_QUEUE_MAX, "filled exactly to the cap");
+        assert_eq!(
+            &out[OUT_QUEUE_MAX - 4..],
+            b"bbbb",
+            "and the head of the tail"
+        );
+
+        enqueue(&mut out, 0, b"cccc");
+        assert_eq!(out.len(), OUT_QUEUE_MAX, "a full queue takes nothing more");
+
+        // `head` is what has already gone to the child, so it frees budget: the queue is
+        // bounded by what is still *owed*, not by everything ever written.
+        enqueue(&mut out, OUT_QUEUE_MAX, b"dddd");
+        assert_eq!(out.len(), OUT_QUEUE_MAX + 4);
+        assert_eq!(&out[OUT_QUEUE_MAX..], b"dddd");
     }
 
     #[test]

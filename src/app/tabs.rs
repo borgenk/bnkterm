@@ -445,6 +445,27 @@ impl Tabs {
         self.entries.iter().filter_map(|entry| entry.core.poll_fd())
     }
 
+    /// The PTY master of every tab that still owes its child bytes, so the wait ends when
+    /// one of them makes room. Empty in the steady state: a write that the kernel took in
+    /// full leaves nothing queued, so this registers nothing and costs nothing.
+    pub(super) fn write_fds(&self) -> impl Iterator<Item = RawFd> + '_ {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.core.write_fd())
+    }
+
+    /// Push each tab's queued output as far as its child will take it. Every tab, not
+    /// just the visible one: a background shell waiting on a paste is owed those bytes
+    /// whether or not it is on screen.
+    pub(super) fn pump_writes(&mut self) -> Result<()> {
+        for entry in &mut self.entries {
+            if entry.core.wants_write() {
+                entry.core.pump_writes()?;
+            }
+        }
+        Ok(())
+    }
+
     /// Pump the active tab first, then background tabs from a rotating cursor,
     /// sharing one byte/time budget across the whole turn.
     pub(super) fn pump_all(&mut self, window_focused: bool) -> Result<bool> {

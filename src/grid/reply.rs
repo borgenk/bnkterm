@@ -48,8 +48,34 @@ impl Screen {
         std::mem::take(&mut self.responses)
     }
 
-    /// Queue bytes to be written back to the child.
+    /// Whether there is room to begin another answer.
+    ///
+    /// Reply *generation* has to be bounded here, because the child controls how many
+    /// questions it asks and nothing guarantees anything is draining the answers. A
+    /// 64 KiB batch of `\x1b[c` is roughly 21,800 device-attributes queries and about
+    /// 150 KB of replies, minted from a file the user merely `cat`s — and `cat` never
+    /// reads its own stdin. `OSC_MAX` bounds one sequence's payload and says nothing
+    /// about how many sequences arrive.
+    ///
+    /// Checked *before* an answer is built, never during, which is what makes
+    /// [`RESPONSE_MAX`] a soft cap: a reply already under way runs to completion and may
+    /// carry the buffer a few tens of bytes past it. That is the point. Several replies
+    /// are assembled in pieces (a prefix through [`respond`](Self::respond), then decimal
+    /// fields pushed straight onto the buffer), and cutting one in half would deliver a
+    /// malformed escape sequence into the child's input — strictly worse than silence,
+    /// because a program waiting on an answer merely times out, while a program handed a
+    /// broken one may act on it.
+    fn can_reply(&self) -> bool {
+        self.responses.len() < RESPONSE_MAX
+    }
+
+    /// Queue bytes to be written back to the child, if there is budget for another
+    /// answer. See [`can_reply`](Self::can_reply) for why the cap exists and why it is
+    /// checked per answer rather than per byte.
     pub(super) fn respond(&mut self, bytes: &[u8]) {
+        if !self.can_reply() {
+            return;
+        }
         self.responses.extend_from_slice(bytes);
     }
 
@@ -67,6 +93,9 @@ impl Screen {
     /// off", which invites the program to switch it on and then depend on it. A lie here
     /// is worse than the silence it replaces.
     pub(super) fn report_mode(&mut self, mode: u16, private: bool) {
+        if !self.can_reply() {
+            return;
+        }
         let state = match self.mode_state(mode, private) {
             Some(true) => 1,
             Some(false) => 2,
@@ -96,6 +125,9 @@ impl Screen {
     /// the cursor position (CPR). The `?6 n` private form is the extended report
     /// (DECXCPR) some programs use. The position is 1-based and origin-mode aware.
     pub(super) fn device_status(&mut self, params: &Params, private: u8) {
+        if !self.can_reply() {
+            return;
+        }
         let ps = params.value(0);
         match (private, ps) {
             (0, 5) => self.respond(b"\x1b[0n"),
@@ -150,6 +182,9 @@ impl Screen {
         if !self.in_band_resize {
             return;
         }
+        if !self.can_reply() {
+            return;
+        }
         let (cols, rows) = self.dimensions();
         let (w, h) = self.pixel_size;
         self.respond(b"\x1b[48;");
@@ -195,6 +230,9 @@ impl Screen {
     /// query". Answering 1 with an empty or invented setting would be worse than silence:
     /// the program would take the reply at face value and restore garbage.
     pub(super) fn decrqss(&mut self, setting: &[u8]) {
+        if !self.can_reply() {
+            return;
+        }
         match setting {
             b"m" => {
                 // SGR. We report the *pen*, which is what a program restoring a rendition
@@ -303,6 +341,9 @@ impl Screen {
     /// protocol's way of saying "I do not have that" — and it is a real answer, not a
     /// silence, so the program stops waiting.
     pub(super) fn xtgettcap(&mut self, data: &[u8]) {
+        if !self.can_reply() {
+            return;
+        }
         for name in data.split(|&b| b == b';') {
             let Some(decoded) = hex_decode(name) else {
                 self.respond(b"\x1bP0+r\x1b\\");
@@ -351,6 +392,9 @@ impl Screen {
     /// that wants key-release events and reads back that it is not getting them can
     /// fall back; one that is told yes and then never sees a release would hang.
     pub(super) fn kitty_keyboard(&mut self, params: &Params, private: u8) {
+        if !self.can_reply() {
+            return;
+        }
         match private {
             b'?' => {
                 self.respond(b"\x1b[?");

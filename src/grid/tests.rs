@@ -3694,6 +3694,46 @@ fn base64_decodes_what_a_terminal_actually_receives() {
 }
 
 #[test]
+fn a_flood_of_queries_cannot_mint_unbounded_replies() {
+    // The child decides how many questions it asks, so reply generation has to be
+    // bounded here rather than trusting the far side to drain. A file full of `\x1b[c`
+    // is ~21,800 device-attributes queries per 64 KiB, each answered — and the `cat`
+    // printing it never reads its stdin, so nothing consumes the answers.
+    let mut s = Screen::new(80, 24);
+    let flood = b"\x1b[c".repeat(40_000);
+    feed(&mut s, &flood);
+    // A soft cap by design: the budget is checked before an answer is built, never
+    // during, so the last one runs past the line rather than being cut in half. The
+    // overshoot is one reply, and the flood it replaces is ~280 KB of answers.
+    let len = s.responses().len();
+    assert!(len >= RESPONSE_MAX, "the cap is where the flood stopped");
+    assert!(
+        len < RESPONSE_MAX + 1024,
+        "and it overshoots by at most the one answer already under way, got {len}"
+    );
+
+    // Capped, not truncated: what is there is whole answers. A half-written reply is a
+    // malformed escape sequence in the child's input, which is worse than no reply.
+    let one = b"\x1b[?1;2c";
+    assert!(
+        !s.responses().is_empty(),
+        "and the early ones were answered"
+    );
+    assert_eq!(
+        s.responses().len() % one.len(),
+        0,
+        "the cap fell on an answer boundary"
+    );
+    assert!(s.responses().chunks(one.len()).all(|c| c == one));
+
+    // Draining resets the budget: it is a per-parse bound, not a lifetime one, so a
+    // long-lived shell asking a normal question an hour later still gets an answer.
+    s.clear_responses();
+    feed(&mut s, b"\x1b[c");
+    assert_eq!(s.responses(), one);
+}
+
+#[test]
 fn decrqm_reports_the_modes_we_have_and_admits_the_ones_we_do_not() {
     // Of the five modes nvim asks about before drawing anything, we now implement all
     // but one. The honest answer for that one is 0 ("I do not know this mode") — never

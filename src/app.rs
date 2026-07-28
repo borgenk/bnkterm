@@ -721,7 +721,21 @@ impl State {
             for fd in self.tabs.gather_fds() {
                 self.poll_set.add(fd);
             }
+            // A child that was not reading has to be able to end this wait, or bytes we
+            // owe it sit in the queue until something unrelated wakes us. Registers
+            // nothing in the steady state, where every write is taken in full. The same
+            // goes for another application still reading a selection off us.
+            for fd in self.tabs.write_fds() {
+                self.poll_set.add_writable(fd);
+            }
+            for send in &self.pending_sends {
+                self.poll_set.add_writable(send.fd());
+            }
             self.poll_set.wait(wait)?;
+            // Before anything else: whatever the far side will now take. Cheap when
+            // nothing is owed, and it is what keeps a queued paste or copy moving.
+            self.tabs.pump_writes()?;
+            self.pump_selection_sends();
             if self.poll_set.readable(wayland_slot) {
                 // poll said the socket has data (or hung up); this recv returns
                 // immediately, its short timeout only a safety net.

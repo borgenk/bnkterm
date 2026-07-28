@@ -341,6 +341,12 @@ impl fmt::Debug for Attrs {
 /// fatal (see [`Screen::collect_links`]).
 const LINK_LIMIT: usize = u16::MAX as usize - 1;
 
+/// How many bytes of query replies may accumulate before further answers are dropped
+/// (see [`Screen::respond`]). Sized far above any real conversation: the chattiest
+/// startup handshake in the wild is nvim's, a few hundred bytes, and this is two
+/// hundred times that. Only a flood reaches it.
+const RESPONSE_MAX: usize = 64 * 1024;
+
 /// Which OSC 8 hyperlink a cell belongs to: an index into the screen's [`LinkTable`],
 /// or [`LinkId::NONE`] for the overwhelming majority of cells, which are in none.
 ///

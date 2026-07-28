@@ -203,11 +203,17 @@ impl Pty {
         }
     }
 
-    /// Write every byte to the child, retrying short writes and `EINTR`, and
-    /// waiting for room on `EAGAIN` (the child is momentarily not reading). This
-    /// carries the encoded key bytes to the shell.
-    pub fn write_all(&self, mut bytes: &[u8]) -> Result<()> {
-        while !bytes.is_empty() {
+    /// Write as much of `bytes` as the kernel will take right now, returning how many
+    /// it took. `Ok(0)` means the child's input buffer is full and the caller must come
+    /// back when the master reports `POLLOUT`; `EINTR` is retried in place.
+    ///
+    /// Deliberately partial. Looping here until everything is written means blocking the
+    /// only thread there is, and the wait has no bound: the child decides when to read,
+    /// and a child that is not reading (`sleep 60`, anything compute-bound, or `cat`
+    /// pouring out a file) never will. The caller owns a queue and drains it from the
+    /// event loop instead, so a full input buffer costs latency rather than the window.
+    pub fn write_some(&self, bytes: &[u8]) -> Result<usize> {
+        loop {
             // SAFETY: bytes is a valid slice; write reads at most its len.
             let n = unsafe {
                 write(
@@ -216,20 +222,15 @@ impl Pty {
                     bytes.len(),
                 )
             };
-            if n > 0 {
-                bytes = &bytes[n as usize..];
-                continue;
+            if n >= 0 {
+                return Ok(n as usize);
             }
             match errno() {
                 EINTR => continue,
-                EAGAIN => {
-                    // The PTY input buffer is full; wait until it drains.
-                    poll_writable(self.master.as_raw_fd())?;
-                }
+                EAGAIN => return Ok(0),
                 e => return Err(Error::msg(format!("pty write failed: errno {e}"))),
             }
         }
-        Ok(())
     }
 
     /// Tell the child the window is now `cols` x `rows` cells; the kernel raises
@@ -396,10 +397,21 @@ impl PollSet {
     /// Register `fd` for readable, hangup, and error notification, returning the
     /// stable slot used to inspect this wait's result with [`Self::readable`].
     pub fn add(&mut self, fd: RawFd) -> usize {
+        self.push(fd, POLLIN)
+    }
+
+    /// Register `fd` for writability, so a wait ends when a child that was not reading
+    /// makes room in its input buffer. Hangup and error arrive regardless of `events`,
+    /// so a dead child wakes the loop here too.
+    pub fn add_writable(&mut self, fd: RawFd) -> usize {
+        self.push(fd, POLLOUT)
+    }
+
+    fn push(&mut self, fd: RawFd, events: c_short) -> usize {
         let slot = self.fds.len();
         self.fds.push(Pollfd {
             fd,
-            events: POLLIN,
+            events,
             revents: 0,
         });
         slot
@@ -438,26 +450,6 @@ impl PollSet {
 impl Default for PollSet {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Block until `fd` is writable (used to wait out a full PTY input buffer).
-fn poll_writable(fd: RawFd) -> Result<()> {
-    let mut pfd = Pollfd {
-        fd,
-        events: POLLOUT,
-        revents: 0,
-    };
-    loop {
-        // SAFETY: one valid pollfd; -1 timeout blocks until writable.
-        let r = unsafe { poll(&mut pfd, 1, -1) };
-        if r < 0 && errno() == EINTR {
-            continue;
-        }
-        if r < 0 {
-            return Err(errno_error("poll"));
-        }
-        return Ok(());
     }
 }
 
@@ -885,7 +877,12 @@ mod tests {
             eprintln!("pty spawn unavailable in this environment; skipping");
             return;
         };
-        pty.write_all(b"hello pty\n").expect("write to the child");
+        let line = b"hello pty\n";
+        assert_eq!(
+            pty.write_some(line).expect("write to the child"),
+            line.len(),
+            "a fresh tty takes a short line whole"
+        );
         // Drain until the echo arrives (cat echoes line-buffered by the tty).
         let mut got = Vec::new();
         let mut buf = [0u8; 4096];
