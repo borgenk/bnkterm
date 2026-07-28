@@ -134,6 +134,65 @@ impl SelectionState {
             selection_text_mime: None,
         }
     }
+
+    /// Record an offer the compositor has just introduced. Returns the offer this one
+    /// supersedes, which the caller must destroy.
+    ///
+    /// Something has to be returned, because an offer nobody destroys is a leak — a
+    /// client id (`alloc_id` never reuses them) plus a compositor resource. And offers
+    /// that are introduced and never named are not an edge case: `wl_data_device` carries
+    /// drag-and-drop offers on the same object, bnkterm handles no DnD events at all, so
+    /// every drag over the surface introduces one that no `selection` will ever claim.
+    ///
+    /// Never the selection's own offer. The compositor introduces an offer and then names
+    /// it, so `incoming_offer` and `selection_offer` are routinely the same id, and that
+    /// one is still ours to paste from.
+    fn introduce(&mut self, offer: u32) -> Option<u32> {
+        let stale = self.incoming_offer;
+        self.incoming_offer = offer;
+        self.incoming_text_mime = None;
+        (stale != 0 && stale != offer && stale != self.selection_offer).then_some(stale)
+    }
+
+    /// Offer `mime` as a candidate paste type, keeping the best one seen.
+    ///
+    /// **Best, not first.** The old rule took the first `text/*` and could only be
+    /// displaced by an exact `text/plain;charset=utf-8` — but `text/html`,
+    /// `text/uri-list` and `text/plain;charset=utf-16` are all `text/*` too, and sources
+    /// advertise the richest type first (LibreOffice and several GTK apps lead with
+    /// `text/html`). So copying a word from a document and pasting it at a shell prompt
+    /// put `<meta http-equiv=...><p>ls -la</p>` on the command line. A `utf-16` win is
+    /// worse still: the bytes are not UTF-8, so the paste arrives as a row of replacement
+    /// characters — visible garbage rather than an invisible no-op, but still wrong.
+    ///
+    /// The rank is recomputed from whatever is stored rather than kept beside it, so the
+    /// two cannot drift.
+    fn offer_mime(&mut self, mime: &str) {
+        let Some(rank) = mime_rank(mime) else { return };
+        let best = self.incoming_text_mime.as_deref().and_then(mime_rank);
+        if best.is_none_or(|best| rank < best) {
+            self.incoming_text_mime = Some(mime.to_string());
+        }
+    }
+
+    /// Record the selection becoming `offer` (`0` clears it). Returns the offer the
+    /// previous selection held, for the caller to destroy.
+    ///
+    /// Clearing `incoming_offer` here is what keeps its invariant — zero, or an offer
+    /// that is alive. Without it a `selection(0)` that destroys the old offer would leave
+    /// `incoming_offer` naming a dead object, and the next introduction would destroy it
+    /// a second time.
+    fn take_selection(&mut self, offer: u32) -> Option<u32> {
+        let old = self.selection_offer;
+        // Only an offer we were introduced to carries a MIME we learned; anything else
+        // (including a clear) leaves the selection with no text type.
+        let becomes_ours = offer != 0 && offer == self.incoming_offer;
+        let mime = self.incoming_text_mime.take();
+        self.selection_text_mime = if becomes_ours { mime } else { None };
+        self.selection_offer = offer;
+        self.incoming_offer = 0;
+        (old != 0 && old != offer).then_some(old)
+    }
 }
 
 impl State {
@@ -234,27 +293,18 @@ impl State {
     /// one (or to null).
     fn on_selection_device(&mut self, t: Transport, opcode: u16, r: &mut Reader) -> Result<()> {
         let ops = Self::ops(t);
-        if opcode == ops.ev_data_offer {
-            let offer = r.u32()?;
-            let st = self.selection_mut(t);
-            st.incoming_offer = offer;
-            st.incoming_text_mime = None;
+        // Wire decoding here, the offer lifecycle in [`SelectionState`], which is what
+        // makes "who owns this offer now, and who destroys it" testable without a
+        // compositor.
+        let doomed = if opcode == ops.ev_data_offer {
+            self.selection_mut(t).introduce(r.u32()?)
         } else if opcode == ops.ev_selection {
-            let offer = r.u32()?;
-            // Copy out what the decision needs so the immutable borrow ends before
-            // the `request` and the mutable write below.
-            let st = self.selection(t);
-            let old = st.selection_offer;
-            let becomes_ours = offer != 0 && offer == st.incoming_offer;
-            let mime = becomes_ours
-                .then(|| st.incoming_text_mime.clone())
-                .flatten();
-            if old != 0 && old != offer {
-                self.conn.request(old, ops.offer_destroy, &[]);
-            }
-            let st = self.selection_mut(t);
-            st.selection_offer = offer;
-            st.selection_text_mime = mime;
+            self.selection_mut(t).take_selection(r.u32()?)
+        } else {
+            None
+        };
+        if let Some(offer) = doomed {
+            self.conn.request(offer, ops.offer_destroy, &[]);
         }
         Ok(())
     }
@@ -283,16 +333,11 @@ impl State {
         Ok(())
     }
 
-    /// One MIME type of an incoming offer; remember the first (preferred) text one so
-    /// a paste knows what to request.
+    /// One MIME type of an incoming offer; keep the best text one seen so a paste knows
+    /// what to request. See [`SelectionState::offer_mime`].
     fn on_selection_offer_mime(&mut self, t: Transport, r: &mut Reader) -> Result<()> {
         let mime = r.string()?;
-        if is_text_mime(mime) {
-            let st = self.selection_mut(t);
-            if st.incoming_text_mime.is_none() || mime == CLIPBOARD_MIMES[0] {
-                st.incoming_text_mime = Some(mime.to_string());
-            }
-        }
+        self.selection_mut(t).offer_mime(mime);
         Ok(())
     }
 
@@ -434,4 +479,169 @@ impl State {
 /// Whether a clipboard MIME type carries text we can paste.
 pub(super) fn is_text_mime(mime: &str) -> bool {
     mime.starts_with("text/") || mime == "UTF8_STRING"
+}
+
+/// How good a text MIME is for pasting into a terminal, **lower is better**; `None` for
+/// one that carries no text at all.
+///
+/// A total order rather than a "first `text/*` wins" rule, because a source advertises
+/// its *richest* type first and the richest type is the one a terminal wants least. The
+/// tiers:
+///
+/// 0. `text/plain;charset=utf-8` — exactly what was asked for, and what we advertise
+///    when copying ([`CLIPBOARD_MIMES`]).
+/// 1. `UTF8_STRING` — the X11 atom naming the same bytes, still offered by Xwayland
+///    clients.
+/// 2. `text/plain` — text with no charset stated, which is UTF-8 in every locale a
+///    terminal runs in.
+/// 3. Everything else under `text/`: `text/html`, `text/uri-list`,
+///    `text/plain;charset=utf-16`. Taken only when a source offers nothing better, on
+///    the grounds that some text beats no paste — a source offering *only* markup is
+///    rare, where one offering markup *first* is the common case.
+fn mime_rank(mime: &str) -> Option<u8> {
+    match mime {
+        "text/plain;charset=utf-8" => Some(0),
+        "UTF8_STRING" => Some(1),
+        "text/plain" => Some(2),
+        _ if is_text_mime(mime) => Some(3),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::clipboard::SelectionState;
+
+    #[test]
+    fn an_offer_that_never_becomes_the_selection_is_still_destroyed() {
+        // `wl_data_device` carries drag-and-drop offers on the same object as clipboard
+        // ones, and bnkterm handles no DnD events at all — so every drag over the surface
+        // introduces an offer that no `selection` will ever claim. Only offers that
+        // *became* the selection were destroyed, so each of those drags leaked a client
+        // id (never reused) and a compositor resource.
+        let mut st = SelectionState::new();
+
+        assert_eq!(st.introduce(10), None, "nothing to supersede yet");
+        assert_eq!(
+            st.introduce(11),
+            Some(10),
+            "the drag's offer is superseded and must be destroyed"
+        );
+        assert_eq!(st.introduce(12), Some(11));
+        assert_eq!(st.introduce(12), None, "the same offer twice is not a leak");
+    }
+
+    #[test]
+    fn the_selections_own_offer_survives_the_next_introduction() {
+        // The compositor introduces an offer and then names it, so `incoming_offer` and
+        // `selection_offer` are routinely the same id. Destroying it on the next
+        // introduction would take down the offer a paste still has to read from.
+        let mut st = SelectionState::new();
+        st.introduce(10);
+        st.incoming_text_mime = Some("text/plain;charset=utf-8".to_string());
+        assert_eq!(st.take_selection(10), None, "no previous selection");
+        assert_eq!(st.selection_offer, 10);
+        assert_eq!(
+            st.selection_text_mime.as_deref(),
+            Some("text/plain;charset=utf-8"),
+            "an offer that became the selection carries its MIME across"
+        );
+
+        assert_eq!(st.introduce(11), None, "the selection's offer is not stale");
+        assert_eq!(st.selection_offer, 10, "and it is still the selection");
+        assert_eq!(st.introduce(12), Some(11), "but the drag's offer goes");
+        assert_eq!(st.selection_offer, 10);
+    }
+
+    #[test]
+    fn a_cleared_selection_does_not_leave_a_destroyed_offer_named() {
+        // The double-free trap. `selection(0)` destroys the old offer, and
+        // `incoming_offer` was pointing at that very id — so without clearing it, the
+        // next introduction would ask the compositor to destroy a dead object.
+        let mut st = SelectionState::new();
+        st.introduce(10);
+        st.take_selection(10);
+
+        assert_eq!(st.take_selection(0), Some(10), "the selection was cleared");
+        assert_eq!(st.selection_offer, 0);
+        assert_eq!(st.incoming_offer, 0, "and nothing still names the dead id");
+        assert_eq!(
+            st.introduce(11),
+            None,
+            "so the next introduction destroys nothing"
+        );
+
+        // A selection replaced by another's is the ordinary case, and the old one goes.
+        let mut st = SelectionState::new();
+        st.introduce(20);
+        st.take_selection(20);
+        st.introduce(21);
+        assert_eq!(st.take_selection(21), Some(20));
+    }
+
+    #[test]
+    fn the_best_offered_text_type_wins_whatever_order_it_arrives_in() {
+        // A source advertises its richest type first, and the richest type is the one a
+        // terminal wants least. Taking the first `text/*` therefore lost to whatever the
+        // source led with: LibreOffice and several GTK apps lead with `text/html`, so
+        // copying a word from a document and pasting it at a shell prompt put
+        // `<meta http-equiv=...><p>ls -la</p>` on the command line.
+        let best = |offers: &[&str]| {
+            let mut st = SelectionState::new();
+            for m in offers {
+                st.offer_mime(m);
+            }
+            st.incoming_text_mime
+        };
+
+        assert_eq!(
+            best(&["text/html", "text/plain", "text/plain;charset=utf-8"]).as_deref(),
+            Some("text/plain;charset=utf-8"),
+            "the richest type arriving first does not win"
+        );
+        assert_eq!(
+            best(&["text/plain;charset=utf-8", "text/plain", "text/html"]).as_deref(),
+            Some("text/plain;charset=utf-8"),
+            "and the best arriving first is not displaced by the rest"
+        );
+
+        // utf-16 is `text/*` and is not UTF-8, so winning meant a paste of replacement
+        // characters — visible garbage where it used to be an invisible no-op.
+        assert_eq!(
+            best(&["text/plain;charset=utf-16", "text/plain"]).as_deref(),
+            Some("text/plain")
+        );
+        // The X11 atom names the same bytes as our first choice, so it outranks bare
+        // `text/plain` but not an explicit utf-8.
+        assert_eq!(
+            best(&["text/plain", "UTF8_STRING"]).as_deref(),
+            Some("UTF8_STRING")
+        );
+        assert_eq!(
+            best(&["UTF8_STRING", "text/plain;charset=utf-8"]).as_deref(),
+            Some("text/plain;charset=utf-8")
+        );
+
+        // Some text beats no paste: a source offering nothing better still gets used.
+        assert_eq!(best(&["text/html"]).as_deref(), Some("text/html"));
+        // And a non-text offer is not a candidate at all.
+        assert_eq!(best(&["image/png", "application/pdf"]), None);
+        assert_eq!(
+            best(&["image/png", "text/plain"]).as_deref(),
+            Some("text/plain")
+        );
+    }
+
+    #[test]
+    fn a_selection_we_were_not_introduced_to_carries_no_mime() {
+        // A MIME learned from one offer must not be attributed to a different one: the
+        // paste would then ask for a type the new source never advertised.
+        let mut st = SelectionState::new();
+        st.introduce(10);
+        st.incoming_text_mime = Some("text/plain".to_string());
+
+        st.take_selection(99);
+        assert_eq!(st.selection_offer, 99);
+        assert_eq!(st.selection_text_mime, None);
+    }
 }
