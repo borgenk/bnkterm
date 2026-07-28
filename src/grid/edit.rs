@@ -731,6 +731,23 @@ impl Screen {
     pub fn resize(&mut self, cols: usize, rows: usize) -> ResizeEffect {
         let cols = cols.max(1);
         let rows = rows.max(1);
+        // A resize that does not resize is not a resize. Both paths below reset state
+        // that belongs to the child rather than to the window — [`Buffer::resize`] runs
+        // its tail unconditionally, including on the `Ordering::Equal` arm, so it clears
+        // the scroll region and the pending-wrap flag, and the height-only branch snaps
+        // the view to the bottom — and the alt path would additionally renumber and drop
+        // the selection. None of that is warranted by a grid that has not moved.
+        //
+        // This is reachable, and silently: the window's own guard early-returns only when
+        // the *pixel* size, the grid dimensions and the bar geometry are all unchanged, so
+        // a sub-cell drag of the window edge or a scale change arrives here with identical
+        // dimensions. The child is not told either, because `set_winsize` always sends
+        // zero for the pixel fields and the kernel compares the whole `winsize` struct
+        // before deciding to raise `SIGWINCH`. So a three-pixel drag would drop tmux's
+        // status-line margin with nothing to prompt tmux to repaint it.
+        if cols == self.primary.cols && rows == self.primary.rows {
+            return ResizeEffect::Stable;
+        }
         let remap = if cols == self.primary.cols {
             // Height-only (or a no-op): re-clamp rows (a grow pulls history back down) and
             // re-pin the view. The primary's ids stay put, so prompts need no translation.

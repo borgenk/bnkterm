@@ -2085,6 +2085,70 @@ fn resize_preserves_the_scrolled_view() {
 }
 
 #[test]
+fn a_resize_to_the_same_size_changes_nothing_at_all() {
+    // Reachable from a sub-cell drag of the window edge, or a scale change: the window's
+    // guard lets anything through whose *pixel* size moved, so the grid is asked to
+    // resize to the dimensions it already has. Every path below this used to run anyway,
+    // resetting state the child owns — and the child is never told, because the pixel
+    // fields of `winsize` are always sent as zero, so the kernel sees a byte-identical
+    // struct and raises no SIGWINCH. The program cannot know to repaint what we broke.
+    let mut s = Screen::new(20, 8);
+
+    // A program reserving a status line, exactly as tmux or vim-with-a-split does.
+    feed(&mut s, b"\x1b[1;5r"); // DECSTBM: rows 1..5, leaving row 6 as a status line
+    feed(&mut s, b"\x1b[6;1HSTATUS");
+    assert_eq!(s.row_string(5).trim_end(), "STATUS");
+
+    // A user scrolled back into history, and a pending wrap parked at the right edge.
+    feed(&mut s, b"\x1b[1;1H");
+    for i in 0..12 {
+        feed(&mut s, format!("line{i}\r\n").as_bytes());
+    }
+    s.scroll_view_up(3);
+    let scrolled_to = s.view_offset();
+    assert!(scrolled_to > 0, "the view is up in history");
+    feed(&mut s, b"\x1b[3;20Hx"); // print in the last column: wrap is now pending
+
+    assert!(s.active().cursor.pending_wrap, "and a wrap is pending");
+
+    let effect = s.resize(20, 8);
+    assert!(
+        matches!(effect, ResizeEffect::Stable),
+        "nothing moved, so the selection stands"
+    );
+    assert_eq!(
+        (s.active().scroll_top, s.active().scroll_bottom),
+        (0, 4),
+        "the scroll region is the child's, and the child was not consulted"
+    );
+    assert!(
+        s.active().cursor.pending_wrap,
+        "the deferred wrap still belongs to the glyph that parked it"
+    );
+    assert_eq!(
+        s.view_offset(),
+        scrolled_to,
+        "the history view is where the user left it"
+    );
+
+    // The behavioural half of the margins, and the failure the user actually sees: a
+    // line feed at the region's bottom margin must scroll *inside* the region and leave
+    // the cursor there. With the margins reset it walks onto row 6 instead, and the next
+    // thing the program prints lands on top of its own status line.
+    feed(&mut s, b"\x1b[5;1H\nOUT");
+    assert_eq!(
+        s.row_string(5).trim_end(),
+        "STATUS",
+        "the status line is intact"
+    );
+    assert_eq!(
+        s.row_string(4).trim_end(),
+        "OUT",
+        "and the output stayed inside the scroll region"
+    );
+}
+
+#[test]
 fn reflow_widen_rejoins_a_wrapped_line() {
     let mut s = Screen::new(4, 3);
     feed(&mut s, b"abcdef");
