@@ -143,8 +143,11 @@ fn shader_words(bytes: &[u8]) -> Result<Vec<u32>> {
         return Err(Error::msg("malformed SPIR-V blob"));
     }
     Ok(bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .copied()
+        .map(u32::from_ne_bytes)
         .collect())
 }
 

@@ -792,7 +792,7 @@ mod tests {
         fn setsid() -> c_int;
         fn execvp(file: *const core::ffi::c_char, argv: *const *const core::ffi::c_char) -> c_int;
         fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
-        fn open(path: *const core::ffi::c_char, flags: c_int) -> c_int;
+        fn open(path: *const core::ffi::c_char, flags: c_int, ...) -> c_int;
         fn close(fd: c_int) -> c_int;
         fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
         fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;

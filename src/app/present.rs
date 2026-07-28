@@ -438,7 +438,7 @@ impl State {
 
         let buffers = self.presentation.buffers;
         let busy = self.presentation.busy;
-        let images: Vec<vulkan::GpuImage> = self.presentation.images.drain(..).collect();
+        let images: Vec<vulkan::GpuImage> = std::mem::take(&mut self.presentation.images);
         // Nothing may be in flight on *our* device while its images are touched, whether they
         // are freed now or held for later; resize is rare enough that a full drain is the
         // simple correct answer.

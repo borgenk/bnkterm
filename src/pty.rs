@@ -601,7 +601,10 @@ extern "C" {
     fn execv(path: *const c_char, argv: *const *const c_char) -> c_int;
     fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
     fn close(fd: c_int) -> c_int;
-    fn open(path: *const c_char, flags: c_int) -> c_int;
+    /// Variadic because POSIX says so: a third `mode_t` argument is read only when
+    /// `flags` carries `O_CREAT` or `O_TMPFILE`. Declaring the two-argument form
+    /// would be a different ABI than the `open` the C library exports.
+    fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;

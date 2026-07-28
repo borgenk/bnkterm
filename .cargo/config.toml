@@ -1,0 +1,13 @@
+# The standard library is built from source with the terminal, which is what lets
+# LTO reach across it and what makes the release profile's immediate-abort panics
+# remove std's backtrace symbolizer rather than just ours. optimize_for_size picks
+# std's smaller algorithms, which measured free on the perf gate.
+[unstable]
+build-std = ["std", "panic_abort"]
+build-std-features = ["optimize_for_size"]
+
+# build-std needs a target named explicitly. This is the only one that ships, so it
+# is the one named here; a build on another architecture has to pass its own
+# --target. Naming it also moves every artifact under target/<triple>/.
+[build]
+target = "x86_64-unknown-linux-gnu"

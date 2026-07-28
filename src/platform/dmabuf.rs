@@ -127,8 +127,8 @@ impl FeedbackState {
     /// table. An index past the table (a compositor bug) is skipped rather than
     /// poisoning the whole tranche.
     pub fn tranche_formats(&mut self, bytes: &[u8]) {
-        for pair in bytes.chunks_exact(2) {
-            let idx = u16::from_ne_bytes([pair[0], pair[1]]) as usize;
+        for &pair in bytes.as_chunks::<2>().0 {
+            let idx = u16::from_ne_bytes(pair) as usize;
             if let Some(&fm) = self.table.get(idx) {
                 self.tranche_formats.push(fm);
             }
@@ -167,7 +167,9 @@ impl FeedbackState {
 /// `u64 modifier`, all native-endian. A trailing partial entry is ignored.
 pub fn parse_format_table(bytes: &[u8]) -> Vec<FormatModifier> {
     bytes
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .map(|e| FormatModifier {
             format: u32::from_ne_bytes([e[0], e[1], e[2], e[3]]),
             modifier: u64::from_ne_bytes([e[8], e[9], e[10], e[11], e[12], e[13], e[14], e[15]]),

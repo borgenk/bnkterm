@@ -423,12 +423,11 @@ fn pick_device(
         props.s_type = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
 
         let exts = enumerate_extensions(enumerate_exts, physical)?;
-        let name;
-        if has_extension(&exts, EXT_PHYSICAL_DEVICE_DRM) {
+        let name = if has_extension(&exts, EXT_PHYSICAL_DEVICE_DRM) {
             props.p_next = (&mut drm as *mut VkPhysicalDeviceDrmPropertiesEXT).cast();
             // SAFETY: physical is live; props chains one correctly-typed struct.
             unsafe { get_props2(physical, &mut props) };
-            name = c_name(&props.properties.device_name);
+            c_name(&props.properties.device_name)
         } else {
             // Without the DRM identity the device cannot be matched to the
             // compositor's; note it for the error message and move on.
@@ -439,7 +438,7 @@ fn pick_device(
                 c_name(&props.properties.device_name)
             ));
             continue;
-        }
+        };
 
         let primary_matches = drm.has_primary != 0
             && (drm.primary_major, drm.primary_minor) == (want_major, want_minor);
