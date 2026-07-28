@@ -4188,7 +4188,44 @@ fn a_kitty_push_loop_cannot_grow_the_stack_without_bound() {
         feed(&mut s, b"\x1b[>0u");
     }
     feed(&mut s, b"\x1b[>1u");
-    assert_eq!(s.kitty_stack.len(), KITTY_STACK_LIMIT);
+    assert_eq!(s.kitty_stack().len(), KITTY_STACK_LIMIT);
+    assert_eq!(s.kitty_flags(), KittyFlags::DISAMBIGUATE);
+}
+
+#[test]
+fn the_kitty_stack_is_per_screen_so_a_dead_program_cannot_strand_the_shell() {
+    // The scenario, and it is the ordinary one: `nvim` sends `?1049h` and then
+    // `CSI > 1 u`, gets `SIGKILL`ed, and never sends the matching `CSI < 1 u`. The
+    // shell's `?1049l` returns to the main screen — which must be speaking exactly the
+    // protocol it was speaking before `nvim` started. With one shared stack it is not:
+    // `Esc` becomes `CSI 27u` and `Ctrl+C` becomes `CSI 99;5u`, so zsh vi-mode never
+    // leaves insert, fzf bindings misfire, and Ctrl+C prints garbage.
+    //
+    // This is why kitty's protocol specifies a stack per screen, and it is the whole
+    // point of having a stack at all: a program cannot strand the terminal in a mode the
+    // shell underneath it does not understand.
+    let mut s = Screen::new(80, 24);
+    feed(&mut s, b"\x1b[>2u"); // the shell's own flags, on the main screen
+    assert_eq!(s.kitty_flags(), KittyFlags::REPORT_EVENT_TYPES);
+
+    feed(&mut s, b"\x1b[?1049h");
+    assert_eq!(
+        s.kitty_flags(),
+        KittyFlags::NONE,
+        "the alt screen starts on its own empty stack, not the main screen's"
+    );
+    feed(&mut s, b"\x1b[>1u\x1b[>1u"); // and the program pushes, twice, and dies
+
+    feed(&mut s, b"\x1b[?1049l");
+    assert_eq!(
+        s.kitty_flags(),
+        KittyFlags::REPORT_EVENT_TYPES,
+        "the shell got its own protocol back, not the dead program's"
+    );
+
+    // And the alt screen kept its own, so re-entering resumes where it left off rather
+    // than inheriting whatever the shell has been doing meanwhile.
+    feed(&mut s, b"\x1b[?1049h");
     assert_eq!(s.kitty_flags(), KittyFlags::DISAMBIGUATE);
 }
 
@@ -4231,6 +4268,45 @@ fn a_reset_takes_the_keyboard_protocols_with_it() {
     feed(&mut s, b"\x1bc"); // RIS
     assert_eq!(s.kitty_flags(), KittyFlags::NONE);
     assert_eq!(s.modify_other_keys(), ModifyOtherKeys::Off);
+}
+
+#[test]
+fn a_reset_does_not_take_what_was_never_the_childs_to_reset() {
+    // RIS wipes the terminal, and the terminal is the part the child owns. Three things
+    // are not that, and rebuilding the whole `Screen` took all three.
+    let mut s = Screen::new(80, 24);
+    s.set_pixel_size(640, 384); // the app's, from the window
+    feed(&mut s, b"\x1b]0;a title\x07");
+
+    // A reply queued and a reset, in one write — which is one `read` from the pty, so
+    // the parser sees them back to back. The answer to a question already asked cannot
+    // be un-asked by what comes after it; xterm delivers it.
+    feed(&mut s, b"\x1b[6n\x1bc");
+    assert_eq!(
+        s.take_responses(),
+        b"\x1b[1;1R",
+        "the cursor report queued before the reset still arrives"
+    );
+
+    assert_eq!(
+        s.title(),
+        "a title",
+        "xterm's RIS does not reset the window title"
+    );
+
+    // And the pixel size is a physical fact about a window the child cannot see and did
+    // not set. Cleared, `?2048` answers `0x0` until the user happens to resize — the
+    // child asks a question the terminal knows the answer to and is told zero.
+    feed(&mut s, b"\x1b[?2048h");
+    assert_eq!(s.take_responses(), b"\x1b[48;24;80;384;640t");
+
+    // What the child *did* set is gone, which is the whole point of RIS.
+    let mut s = Screen::new(80, 24);
+    feed(&mut s, b"\x1b[?7l\x1b[4h\x1b[?2027h\x1bc");
+    feed(&mut s, b"\x1b[?7$p");
+    assert_eq!(s.take_responses(), b"\x1b[?7;1$y", "autowrap back on");
+    feed(&mut s, b"\x1b[?2027$p");
+    assert_eq!(s.take_responses(), b"\x1b[?2027;2$y", "clustering back off");
 }
 
 #[test]

@@ -731,16 +731,29 @@ pub struct Screen {
     /// its own link namespace, so an id means the same thing whichever buffer holds it
     /// and switching buffers costs nothing.
     links: LinkTable,
-    /// The kitty keyboard protocol's flag stack. It is a stack because a full-screen
-    /// program pushes the flags it wants on entry and pops them on exit,
-    /// so it cannot strand the terminal in a mode the shell underneath it does not
+    /// The kitty keyboard protocol's flag stacks, **one per screen**. It is a stack
+    /// because a full-screen program pushes the flags it wants on entry and pops them on
+    /// exit, so it cannot strand the terminal in a mode the shell underneath it does not
     /// understand — and a program that dies without popping is cleaned up by whatever
     /// pushed beneath it. The top entry is what is in force; an empty stack is legacy.
     ///
-    /// The child chooses the depth, so this is attacker-controlled and therefore capped
+    /// Per screen because kitty's protocol says so, and for the reason the whole stack
+    /// exists: a program that dies in the alt screen must not leave the *main* screen's
+    /// shell speaking a protocol it does not know. `nvim` sends `?1049h` then `CSI > 1 u`,
+    /// is `SIGKILL`ed, and never sends `CSI < 1 u`; the shell's `?1049l` comes back to a
+    /// main screen where `Esc` is `CSI 27u` and `Ctrl+C` is `CSI 99;5u`. zsh vi-mode never
+    /// leaves insert, fzf bindings misfire, and `Ctrl+C` prints garbage.
+    ///
+    /// Two fields rather than a save/restore in `switch_alt`, which is deliberate: the
+    /// bug this fixes *was* a switch that forgot a field, so the fix is a shape where
+    /// there is nothing to forget. [`Screen::kitty_stack`] picks by `on_alt`, exactly as
+    /// [`Screen::active`] picks the buffer.
+    ///
+    /// The child chooses the depth, so these are attacker-controlled and therefore capped
     /// ([`KITTY_STACK_LIMIT`]); a program in a push loop must not grow the terminal's
     /// memory without bound.
-    kitty_stack: Vec<KittyFlags>,
+    kitty_primary: Vec<KittyFlags>,
+    kitty_alt: Vec<KittyFlags>,
     /// xterm's `modifyOtherKeys` level (`CSI > 4 ; Pv m`). Not a stack: XTMODKEYS has no
     /// push/pop, a program just sets a level and sets it back.
     modify_other_keys: ModifyOtherKeys,
@@ -895,7 +908,8 @@ impl Screen {
             cursor_appearance: CursorAppearance::default(),
             responses: Vec::new(),
             links: LinkTable::default(),
-            kitty_stack: Vec::new(),
+            kitty_primary: Vec::new(),
+            kitty_alt: Vec::new(),
             modify_other_keys: ModifyOtherKeys::default(),
             theme: Box::new(Theme::default()),
             cwd: None,
@@ -936,6 +950,25 @@ impl Screen {
             &mut self.alt
         } else {
             &mut self.primary
+        }
+    }
+
+    /// The kitty flag stack of the screen currently showing. Same selector as
+    /// [`Self::active`], on the same flag, so the two can never disagree about which
+    /// screen we are on.
+    pub(super) fn kitty_stack(&self) -> &Vec<KittyFlags> {
+        if self.on_alt {
+            &self.kitty_alt
+        } else {
+            &self.kitty_primary
+        }
+    }
+
+    pub(super) fn kitty_stack_mut(&mut self) -> &mut Vec<KittyFlags> {
+        if self.on_alt {
+            &mut self.kitty_alt
+        } else {
+            &mut self.kitty_primary
         }
     }
 

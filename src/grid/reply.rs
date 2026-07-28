@@ -407,19 +407,20 @@ impl Screen {
                 let mode = if params.len() > 1 { params.value(1) } else { 1 };
                 let current = self.kitty_flags();
                 let next = current.apply(flags, mode);
-                match self.kitty_stack.last_mut() {
+                match self.kitty_stack_mut().last_mut() {
                     Some(top) => *top = next,
                     // Setting flags with nothing pushed still has to take effect, so the
                     // set becomes the stack's first entry.
-                    None => self.kitty_stack.push(next),
+                    None => self.kitty_stack_mut().push(next),
                 }
             }
             b'>' => {
                 let flags = KittyFlags::from_request(params.value(0));
-                if self.kitty_stack.len() >= KITTY_STACK_LIMIT {
-                    self.kitty_stack.remove(0);
+                let stack = self.kitty_stack_mut();
+                if stack.len() >= KITTY_STACK_LIMIT {
+                    stack.remove(0);
                 }
-                self.kitty_stack.push(flags);
+                stack.push(flags);
             }
             b'<' => {
                 let count = usize::from(
@@ -430,8 +431,9 @@ impl Screen {
                     }
                     .max(1),
                 );
-                let keep = self.kitty_stack.len().saturating_sub(count);
-                self.kitty_stack.truncate(keep);
+                let stack = self.kitty_stack_mut();
+                let keep = stack.len().saturating_sub(count);
+                stack.truncate(keep);
             }
             _ => {}
         }
@@ -440,7 +442,10 @@ impl Screen {
     /// The kitty keyboard flags in force: the top of the stack, or none when the child
     /// has pushed nothing and the legacy encoding applies.
     pub fn kitty_flags(&self) -> KittyFlags {
-        self.kitty_stack.last().copied().unwrap_or(KittyFlags::NONE)
+        self.kitty_stack()
+            .last()
+            .copied()
+            .unwrap_or(KittyFlags::NONE)
     }
 
     /// The `modifyOtherKeys` level the child asked for.

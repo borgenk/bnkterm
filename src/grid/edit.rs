@@ -723,14 +723,40 @@ impl Screen {
         }
     }
 
-    /// RIS: hard reset to the power-on state, keeping the current dimensions.
+    /// RIS: hard reset to the power-on state, keeping the current dimensions and the few
+    /// facts that were never the child's to reset.
+    ///
+    /// Rebuilding wholesale and then putting a short list back, rather than assigning
+    /// every child-owned field its default one by one. The choice is between two ways of
+    /// being wrong when someone adds a field and forgets this function, and they are not
+    /// symmetric: a new *child*-owned field that survives RIS means `reset` has stopped
+    /// recovering a wedged terminal, and RIS is the recovery of last resort — there is
+    /// nothing after it. A new *app*-owned field that gets cleared is a stale value until
+    /// the app next pushes it. So the default stays "wiped", and the rule for a new field
+    /// is: if the child could not have set it, name it below.
     pub fn reset(&mut self) {
         let (cols, rows) = self.dimensions();
         let epoch = self.epoch.next();
+        // The window's pixel size is a physical fact about a window the child does not
+        // own and cannot observe otherwise. Cleared, `?2048` reports `0x0` until the user
+        // happens to resize — the child asks a question the terminal knows the answer to
+        // and is told zero.
+        let pixel_size = self.pixel_size;
+        // Replies already queued in this same parse batch. `CSI 6n` then `ESC c` in one
+        // write must still deliver the cursor report; xterm delivers it. They are answers
+        // to questions already asked, so a reset cannot un-ask them.
+        let responses = std::mem::take(&mut self.responses);
+        // xterm's RIS does not reset the window title, so neither does this.
+        let title = std::mem::take(&mut self.title);
+
         *self = Screen::new(cols, rows);
+
         // A fresh `Screen` starts at epoch zero, which would make ids minted before the
         // reset look current again. Identity moves forward across a reset, never back.
         self.epoch = epoch;
+        self.pixel_size = pixel_size;
+        self.responses = responses;
+        self.title = title;
     }
 
     /// DECSTR (`CSI ! p`): soft reset. Puts the *settings* back to their defaults while
