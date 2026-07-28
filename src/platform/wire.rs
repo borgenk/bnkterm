@@ -36,6 +36,19 @@ pub struct Message {
 }
 
 /// Append an encoded request to `buf`.
+///
+/// A request that will not fit the header's 16-bit size field is **dropped**, not
+/// truncated: `(size << 16) | opcode` would carry the length's high bits into the opcode
+/// bits and put a frame on the wire that says it is a different, shorter request. The
+/// compositor then reads the next request's bytes as this one's arguments and every
+/// message after it is garbage — one oversized string desynchronizing the whole
+/// connection.
+///
+/// It used to be a `debug_assert!`, which is compiled out of exactly the build where the
+/// corruption would be silent. Unreachable today either way, and only for a reason two
+/// modules from here: the sole variable-length request (`xdg_toplevel.set_title`) is
+/// bounded by `OSC_MAX` in the VT parser. That is a fact about a caller, not a property
+/// of the encoder, so the encoder now holds its own invariant.
 pub fn encode(buf: &mut Vec<u8>, object: u32, opcode: u16, args: &[Arg]) {
     let start = buf.len();
     buf.extend_from_slice(&object.to_ne_bytes());
@@ -43,16 +56,18 @@ pub fn encode(buf: &mut Vec<u8>, object: u32, opcode: u16, args: &[Arg]) {
     for arg in args {
         encode_arg(buf, arg);
     }
-    let size = (buf.len() - start) as u32;
     // The size lives in the header's high 16 bits, so a request must be < 64 KiB.
-    // We never build one anywhere near that; assert the invariant rather than let
-    // `size << 16` silently truncate the length into the opcode bits.
-    debug_assert!(
-        size <= 0xffff,
-        "wayland request too large to encode: {size} bytes"
-    );
-    let word = (size << 16) | u32::from(opcode);
-    buf[start + 4..start + 8].copy_from_slice(&word.to_ne_bytes());
+    // Refused in *every* build rather than asserted in one: a `debug_assert!` here made
+    // debug and release disagree about what an oversized request does, which for a wire
+    // encoder is worse than either answer on its own.
+    let Ok(size) = u16::try_from(buf.len() - start) else {
+        buf.truncate(start);
+        return;
+    };
+    let word = (u32::from(size) << 16) | u32::from(opcode);
+    if let Some(header) = buf.get_mut(start + 4..start + 8) {
+        header.copy_from_slice(&word.to_ne_bytes());
+    }
 }
 
 fn encode_arg(buf: &mut Vec<u8>, arg: &Arg) {
@@ -156,6 +171,46 @@ mod tests {
         assert_eq!(object, 5);
         assert_eq!(word >> 16, 16, "size in bytes");
         assert_eq!(word & 0xffff, 2, "opcode");
+    }
+
+    #[test]
+    fn a_request_too_large_for_the_header_is_dropped_not_truncated() {
+        // `(size << 16) | opcode` carries an oversized length's high bits into the opcode
+        // bits, so the frame would claim to be a different, shorter request. The
+        // compositor then reads the *next* request's bytes as this one's arguments and
+        // everything after it is garbage — one oversized string desynchronizing the whole
+        // connection. The guard was a `debug_assert!`, compiled out of exactly the build
+        // where that would be silent.
+        let mut buf = Vec::new();
+        encode(&mut buf, 1, 0, &[Arg::Uint(7)]);
+        let good = buf.clone();
+
+        let huge = "x".repeat(0x1_0000);
+        encode(&mut buf, 2, 3, &[Arg::Str(&huge)]);
+        assert_eq!(
+            buf, good,
+            "nothing of the oversized request reached the wire"
+        );
+
+        // And the stream carries on: the next request encodes normally, at the offset the
+        // dropped one would have occupied.
+        encode(&mut buf, 4, 5, &[Arg::Uint(9)]);
+        let word = u32::from_ne_bytes(buf[good.len() + 4..good.len() + 8].try_into().unwrap());
+        assert_eq!((word >> 16, word & 0xffff), (12, 5));
+
+        // The largest request that *does* fit still encodes, so the refusal is at the
+        // boundary and not short of it. A 0xfff4-byte string plus its 4-byte length and
+        // the 8-byte header is exactly 0x10000... one over, so back off one word.
+        let mut buf = Vec::new();
+        let big = "x".repeat(0xffef);
+        encode(&mut buf, 1, 0, &[Arg::Str(&big)]);
+        assert_eq!(
+            buf.len(),
+            0xfffc,
+            "8 header + 4 length + 0xfff0 padded string"
+        );
+        let word = u32::from_ne_bytes(buf[4..8].try_into().unwrap());
+        assert_eq!(word >> 16, 0xfffc);
     }
 
     #[test]

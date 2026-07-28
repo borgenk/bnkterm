@@ -1,7 +1,7 @@
 //! The typed messages crossing the terminal/window seam.
 //!
 //! The window side owns Wayland, xkb, and the GPU; each terminal core owns one PTY,
-//! parser, and grid. [`super::tabs::Tabs`] sits between them: active-only input,
+//! parser, and grid. [`crate::app::tabs::Tabs`] sits between them: active-only input,
 //! focus, title, blink, and frames route to one core; resize and pumping fan out to
 //! all cores. `Title` and `Closed` are per-tab facts until `Tabs` translates them
 //! into window actions. Everything except PTY reads stays on `app::State`'s main
@@ -127,7 +127,7 @@ pub enum ToWindow {
     /// launching a process is a window-side concern like every other action here.
     OpenUrl(String),
     /// The window should shut down: every tab is gone. A core signals its own
-    /// child's exit to [`super::tabs::Tabs`] through the pump's stream-end, not
+    /// child's exit to [`crate::app::tabs::Tabs`] through the pump's stream-end, not
     /// this message; `Tabs` removes that tab and synthesizes `Closed` only once
     /// the last one is gone.
     Closed,

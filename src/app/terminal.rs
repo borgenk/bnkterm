@@ -11,7 +11,7 @@
 //!   grid state ─▶ fill_frame_list ─▶ DisplayList (pulled by the window each frame)
 //! ```
 //!
-//! [`super::tabs::Tabs`] drives each core on the main thread: it routes the
+//! [`crate::app::tabs::Tabs`] drives each core on the main thread: it routes the
 //! window's [`ToTerminal`] messages to the active core (or resize to all cores),
 //! pulls only the active [`DisplayList`], and translates each per-core
 //! [`ToWindow`] fact. The child's output is drained off-thread by [`crate::gather`] (see
@@ -1087,6 +1087,12 @@ impl TerminalCore {
         }
         // Drain the wake eventfd once per pump; a publish that races this still
         // re-arms it (empty→nonempty), so the next poll returns and we catch it.
+        //
+        // Unconditional, including on turns woken only by pointer motion, which is one
+        // `read(2)` per tab per turn that usually finds nothing. Considered and kept:
+        // skipping it when no batch is ready inverts the race — a turn woken *by* the
+        // eventfd that then finds the batch already consumed would leave it armed and
+        // spin. The syscall is the cheap side of that trade.
         if let Some(g) = &self.gatherer {
             g.clear_wakeup();
         }

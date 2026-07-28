@@ -1201,6 +1201,14 @@ impl State {
                     .conn
                     .take_fd()
                     .ok_or_else(|| Error::msg("wl_keyboard.keymap arrived without its fd"))?;
+                // A zero-length keymap is "no keymap", not a fatal error. `mmap` with
+                // `len == 0` is `EINVAL`, which would propagate out of `run_until` and
+                // exit the terminal over an event that is merely useless: `Xkb` already
+                // handles having no keymap (every key query answers `None`), which is the
+                // state it is in before this event arrives at all.
+                if size == 0 {
+                    return Ok(());
+                }
                 let bytes = ffi::read_mapped(fd.as_raw_fd(), size)?;
                 self.xkb.load_keymap(&bytes, format)?;
             }

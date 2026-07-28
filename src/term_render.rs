@@ -734,8 +734,23 @@ impl Painter<'_> {
     ) -> usize {
         let m = self.metrics;
         // The run breaks on foreground, not background, so the first cell's background
-        // stands in for the run when weighting the glyph anti-aliasing; a same-fg run
-        // over a mixed background is rare (reverse video and selection tint uniformly).
+        // stands in for the whole run when weighting the glyph anti-aliasing.
+        //
+        // **A selection band is the case where that is wrong**, and the claim that used to
+        // sit here — "reverse video and selection tint uniformly" — was only true of
+        // reverse video. A selection covers *part* of a row, and `resolve(.., false)`
+        // deliberately reports the cell's own background rather than the band's, so glyphs
+        // painted over `SELECTION_BG` are weighted against the ground they would have had
+        // without it. On a light theme (dark ink on a light page) the selected text comes
+        // out visibly heavier than the same text beside it.
+        //
+        // Left alone on purpose. Fixing it means ending the run at the selection's edges,
+        // which is a per-cell selection test on the painter's hottest loop — the exact
+        // shape that cost the hovered-link underline 12.9% of the frame before it was
+        // moved to a per-row span. It is stable, so
+        // the damage diff stays honest, and it is invisible on the default dark theme.
+        // Recorded as an open question on `fixed-pitch-run-painting` rather than traded
+        // for a measured regression.
         let (_, bg) = self.resolve(first, false);
         let run = self.run_style(first);
         // A run cannot outlast its row, so ask the pool for that much and let every

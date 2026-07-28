@@ -3652,6 +3652,44 @@ fn the_alt_screen_and_a_reset_end_the_row_epoch() {
 }
 
 #[test]
+fn running_a_full_screen_program_does_not_forget_the_prompts_behind_it() {
+    // Entering the alt screen shows a different set of cells, so a *selection* made over
+    // the old ones has to go — but the primary buffer's rows are untouched by the switch,
+    // and the prompt marks name lines in it, so those ids still resolve to exactly the
+    // lines they always did. Breaking the whole row-identity regime cleared them anyway,
+    // so running and quitting `vim` forgot every prompt older than the one the shell
+    // redraws on the way out: the entire history prompt-jump exists to walk.
+    let mut s = Screen::with_scrollback(20, 6, 100);
+    for i in 0..4 {
+        feed(&mut s, b"\x1b]133;A\x07$ cmd\r\n\x1b]133;C\x07");
+        feed(&mut s, format!("out {i}\r\n").as_bytes());
+        feed(&mut s, b"\x1b]133;D;0\x07");
+    }
+    let before: Vec<_> = s.prompts().iter().map(|p| p.row).collect();
+    assert_eq!(before.len(), 4, "four commands run at four prompts");
+
+    let epoch = s.row_epoch();
+    feed(&mut s, b"\x1b[?1049h"); // vim starts
+    assert_ne!(
+        s.row_epoch(),
+        epoch,
+        "a display-anchored selection still dies: those cells are gone"
+    );
+    feed(&mut s, b"\x1b[2Jediting\r\n");
+    feed(&mut s, b"\x1b[?1049l"); // and quits
+
+    let after: Vec<_> = s.prompts().iter().map(|p| p.row).collect();
+    assert_eq!(
+        after, before,
+        "every prompt survived, naming the same lines"
+    );
+    // And they are still usable, which is the whole point: prompt-jump walks back
+    // through them rather than finding one lone entry the shell redrew on the way out.
+    assert!(s.scroll_to_prompt(true), "jump back to the previous prompt");
+    assert!(s.scroll_to_prompt(true), "and the one before that");
+}
+
+#[test]
 fn erasing_the_history_keeps_the_live_rows_ids() {
     // ED 3 drops history off the *front* of the stream, which is an eviction like any
     // other: the live rows have not moved, so they keep the ids they had. (Getting

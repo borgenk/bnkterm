@@ -366,16 +366,19 @@ pub fn recv_with_fds(sock: RawFd, buf: &mut [u8], out: &mut Vec<OwnedFd>) -> Res
             }
             return Err(Error::msg(format!("recvmsg failed: errno {e}")));
         }
-        // A full control buffer means the kernel truncated the ancillary data and
-        // some passed fds were lost. CMSG_CAP holds far more than Wayland's 1-2
-        // fds, so this is unreachable; surface it rather than proceed with a
-        // half-received message if it ever fires.
+        // Whatever the kernel did put in the control buffer is collected first, and only
+        // then is truncation reported. Erroring straight out would abandon the fds that
+        // *did* arrive: nothing closes them, and `out` is the only record they exist.
+        // Harmless today twice over — the error is fatal, and `CMSG_CAP` holds far more
+        // than Wayland's one or two fds, so this is unreachable — but "we leak, and it is
+        // fine because we are about to die" is a property of the caller, not of this
+        // function.
+        parse_cmsgs(&cbuf, msg.msg_controllen, out);
         if msg.msg_flags & MSG_CTRUNC != 0 {
             return Err(Error::msg(
                 "recvmsg truncated ancillary data (too many fds)",
             ));
         }
-        parse_cmsgs(&cbuf, msg.msg_controllen, out);
         return Ok(Some(n as usize));
     }
 }

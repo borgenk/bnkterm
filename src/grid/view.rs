@@ -214,11 +214,37 @@ impl Screen {
     /// End the current identity regime: the rows the outstanding ids named are gone or
     /// renumbered. See [`RowEpoch`] for the (short) list of things that do this.
     pub(super) fn break_row_identity(&mut self) {
-        self.epoch = self.epoch.next();
+        self.break_display_identity();
         // The marks hold row ids, and the ids no longer name the lines they named. Keeping
         // them would mean offering to jump to a prompt that is not there any more — the
         // same reason the selection is dropped here, and the same fix.
-        self.prompts.clear();
+        //
+        // *If* it was the primary stream that moved. Prompts name lines there — a shell
+        // marks them, and a shell does not run on the alt screen — so an alt-screen scroll
+        // or an `ED 2` inside `vim` renumbers nothing they point at. This is the same
+        // over-broad clearing as the one `break_display_identity` exists for, one level
+        // down: `vim` erasing its own screen would otherwise forget the whole session's
+        // prompt history.
+        if !self.on_alt {
+            self.prompts.clear();
+        }
+    }
+
+    /// End the regime for everything anchored to *what is on screen*, leaving the prompt
+    /// marks alone.
+    ///
+    /// The alt-screen switch is why this is separate. Entering or leaving the alt screen
+    /// shows a different set of cells, so a selection made over the old ones has to go —
+    /// but the **primary buffer's rows are untouched**, and the prompts name lines in it,
+    /// so those ids still resolve to exactly the lines they always did. Clearing them
+    /// meant that running and quitting `vim` forgot every prompt older than the one the
+    /// shell redraws on the way out, which is the entire history prompt-jump exists to
+    /// walk.
+    ///
+    /// [`Self::break_row_identity`] is the stronger form, for when the stream itself has
+    /// been renumbered.
+    pub(super) fn break_display_identity(&mut self) {
+        self.epoch = self.epoch.next();
     }
 
     /// The id of the line currently shown at display `row`.

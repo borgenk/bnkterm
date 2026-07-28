@@ -11,6 +11,7 @@
 
 use crate::color::Rgb;
 use crate::platform::freetype::{FontConfig, FontFamily};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// A font file in the XDG user font directory (`$XDG_DATA_HOME/fonts`, else
@@ -19,13 +20,37 @@ use std::path::PathBuf;
 /// Derived from the environment rather than a literal `/home/<user>/…` so it
 /// stays portable; when neither variable is set it yields a path that will not
 /// exist, and the family simply falls through to the next candidate.
+///
+/// "A path that will not exist" is doing real work there, and it has to be an
+/// *absolute* one. With both variables unset the base was an empty `PathBuf`, so the
+/// result was the **relative** `fonts/consola.ttf` — and a file of that name in whatever
+/// directory the process happened to start in would be opened and handed to FreeType.
+/// Rare (a systemd unit with no `HOME`), and not a path anything should be able to reach
+/// by choosing the cwd.
 fn user_font(name: &str) -> String {
-    let dir = std::env::var_os("XDG_DATA_HOME")
+    user_font_in(
+        std::env::var_os("XDG_DATA_HOME"),
+        std::env::var_os("HOME"),
+        name,
+    )
+}
+
+/// The path itself, with the environment passed in so it stays pure — and so the test
+/// does not have to mutate process-wide variables to run. `$HOME` and `$XDG_DATA_HOME`
+/// are read by everything, and this suite runs its tests in parallel.
+fn user_font_in(xdg_data_home: Option<OsString>, home: Option<OsString>, name: &str) -> String {
+    let dir = xdg_data_home
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_default();
+        .or_else(|| home.map(|h| PathBuf::from(h).join(".local/share")))
+        .filter(|dir| dir.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(NO_USER_FONT_DIR));
     dir.join("fonts").join(name).to_string_lossy().into_owned()
 }
+
+/// Where a user font path is rooted when the environment names nowhere usable. Absolute
+/// and (by the FHS) never a real directory, so the candidate misses and the family falls
+/// through — which is the whole intent, and what an empty base failed to deliver.
+const NO_USER_FONT_DIR: &str = "/nonexistent";
 
 impl Default for FontConfig {
     fn default() -> Self {
@@ -256,5 +281,46 @@ impl Default for TabBarConfig {
             label_scale_pct: 85,
             path_prefix_programs: vec!["claude".to_string()],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{user_font_in, NO_USER_FONT_DIR};
+
+    #[test]
+    fn a_user_font_path_is_absolute_even_with_no_home() {
+        // The fallback's whole job is to name a path that will not exist, and that only
+        // works if it is *absolute*. With both variables unset the base was an empty
+        // `PathBuf`, so the candidate came out as the relative `fonts/consola.ttf` — and
+        // a file of that name in whatever directory the process happened to start in
+        // would be opened and handed to FreeType. Rare (a systemd unit with no `HOME`),
+        // and not a path anything should reach by choosing the cwd.
+        let path = user_font_in(None, None, "consola.ttf");
+        assert_eq!(path, format!("{NO_USER_FONT_DIR}/fonts/consola.ttf"));
+        assert!(path.starts_with('/'), "never relative: {path}");
+
+        // A *relative* value in the environment is the same hazard wearing a disguise,
+        // so it is refused rather than joined onto.
+        for env in ["", ".", "relative/dir"] {
+            let xdg = user_font_in(Some(env.into()), None, "x.ttf");
+            assert!(xdg.starts_with('/'), "XDG_DATA_HOME={env:?} gave {xdg}");
+            let home = user_font_in(None, Some(env.into()), "x.ttf");
+            assert!(home.starts_with('/'), "HOME={env:?} gave {home}");
+        }
+    }
+
+    #[test]
+    fn xdg_data_home_wins_over_home_and_home_gets_the_xdg_default() {
+        assert_eq!(
+            user_font_in(Some("/xdg".into()), Some("/home/b".into()), "f.ttf"),
+            "/xdg/fonts/f.ttf",
+            "an explicit XDG_DATA_HOME is used as given"
+        );
+        assert_eq!(
+            user_font_in(None, Some("/home/b".into()), "f.ttf"),
+            "/home/b/.local/share/fonts/f.ttf",
+            "and HOME takes the spec's default suffix"
+        );
     }
 }

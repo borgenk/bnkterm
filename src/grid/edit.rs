@@ -683,8 +683,12 @@ impl Screen {
         // Entering or leaving the alt screen shows a live view, never stale
         // history; the alt screen has no scrollback to scroll anyway. The rows now
         // belong to a different buffer, so no id minted against the old one survives.
+        //
+        // The *display* regime only: the primary buffer's rows are untouched by a switch,
+        // so the prompt marks still name the lines they always named. See
+        // [`Screen::break_display_identity`].
         self.view_offset = 0;
-        self.break_row_identity();
+        self.break_display_identity();
         if enable {
             let blank = self.blank_cell();
             // The cursor carries across the switch rather than homing: the alt screen

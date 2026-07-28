@@ -129,8 +129,17 @@ pub(crate) fn layout(
     }
     let n = labels.len();
     // The widest equal width that still fills the bar, then clamped to taste.
+    //
+    // Not `base.clamp(min, max)`: `usize::clamp` **panics** when `min > max`, and the two
+    // are configuration. They are 10 and 24 today, so the call is safe today — and that
+    // is exactly the shape of a trap, since the first user-supplied pair makes a
+    // no-panic-outside-tests violation out of a line nobody edited. An inverted pair is
+    // nonsense either way; taking the floor as the answer is the reading that keeps every
+    // tab visible.
     let base = cols / n;
-    let mut width = base.clamp(cfg.min_width, cfg.max_width);
+    let mut width = base
+        .max(cfg.min_width)
+        .min(cfg.max_width.max(cfg.min_width));
     // Clamping up to `min_width` can overflow the bar when there are more tabs
     // than `cols / min_width`; there is no width that both fits and honors the
     // floor, so fall back to an equal fill. Tabs then all stay visible and equal,
@@ -623,6 +632,39 @@ mod tests {
         assert_eq!(hit_test(&slots, 4), Some(0));
         assert_eq!(hit_test(&slots, 5), Some(1));
         assert_eq!(hit_test(&slots, 10), None);
+    }
+
+    #[test]
+    fn an_inverted_width_range_lays_out_instead_of_panicking() {
+        // `usize::clamp` panics when `min > max`, and both bounds are configuration. The
+        // defaults are 10 and 24, so the old `base.clamp(min, max)` was safe *today* — and
+        // that is the shape of a trap rather than a reason to leave it: the first
+        // user-supplied pair turns a line nobody edited into a no-panic-outside-tests
+        // violation, and the panic lands on window paint.
+        let cfg = TabBarConfig {
+            min_width: 30,
+            max_width: 4,
+            ..TabBarConfig::default()
+        };
+        let slots = lay(80, &[label("a", true), label("b", false)], &cfg);
+        assert_eq!(slots.len(), 2, "both tabs still laid out");
+        assert!(slots.iter().all(|s| !s.cells.is_empty()));
+        assert!(
+            slots.iter().map(|s| s.cells.len()).sum::<usize>() <= 80,
+            "and they still fit the bar"
+        );
+
+        // Degenerate bounds are not a special case either.
+        for (min_width, max_width) in [(0, 0), (usize::MAX, 0), (0, usize::MAX)] {
+            let cfg = TabBarConfig {
+                min_width,
+                max_width,
+                ..TabBarConfig::default()
+            };
+            let slots = lay(80, &[label("a", true)], &cfg);
+            assert_eq!(slots.len(), 1);
+            assert!(!slots[0].cells.is_empty(), "{min_width}/{max_width}");
+        }
     }
 
     #[test]

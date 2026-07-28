@@ -37,8 +37,8 @@
 //!
 //! # The dependency
 //!
-//! `libfontconfig` is a system C library, reached the way [`freetype`](super::freetype),
-//! [`shape`](super::shape) (HarfBuzz), and [`xkb`](super::xkb) (libxkbcommon) are reached:
+//! `libfontconfig` is a system C library, reached the way [`freetype`](crate::platform::freetype),
+//! [`shape`](crate::platform::shape) (HarfBuzz), and [`xkb`](crate::platform::xkb) (libxkbcommon) are reached:
 //! `extern "C"` against the real ABI, no `-sys` crate. It binds cleanly: nearly every type
 //! below is an **opaque handle**, with one exception — `FcFontSet`, whose three fields we
 //! read directly, and whose layout is therefore mirrored field-for-field and pinned against

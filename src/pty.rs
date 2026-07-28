@@ -10,7 +10,7 @@
 //!
 //! # FFI kept out of the platform layer
 //!
-//! The PTY needs a cluster of libc calls (`posix_openpt`, `fork`, `execvp`, the
+//! The PTY needs a cluster of libc calls (`posix_openpt`, `fork`, `execv`, the
 //! tty ioctls) that the portable `platform` layer deliberately does not carry:
 //! not every app built on that layer has a PTY, so putting this in the vendored
 //! leaf would muddy it. The raw ABI for the PTY stays isolated in this one module. The
@@ -118,7 +118,7 @@ impl Pty {
         // O_CLOEXEC is set atomically at open so a *later* tab's fork/exec cannot
         // leak this master into its shell. A leaked master keeps its slave's
         // hangup from firing, so closing this tab would never reap its child (see
-        // the multi-tab teardown in `super::tabs`). Doing it here, not with a
+        // the multi-tab teardown in `crate::app::tabs`). Doing it here, not with a
         // follow-up fcntl, closes the window where a concurrent fork could inherit
         // the fd before the flag is set.
         // SAFETY: posix_openpt with O_RDWR|O_NOCTTY|O_CLOEXEC returns a fresh master
@@ -149,10 +149,15 @@ impl Pty {
         // Everything the child touches is built here, in the parent, where the
         // allocator is safe to use. The `CString`s own the bytes; `ptrs` is the
         // NUL-terminated argv (a trailing null past the arguments) the child execs.
-        let cstrings: Vec<CString> = argv
-            .iter()
+        //
+        // The `$PATH` search is part of "everything": the child runs `execv`, not
+        // `execvp`, so a bare program name has to become a path *before* the fork. See
+        // [`resolve_program`] and the note in [`fork_child_in_pty`].
+        let program = resolve_program(argv.first().copied().unwrap_or_default());
+        let cstrings: Vec<CString> = std::iter::once(program.as_str())
+            .chain(argv.iter().skip(1).copied())
             .map(|arg| {
-                CString::new(*arg)
+                CString::new(arg)
                     .map_err(|_| Error::msg("a command argument contains an interior NUL"))
             })
             .collect::<Result<_>>()?;
@@ -365,10 +370,45 @@ fn parse_tpgid(stat: &str) -> Option<i32> {
     after_comm.split_whitespace().nth(5)?.parse().ok()
 }
 
+/// Resolve `program` to a path the child can `execv`, searching `$PATH` when it has no
+/// `/` in it. Returns `program` unchanged when nothing matches, so the failure is the
+/// child's `_exit(127)` rather than a different error here.
+///
+/// This is the `p` of `execvp`, done in the parent. The child cannot do it: `execvp` is
+/// not on POSIX's async-signal-safe list precisely *because* it reads `$PATH` and may
+/// allocate, and the child is a fork of a threaded process. Here there are no
+/// restrictions at all.
+///
+/// A bare name is possible; the live terminal passes `$SHELL`, an absolute
+/// path. The search is a plain first-match: no executability probe, because that would be
+/// a TOCTOU check whose answer the exec re-derives anyway.
+fn resolve_program(program: &str) -> String {
+    if program.contains('/') {
+        return program.to_string();
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return program.to_string();
+    };
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+        .map_or_else(|| program.to_string(), |p| p.to_string_lossy().into_owned())
+}
+
 impl Drop for Pty {
     fn drop(&mut self) {
-        // Closing the master hangs up the slave (SIGHUP to the child); then reap
-        // so it does not linger as a zombie. The OwnedFd closes itself after.
+        // The comment that used to sit here described the opposite of what runs. `reap`
+        // is called *before* the `OwnedFd` closes, so the hangup that would make the
+        // child exitable has not happened yet, and a nonblocking `waitpid` can only
+        // succeed for a child that had already exited on its own.
+        //
+        // Left as it is rather than reordered, because the honest fix is not to close and
+        // then spin: a `waitpid` that actually waited would block app teardown on a shell
+        // that ignores `SIGHUP`. This path is only reachable at teardown — closing a tab
+        // goes through [`Pty::into_zombie`], which hands the pid to the reaper that does
+        // poll it — and at teardown the process is exiting, so `init` inherits whatever
+        // is left. So: an opportunistic reap of a child that has already gone, and the
+        // fd close below is what tells the rest.
         let _ = self.reap();
     }
 }
@@ -555,7 +595,10 @@ extern "C" {
     fn setsid() -> c_int;
     fn signal(signum: c_int, handler: usize) -> usize;
     fn sigprocmask(how: c_int, set: *const SigSet, oldset: *mut SigSet) -> c_int;
-    fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
+    /// `execv`, not `execvp`: the `p` variant searches `$PATH` and may allocate, so it
+    /// is not async-signal-safe and has no business in a post-fork child.
+    /// [`resolve_program`] does the search in the parent instead.
+    fn execv(path: *const c_char, argv: *const *const c_char) -> c_int;
     fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
     fn close(fd: c_int) -> c_int;
     fn open(path: *const c_char, flags: c_int) -> c_int;
@@ -684,15 +727,34 @@ unsafe fn fork_child_in_pty(
     if slave < 0 {
         _exit(127);
     }
-    ioctl(slave, TIOCSCTTY, 0 as c_ulong);
-    dup2(slave, 0);
-    dup2(slave, 1);
-    dup2(slave, 2);
+    // Every one of these is checked, and the point is what an *unchecked* failure would
+    // look like: a `TIOCSCTTY` that quietly fails hands the shell a session with no
+    // controlling terminal, so job control does not work, `Ctrl+C` reaches nothing, and
+    // no error is ever printed. Failing to `_exit(127)` here is the difference between a
+    // tab that visibly refuses to open and one that opens subtly broken.
+    if ioctl(slave, TIOCSCTTY, 0 as c_ulong) < 0 {
+        _exit(127);
+    }
+    for fd in [0, 1, 2] {
+        if dup2(slave, fd) < 0 {
+            _exit(127);
+        }
+    }
     if slave > 2 {
         close(slave);
     }
     close(master);
-    execvp(argv[0], argv.as_ptr());
+    // `execv`, not `execvp`. POSIX's list of async-signal-safe functions has `execve` on
+    // it and not `execvp`, and this is a post-`fork` child in a threaded process: `execvp`
+    // walks `$PATH` and may allocate inside glibc, either of which can deadlock against a
+    // lock another thread held at the moment of the fork.
+    //
+    // Unreachable in the live terminal — glibc short-circuits to `execve` whenever the
+    // path contains a `/`, and `argv[0]` is `$SHELL` — but reachable
+    // with a bare program name, and "safe because of what the callers happen to pass" is
+    // not the guarantee to rely on here. `resolve_program` does the `$PATH` search up
+    // front, in the parent, where searching is allowed.
+    execv(argv[0], argv.as_ptr());
     // Only reached if exec failed.
     _exit(127);
 }
@@ -700,6 +762,35 @@ unsafe fn fork_child_in_pty(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bare_program_name_resolves_against_path_before_the_fork() {
+        // The `p` of `execvp`, moved into the parent. The child cannot do it: `execvp` is
+        // not on POSIX's async-signal-safe list precisely because it reads `$PATH` and may
+        // allocate, and the child is a fork of a process the Vulkan driver has already put
+        // threads in. Here there are no restrictions at all.
+        //
+        // `/bin/sh` exists on any machine that can run this suite (the module's own
+        // fallback shell), so it is the fixture — no environment to set up, nothing
+        // fetched.
+        let resolved = resolve_program("sh");
+        assert!(
+            resolved.starts_with('/'),
+            "a bare name became a path: {resolved}"
+        );
+        assert!(std::path::Path::new(&resolved).is_file());
+
+        // A path is already a path, and is passed through untouched — which is the live
+        // terminal's case, since `argv[0]` is `$SHELL`.
+        assert_eq!(resolve_program("/bin/sh"), "/bin/sh");
+        assert_eq!(resolve_program("./x"), "./x");
+        assert_eq!(resolve_program("a/b/c"), "a/b/c");
+
+        // Nothing on `$PATH` matches: hand back what was asked for, so the failure is the
+        // child's `_exit(127)` — one way for an unrunnable program to fail, not two.
+        let missing = "bnkterm-no-such-program-anywhere";
+        assert_eq!(resolve_program(missing), missing);
+    }
 
     #[test]
     fn winsize_and_pollfd_match_the_c_abi() {

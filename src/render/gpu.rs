@@ -311,7 +311,7 @@ impl Atlas {
     /// records the empty placement so the pen still advances). `src` is
     /// `w * h * bpp` bytes, row-major, tight.
     fn pack(&mut self, w: u32, h: u32, src: &[u8]) -> Option<Slot> {
-        if w == 0 || h == 0 {
+        if w == 0 || h == 0 || src.len() < self.raster_len(w, h) {
             return None;
         }
         let slot = self.reserve(w, h)?;
@@ -322,12 +322,28 @@ impl Atlas {
     /// Like [`pack`](Self::pack) but from ARGB words (the color-glyph path), writing
     /// them into the 4-bpp mirror directly. `src` is `w * h` words, row-major, tight.
     fn pack_words(&mut self, w: u32, h: u32, src: &[u32]) -> Option<Slot> {
-        if w == 0 || h == 0 {
+        if w == 0 || h == 0 || src.len() < (w as usize).saturating_mul(h as usize) {
             return None;
         }
         let slot = self.reserve(w, h)?;
         self.write_words(slot, src);
         Some(slot)
+    }
+
+    /// How many bytes a tight `w`-by-`h` raster occupies at this atlas's depth: what
+    /// [`Self::write`] will read, and therefore what [`Self::pack`] insists on having.
+    ///
+    /// The check exists because the dimensions and the buffer come from different places
+    /// and are not guaranteed to agree. `copy_coverage` returns an empty `Vec` when
+    /// FreeType hands back a null `bitmap.buffer`, while `Glyph::width`/`rows` keep the
+    /// nonzero dimensions the metrics reported — and `packed_scalar` then packs
+    /// `(g.width, g.rows, &g.coverage)`, so the slice range in `write` traps. Release
+    /// builds are `panic = "abort"`, so that is the whole process for a font or driver
+    /// anomaly. `pack_words` already had this shape; `pack` did not.
+    fn raster_len(&self, w: u32, h: u32) -> usize {
+        (w as usize)
+            .saturating_mul(h as usize)
+            .saturating_mul(self.bpp as usize)
     }
 
     /// The bytes of the dirty region (row-contiguous), clearing the flag.
@@ -995,11 +1011,9 @@ impl Batcher<'_> {
 /// `None` for a zero-area or malformed glyph or a full atlas; the placement is
 /// recorded as `None` so the pen advances without drawing.
 fn pack_argb(atlas: &mut Atlas, w: u32, h: u32, argb: &[u32]) -> Option<Slot> {
-    if w == 0 || h == 0 || argb.len() < (w * h) as usize {
-        return None;
-    }
     // ARGB words are B,G,R,A bytes in memory: B8G8R8A8 verbatim, written straight
     // into the mirror rather than first collected into a byte-conversion vector.
+    // `pack_words` owns the dimension-versus-buffer check, so no caller can skip it.
     atlas.pack_words(w, h, argb)
 }
 
@@ -1154,6 +1168,34 @@ mod tests {
         assert_eq!((up.x, up.y, up.w, up.h), (0, 0, 10, 8));
         assert!(up.bytes.iter().all(|&b| b == 7));
         assert!(a.take_upload().is_none(), "dirty cleared");
+    }
+
+    #[test]
+    fn packing_a_raster_shorter_than_its_dimensions_refuses_instead_of_trapping() {
+        // The dimensions and the buffer come from different places and are not guaranteed
+        // to agree: `copy_coverage` returns an empty `Vec` when FreeType hands back a null
+        // `bitmap.buffer`, while `Glyph::width`/`rows` keep the nonzero dimensions the
+        // metrics reported. `packed_scalar` then packs `(width, rows, &coverage)` and the
+        // slice range inside `write` traps — and release is `panic = "abort"`, so a font
+        // or driver anomaly takes the whole process.
+        let mut a = Atlas::new(1);
+        assert_eq!(a.pack(4, 4, &[]), None, "the empty-coverage case exactly");
+        assert_eq!(a.pack(4, 4, &[0u8; 15]), None, "one byte short is short");
+        assert!(
+            a.pack(4, 4, &[0u8; 16]).is_some(),
+            "and exactly enough fits"
+        );
+
+        // The colour atlas counts four bytes to the pixel, so the same raster needs four
+        // times the buffer. A check that forgot `bpp` would pass this and then trap.
+        let mut a = Atlas::new(4);
+        assert_eq!(a.pack(4, 4, &[0u8; 16]), None);
+        assert!(a.pack(4, 4, &[0u8; 64]).is_some());
+
+        // And the word path, which already refused, still does.
+        let mut a = Atlas::new(4);
+        assert_eq!(a.pack_words(2, 2, &[0u32; 3]), None);
+        assert!(a.pack_words(2, 2, &[0u32; 4]).is_some());
     }
 
     #[test]

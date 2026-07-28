@@ -154,8 +154,16 @@ impl Theme {
 ///   #RGB  #RRGGBB         the CSS-looking form, 1 to 4 digits per channel
 /// ```
 ///
-/// A channel narrower than 8 bits is scaled up rather than zero-padded, so `#f00` is
-/// full red and not `0x0f0000`: X11 defines the digits as the *high* bits of the value.
+/// **The two forms scale differently, and that asymmetry is X11's, not a slip.**
+/// `XParseColor` — which is what xterm calls — left-justifies the `#` form's digits into
+/// 16 bits and zero-fills on the right, while the newer `rgb:` form scales
+/// proportionally. So `#f00` is `0xf000` and reads back as 240, `rgb:f/0/0` is `0xffff`
+/// and reads back as 255, and `#fff` is famously *not* white. Neither is zero-padded on
+/// the left: a short channel is the *high* bits either way, so `#f00` is red and never
+/// near-black.
+///
+/// Matching that costs nothing and diverging from it costs the one thing this file is
+/// for: a program that sends `#fff` expecting xterm's off-white must not get white here.
 ///
 /// X11 color *names* (`red`, `cornflowerblue`) are deliberately not supported. They need
 /// the rgb.txt database, and a terminal that must ship a color-name table to parse an
@@ -164,9 +172,9 @@ impl Theme {
 pub fn parse_x11_color(spec: &[u8]) -> Option<Rgb> {
     if let Some(rest) = spec.strip_prefix(b"rgb:") {
         let mut parts = rest.split(|&b| b == b'/');
-        let r = scale_hex(parts.next()?)?;
-        let g = scale_hex(parts.next()?)?;
-        let b = scale_hex(parts.next()?)?;
+        let r = scale_hex(parts.next()?, HexScale::Proportional)?;
+        let g = scale_hex(parts.next()?, HexScale::Proportional)?;
+        let b = scale_hex(parts.next()?, HexScale::Proportional)?;
         if parts.next().is_some() {
             return None;
         }
@@ -178,17 +186,31 @@ pub fn parse_x11_color(spec: &[u8]) -> Option<Rgb> {
             return None;
         }
         let width = rest.len() / 3;
-        let r = scale_hex(rest.get(..width)?)?;
-        let g = scale_hex(rest.get(width..width * 2)?)?;
-        let b = scale_hex(rest.get(width * 2..)?)?;
+        let r = scale_hex(rest.get(..width)?, HexScale::LeftJustified)?;
+        let g = scale_hex(rest.get(width..width * 2)?, HexScale::LeftJustified)?;
+        let b = scale_hex(rest.get(width * 2..)?, HexScale::LeftJustified)?;
         return Some(Rgb::new(r, g, b));
     }
     None
 }
 
-/// One channel of hex digits, scaled to 8 bits. X11 reads the digits as the most
-/// significant bits of the channel, so `f` is 0xff and `f000` is also 0xff.
-fn scale_hex(digits: &[u8]) -> Option<u8> {
+/// How a channel's hex digits become an 8-bit value. The two X11 forms genuinely differ,
+/// and collapsing them into one rule is what made `#f00` come out 255 where xterm gives
+/// 240.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HexScale {
+    /// The `rgb:` form: scale the value across the channel's full range, so `f` is
+    /// `0xffff` and `ffff` is `0xffff` — both full intensity.
+    Proportional,
+    /// The `#` form, as `XParseColor` reads it: left-justify the digits into 16 bits and
+    /// zero-fill on the right. `f` is `0xf000`, not `0xffff`.
+    LeftJustified,
+}
+
+/// One channel of hex digits, as 8 bits. A short channel is the *high* bits of the value
+/// under either rule (`f` is never near-black); what differs is what fills in below them,
+/// which is [`HexScale`]'s whole subject.
+fn scale_hex(digits: &[u8], scale: HexScale) -> Option<u8> {
     if digits.is_empty() || digits.len() > 4 {
         return None;
     }
@@ -197,11 +219,18 @@ fn scale_hex(digits: &[u8]) -> Option<u8> {
         let nibble = (d as char).to_digit(16)?;
         value = (value << 4) | nibble;
     }
-    // Rescale from `4 * len` bits down to 8: shift down, or fan out a short value so
-    // `#f00` is full red rather than nearly black.
+    // `1..=4` digits, so `4..=16`: every shift below is in range.
     let bits = digits.len() * 4;
-    let max = (1u32 << bits) - 1;
-    Some(((value * 255 + max / 2) / max) as u8)
+    match scale {
+        // Rescale across the full range, rounding to nearest.
+        HexScale::Proportional => {
+            let max = (1u32 << bits) - 1;
+            Some(((value * 255 + max / 2) / max) as u8)
+        }
+        // Into the top of a 16-bit channel with zeros below, then keep the high byte —
+        // which is what a 16-bit X11 value becomes on an 8-bit display.
+        HexScale::LeftJustified => Some(((value << (16 - bits)) >> 8) as u8),
+    }
 }
 
 /// Format a color the way a terminal answers a color query: `rgb:RRRR/GGGG/BBBB`, the
@@ -309,10 +338,51 @@ mod tests {
             parse_x11_color(b"rgb:ffff/0000/8080"),
             Some(Rgb::new(255, 0, 128))
         );
-        // A short channel is the *high* bits, so `#f00` is full red — not near-black,
-        // which is what zero-padding would give.
-        assert_eq!(parse_x11_color(b"#f00"), Some(Rgb::new(255, 0, 0)));
+        // A short channel is the *high* bits under either rule, so `#f00` is red and
+        // never the near-black that padding on the left would give.
+        assert!(parse_x11_color(b"#f00").is_some_and(|c| c.r > 200 && c.g == 0));
         assert_eq!(parse_x11_color(b"rgb:f/0/0"), Some(Rgb::new(255, 0, 0)));
+    }
+
+    #[test]
+    fn the_two_x11_forms_scale_a_short_channel_differently() {
+        // X11's own asymmetry, and it is the whole reason `HexScale` exists. `XParseColor`
+        // — what xterm calls — **left-justifies the `#` form and zero-fills on the right**,
+        // while the newer `rgb:` form scales across the range. So the same digits mean
+        // different colours in the two spellings, and a terminal that flattens them
+        // answers a program with a colour xterm would not have given it.
+        //
+        // Only the 1- and 3-digit `#` widths can differ; at 2 and 4 the two rules agree by
+        // construction, which is why this went unnoticed.
+
+        // `#f00`: 0xf000 → 0xf0. Not 255 — and `#fff` is famously not white.
+        assert_eq!(parse_x11_color(b"#f00"), Some(Rgb::new(0xf0, 0, 0)));
+        assert_eq!(
+            parse_x11_color(b"#fff"),
+            Some(Rgb::new(0xf0, 0xf0, 0xf0)),
+            "the canonical example: #fff is off-white in X11"
+        );
+        assert_eq!(parse_x11_color(b"#800"), Some(Rgb::new(0x80, 0, 0)));
+
+        // `rgb:` scales instead, so the same digits reach full intensity.
+        assert_eq!(parse_x11_color(b"rgb:f/f/f"), Some(Rgb::new(255, 255, 255)));
+        assert_eq!(parse_x11_color(b"rgb:8/0/0"), Some(Rgb::new(0x88, 0, 0)));
+
+        // Three digits per channel: left-justified drops what proportional rounds up.
+        assert_eq!(parse_x11_color(b"#00f000000"), Some(Rgb::new(0, 0, 0)));
+        assert_eq!(
+            parse_x11_color(b"rgb:00f/000/000"),
+            Some(Rgb::new(1, 0, 0)),
+            "proportional rounds 15/4095 up to 1"
+        );
+
+        // At two and four digits the rules coincide, so both spellings agree.
+        for spec in [&b"#ff8000"[..], b"rgb:ff/80/00"] {
+            assert_eq!(parse_x11_color(spec), Some(Rgb::new(0xff, 0x80, 0)));
+        }
+        for spec in [&b"#ffff80800000"[..], b"rgb:ffff/8080/0000"] {
+            assert_eq!(parse_x11_color(spec), Some(Rgb::new(0xff, 0x80, 0)));
+        }
     }
 
     #[test]

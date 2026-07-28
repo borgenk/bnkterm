@@ -664,6 +664,21 @@ impl Parser {
 
     // ---- escape -------------------------------------------------------------
 
+    /// The `ESC` state: one byte decides which of the machines below runs.
+    ///
+    /// **The sequence state is already clear on entry, and nothing here re-clears it.**
+    /// `State::Escape` is set in exactly one place — the `0x1b` arm of
+    /// [`Self::advance`] — which calls `clear()` immediately before it, and nothing
+    /// reachable between there and here writes a parameter, an intermediate, a private
+    /// marker or the ignore flag: a C0 byte executes and returns without touching them,
+    /// and `escape_intermediate` dispatches `0x30..=0x7e` (which includes `0x5b`) rather
+    /// than transitioning back into a sequence.
+    ///
+    /// That is an invariant, not an accident, so a change that breaks it — a second place
+    /// setting `State::Escape`, or an arm here that collects before dispatching — has to
+    /// restore the `clear()` with it. The DCS *payload* buffer is separate and is still
+    /// cleared below: it is written by a different state and this is where its lifetime
+    /// begins.
     fn escape<P: Perform>(&mut self, p: &mut P, byte: u8) {
         if is_c0(byte) {
             p.execute(byte);
@@ -675,15 +690,11 @@ impl Parser {
                 self.state = State::EscapeIntermediate;
             }
             0x50 => {
-                self.clear();
                 self.dcs.clear();
                 self.state = State::DcsEntry; // DCS
             }
             0x58 | 0x5e | 0x5f => self.state = State::StringIgnore, // SOS / PM / APC
-            0x5b => {
-                self.clear();
-                self.state = State::CsiEntry;
-            }
+            0x5b => self.state = State::CsiEntry,
             0x5d => {
                 self.osc.clear();
                 self.state = State::OscString;
