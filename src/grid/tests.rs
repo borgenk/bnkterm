@@ -49,6 +49,32 @@ fn a_full_scrollback_ring_never_outgrows_its_limit() {
 }
 
 #[test]
+fn a_full_grid_holds_exactly_the_bytes_it_should() {
+    // The footprint gate compares this number exactly, so it is worth
+    // knowing here that every byte of it is accounted for rather than merely stable.
+    // A grid is its rows and nothing else: cells, one `Row` header per row in each
+    // ring, and the tab table.
+    const COLS: usize = 20;
+    const ROWS: usize = 4;
+    const LIMIT: usize = 64;
+    let mut s = Screen::with_scrollback(COLS, ROWS, LIMIT);
+    for _ in 0..LIMIT * 3 {
+        feed(&mut s, b"line\r\n");
+    }
+    assert_eq!(s.scrollback_len(), LIMIT);
+
+    let cell = std::mem::size_of::<Cell>();
+    let row = std::mem::size_of::<buffer::Row>();
+    let tabs = buffer::default_tabs(COLS).capacity();
+    // Both buffers: the primary's full ring plus live screen, and the alt screen's
+    // live rows (it keeps no history, and its ring still carries the spare slot).
+    let primary =
+        (LIMIT + ROWS) * COLS * cell + buffer::scrollback_capacity(LIMIT) * row + ROWS * row + tabs;
+    let alt = ROWS * COLS * cell + buffer::scrollback_capacity(0) * row + ROWS * row + tabs;
+    assert_eq!(s.storage_bytes(), primary + alt);
+}
+
+#[test]
 fn blank_is_a_default_space() {
     assert_eq!(Cell::BLANK, Cell::default());
     assert_eq!(Cell::BLANK.rune, ' ');

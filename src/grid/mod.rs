@@ -461,6 +461,17 @@ impl LinkTable {
         Some(id)
     }
 
+    /// The heap this table holds: the URL text (already tracked, both copies) plus the
+    /// two containers' own capacity. The `HashMap` entry is charged at key-plus-value,
+    /// which understates its control bytes slightly and is close enough for a table
+    /// that is empty in every session without hyperlinks.
+    fn storage_bytes(&self) -> usize {
+        self.bytes
+            + self.urls.capacity() * std::mem::size_of::<String>()
+            + self.index.capacity()
+                * (std::mem::size_of::<String>() + std::mem::size_of::<LinkId>())
+    }
+
     /// The URL behind `id`, or `None` for [`LinkId::NONE`] and any id this table does
     /// not hold.
     fn url(&self, id: LinkId) -> Option<&str> {

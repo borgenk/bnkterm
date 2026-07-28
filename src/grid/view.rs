@@ -104,6 +104,23 @@ impl Screen {
         self.primary.scrollback.len()
     }
 
+    /// The heap this screen's **content** holds: both buffers' cells, combining side
+    /// tables, row headers and ring capacity, tab stops, and the hyperlink table.
+    ///
+    /// This is the terminal's memory footprint in the only sense that scales with what
+    /// the child prints, which is why it is measured structurally rather than sampled
+    /// from the OS. It is computed from capacities, so it is *exact* and identical on
+    /// every machine: a byte of growth is a real regression, never allocator noise. The
+    /// perf gate holds it to that standard, and `/proc` sampling stays in the
+    /// Tier 2 lab where fragmentation and allocator behaviour are the question.
+    ///
+    /// Deliberately excludes the fixed-size odds and ends — the title, the palette, the
+    /// reply queue, the prompt and kitty stacks — which are bounded by construction and
+    /// would only add a constant to every reading.
+    pub fn storage_bytes(&self) -> usize {
+        self.primary.storage_bytes() + self.alt.storage_bytes() + self.links.storage_bytes()
+    }
+
     /// Lines of history the *view* can scroll through: the primary's scrollback, or none
     /// at all on the alt screen, which does not show it (the history is still there
     /// behind it, which is why this is not [`Self::scrollback_len`]).

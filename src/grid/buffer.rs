@@ -239,6 +239,15 @@ impl Row {
         self.wrapped = false;
     }
 
+    /// The heap this row holds: its cells and its combining side table, at
+    /// **capacity** rather than length, because capacity is what is actually held.
+    /// A recycled row keeps both allocations by design (see [`Row::reset`]), so the
+    /// difference is the whole point of measuring it.
+    pub(super) fn storage_bytes(&self) -> usize {
+        self.cells.capacity() * std::mem::size_of::<Cell>()
+            + self.combining.capacity() * std::mem::size_of::<CombiningMark>()
+    }
+
     /// Blank a wide glyph straddling the boundary *before* `col`, so an operation that
     /// cuts the row there cannot leave half a glyph behind.
     ///
@@ -441,6 +450,21 @@ impl Buffer {
             .and_then(|r| r.cells.get(col))
             .copied()
             .unwrap_or(Cell::BLANK)
+    }
+
+    /// The heap this buffer holds: every row's cells and marks, the two ring
+    /// allocations the row headers sit in, and the tab-stop table.
+    ///
+    /// Both rings count at **capacity**, which is not a rounding detail: a ring is
+    /// filled by pushing past its limit and popping the front back off, so it doubles
+    /// on the push that crosses the cap and then holds the doubled allocation forever.
+    /// Measuring `len` would hide exactly the kind of waste this number exists to find.
+    pub(super) fn storage_bytes(&self) -> usize {
+        let ring = |d: &VecDeque<Row>| {
+            d.capacity() * std::mem::size_of::<Row>()
+                + d.iter().map(Row::storage_bytes).sum::<usize>()
+        };
+        ring(&self.lines) + ring(&self.scrollback) + self.tabs.capacity()
     }
 
     /// The row at `idx` in this buffer's stream — history first (oldest at 0), then the
