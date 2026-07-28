@@ -529,9 +529,12 @@ impl State {
         );
         self.roundtrip()?;
 
-        let compositor = self
-            .compositor
-            .ok_or_else(|| Error::msg("compositor has no wl_compositor"))?;
+        let compositor = self.compositor.ok_or_else(|| {
+            Error::msg(format!(
+                "compositor has no wl_compositor at version {} or newer",
+                protocol::VERSION_COMPOSITOR
+            ))
+        })?;
         let wm_base = self
             .wm_base
             .ok_or_else(|| Error::msg("compositor has no xdg_wm_base"))?;
@@ -1838,6 +1841,15 @@ impl State {
         let version = r.u32()?;
         match interface {
             protocol::IFACE_COMPOSITOR => {
+                // Version 4 is a hard floor, not a preference: the frame is presented with
+                // `wl_surface.damage_buffer`, which does not exist before it, and there is
+                // no correct fallback worth carrying (`damage` would need every rect
+                // divided by the scale, throwing away precision the buffer has). Leaving
+                // the global unbound turns this into the clear startup error in
+                // `bring_up` rather than a protocol error on the first frame.
+                if version < protocol::VERSION_COMPOSITOR {
+                    return Ok(());
+                }
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_COMPOSITOR);
                 self.compositor = Some(id);
             }

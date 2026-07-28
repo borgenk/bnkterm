@@ -27,11 +27,22 @@ pub mod wl_compositor {
 
 pub mod wl_surface {
     pub const ATTACH: u16 = 1;
-    pub const DAMAGE: u16 = 2;
     /// Request a one-shot `wl_callback` that fires `done` when the compositor is
     /// ready for the next frame, pacing redraws to the refresh rate.
     pub const FRAME: u16 = 3;
     pub const COMMIT: u16 = 6;
+    /// Damage in **buffer** (device-pixel) coordinates, `wl_surface` version 4.
+    ///
+    /// The one to use. `DAMAGE` takes *surface-local* (logical) coordinates, so on any
+    /// scaled output it means something different from the rectangles a renderer
+    /// produces: the buffer is mapped down to the logical surface by a viewport
+    /// destination or `SET_BUFFER_SCALE`, and at 2x a rect reported in buffer pixels
+    /// names a region twice as far out and twice as large as the one that changed. The
+    /// two do not even overlap once `x >= w`, so a compositor that recomposites only
+    /// damaged regions never re-reads what actually moved: a stale glyph sits there
+    /// until something forces full-surface damage. It hides completely at scale 1.0,
+    /// which is why this is worth a paragraph.
+    pub const DAMAGE_BUFFER: u16 = 9;
     /// Declare the integer scale the buffer is drawn at (the buffer is
     /// `logical * scale` pixels). The compositor divides by it to place the
     /// surface. Used on the integer-scale fallback path; the fractional path uses

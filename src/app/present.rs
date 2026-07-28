@@ -722,10 +722,14 @@ impl State {
             }
             _ => {}
         }
+        // `damage_buffer`, not `damage`: these rectangles come out of the display-list
+        // diff, which works in the same device pixels the buffer is drawn in, and
+        // `wl_surface.damage` would read them as surface-local (logical) coordinates.
+        // The two spaces coincide only at scale 1.0.
         for r in self.presentation.damage_scratch.rects() {
             self.conn.request(
                 self.surface,
-                wl_surface::DAMAGE,
+                wl_surface::DAMAGE_BUFFER,
                 &[Arg::Int(r.x), Arg::Int(r.y), Arg::Int(r.w), Arg::Int(r.h)],
             );
         }
