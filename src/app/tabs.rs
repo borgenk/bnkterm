@@ -616,6 +616,16 @@ impl Tabs {
             .and_then(|entry| entry.core.sync_deadline())
     }
 
+    /// Release the visible child's synchronized-output hold once its deadline has passed.
+    /// Only the visible tab, because only the visible tab's deadline reaches the
+    /// event-loop wait; a hidden tab's stale hold is cleared on the turn after it is
+    /// shown, before that wait is computed.
+    pub(super) fn tick_sync_if_due(&mut self) {
+        if let Some(entry) = self.entries.get_mut(self.active) {
+            entry.core.tick_sync_if_due();
+        }
+    }
+
     /// The visible child's visual-bell deadline, likewise: the flash has to be taken back
     /// off, and no output is coming to prompt it.
     pub(super) fn bell_deadline(&self) -> Option<Instant> {

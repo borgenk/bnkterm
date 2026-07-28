@@ -733,12 +733,19 @@ impl State {
         }
     }
 
-    /// Fire the cursor blink, the scrollbar's fade, and key repeat if their deadlines
-    /// have passed. The blink and the fade are the core's (it builds the frame); key
-    /// repeat is the window's (it holds the compositor's `repeat_info` and the held key).
+    /// Fire every deadline that has come due. Each one here has a counterpart in
+    /// [`Self::next_wake`], and the pairing is load-bearing: a deadline that can be
+    /// waited on but never disarmed clamps the wait to 1 ms and spins the loop forever,
+    /// so anything added to that list needs a tick here that clears or re-arms it.
+    ///
+    /// Ownership splits the obvious way. The blink, the fade, the bell, the
+    /// synchronized-output hold and the debounced resize are the core's (it builds the
+    /// frame and owns the child); key repeat is the window's, which holds the
+    /// compositor's `repeat_info` and the key being held down.
     fn service_timers(&mut self) -> Result<()> {
         self.tabs.tick_blink_if_due();
         self.tabs.tick_bell_if_due();
+        self.tabs.tick_sync_if_due();
         self.tabs.tick_scrollbar();
         // Deliver any resize that has now settled to the children (debounced SIGWINCH).
         self.tabs.flush_winsize_if_due()?;

@@ -1188,6 +1188,12 @@ impl TerminalCore {
     /// in and not extended by later output: it bounds how long a *frame* can take, and a
     /// child that keeps writing while holding the lock is exactly the case that must not
     /// be able to hold it forever.
+    ///
+    /// Once [`Self::tick_sync_if_due`] has fired the deadline and cleared it, output that
+    /// still finds the lock held arms a *new* one. That is deliberate: the frame just
+    /// presented is over, so the next one gets its own budget, and a child that never
+    /// releases the lock therefore settles at one presented frame per timeout instead of
+    /// having synchronization silently switched off for the rest of its life.
     fn track_sync_lock(&mut self) {
         if !self.screen.synchronized() {
             self.sync_until = None;
@@ -1203,6 +1209,25 @@ impl TerminalCore {
     /// frame is a cosmetic problem; a window that never repaints again is not.
     pub(super) fn holds_frame(&self) -> bool {
         self.sync_until.is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Give up on a synchronized frame whose deadline has passed, and present what we
+    /// have.
+    ///
+    /// The deadline has to be disarmed by the clock, not by the child, because the child
+    /// is exactly what may have stopped talking: [`Self::track_sync_lock`] runs only when
+    /// bytes arrived, so a child that opens `?2026` and then goes quiet (or dies) leaves
+    /// `sync_until` set in the past forever. That is not merely untidy, it pins the event
+    /// loop: a deadline already past clamps the loop's wait to 1 ms, so the window spins
+    /// at 1 kHz with nothing to draw until the child speaks again. Clearing it here makes
+    /// the deadline behave like every other timer in `service_timers` — armed once, fired
+    /// once, gone.
+    pub(super) fn tick_sync_if_due(&mut self) {
+        if self.sync_until.is_some_and(|until| until <= Instant::now()) {
+            self.sync_until = None;
+            // The frame that was being held is now the frame to show.
+            self.dirty = true;
+        }
     }
 
     /// When to wake and present anyway, for the event loop's wait.
@@ -1976,6 +2001,61 @@ mod tests {
             core.sync_deadline().is_some(),
             "and the loop had a deadline to wake on, or nothing would have brought it back"
         );
+
+        // Servicing that wake both presents the held frame and takes the deadline back
+        // out of the loop's wait. Leaving it set is the whole defect: a deadline in the
+        // past is not a deadline, it is a 1 ms wait forever.
+        core.dirty = false;
+        core.tick_sync_if_due();
+        assert!(core.dirty, "the held frame is presented");
+        assert_eq!(
+            core.sync_deadline(),
+            None,
+            "and the deadline is disarmed, or a past deadline clamps the wait to 1ms and \
+             spins the loop at 1kHz forever"
+        );
+
+        // The child never released the lock, so the *next* output opens a fresh frame
+        // under it. That is a new deadline, not an extension of the expired one, and it
+        // is in the future, which is the property that matters: a child that holds
+        // `?2026` forever costs one wake per timeout, not one per millisecond.
+        assert!(core.screen.synchronized(), "the child never released it");
+        core.feed_test_bytes(b"x");
+        let rearmed = core
+            .sync_deadline()
+            .expect("a fresh frame, a fresh deadline");
+        assert!(
+            rearmed > Instant::now(),
+            "and it is ahead of us, not behind"
+        );
+        assert!(
+            core.holds_frame(),
+            "so the new frame is held like any other"
+        );
+    }
+
+    #[test]
+    fn a_live_synchronized_frame_is_not_cut_short_by_the_timer() {
+        // The other half of the deadline's contract: servicing timers must not end a
+        // frame the child is still legitimately drawing, or `?2026` would tear exactly
+        // the frames it exists to keep whole.
+        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        core.feed_test_bytes(b"\x1b[?2026h");
+        let armed = core.sync_deadline();
+        assert!(armed.is_some(), "entering arms the deadline");
+
+        core.tick_sync_if_due();
+        assert_eq!(
+            core.sync_deadline(),
+            armed,
+            "still in the future, so untouched"
+        );
+        assert!(core.holds_frame(), "and the frame is still held");
+
+        // Leaving is what normally clears it, and still does.
+        core.feed_test_bytes(b"\x1b[?2026l");
+        assert_eq!(core.sync_deadline(), None);
+        assert!(!core.holds_frame());
     }
 
     #[test]
