@@ -1854,13 +1854,10 @@ impl State {
         // Gather fractional deltas (touchpads send many small ones) into whole
         // notches, then hand them to the terminal (which reports them, scrolls the
         // view, or sends arrow keys — see `apply_pointer`).
-        self.axis_accum += value;
-        let step = 15.0; // a typical wheel notch in wl_fixed units
-        let notches = (self.axis_accum / step) as i32;
+        let notches = wheel_notches(&mut self.axis_accum, value);
         if notches == 0 {
             return Ok(());
         }
-        self.axis_accum -= notches as f32 * step;
         let (col, row, _) = self.pointer_cell();
         let mods = self.current_mods();
         self.tabs.active_mut().apply(ToTerminal::Pointer {
@@ -2138,9 +2135,37 @@ fn open_url(url: &str) {
     }
 }
 
-/// Map a Wayland pointer button (a `linux/input-event-codes.h` code) to the
-/// logical button the mouse encoder speaks. Unknown buttons (side buttons) are
-/// ignored.
+/// A wheel notch, in **logical pixels**. Not `wl_fixed` units: [`Reader::fixed`] has
+/// already divided the wire's 24.8 fixed-point value by 256 by the time an axis delta
+/// reaches here, so `value` is pixels and so is this. The constant was always right and
+/// the comment beside it named the wrong unit, which is precisely the
+/// measured-the-wrong-thing hazard the house rules are about.
+const WHEEL_STEP: f32 = 15.0;
+
+/// Fold one axis delta into the pending wheel travel, returning the whole notches to
+/// emit (positive = down) and leaving the remainder behind.
+///
+/// The accumulator exists because a touchpad sends many small deltas where a wheel sends
+/// one big one, and a terminal scrolls in whole lines either way.
+///
+/// **A direction change starts over**, and that is the part worth stating: the
+/// accumulator holds *travel that has not yet become a notch*, and travel one way says
+/// nothing about travel the other. Scroll down until it holds 14 — below the threshold,
+/// so nothing has been emitted — then reverse, and an up-notch has to climb from +14 all
+/// the way to −15. That is 29 units of upward travel for the first notch, so the first
+/// two flicks of the reversal do nothing at all. And with no `axis_stop` handling the
+/// leftover survives *between* gestures, so 14/15 of a notch from minutes ago makes the
+/// next single flick overshoot.
+fn wheel_notches(accum: &mut f32, value: f32) -> i32 {
+    if value != 0.0 && *accum != 0.0 && (value < 0.0) != (*accum < 0.0) {
+        *accum = 0.0;
+    }
+    *accum += value;
+    let notches = (*accum / WHEEL_STEP) as i32;
+    *accum -= notches as f32 * WHEEL_STEP;
+    notches
+}
+
 /// Map a grid-local device x (already inset past the padding, floored at zero) to
 /// the column under it, clamped into the grid, and the [`Side`] of that column's
 /// midline it falls on. The side is measured against the *clamped* column, so a
@@ -2157,6 +2182,9 @@ fn column_under(px: f32, cell_w: i32, cols: usize) -> (usize, Side) {
     (col, side)
 }
 
+/// Map a Wayland pointer button (a `linux/input-event-codes.h` code) to the
+/// logical button the mouse encoder speaks. Unknown buttons (side buttons) are
+/// ignored.
 fn pointer_button(code: u32) -> Option<MouseButton> {
     match code {
         protocol::wl_pointer::BTN_LEFT => Some(MouseButton::Left),
@@ -2178,6 +2206,62 @@ mod tests {
         reporting: false,
         shift: false,
     };
+
+    #[test]
+    fn the_wheel_accumulator_starts_over_when_the_direction_flips() {
+        // The accumulator holds travel that has not yet become a notch, and travel one
+        // way says nothing about travel the other.
+        let mut accum = 0.0;
+
+        // Almost a notch down: nothing emitted, 14 pending.
+        assert_eq!(wheel_notches(&mut accum, 14.0), 0);
+        assert_eq!(accum, 14.0);
+
+        // Now reverse. Carrying the +14 forward, the first up-notch would need 29 units
+        // of upward travel and the first two flicks of the reversal would do nothing —
+        // the scroll wheel simply not responding, right after a scroll the other way.
+        assert_eq!(
+            wheel_notches(&mut accum, -15.0),
+            -1,
+            "one flick up is one notch up, whatever was pending downward"
+        );
+
+        // And a leftover cannot survive a reversal into the next gesture either. With no
+        // `axis_stop` to clear it, 14/15 of a notch from minutes ago would make the next
+        // single flick the other way overshoot.
+        let mut accum = 0.0;
+        assert_eq!(wheel_notches(&mut accum, 14.0), 0);
+        assert_eq!(wheel_notches(&mut accum, -14.0), 0, "under the threshold");
+        assert_eq!(accum, -14.0, "and the down travel is gone, not banked");
+    }
+
+    #[test]
+    fn the_wheel_gathers_fractional_deltas_and_keeps_the_remainder() {
+        // The reason the accumulator exists: a touchpad sends many small deltas where a
+        // wheel sends one 15. Same direction throughout, so nothing is discarded.
+        let mut accum = 0.0;
+        for _ in 0..4 {
+            assert_eq!(wheel_notches(&mut accum, 3.0), 0);
+        }
+        assert_eq!(wheel_notches(&mut accum, 3.0), 1, "12 + 3 is one notch");
+        assert_eq!(accum, 0.0);
+
+        // A big delta yields every notch in it and banks the rest.
+        let mut accum = 0.0;
+        assert_eq!(wheel_notches(&mut accum, 47.0), 3);
+        assert!((accum - 2.0).abs() < 1e-4, "remainder kept: {accum}");
+
+        // Upward is symmetric.
+        let mut accum = 0.0;
+        assert_eq!(wheel_notches(&mut accum, -47.0), -3);
+        assert!((accum + 2.0).abs() < 1e-4, "remainder kept: {accum}");
+
+        // A zero delta is not a direction, so it neither emits nor resets.
+        let mut accum = 0.0;
+        assert_eq!(wheel_notches(&mut accum, 7.0), 0);
+        assert_eq!(wheel_notches(&mut accum, 0.0), 0);
+        assert_eq!(accum, 7.0);
+    }
 
     #[test]
     fn a_pointer_rounds_to_the_nearer_cell_edge() {

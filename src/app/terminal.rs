@@ -255,6 +255,19 @@ pub(super) struct TerminalCore {
     /// The button held for drag reporting under mouse mode (`None` when none is
     /// down).
     mouse_held: Option<MouseButton>,
+    /// The cell the last motion report named, so an identical one is not sent again.
+    ///
+    /// A mouse reports position in pixels and the protocol reports it in *cells*, so
+    /// under `?1003` (or `?1002` with a button down) a slow crossing of one 8px column
+    /// with a 1000 Hz mouse produces dozens of byte-identical reports. Downstream, a TUI
+    /// that repaints per motion report repaints tens of times per cell, and a
+    /// tmux-over-ssh session pays a round trip for each duplicate. xterm and foot both
+    /// track the last reported cell and stay silent until it changes.
+    ///
+    /// Cleared on a button press or release and when the pointer leaves the grid, so a
+    /// program always hears a fresh position at the start of a gesture rather than
+    /// inheriting one from the last.
+    reported_cell: Option<(usize, usize)>,
     /// The active text selection (a left-drag), or `None`. In absolute rows, so child
     /// output scrolling the grid does not drag it off the text it was made over; see
     /// [`Self::prune_selection`] for the (short) list of things that do end it.
@@ -346,6 +359,7 @@ impl TerminalCore {
             bell_until: None,
             tty_mode: TtyMode::Cooked,
             mouse_held: None,
+            reported_cell: None,
             selection: None,
             drag: None,
             hover: None,
@@ -721,6 +735,9 @@ impl TerminalCore {
             } => {
                 if reporting {
                     self.mouse_held = pressed.then_some(button);
+                    // A press or release starts a new gesture, so the next motion is
+                    // news whatever cell it lands in.
+                    self.reported_cell = None;
                     let kind = if pressed {
                         MouseKind::Press
                     } else {
@@ -755,9 +772,11 @@ impl TerminalCore {
             PointerEvent::Motion { col, row, side } => {
                 if self.drag.is_some() {
                     self.extend_selection(row, col, side);
-                } else if reporting {
+                } else if reporting && self.reported_cell != Some((row, col)) {
                     // Report motion to a program that asked for it (drag under ?1002,
-                    // any move under ?1003).
+                    // any move under ?1003) — once per *cell*, which is the only
+                    // resolution the report has. See `reported_cell`.
+                    self.reported_cell = Some((row, col));
                     let button = self.mouse_held.unwrap_or(MouseButton::None);
                     self.write_mouse(button, MouseKind::Motion, col, row, mods, 1)?;
                 }
@@ -765,7 +784,12 @@ impl TerminalCore {
                 // drag is a selection, and a grabbed mouse belongs to the program.
                 self.track_hover(row, col, !reporting && self.drag.is_none());
             }
-            PointerEvent::Left => self.track_hover(0, 0, false),
+            PointerEvent::Left => {
+                // Off the grid entirely: the next motion back onto it is a fresh
+                // position, even if it lands on the cell the pointer left from.
+                self.reported_cell = None;
+                self.track_hover(0, 0, false);
+            }
             PointerEvent::Wheel {
                 down,
                 notches,
@@ -2749,6 +2773,78 @@ mod tests {
         });
         assert_eq!(primary, Some(b"bnkt".as_slice()), "primary gets the text");
         assert_eq!(clipboard, Some(b"bnkt".as_slice()), "clipboard too");
+    }
+
+    /// Whether one motion event produced a mouse report, and the bytes if it did.
+    ///
+    /// `key_buf` is where every encoder writes before the bytes are handed off, and it is
+    /// where they are observable in a core with no child attached: `pump_writes` discards
+    /// the outbound queue when there is no pty to take it, so `out_buf` cannot be read
+    /// after the fact.
+    fn motion_report(core: &mut TerminalCore, col: usize, row: usize, side: Side) -> Vec<u8> {
+        core.key_buf.clear();
+        drag_in(core, col, row, side);
+        core.key_buf.clone()
+    }
+
+    #[test]
+    fn motion_is_reported_once_per_cell_not_once_per_pixel() {
+        // A mouse reports position in pixels; the protocol reports it in cells. Under
+        // `?1003` (or `?1002` with a button held) crossing one 8px column slowly with a
+        // 1000 Hz mouse therefore produces dozens of byte-identical reports. Downstream a
+        // TUI that repaints per motion report repaints tens of times per cell, and a
+        // tmux-over-ssh session pays a round trip for every duplicate. xterm and foot both
+        // stay silent until the cell changes.
+        let mut core = pointer_core();
+        core.feed_test_bytes(b"\x1b[?1003h\x1b[?1006h"); // any-motion reporting, SGR
+
+        assert_eq!(
+            motion_report(&mut core, 4, 2, Side::Left),
+            b"\x1b[<35;5;3M",
+            "the first motion into a cell is reported"
+        );
+        for _ in 0..12 {
+            assert!(
+                motion_report(&mut core, 4, 2, Side::Left).is_empty(),
+                "a further twelve events in the same cell say nothing new"
+            );
+        }
+
+        assert_eq!(
+            motion_report(&mut core, 5, 2, Side::Left),
+            b"\x1b[<35;6;3M",
+            "crossing a column boundary is news"
+        );
+        assert_eq!(
+            motion_report(&mut core, 5, 3, Side::Left),
+            b"\x1b[<35;6;4M",
+            "so is a row change"
+        );
+        assert!(
+            motion_report(&mut core, 5, 3, Side::Right).is_empty(),
+            "but half a cell is not a cell — the report has no room for it"
+        );
+
+        // A gesture boundary re-arms it, so a program hears a fresh position at the start
+        // of one rather than inheriting the last one's.
+        press(&mut core, MouseButton::Left, true, 5, 3);
+        assert_eq!(
+            motion_report(&mut core, 5, 3, Side::Left),
+            b"\x1b[<32;6;4M",
+            "the first motion after a press reports, on the very same cell"
+        );
+        press(&mut core, MouseButton::Left, false, 5, 3);
+        assert!(!motion_report(&mut core, 5, 3, Side::Left).is_empty());
+
+        // Leaving the grid does the same: coming back to the cell it left from is a new
+        // position, because in between the pointer was somewhere else entirely.
+        assert!(motion_report(&mut core, 5, 3, Side::Left).is_empty());
+        core.apply(ToTerminal::Pointer {
+            event: PointerEvent::Left,
+            mods: input::Mods::NONE,
+        })
+        .unwrap();
+        assert!(!motion_report(&mut core, 5, 3, Side::Left).is_empty());
     }
 
     #[test]
