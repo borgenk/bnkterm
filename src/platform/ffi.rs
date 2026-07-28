@@ -48,6 +48,11 @@ const O_CLOEXEC: c_int = 0x8_0000;
 const EINTR: c_int = 4;
 /// A timed-out or would-block read (EAGAIN == EWOULDBLOCK on Linux).
 const EAGAIN: c_int = 11;
+/// `fcntl` commands and the flag they carry here, for putting a descriptor the
+/// compositor handed us into non-blocking mode.
+const F_GETFL: c_int = 3;
+const F_SETFL: c_int = 4;
+const O_NONBLOCK: c_int = 0o4000;
 
 /// Resolve all symbols at load time, so a broken library fails at `dlopen`
 /// rather than at first call.
@@ -390,54 +395,106 @@ pub fn pipe() -> Result<(OwnedFd, OwnedFd)> {
     Ok((read_end, write_end))
 }
 
-/// Write every byte of `bytes` to `fd`, retrying short writes and EINTR.
-pub fn write_all(fd: RawFd, bytes: &[u8]) -> Result<()> {
-    let mut sent = 0usize;
-    while sent < bytes.len() {
-        // SAFETY: the slice from `sent` is valid for `len - sent` bytes.
-        let n = unsafe {
-            write(
-                fd,
-                bytes[sent..].as_ptr() as *const c_void,
-                bytes.len() - sent,
-            )
-        };
-        if n < 0 {
-            let e = errno();
-            if e == EINTR {
-                continue;
-            }
-            return Err(Error::msg(format!("write failed: errno {e}")));
+/// Write what the kernel will take right now, returning how many bytes it took.
+/// `Ok(0)` means the pipe is full (`EAGAIN`); `fd` must be non-blocking for that to be
+/// reachable rather than a stall. `EINTR` is retried in place.
+pub fn write_some(fd: RawFd, bytes: &[u8]) -> Result<usize> {
+    loop {
+        // SAFETY: bytes is a valid slice; write reads at most its len.
+        let n = unsafe { write(fd, bytes.as_ptr() as *const c_void, bytes.len()) };
+        if n >= 0 {
+            return Ok(n as usize);
         }
-        if n == 0 {
-            break;
+        let e = errno();
+        if e == EINTR {
+            continue;
         }
-        sent += n as usize;
+        if e == EAGAIN {
+            return Ok(0);
+        }
+        return Err(Error::msg(format!("write failed: errno {e}")));
+    }
+}
+
+/// Put `fd` in non-blocking mode, so a read or write on it can never stall the thread.
+pub fn set_nonblocking(fd: RawFd) -> Result<()> {
+    // SAFETY: F_GETFL takes no third argument and only reads the descriptor.
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags < 0 {
+        return Err(Error::msg(format!("fcntl(F_GETFL): errno {}", errno())));
+    }
+    // SAFETY: F_SETFL takes the new flag word; `fd` is valid for the call.
+    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
+        return Err(Error::msg(format!("fcntl(F_SETFL): errno {}", errno())));
     }
     Ok(())
 }
 
-/// Read `fd` to end-of-file, returning all bytes. Used to pull a paste payload
-/// out of the pipe the compositor writes into.
-pub fn read_to_end(fd: RawFd) -> Result<Vec<u8>> {
+/// Read `fd` to end-of-file, giving up after `budget` or once `max_bytes` have arrived.
+/// Used to pull a paste payload out of the pipe the compositor writes into.
+///
+/// Both bounds are load-bearing, because the party on the other end is another
+/// application and this runs on the thread that also renders, dispatches Wayland and
+/// handles keys. A clipboard owner that accepts `wl_data_offer.receive` and then never
+/// writes and never closes would otherwise hang every tab until SIGKILL — a
+/// user-triggered, remotely-influenced freeze on an ordinary Ctrl+Shift+V. Failing the
+/// paste is a far better outcome than losing the terminal, and a real transfer completes
+/// in well under a millisecond, so the budget is never felt.
+///
+/// The deadline is absolute, so `EINTR` retries do not restart the clock. `fd` is put in
+/// non-blocking mode here rather than trusted to arrive that way.
+pub fn read_to_end_bounded(fd: RawFd, budget: Duration, max_bytes: usize) -> Result<Vec<u8>> {
+    const POLLIN: c_short = 0x0001;
+    set_nonblocking(fd)?;
+    let deadline = Instant::now() + budget;
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
         // SAFETY: buf is a live writable array of buf.len() bytes.
         let n = unsafe { read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-        if n < 0 {
-            let e = errno();
-            if e == EINTR {
-                continue;
+        if n == 0 {
+            return Ok(out); // EOF: the sender closed its end, so the payload is complete
+        }
+        if n > 0 {
+            out.extend_from_slice(&buf[..n as usize]);
+            if out.len() > max_bytes {
+                return Err(Error::msg(format!(
+                    "clipboard payload exceeded {max_bytes} bytes"
+                )));
             }
+            continue;
+        }
+        let e = errno();
+        if e == EINTR {
+            continue;
+        }
+        if e != EAGAIN {
             return Err(Error::msg(format!("read failed: errno {e}")));
         }
-        if n == 0 {
-            break;
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(Error::msg("clipboard owner stopped sending"));
+        };
+        let mut pfd = PollFd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live PollFd for the length of the call; poll reads `events`, writes
+        // `revents`, and treats `fd` as read-only.
+        let r = unsafe {
+            poll(
+                &mut pfd,
+                1,
+                c_int::try_from(left.as_millis()).unwrap_or(c_int::MAX),
+            )
+        };
+        if r < 0 && errno() != EINTR {
+            return Err(Error::msg(format!("poll failed: errno {}", errno())));
         }
-        out.extend_from_slice(&buf[..n as usize]);
+        if r == 0 {
+            return Err(Error::msg("clipboard owner stopped sending"));
+        }
     }
-    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -711,6 +768,7 @@ struct PollFd {
 
 extern "C" {
     fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
+    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
 }
 
 /// Block until `fd` — a sync file — signals its fence, or `timeout_ms` elapses; returns
@@ -843,6 +901,104 @@ mod tests {
     use super::*;
     use core::ffi::c_short;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn a_bounded_read_returns_everything_a_sender_writes_then_closes() {
+        // The ordinary case, over a real pipe: the payload arrives whole, and EOF is what
+        // ends the read rather than the deadline.
+        let (read_end, write_end) = pipe().unwrap();
+        let payload = vec![b'z'; 200_000]; // several pipe-fuls, so it takes many reads
+        let writer = std::thread::spawn(move || {
+            let mut sent = 0;
+            while sent < payload.len() {
+                // The write end is blocking, which is what a well-behaved clipboard owner
+                // does; the reader draining it is what lets this finish.
+                let n = unsafe {
+                    write(
+                        write_end.as_raw_fd(),
+                        payload[sent..].as_ptr() as *const c_void,
+                        payload.len() - sent,
+                    )
+                };
+                assert!(n > 0);
+                sent += n as usize;
+            }
+            drop(write_end); // EOF
+        });
+        let got =
+            read_to_end_bounded(read_end.as_raw_fd(), Duration::from_secs(10), 1 << 20).unwrap();
+        writer.join().unwrap();
+        assert_eq!(got.len(), 200_000);
+        assert!(got.iter().all(|&b| b == b'z'));
+    }
+
+    #[test]
+    fn a_sender_that_never_writes_gives_up_instead_of_hanging() {
+        // The freeze: a clipboard owner that accepts the transfer and then neither writes
+        // nor closes. Without the deadline this blocks forever on the thread that also
+        // renders and handles keys, so every tab is gone until SIGKILL. The write end is
+        // held open for the whole call, which is precisely why no EOF ever arrives.
+        let (read_end, write_end) = pipe().unwrap();
+        let start = Instant::now();
+        let err = read_to_end_bounded(read_end.as_raw_fd(), Duration::from_millis(80), 1 << 20)
+            .expect_err("a silent sender must not read as an empty clipboard");
+        let waited = start.elapsed();
+        drop(write_end);
+        assert!(waited >= Duration::from_millis(70), "it waited its budget");
+        assert!(
+            waited < Duration::from_secs(2),
+            "and gave up, taking {waited:?}"
+        );
+        assert!(format!("{err}").contains("stopped sending"), "{err}");
+    }
+
+    #[test]
+    fn a_bounded_read_refuses_a_payload_past_its_cap() {
+        // A clipboard owner that streams without end is the other half of the same
+        // problem: bounded in time is not bounded in memory.
+        let (read_end, write_end) = pipe().unwrap();
+        let fd = write_end.as_raw_fd();
+        let writer = std::thread::spawn(move || {
+            let chunk = vec![b'q'; 4096];
+            // Runs until the reader gives up and closes, which makes this EPIPE.
+            while unsafe { write(fd, chunk.as_ptr() as *const c_void, chunk.len()) } > 0 {}
+            drop(write_end);
+        });
+        let err = read_to_end_bounded(read_end.as_raw_fd(), Duration::from_secs(10), 64 * 1024)
+            .expect_err("an endless sender must be refused");
+        drop(read_end);
+        writer.join().unwrap();
+        assert!(format!("{err}").contains("exceeded"), "{err}");
+    }
+
+    #[test]
+    fn a_nonblocking_write_reports_a_full_pipe_rather_than_stalling() {
+        // The property the selection serve rests on: with the pipe full and nobody
+        // reading, the write returns 0 instead of parking the event loop. A blocking fd
+        // here is what made a large copy into a lazy reader stop the window.
+        let (read_end, write_end) = pipe().unwrap();
+        set_nonblocking(write_end.as_raw_fd()).unwrap();
+        let chunk = vec![b'w'; 64 * 1024];
+        let mut total = 0usize;
+        let start = Instant::now();
+        loop {
+            let n = write_some(write_end.as_raw_fd(), &chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n;
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "a pipe nobody reads must fill"
+            );
+        }
+        assert!(total > 0, "it accepted the first writes");
+        // And it is a stall, not a failure: draining the reader makes room again.
+        let mut sink = [0u8; 4096];
+        let n = unsafe { read(read_end.as_raw_fd(), sink.as_mut_ptr() as *mut c_void, 4096) };
+        assert!(n > 0);
+        assert!(write_some(write_end.as_raw_fd(), &chunk[..4096]).unwrap() > 0);
+    }
 
     #[test]
     fn cmsg_math_matches_one_fd() {

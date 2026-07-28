@@ -34,7 +34,7 @@ mod terminal;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
-use self::clipboard::SelectionState;
+use self::clipboard::{PendingSend, SelectionState};
 use self::message::{PointerEvent, Side, ToTerminal, ToWindow};
 use self::present::GpuPresentation;
 use self::tabs::{Reorder, Tabs};
@@ -396,6 +396,10 @@ struct State {
     primary_manager: Option<u32>,
     primary_device: u32,
     primary: SelectionState,
+    /// Selection transfers still owed bytes to whoever asked for them, shared by both
+    /// transports. Serving is asynchronous because the receiver decides when to read and
+    /// a pipe holds only 64 KiB (see `State::begin_selection_send`).
+    pending_sends: Vec<PendingSend>,
     /// The latest input-event serial, needed to claim a selection.
     last_serial: u32,
     /// GPU/dmabuf presentation resources.
@@ -492,6 +496,7 @@ impl State {
             primary_manager: None,
             primary_device: 0,
             primary: SelectionState::new(),
+            pending_sends: Vec::new(),
             last_serial: 0,
             presentation: GpuPresentation::new(),
             next_id: 2, // 1 is wl_display

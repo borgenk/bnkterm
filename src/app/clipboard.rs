@@ -11,7 +11,8 @@
 //!   paste: offer.receive(mime, pipe) ─▶ read to EOF ─▶ (bracket?) ─▶ PTY
 //! ```
 
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::time::Duration;
 
 use super::message::ToTerminal;
 use super::State;
@@ -26,6 +27,38 @@ use crate::platform::wire::{Arg, Reader};
 
 /// The MIME types we advertise on copy and accept on paste, preferred first.
 pub(super) const CLIPBOARD_MIMES: &[&str] = &["text/plain;charset=utf-8", "text/plain"];
+
+/// How long a paste waits on the clipboard's owner before giving up, and how much it
+/// will accept. The owner is another application, and the wait is on the thread that
+/// renders and handles keys, so neither can be unbounded. Half a second is far beyond
+/// any real transfer (they finish in microseconds, in one `read`) and short enough that
+/// a broken peer costs a dropped paste rather than a hung terminal. 16 MiB is likewise
+/// far past anything a person pastes into a shell.
+const PASTE_BUDGET: Duration = Duration::from_millis(500);
+const PASTE_MAX: usize = 16 * 1024 * 1024;
+
+/// How much of a selection can still be owed to a paster before we stop tracking it.
+/// Serving is asynchronous (see [`State::pump_selection_sends`]) and a receiver that
+/// never reads would otherwise pin our copy of the data forever; four concurrent
+/// transfers is already generous, since each is one application asking for one paste.
+const MAX_PENDING_SENDS: usize = 4;
+
+/// A selection transfer in flight: the pipe the compositor handed us, our copy of the
+/// bytes, and how far into them the receiver has taken. The data is owned rather than
+/// borrowed because the selection can be replaced (or the source cancelled, which clears
+/// it) while a paster is still reading the old one.
+pub(super) struct PendingSend {
+    fd: OwnedFd,
+    data: Vec<u8>,
+    head: usize,
+}
+
+impl PendingSend {
+    /// The pipe to watch for writability while this transfer is still owed bytes.
+    pub(super) fn fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
 
 /// Which of the two selection transports a request or event belongs to. They share
 /// one state machine over two object families, so the code is written once and the
@@ -237,11 +270,7 @@ impl State {
                 .conn
                 .take_fd()
                 .ok_or_else(|| Error::msg("selection source.send arrived without its fd"))?;
-            // A paster that closes its read end early makes this EPIPE; serving the
-            // selection must never take the terminal down, so report and go on.
-            if let Err(e) = ffi::write_all(fd.as_raw_fd(), &self.selection(t).data) {
-                eprintln!("bnkterm: selection serve failed: {e}");
-            }
+            self.begin_selection_send(t, fd);
         } else if opcode == ops.ev_cancelled {
             let source = self.selection(t).source;
             if source != 0 {
@@ -300,6 +329,59 @@ impl State {
         st.data = data;
     }
 
+    /// Start serving our selection down `fd`, writing what fits now and queueing the
+    /// rest for [`Self::pump_selection_sends`].
+    ///
+    /// The write cannot be finished here, for the same reason the PTY's cannot: a pipe
+    /// holds 64 KiB by default and the receiver decides when to read. Select a megabyte
+    /// of scrollback and paste it into an application that reads lazily (or a clipboard
+    /// manager that defers reading entirely) and a blocking write stops the event loop
+    /// mid-transfer — the window stops repainting while another program's scheduling
+    /// decides when it resumes.
+    ///
+    /// A deadline is not an option here the way it is for a paste. Giving up halfway
+    /// through delivers a *truncated selection* to whatever asked for it, silently and
+    /// plausibly, so the only correct outcomes are all of it or a closed pipe.
+    fn begin_selection_send(&mut self, t: Transport, fd: OwnedFd) {
+        if let Err(e) = ffi::set_nonblocking(fd.as_raw_fd()) {
+            eprintln!("bnkterm: selection serve failed: {e}");
+            return;
+        }
+        // Oldest first: a receiver that never reads is the one that piles up, and a fresh
+        // request is likelier to be a live paster than a stalled one.
+        if self.pending_sends.len() >= MAX_PENDING_SENDS {
+            self.pending_sends.remove(0);
+        }
+        self.pending_sends.push(PendingSend {
+            fd,
+            data: self.selection(t).data.clone(),
+            head: 0,
+        });
+        self.pump_selection_sends();
+    }
+
+    /// Push every in-flight selection transfer as far as its receiver will take it,
+    /// dropping the ones that finish or fail. A closed read end reports `EPIPE` rather
+    /// than raising `SIGPIPE`, because the Rust runtime ignores it process-wide (only the
+    /// PTY child restores the default), so a paster that goes away is an ordinary error.
+    pub(super) fn pump_selection_sends(&mut self) {
+        self.pending_sends.retain_mut(|send| {
+            while send.head < send.data.len() {
+                match ffi::write_some(send.fd.as_raw_fd(), &send.data[send.head..]) {
+                    Ok(0) => return true, // the pipe is full; come back on POLLOUT
+                    Ok(n) => send.head += n,
+                    Err(e) => {
+                        // Almost always EPIPE: the paster took what it wanted and closed.
+                        // Serving a selection must never take the terminal down.
+                        eprintln!("bnkterm: selection serve failed: {e}");
+                        return false;
+                    }
+                }
+            }
+            false // delivered in full; closing the fd is what signals EOF
+        });
+    }
+
     /// Paste a transport's text to the child: the core normalizes, brackets, and
     /// writes it (see `TerminalCore::apply`). A no-op when the transport is empty.
     fn paste_from(&mut self, t: Transport) -> Result<()> {
@@ -336,9 +418,16 @@ impl State {
             &[Arg::Str(&mime)],
             write_end.as_raw_fd(),
         )?;
+        // Our copy goes now, so the only writer left is the owner: without this the read
+        // below never sees EOF, because the pipe still has a write end open here.
         drop(write_end);
-        let bytes = ffi::read_to_end(read_end.as_raw_fd())?;
-        Ok(String::from_utf8(bytes).ok())
+        // Bounded, because the sender is another application and this is the thread that
+        // also renders, dispatches Wayland and handles keys. A clipboard owner that
+        // accepts the transfer and then never writes and never closes would otherwise
+        // hang every tab until SIGKILL, on an ordinary Ctrl+Shift+V. A real transfer
+        // completes in microseconds, so the budget is only ever spent on a broken peer.
+        let bytes = ffi::read_to_end_bounded(read_end.as_raw_fd(), PASTE_BUDGET, PASTE_MAX)?;
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
 }
 
