@@ -20,6 +20,35 @@ fn cell_layout_is_pinned() {
 }
 
 #[test]
+fn a_full_scrollback_ring_never_outgrows_its_limit() {
+    // The ring is filled by pushing past the cap and popping the front back off, so it
+    // is momentarily one row longer than it is allowed to be. Allocated at exactly the
+    // limit, that one push doubles the header array and the doubling is never given
+    // back: 0.53 MiB held for nothing at the default 10k ring. The spare slot
+    // ([`buffer::scrollback_capacity`]) is what stops it, and this is what stops the
+    // spare slot from being tidied away again.
+    const LIMIT: usize = 64;
+    let mut s = Screen::with_scrollback(20, 4, LIMIT);
+    let want = buffer::scrollback_capacity(LIMIT);
+
+    // Well past the cap, so eviction has been running for a while.
+    for _ in 0..LIMIT * 3 {
+        feed(&mut s, b"line\r\n");
+    }
+    assert_eq!(s.scrollback_len(), LIMIT);
+    assert_eq!(s.primary.scrollback.capacity(), want);
+
+    // A width change rebuilds the ring from scratch, which is where this last came
+    // back: reflow sized the new deque to the rows it was putting in it.
+    s.resize(11, 4);
+    for _ in 0..LIMIT * 3 {
+        feed(&mut s, b"line\r\n");
+    }
+    assert_eq!(s.scrollback_len(), LIMIT);
+    assert_eq!(s.primary.scrollback.capacity(), want);
+}
+
+#[test]
 fn blank_is_a_default_space() {
     assert_eq!(Cell::BLANK, Cell::default());
     assert_eq!(Cell::BLANK.rune, ' ');

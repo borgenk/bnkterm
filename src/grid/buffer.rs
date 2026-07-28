@@ -420,7 +420,7 @@ impl Buffer {
             cols,
             rows,
             lines,
-            scrollback: VecDeque::with_capacity(scrollback_limit),
+            scrollback: VecDeque::with_capacity(scrollback_capacity(scrollback_limit)),
             scrollback_limit,
             evicted: 0,
             cursor: Cursor::default(),
@@ -1113,7 +1113,12 @@ impl Buffer {
         let live_end = live_top.saturating_add(new_rows).min(total);
 
         let mut lines_out: VecDeque<Row> = VecDeque::with_capacity(new_rows);
-        let mut scrollback_out: VecDeque<Row> = VecDeque::with_capacity(live_top);
+        // Sized for the ring this will become, not just the rows going into it: a
+        // narrow can rewrap more history than the limit holds (it is trimmed just
+        // below), and the steady state after that is a full ring (see
+        // [`scrollback_capacity`]). Either way the deque must never have to grow.
+        let mut scrollback_out: VecDeque<Row> =
+            VecDeque::with_capacity(live_top.max(scrollback_capacity(self.scrollback_limit)));
         for (idx, row) in new_stream.into_iter().enumerate() {
             if idx < live_top {
                 scrollback_out.push_back(row);
@@ -1291,6 +1296,26 @@ impl Buffer {
             self.clear_line_full(row, fill);
         }
     }
+}
+
+/// How many row slots a scrollback ring holding `limit` rows must be allocated: one
+/// **past** the limit, and that spare slot is worth half a megabyte.
+///
+/// A row retires by pushing onto the back and popping the front back off, so a full
+/// ring is momentarily `limit + 1` rows long. Against a `limit`-sized allocation that
+/// push is one too many: the deque doubles, the pop brings the length back down, and
+/// the doubled header array is held for the rest of the session. At the default 10k
+/// ring that is 20000 slots kept for 10000 rows, 0.53 MiB of nothing, on every
+/// terminal, forever. It is stated here rather than at the two allocation sites
+/// because [`Buffer::reflow`] rebuilds the ring and silently reintroduced it on every
+/// width change.
+///
+/// ```text
+///   cap = limit      push ─▶ len = limit+1 ─▶ REALLOC to 2*limit ─▶ pop ─▶ len = limit
+///   cap = limit + 1  push ─▶ len = limit+1 ─▶ fits ──────────────▶ pop ─▶ len = limit
+/// ```
+pub(super) fn scrollback_capacity(limit: usize) -> usize {
+    limit.saturating_add(1)
 }
 
 /// The default table: a stop every [`TAB_WIDTH`] columns, across [`MAX_TAB_COLUMNS`] or
