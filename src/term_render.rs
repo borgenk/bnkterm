@@ -1541,14 +1541,26 @@ fn text_bounds(x: i32, baseline: i32, run_w: i32, m: CellMetrics) -> Rect {
     }
 }
 
-/// Whether a rune is safe to batch into a fixed-pitch [`DrawCmd::Cells`] run:
-/// every Basic-Multilingual-Plane scalar is, because none of them are regional
-/// indicators or emoji that a grapheme segmenter would merge across cell
-/// boundaries (those all live in the astral planes). An astral rune is drawn
-/// standalone so one cell always maps to one cluster in a run. Indic conjuncts
-/// and other segmentation exotica are the 5% we deliberately punt.
+/// Whether a rune is safe to batch into a fixed-pitch [`DrawCmd::Cells`] run.
+///
+/// The batcher recovers cell boundaries by segmenting the run's text and using each
+/// cluster's index as the pen multiplier, so the run must hold one cluster per cell. Two
+/// families break that and are excluded here:
+///
+/// - **astral scalars**, the regional indicators and emoji that pair up into flags and
+///   ZWJ sequences;
+/// - **the mergeable BMP scalars** ([`grapheme::joins_across_cells`]) — Indic spacing
+///   vowel signs, `Prepend`, and the trailing consonant of a conjunct. These are a full
+///   column wide on the grid *and* joinable by UAX #29, which is the exact combination
+///   the fixed-pitch path cannot represent.
+///
+/// Everything else a segmenter would merge is zero-width and never occupies a cell at
+/// all: it lives in the grid's combining-mark side list, and the run text picks it up
+/// with the cell it belongs to.
+///
+/// An excluded rune is drawn standalone, the same treatment a wide rune already gets.
 fn cells_safe(rune: char) -> bool {
-    (rune as u32) <= 0xFFFF
+    (rune as u32) <= 0xFFFF && !grapheme::joins_across_cells(rune)
 }
 
 /// The font style a cell's bold/italic attributes select. Takes the attributes rather
@@ -2933,12 +2945,116 @@ mod tests {
         assert_eq!(damaged_area(&rects), surface, "the whole surface");
     }
 
+    /// Every cell in a painted frame lands on its own column, for the scripts a
+    /// fixed-pitch run cannot batch.
+    ///
+    /// A `Cells` run is drawn by segmenting its text and multiplying the cluster *index*
+    /// by the cell width, so a run holding a scalar that a segmenter merges leftward
+    /// silently paints every following cell one column short. That is not a subtle
+    /// artefact: for Devanagari it was every line of text, with the background fill, the
+    /// selection band and the cursor all still on the true grid.
+    ///
+    /// Checked by walking the display list and asking where each cluster actually lands,
+    /// rather than by asserting the internal predicate, so the property survives a change
+    /// in how the exclusion is implemented.
+    #[test]
+    fn every_cell_paints_on_its_own_column_in_every_script() {
+        let theme = Theme::default();
+        // One line per script, each ending in an ASCII letter: the letter is what visibly
+        // walks left when a cluster merge eats a column.
+        for (script, text) in [
+            ("Devanagari (SpacingMark)", "कीx"),
+            ("Devanagari (conjunct)", "क्षx"),
+            ("Bengali", "কীx"),
+            ("Gurmukhi", "ਕੀx"),
+            ("Gujarati", "કીx"),
+            ("Oriya", "କୀx"),
+            ("Tamil", "கீx"),
+            ("Telugu", "కీx"),
+            ("Kannada", "ಕೀx"),
+            ("Malayalam", "കീx"),
+        ] {
+            let screen = screen_after(12, 2, text.as_bytes());
+            let list = build_display_list(&inputs(&screen, &theme));
+
+            // Where the painter puts each cluster: one entry per column it draws at.
+            let mut pens: Vec<i32> = Vec::new();
+            for cmd in list.iter() {
+                match cmd {
+                    DrawCmd::Cells {
+                        x, cell_w, text, ..
+                    } => {
+                        for (i, _) in grapheme::graphemes(text.as_str()).enumerate() {
+                            pens.push(x + i as i32 * cell_w);
+                        }
+                    }
+                    DrawCmd::Text { x, .. } => pens.push(*x),
+                    _ => {}
+                }
+            }
+            pens.sort_unstable();
+            pens.dedup();
+
+            // The grid's own answer, from the cells it filled.
+            let cell_w = M.w;
+            let expected: Vec<i32> = (0..12)
+                .filter(|&c| screen.cell(0, c).rune != ' ')
+                .map(|c| pens[0] + (c as i32 - first_inked_col(&screen)) * cell_w)
+                .collect();
+            assert_eq!(
+                pens,
+                expected,
+                "{script}: {} clusters painted at {pens:?}, grid wants {expected:?}",
+                pens.len()
+            );
+        }
+    }
+
+    /// The column of the first cell holding anything, for anchoring a placement check.
+    fn first_inked_col(screen: &Screen) -> i32 {
+        (0..12)
+            .find(|&c| screen.cell(0, c).rune != ' ')
+            .unwrap_or(0) as i32
+    }
+
     /// The damage never lies by omission: whatever changed on the grid is covered.
     ///
     /// A property rather than a case list — it compares the damage against the cells
     /// that actually differ, over a structured stream, so it holds for operations nobody
     /// thought to write a case for. Under-damage is the failure that leaves the window
     /// showing something the terminal no longer believes.
+    /// A cell reduced to what the painter can actually show.
+    ///
+    /// The painter's own rule (`push_run`, `push_glyph`): a `HIDDEN` cell is drawn as a
+    /// space and is never inked, so its rune cannot be observed and neither can its
+    /// foreground — unless `REVERSE` is also set, which swaps the foreground into the
+    /// *background* and makes it visible again. `SGR 8` is what a program masking a
+    /// password field sends, and two such cells differing only in the character they
+    /// conceal are, correctly, the same picture.
+    ///
+    /// Nothing else is normalised. The point of the property is to catch damage that
+    /// omits a real change, so anything that might be visible stays in the comparison.
+    fn painted(cell: Cell) -> Cell {
+        if !cell.attrs.contains(Attrs::HIDDEN) {
+            return cell;
+        }
+        let reverse = cell.attrs.contains(Attrs::REVERSE);
+        // With no glyph to shape, bold and italic have nothing to act on, and `HIDDEN`
+        // itself says only "draw no ink". `DIM` acts on the foreground, which is drawn
+        // only when `REVERSE` has moved it into the background.
+        let mut attrs = cell.attrs;
+        attrs.remove(Attrs::HIDDEN | Attrs::BOLD | Attrs::ITALIC);
+        if !reverse {
+            attrs.remove(Attrs::DIM);
+        }
+        Cell {
+            rune: ' ',
+            fg: if reverse { cell.fg } else { Color::Default },
+            attrs,
+            ..cell
+        }
+    }
+
     #[test]
     fn damage_covers_every_cell_that_changed() {
         let theme = Theme::default();

@@ -319,6 +319,51 @@ fn incb(c: char) -> Option<Incb> {
     search(INCB_RANGES, c as u32)
 }
 
+/// Whether `c` can be joined into the cluster to its left by a rule other than the
+/// zero-width ones, and therefore cannot be batched into a fixed-pitch run.
+///
+/// The renderer paints a `Cells` run by segmenting the run's *text* and using each
+/// cluster's index as the pen multiplier, which is only correct while one cell yields one
+/// cluster. That holds for almost everything, because the scalars a segmenter merges are
+/// overwhelmingly zero-width: `Extend`, `ZWJ` and the like never occupy a cell of their
+/// own, they live in the grid's combining-mark side list. These are the exceptions —
+/// scalars that are a full column wide on the grid *and* mergeable by UAX #29:
+///
+/// - **`SpacingMark`** (GB9a): the Indic spacing vowel signs. `की` is two cells and, to a
+///   segmenter, one cluster.
+/// - **`Extend`** and **`ZWJ`** (GB9): almost always zero-width, but not always — Kannada
+///   `ೀ` U+0CC0 is a spacing mark by general category, so the grid gives it a column,
+///   while UAX #29 classifies it `Extend` rather than `SpacingMark`. Assuming the two
+///   properties agree is exactly the mistake this function exists to stop.
+/// - **`Prepend`** (GB9b): joins rightward, so the cell after it disappears into it.
+/// - **`V`** / **`T`** (GB7, GB8): conjoining jamo, which join to the syllable before them.
+/// - **`InCB=Consonant`** (GB9c): the second consonant of a conjunct joins back across
+///   the virama, which is itself a zero-width mark. `क्ष` is two cells, one cluster.
+///
+/// A run containing one of these draws every following cell one column to the left per
+/// merge, while the background fill, the selection band and the cursor stay on the true
+/// grid. The test is deliberately generous: a scalar wrongly excluded costs its script the
+/// batched path, while one wrongly included misplaces every glyph after it.
+pub fn joins_across_cells(c: char) -> bool {
+    // This runs per cell on the painting path, where the answer is "no" for essentially
+    // all of it, so the common case must not pay for two binary searches. Nothing below
+    // the combining diacriticals can merge with a neighbour — the lowest scalar in any of
+    // these classes is U+0300 — and `no_scalar_below_the_fast_path_can_join` sweeps the
+    // tables to keep that true rather than trusting it.
+    if (c as u32) < FIRST_JOINABLE {
+        return false;
+    }
+    matches!(
+        gcb(c),
+        Gcb::Extend | Gcb::Zwj | Gcb::SpacingMark | Gcb::Prepend | Gcb::V | Gcb::T
+    ) || incb(c) == Some(Incb::Consonant)
+}
+
+/// The lowest scalar that [`joins_across_cells`] can answer `true` for: U+0300, the first
+/// combining diacritical. Everything below it — all of ASCII and Latin-1 — takes the fast
+/// path out.
+const FIRST_JOINABLE: u32 = 0x0300;
+
 /// Whether `c` has the Unicode `Extended_Pictographic` property, i.e. is (or
 /// can start) an emoji-form cluster. Public for the font layer, which uses it
 /// to route emoji clusters to the color emoji face.
@@ -342,6 +387,46 @@ include!("grapheme_tables.rs");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fast-path threshold in [`joins_across_cells`] is a claim about the tables, so
+    /// it is checked against them rather than believed. Sweeps every scalar below the
+    /// cutoff and requires the full predicate to agree that none of them can merge.
+    #[test]
+    fn no_scalar_below_the_fast_path_can_join() {
+        for u in 0..FIRST_JOINABLE {
+            let Some(c) = char::from_u32(u) else {
+                continue;
+            };
+            let by_table = matches!(
+                gcb(c),
+                Gcb::Extend | Gcb::Zwj | Gcb::SpacingMark | Gcb::Prepend | Gcb::V | Gcb::T
+            ) || incb(c) == Some(Incb::Consonant);
+            assert!(
+                !by_table,
+                "U+{u:04X} can join, so the fast path skips a scalar that needs the check"
+            );
+        }
+    }
+
+    /// The scalars that make the predicate necessary, one per reason.
+    #[test]
+    fn a_wide_column_scalar_that_a_segmenter_merges_is_named() {
+        // GB9a, an Indic spacing vowel sign: a full column on the grid.
+        assert!(joins_across_cells('\u{093E}'));
+        // GB9, and the case that shows the two properties do not agree: Kannada U+0CC0 is
+        // a spacing mark by general category, so it gets a column, while UAX #29 calls it
+        // Extend rather than SpacingMark.
+        assert!(joins_across_cells('\u{0CC0}'));
+        // GB9b, joins rightward.
+        assert!(joins_across_cells('\u{0600}'));
+        // GB9c, the trailing consonant of a conjunct.
+        assert!(joins_across_cells('\u{0937}'));
+
+        // And the everyday scalars that must stay on the batched path.
+        for c in ['a', 'Z', '0', ' ', '~', 'é', '日', '→'] {
+            assert!(!joins_across_cells(c), "{c:?} lost the fixed-pitch path");
+        }
+    }
 
     /// Cluster boundaries as a list, for compact assertions.
     fn bounds(s: &str) -> Vec<usize> {
