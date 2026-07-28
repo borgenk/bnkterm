@@ -53,7 +53,6 @@ use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use core::ffi::{c_int, c_short, c_uint, c_ulong, c_void};
 
@@ -269,17 +268,14 @@ struct PollBits {
     stop: bool,
 }
 
-/// Wait for the PTY read fd or the stop fd, collapsing `EINTR`. A `timeout` cap is
-/// pure defence: no wake should be lost, but a bug must not hang the thread.
-fn poll_pty_or_stop(
-    read_fd: RawFd,
-    stop_fd: RawFd,
-    timeout: Duration,
-) -> core::result::Result<PollBits, c_int> {
-    let ts = KernelTimespec {
-        tv_sec: timeout.as_secs() as i64,
-        tv_nsec: timeout.subsec_nanos() as i64,
-    };
+/// Wait for the PTY read fd or the stop fd, collapsing `EINTR`.
+///
+/// The wait is unbounded, and can be, because both watched fds are level-triggered:
+/// a byte sitting unread in the PTY and a nonzero stop-eventfd counter each make the
+/// *next* `ppoll` return immediately, so there is no edge to miss and no wake to lose.
+/// A periodic timeout would buy nothing and cost a timer wakeup per thread per tick,
+/// on a thread whose entire job is to sleep until the child says something.
+fn poll_pty_or_stop(read_fd: RawFd, stop_fd: RawFd) -> core::result::Result<PollBits, c_int> {
     loop {
         let mut fds = [
             Pollfd {
@@ -293,16 +289,9 @@ fn poll_pty_or_stop(
                 revents: 0,
             },
         ];
-        // SAFETY: fds points at two valid pollfd entries; ts is a live timespec; a
-        // null sigmask leaves the signal mask unchanged.
-        let r = unsafe {
-            ppoll(
-                fds.as_mut_ptr(),
-                2,
-                &ts as *const KernelTimespec,
-                core::ptr::null(),
-            )
-        };
+        // SAFETY: fds points at two valid pollfd entries; a null timeout blocks until
+        // one of them is ready, and a null sigmask leaves the signal mask unchanged.
+        let r = unsafe { ppoll(fds.as_mut_ptr(), 2, core::ptr::null(), core::ptr::null()) };
         if r < 0 {
             let e = errno();
             if e == EINTR {
@@ -330,13 +319,13 @@ fn gather_loop(read_fd: RawFd, ready_efd: RawFd, stop_efd: RawFd, pool: Arc<BufP
     };
 
     'outer: loop {
-        match poll_pty_or_stop(read_fd, stop_efd, Duration::from_millis(100)) {
+        match poll_pty_or_stop(read_fd, stop_efd) {
             Ok(bits) => {
                 if bits.stop {
                     break; // clean shutdown
                 }
                 if !bits.pty {
-                    continue; // timeout / spurious wake
+                    continue; // spurious wake
                 }
             }
             Err(e) => {
@@ -604,8 +593,13 @@ fn make_eventfd() -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Add 1 to the eventfd's counter to wake a poller. Best-effort: a failed wake is
-/// covered by the poll timeout safety net, so it is never fatal.
+/// Add 1 to the eventfd's counter to wake a poller. The return is unchecked because
+/// this write cannot meaningfully fail: an 8-byte write to a counter eventfd blocks
+/// (or returns `EAGAIN`) only at `u64::MAX - 1`, which is unreachable when the
+/// consumer zeroes the counter on every wake, and `EBADF` is impossible for an fd this
+/// process owns for the gatherer's whole life. Nothing else can go wrong, so there is
+/// nothing to report; the poller waits with no timeout and has no other way to learn
+/// the buffer is ready.
 fn efd_signal(fd: RawFd) {
     let one: u64 = 1;
     // SAFETY: writing 8 bytes of a u64 is the eventfd contract; overflow at
@@ -633,7 +627,7 @@ mod tests {
     use std::ffi::CString;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     // -- ABI pins -----------------------------------------------------------
 
@@ -1077,6 +1071,11 @@ mod tests {
     }
 
     /// Stop while the gather thread is polling an idle child: `Drop` joins promptly.
+    ///
+    /// This is the test that holds the unbounded `ppoll` honest. The wait has no
+    /// timeout to fall back on, so the stop eventfd is the *only* thing that can bring
+    /// the thread out of an idle poll: break the wake and this hangs rather than
+    /// merely getting slower.
     #[test]
     fn stop_while_polling() {
         // `sleep` produces nothing, so the gather thread parks in poll.
