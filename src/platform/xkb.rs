@@ -12,9 +12,16 @@
 //!
 //! Text runs through libxkbcommon's Compose machine (a compose table built from the
 //! user's locale), so dead keys and compose sequences resolve: on a Nordic layout
-//! `dead_grave` then Space yields `` ` ``, then `a` yields `à`, and so on. A key
-//! mid-sequence produces no text until the sequence completes; keys that are not part
-//! of one fall through to their own UTF-8.
+//! `dead_grave` then Space yields `` ` ``, then `a` yields `à`, and on a French azerty
+//! `´` then `e` yields `é`. A key mid-sequence produces no text until the sequence
+//! completes; keys that are not part of one fall through to their own keysym.
+//!
+//! The machine is *state between two keystrokes*, which is what makes it awkward and
+//! what the two rules here are about. It advances on exactly one call —
+//! [`Xkb::key_text`], the typing path — so a caller that merely wants to know which key
+//! this is asks [`Xkb::key_char`] and leaves any sequence in flight alone. And it is
+//! reset on focus loss ([`Xkb::reset_compose`]), because the keystroke that would have
+//! completed the sequence is now going to somebody else's window.
 
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr::NonNull;
@@ -88,7 +95,6 @@ extern "C" {
         latched_layout: u32,
         locked_layout: u32,
     ) -> u32;
-    fn xkb_state_key_get_utf8(st: *mut c_void, key: u32, buf: *mut c_char, size: usize) -> c_int;
     fn xkb_state_mod_name_is_active(st: *mut c_void, name: *const c_char, type_: u32) -> c_int;
     fn xkb_state_key_get_one_sym(st: *mut c_void, key: u32) -> u32;
     fn xkb_state_key_get_layout(st: *mut c_void, key: u32) -> u32;
@@ -230,6 +236,20 @@ impl Xkb {
         self.update_modifiers(0, 0, 0, 0);
     }
 
+    /// Abandon any compose sequence in flight, the other half of what
+    /// `wl_keyboard.leave` means.
+    ///
+    /// A dead key is state held between two keystrokes, and the second one is now going
+    /// somewhere else. Without this, pressing `´` and alt-tabbing away leaves the machine
+    /// waiting: the next keystroke *after coming back*, whatever it is and however much
+    /// later, gets composed against an accent the user typed into a different window and
+    /// has long forgotten.
+    pub fn reset_compose(&self) {
+        let Some(compose) = self.compose else { return };
+        // SAFETY: compose is valid for the lifetime of self; reset only clears state.
+        unsafe { xkb_compose_state_reset(compose.as_ptr()) };
+    }
+
     /// Whether Shift is currently active, so navigation keys extend a selection.
     pub fn shift_active(&self) -> bool {
         self.mod_active(XKB_MOD_NAME_SHIFT)
@@ -257,10 +277,7 @@ impl Xkb {
         // SAFETY: state is valid; the sym lookup only reads it. The keysym
         // reflects Shift and the layout but is Ctrl/Alt-independent.
         let sym = unsafe { xkb_state_key_get_one_sym(state.as_ptr(), keycode + EVDEV_OFFSET) };
-        // SAFETY: a pure value conversion; 0 means the keysym has no Unicode form.
-        let cp = unsafe { xkb_keysym_to_utf32(sym) };
-        let c = char::from_u32(cp)?;
-        (cp >= 0x20 && c != '\u{7f}').then_some(c)
+        Self::graphic(sym)
     }
 
     /// The character `keycode` produces with *no* modifiers applied, under the layout
@@ -338,84 +355,91 @@ impl Xkb {
         Some(unsafe { xkb_state_key_get_one_sym(state.as_ptr(), keycode + EVDEV_OFFSET) })
     }
 
-    /// The character `keycode` types under the current modifiers and the Compose
-    /// machine, or `None` when it produces no text: a modifier, a named key, a key
-    /// part-way through a dead-key sequence, or one that cancelled an invalid one.
+    /// The character `keycode` types, run through the Compose machine: `None` when it
+    /// produces no text — a modifier, a named key, a key part-way through a dead-key
+    /// sequence, or one that cancelled an invalid one.
     ///
-    /// This is the typing path and the only caller of the Compose state, which is
-    /// what makes `dead_grave` then `a` arrive as one `à` rather than two keys. Only
-    /// a single non-control scalar is returned; a sequence yielding several is
+    /// This is the typing path and the only caller of the Compose state, which is what
+    /// makes `dead_acute` then `e` arrive as one `é` rather than as nothing and then an
+    /// `e`. Only a single non-control scalar is returned; a sequence yielding several is
     /// dropped.
+    ///
+    /// **It advances the machine**, so it must be called exactly once per press and never
+    /// for a lookup or a release. [`Self::key_char`] is the question to ask when the
+    /// answer is only being looked at.
+    ///
+    /// Like `key_char`, the non-composing fallback goes through the *keysym*, not
+    /// `xkb_state_key_get_utf8`. That is the load-bearing detail: `get_utf8` applies Ctrl,
+    /// so `Ctrl+A` would come back as `0x01` — a control scalar this filters out, leaving
+    /// the key sending nothing at all, and leaving the CSI-u protocols without the base
+    /// codepoint they name a key by. Folding `Ctrl` is the encoder's job, not the layout's.
     pub fn key_text(&self, keycode: u32) -> Option<char> {
         let state = self.state?;
         let key = keycode + EVDEV_OFFSET;
-        let mut buf = [0u8; 16];
-        // Feed the key's keysym through the Compose machine first, so dead keys and
-        // compose sequences resolve. A key mid-sequence (or one that cancels an
-        // invalid sequence) produces nothing; a completed sequence yields its composed
-        // text; a key that is part of no sequence falls through to its own UTF-8 (the
-        // common path for ordinary typing).
-        let n = match self.compose {
-            Some(compose) => {
-                // SAFETY: state and compose are valid; the sym lookup reads state,
-                // the feed advances compose.
-                let sym = unsafe { xkb_state_key_get_one_sym(state.as_ptr(), key) };
-                unsafe { xkb_compose_state_feed(compose.as_ptr(), sym) };
-                // SAFETY: compose is valid.
-                match unsafe { xkb_compose_state_get_status(compose.as_ptr()) } {
-                    XKB_COMPOSE_COMPOSING => return None,
-                    XKB_COMPOSE_CANCELLED => {
-                        // SAFETY: compose is valid; clear the abandoned sequence.
-                        unsafe { xkb_compose_state_reset(compose.as_ptr()) };
-                        return None;
-                    }
-                    XKB_COMPOSE_COMPOSED => {
-                        // SAFETY: compose is valid; buf is writable and sized for
-                        // one composed result.
-                        let n = unsafe {
-                            xkb_compose_state_get_utf8(
-                                compose.as_ptr(),
-                                buf.as_mut_ptr() as *mut c_char,
-                                buf.len(),
-                            )
-                        };
-                        // SAFETY: compose is valid; ready it for the next sequence.
-                        unsafe { xkb_compose_state_reset(compose.as_ptr()) };
-                        n
-                    }
-                    // XKB_COMPOSE_NOTHING, or any value a newer library returns.
-                    _ => self.key_utf8(state, key, &mut buf),
+        // SAFETY: state is valid; the sym lookup only reads it. The keysym reflects Shift
+        // and the layout but is Ctrl/Alt-independent.
+        let sym = unsafe { xkb_state_key_get_one_sym(state.as_ptr(), key) };
+        let Some(compose) = self.compose else {
+            // No compose table for this locale, which is not an error: input simply has
+            // no dead-key support, and every key is its own keysym.
+            return Self::graphic(sym);
+        };
+        // A key mid-sequence (or one that cancels an invalid sequence) produces nothing;
+        // a completed sequence yields its composed text; a key that is part of no
+        // sequence falls through to its own keysym (the common path for ordinary typing).
+        //
+        // SAFETY: compose is valid; the feed advances it.
+        unsafe { xkb_compose_state_feed(compose.as_ptr(), sym) };
+        // SAFETY: compose is valid.
+        match unsafe { xkb_compose_state_get_status(compose.as_ptr()) } {
+            XKB_COMPOSE_COMPOSING => None,
+            XKB_COMPOSE_CANCELLED => {
+                // SAFETY: compose is valid; clear the abandoned sequence.
+                unsafe { xkb_compose_state_reset(compose.as_ptr()) };
+                None
+            }
+            XKB_COMPOSE_COMPOSED => {
+                let mut buf = [0u8; 16];
+                // SAFETY: compose is valid; buf is writable and sized for one composed
+                // result.
+                let n = unsafe {
+                    xkb_compose_state_get_utf8(
+                        compose.as_ptr(),
+                        buf.as_mut_ptr() as *mut c_char,
+                        buf.len(),
+                    )
+                };
+                // SAFETY: compose is valid; ready it for the next sequence.
+                unsafe { xkb_compose_state_reset(compose.as_ptr()) };
+                if n <= 0 {
+                    return None;
+                }
+                // Like snprintf, the return is the required length; clamp before slicing.
+                let n = (n as usize).min(buf.len());
+                let s = core::str::from_utf8(buf.get(..n)?).ok()?;
+                let mut chars = s.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => Self::printable(c),
+                    _ => None,
                 }
             }
-            None => self.key_utf8(state, key, &mut buf),
-        };
-        if n <= 0 {
-            return None;
-        }
-        // Like snprintf, the return is the required length; clamp before slicing.
-        let n = (n as usize).min(buf.len());
-        let s = core::str::from_utf8(&buf[..n]).ok()?;
-        let mut chars = s.chars();
-        match (chars.next(), chars.next()) {
-            (Some(c), None) if (c as u32) >= 0x20 && c != '\x7f' => Some(c),
-            _ => None,
+            // XKB_COMPOSE_NOTHING, or any value a newer library returns.
+            _ => Self::graphic(sym),
         }
     }
 
-    /// The UTF-8 a key produces under the current modifiers, written into `buf`
-    /// and returning its byte length (snprintf-style: the required length, which
-    /// the caller clamps). The plain, non-compose path.
-    fn key_utf8(&self, state: NonNull<c_void>, key: u32, buf: &mut [u8]) -> c_int {
-        // SAFETY: state is valid; buf is writable and sized for any one key's
-        // UTF-8 output.
-        unsafe {
-            xkb_state_key_get_utf8(
-                state.as_ptr(),
-                key,
-                buf.as_mut_ptr() as *mut c_char,
-                buf.len(),
-            )
-        }
+    /// A keysym's printable character, or `None`. The one place a keysym becomes text,
+    /// so `key_char` and `key_text` cannot drift about what counts as typing.
+    fn graphic(sym: u32) -> Option<char> {
+        // SAFETY: a pure value conversion; 0 means the keysym has no Unicode form.
+        let cp = unsafe { xkb_keysym_to_utf32(sym) };
+        Self::printable(char::from_u32(cp)?)
+    }
+
+    /// Control scalars and DEL are not typing: a terminal makes those itself, out of a
+    /// key plus Ctrl, and a layout handing one over directly would bypass the encoder.
+    fn printable(c: char) -> Option<char> {
+        ((c as u32) >= 0x20 && c != '\u{7f}').then_some(c)
     }
 
     fn replace(&mut self, keymap: NonNull<c_void>, state: NonNull<c_void>) {
@@ -474,12 +498,15 @@ mod tests {
     }
 
     /// The smallest keymap that can answer "is Ctrl held": one key bound to
-    /// `Control_L` and mapped into the real `Control` modifier. Written out here
-    /// rather than read from the system's xkb data so the test depends on nothing
-    /// outside the process.
+    /// `Control_L` and mapped into the real `Control` modifier, plus the two keys the
+    /// compose tests type on. Written out here rather than read from the system's xkb
+    /// data so the test depends on nothing outside the process.
+    ///
+    /// The keycodes carry the `+8` evdev offset, so `<AC01> = 38` is evdev 30 (the `a`
+    /// key) and `<AD03> = 26` is evdev 18.
     const MINIMAL_KEYMAP: &str = r#"
 xkb_keymap {
-  xkb_keycodes "min" { minimum = 8; maximum = 255; <LCTL> = 37; };
+  xkb_keycodes "min" { minimum = 8; maximum = 255; <LCTL> = 37; <AC01> = 38; <AD03> = 26; };
   xkb_types "min" {
     type "ONE_LEVEL" { modifiers = none; map[none] = Level1; level_name[Level1] = "Any"; };
   };
@@ -488,10 +515,148 @@ xkb_keymap {
   };
   xkb_symbols "min" {
     key <LCTL> { type = "ONE_LEVEL", [ Control_L ] };
+    key <AC01> { type = "ONE_LEVEL", [ a ] };
+    key <AD03> { type = "ONE_LEVEL", [ dead_acute ] };
     modifier_map Control { <LCTL> };
   };
 };
 "#;
+
+    /// Evdev codes for the two keys `MINIMAL_KEYMAP` binds to text.
+    const KEY_A: u32 = 30;
+    const KEY_DEAD_ACUTE: u32 = 18;
+
+    /// A compose table in the standard `Compose` file format, holding the one sequence
+    /// these tests need.
+    const COMPOSE_TABLE: &str = "<dead_acute> <a> : \"á\"\n";
+
+    // Building a table from a *buffer* is the only reason this is declared: production
+    // builds one from the user's locale, which means reading
+    // `/usr/share/X11/locale/.../Compose` — a system file that may or may not exist on
+    // the machine running the suite. A test that depends on it is a test that fails
+    // somewhere else for reasons that have nothing to do with the code.
+    #[link(name = "xkbcommon")]
+    extern "C" {
+        fn xkb_compose_table_new_from_buffer(
+            ctx: *mut c_void,
+            buffer: *const c_char,
+            length: usize,
+            locale: *const c_char,
+            format: u32,
+            flags: u32,
+        ) -> *mut c_void;
+    }
+
+    /// An [`Xkb`] with `MINIMAL_KEYMAP` loaded and the real libxkbcommon Compose machine
+    /// running `COMPOSE_TABLE`. Not a mock: it is the same machine production uses, fed
+    /// a fixture table instead of the system's.
+    fn composing_xkb() -> Xkb {
+        let mut xkb = Xkb::new().expect("xkb context");
+        xkb.load_keymap(MINIMAL_KEYMAP.as_bytes(), XKB_KEYMAP_FORMAT_TEXT_V1)
+            .expect("the minimal keymap compiles");
+
+        let locale = std::ffi::CString::new("C").expect("no NUL");
+        // SAFETY: ctx is valid; the buffer and locale live across the call. Format 1 is
+        // XKB_COMPOSE_FORMAT_TEXT_V1, the only format the library defines.
+        let table = unsafe {
+            xkb_compose_table_new_from_buffer(
+                xkb.ctx.as_ptr(),
+                COMPOSE_TABLE.as_ptr() as *const c_char,
+                COMPOSE_TABLE.len(),
+                locale.as_ptr(),
+                1,
+                0,
+            )
+        };
+        let table = NonNull::new(table).expect("the fixture compose table compiles");
+        // SAFETY: table is valid; the state takes its own reference, so ours is released
+        // immediately afterwards.
+        let state = unsafe { xkb_compose_state_new(table.as_ptr(), 0) };
+        // SAFETY: table came from compose_table_new_from_buffer and is released once.
+        unsafe { xkb_compose_table_unref(table.as_ptr()) };
+        let state = NonNull::new(state).expect("compose state");
+        if let Some(old) = xkb.compose.replace(state) {
+            // SAFETY: the locale-built state this replaces is freed exactly once.
+            unsafe { xkb_compose_state_unref(old.as_ptr()) };
+        }
+        xkb
+    }
+
+    #[test]
+    fn a_dead_key_composes_with_the_key_after_it() {
+        // The headline: on a layout with dead keys, `´` then `a` is one `á`. Before this
+        // was wired up, `key_text` had zero production callers — the typing path used
+        // `key_char`, which reads the keysym directly — so `´` sent nothing, buffered
+        // nothing, and `a` then gave a bare `a`. Typing `á` was impossible, on every
+        // French, Nordic and US-international layout.
+        let xkb = composing_xkb();
+
+        assert_eq!(
+            xkb.key_text(KEY_DEAD_ACUTE),
+            None,
+            "a key mid-sequence types nothing yet"
+        );
+        assert_eq!(
+            xkb.key_text(KEY_A),
+            Some('á'),
+            "and the next key completes it"
+        );
+        assert_eq!(
+            xkb.key_text(KEY_A),
+            Some('a'),
+            "the machine is ready for a fresh sequence, not still holding the accent"
+        );
+    }
+
+    #[test]
+    fn a_half_typed_sequence_does_not_survive_losing_focus() {
+        // The keystroke that would have completed the sequence is going to another
+        // window now. Without the reset the accent waits — through an alt-tab, through a
+        // coffee break — and lands on whatever is typed next, in a sequence the user
+        // stopped composing minutes ago.
+        let xkb = composing_xkb();
+        assert_eq!(xkb.key_text(KEY_DEAD_ACUTE), None, "sequence in flight");
+
+        xkb.reset_compose();
+        assert_eq!(
+            xkb.key_text(KEY_A),
+            Some('a'),
+            "the abandoned accent did not outlive the focus"
+        );
+    }
+
+    #[test]
+    fn holding_ctrl_does_not_turn_typing_into_a_control_byte() {
+        // The trap in routing the typing path through Compose. The obvious way to read a
+        // key's text is `xkb_state_key_get_utf8`, and it applies Ctrl: `Ctrl+A` comes
+        // back as `0x01`. That is wrong twice over — the control scalar is filtered out
+        // as non-typing, so the key would send *nothing at all*, and the CSI-u protocols
+        // name a key by its base codepoint, which `0x01` is not. Folding Ctrl is the
+        // encoder's job; the layer below hands over the character.
+        let xkb = composing_xkb();
+        // `Control` is real modifier index 2 in every keymap.
+        xkb.update_modifiers(1 << 2, 0, 0, 0);
+        assert!(xkb.ctrl_active());
+
+        assert_eq!(xkb.key_text(KEY_A), Some('a'), "still the letter");
+        assert_eq!(xkb.key_char(KEY_A), Some('a'), "and the lookup agrees");
+    }
+
+    #[test]
+    fn a_lookup_leaves_a_sequence_in_flight_alone() {
+        // `key_char` is the question to ask when the answer is only being looked at (a
+        // shortcut table, a release). Advancing the machine there would consume a dead
+        // key's partner before the user had typed it.
+        let xkb = composing_xkb();
+        assert_eq!(xkb.key_text(KEY_DEAD_ACUTE), None, "sequence in flight");
+
+        assert_eq!(xkb.key_char(KEY_A), Some('a'), "the lookup reads the key");
+        assert_eq!(
+            xkb.key_text(KEY_A),
+            Some('á'),
+            "and the sequence is still waiting for it"
+        );
+    }
 
     #[test]
     fn losing_focus_clears_a_held_modifier() {

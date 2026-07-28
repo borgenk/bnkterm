@@ -130,6 +130,21 @@ const MAX_DIMENSION: u32 = 16384;
 /// below this; the free list only ever recycles client ids.
 const SERVER_ID_BASE: u32 = 0xff00_0000;
 
+/// Whether resolving a key advances the layout's Compose machine.
+///
+/// It has to advance exactly once per press, and for nothing else. Feeding a dead key
+/// twice composes it with itself (`´´` is a literal acute in every compose table), and
+/// feeding a *release* leaves the sequence one keystroke out of step with the user — so
+/// the lookups that merely ask "which key is this?" hold the machine still, and only the
+/// one call that actually types advances it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Compose {
+    /// The typing path: run the key through the Compose machine.
+    Advance,
+    /// A lookup: read the key's own character and leave any sequence in flight alone.
+    Hold,
+}
+
 /// How much bnkterm says about itself on stderr. Quiet by default: a terminal
 /// that narrates its own bring-up prints into the very scrollback the user
 /// opened it to read, and the shell's first line should be the shell's. Only
@@ -1202,6 +1217,9 @@ impl State {
                                     // Losing focus resets the modifier state (see `Xkb::clear_modifiers`);
                                     // if Ctrl was down, the hand cursor it earned goes with it.
                 self.xkb.clear_modifiers();
+                // And any half-typed compose sequence, for the same reason: its second
+                // keystroke is going to another window now.
+                self.xkb.reset_compose();
                 self.update_pointer_shape();
             }
             wl_keyboard::EV_MODIFIERS => {
@@ -1267,7 +1285,10 @@ impl State {
     /// it — a mode is armed by pressing a key, not by letting go of one.
     fn on_key_release(&mut self, keycode: u32) -> Result<()> {
         let mods = self.current_mods();
-        if let Some(key) = self.resolve_key(keycode) {
+        // `Hold`: a release is not typing. Feeding it to the Compose machine would put
+        // every dead key one keystroke out of step — press `´`, release it, and the
+        // release would already have consumed the `a` the user had not typed yet.
+        if let Some(key) = self.resolve_key(keycode, Compose::Hold) {
             self.tabs.active_mut().apply(ToTerminal::Key {
                 key,
                 mods,
@@ -1279,12 +1300,16 @@ impl State {
 
     fn on_key_press(&mut self, keycode: u32) -> Result<()> {
         let mods = self.current_mods();
+        // Resolved once for the whole press, and that is load-bearing rather than tidy:
+        // this is the call that advances the Compose machine, so resolving again further
+        // down would feed a dead key a second time and compose it with itself.
+        let resolved = self.resolve_key(keycode, Compose::Advance);
 
         // The modal leader tables (wezterm-style) get first look at every resolved
         // key. In Normal mode only Ctrl+A is a mode key, so everything else reports
         // `Passthrough` and drops to the chords and the child below unchanged; once
         // a mode is armed the machine owns the keystroke until it returns to Normal.
-        if let Some(key) = self.resolve_key(keycode) {
+        if let Some(key) = resolved {
             let (next, disposition) = keymode::advance(self.key_mode, key, mods);
             self.set_key_mode(next);
             match disposition {
@@ -1378,15 +1403,16 @@ impl State {
         }
         // Shift + Page/Home/End scrolls the scrollback view instead of reaching the
         // child (the alt screen has no history, so there it is a normal key). The
-        // window resolves the keycode to a named key; the core does the scrolling.
-        if let Some(named) = input::key_from_keycode(keycode) {
+        // already-resolved key rather than the keycode, so the keypad's Page/Home/End
+        // reach this too — with NumLock off they *are* those keys.
+        if let Some(named) = resolved {
             if self.tabs.active_mut().handle_scroll_key(named, mods) {
                 return Ok(());
             }
         }
         // Send the key, and if it produced bytes and the keymap marks it
         // repeatable, arm auto-repeat on it.
-        if let Some(key) = self.resolve_key(keycode) {
+        if let Some(key) = resolved {
             if self.tabs.active_mut().apply(ToTerminal::Key {
                 key,
                 mods,
@@ -1465,14 +1491,25 @@ impl State {
     }
 
     /// The window half of a key press: resolve `keycode` to an [`input::Key`] via
-    /// the keymap (a named key by its keycode, else its layout character), or `None`
-    /// for a bare modifier / unresolved key. xkb belongs with the Wayland keyboard,
-    /// so this stays window-side; the terminal half is [`TerminalCore::apply`](terminal::TerminalCore::apply).
-    fn resolve_key(&self, keycode: u32) -> Option<input::Key> {
+    /// the keymap (a named key by its keycode, a keypad key by its keysym, else its
+    /// layout character), or `None` for a bare modifier / unresolved key. xkb belongs
+    /// with the Wayland keyboard, so this stays window-side; the terminal half is
+    /// [`TerminalCore::apply`](terminal::TerminalCore::apply).
+    fn resolve_key(&self, keycode: u32, compose: Compose) -> Option<input::Key> {
         if let Some(named) = input::key_from_keycode(keycode) {
             return Some(named);
         }
-        let typed = self.xkb.key_char(keycode)?;
+        // The keypad is named by its *keysym*, not its keycode, and that is not an
+        // implementation detail: NumLock decides whether keypad 4 is a `4` or a Left
+        // arrow, and xkb is what applies NumLock. Asking the physical code cannot tell
+        // the two apart, which is why the whole cluster used to send nothing.
+        if let Some(named) = self.xkb.key_sym(keycode).and_then(input::key_from_keysym) {
+            return Some(named);
+        }
+        let typed = match compose {
+            Compose::Advance => self.xkb.key_text(keycode)?,
+            Compose::Hold => self.xkb.key_char(keycode)?,
+        };
         // The character the key types, and the character it *is*. They differ on a
         // shifted key (`Shift+2` types `'@'` but is the `2` key), and the CSI-u keyboard
         // protocols report the latter. A key whose unshifted level produces no character
@@ -1502,7 +1539,10 @@ impl State {
             return Ok(());
         };
         let mods = self.current_mods();
-        let sent = match self.resolve_key(keycode) {
+        // A repeat is a press, Compose machine included: holding a key down after a dead
+        // key composes the first one and then types the rest plainly, which is what every
+        // other toolkit does with the same held key.
+        let sent = match self.resolve_key(keycode, Compose::Advance) {
             // The keyboard is repeating a held key. A program that asked to hear about
             // repeats is told it is one; to everyone else it is another press, which is
             // exactly what a repeat has always looked like to a terminal.

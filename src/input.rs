@@ -106,6 +106,76 @@ pub enum Key {
     /// The keypad's Enter, which sends `SS3 M` while the application keypad mode
     /// (`DECKPAM`) is set and a plain `CR` otherwise.
     KeypadEnter,
+    /// A keypad key in its *numeric* role, which under `DECKPAM` gets its own `SS3`
+    /// form. See [`KeypadKey`].
+    Keypad(KeypadKey),
+}
+
+/// A keypad key, named by what is printed on it.
+///
+/// These are only half the keypad's story, and the half NumLock is *on* for. With
+/// NumLock off the layout resolves the very same physical keys to navigation keysyms
+/// (`KP_Left`, `KP_Home`, `KP_Next`, …), and they are then genuinely the arrows and
+/// editing keys — so they resolve to [`Key::Left`] and friends and never reach here.
+/// Nothing in this module has to know about NumLock: xkb applies it before the keysym
+/// is ever looked up, exactly as X does for xterm.
+///
+/// Under `DECKPNM` (the default) each of these sends the character printed on the key,
+/// which is why an unmapped keypad has always *seemed* to work — until a program sets
+/// `DECKPAM` and expects `SS3` back. Every ncurses program calling `keypad(true)` does:
+/// `smkx` for `xterm-256color` is `\E[?1h\E=`, and that `\E=` is `DECKPAM`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeypadKey {
+    /// `0`-`9`, held as the digit itself (always `0..=9`; nothing else constructs one).
+    Digit(u8),
+    /// `.` — or `,` on the layouts that print one there, which is a different keysym
+    /// and a different application-mode final byte.
+    Decimal,
+    Separator,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Equal,
+    /// The centre key (`5`) with NumLock off, which X names `KP_Begin`. It is the one
+    /// keypad key whose NumLock-off role is not an editing key, so it stays here.
+    Begin,
+}
+
+impl KeypadKey {
+    /// The character printed on the key, sent verbatim under `DECKPNM`. `None` for
+    /// [`KeypadKey::Begin`], which has no numeric role of its own.
+    fn glyph(self) -> Option<char> {
+        Some(match self {
+            KeypadKey::Digit(n) => char::from(b'0'.saturating_add(n.min(9))),
+            KeypadKey::Decimal => '.',
+            KeypadKey::Separator => ',',
+            KeypadKey::Add => '+',
+            KeypadKey::Subtract => '-',
+            KeypadKey::Multiply => '*',
+            KeypadKey::Divide => '/',
+            KeypadKey::Equal => '=',
+            KeypadKey::Begin => return None,
+        })
+    }
+
+    /// The final byte of this key's `SS3` form under `DECKPAM`, from xterm's keypad
+    /// table. The digits run `0`→`p` … `9`→`y`, which is what makes terminfo's
+    /// `ka1`/`ka3`/`kb2`/`kc1`/`kc3` (`\EOw`, `\EOy`, `\EOu`, `\EOq`, `\EOs`) name the
+    /// keypad's four corners and its centre.
+    fn application_final(self) -> u8 {
+        match self {
+            KeypadKey::Digit(n) => b'p'.saturating_add(n.min(9)),
+            KeypadKey::Multiply => b'j',
+            KeypadKey::Add => b'k',
+            KeypadKey::Separator => b'l',
+            KeypadKey::Subtract => b'm',
+            KeypadKey::Decimal => b'n',
+            KeypadKey::Divide => b'o',
+            KeypadKey::Equal => b'X',
+            KeypadKey::Begin => b'E',
+        }
+    }
 }
 
 impl Key {
@@ -375,6 +445,11 @@ fn reports_release(key: Key, mods: Mods) -> bool {
         // The spec's carve-out, so `reset` stays typable after a program leaves the mode
         // on and exits.
         Key::Enter | Key::Tab | Key::Backspace => false,
+        // The keypad's sequences are xterm's `SS3` forms, which have no parameters and
+        // so nowhere to put an event type. Reporting a release would re-send the press
+        // byte for byte, which is worse than saying nothing: a program counting keypad
+        // presses would see two for every one.
+        Key::KeypadEnter | Key::Keypad(_) => false,
         _ => true,
     }
 }
@@ -451,8 +526,39 @@ fn encode_named_event(key: Key, mods: Mods, event: KeyEvent, modes: Modes, out: 
                 out.push(b'\r');
             }
         }
+        Key::Keypad(k) => keypad_key(k, mods, modes, out),
         // The text keys never reach here: each encoding handles them itself.
         Key::Char { .. } | Key::Enter | Key::Tab | Key::Backspace | Key::Escape => {}
+    }
+}
+
+/// A keypad key under whichever keypad mode is in force.
+///
+/// `DECKPAM` (application) gives every key its own `SS3` form, which is the whole point
+/// of the mode: an application can then tell keypad `7` from the `7` on the number row.
+/// `DECKPNM` (numeric, the default) sends the character printed on the key, through the
+/// ordinary text encoder so Ctrl and Alt fold exactly as they do everywhere else — a
+/// keypad key in numeric mode really is just that character.
+///
+/// The modifier parameter has no place in either form. xterm's `SS3` keypad sequences
+/// have no parameters at all, so a modified keypad key in application mode sends the
+/// bare sequence; a program that wants modified keypad keys asks for a CSI-u protocol,
+/// where this function is not reached.
+fn keypad_key(key: KeypadKey, mods: Mods, modes: Modes, out: &mut Vec<u8>) {
+    if modes.app_keypad {
+        out.extend_from_slice(b"\x1bO");
+        out.push(key.application_final());
+        return;
+    }
+    match key.glyph() {
+        Some(c) => encode_char(c, mods, out),
+        // `Begin` is the centre key with NumLock *off*, so it has no character to be.
+        // xterm sends the cursor-key form, the same `CSI E` the other four corners of
+        // the cluster take in their navigation role.
+        None => {
+            alt_prefix(mods, out);
+            out.extend_from_slice(b"\x1b[E");
+        }
     }
 }
 
@@ -746,6 +852,80 @@ pub fn key_from_keycode(keycode: u32) -> Option<Key> {
         keycode::F12 => Key::Function(12),
         _ => return None,
     })
+}
+
+/// Map an X keysym to a named [`Key`], for the keys a *keycode* cannot identify.
+///
+/// The keypad is the whole reason this exists, and NumLock is the reason it cannot be
+/// done from the keycode. One physical key has two jobs — keypad `4` and Left arrow —
+/// and which one it is depends on a modifier, so the physical code is not enough to
+/// name it. The layout resolves that (`KP_4` vs `KP_Left`) before anything here runs,
+/// which is exactly how xterm gets it right: X hands xterm a keysym, not a scancode.
+///
+/// So the NumLock-off half maps onto the ordinary named keys — keypad `4` genuinely
+/// *is* Left, and sends what Left sends, `DECCKM` and all — while the NumLock-on half
+/// becomes [`Key::Keypad`], which is where `DECKPAM` applies.
+///
+/// `None` for every keysym outside the keypad, including all ordinary text keys: those
+/// resolve through the layout's character instead. `KP_Enter` is also absent, and
+/// deliberately: it means the same thing under either NumLock state, so
+/// [`key_from_keycode`] names it from the physical code and gets it right even before a
+/// keymap has arrived.
+pub fn key_from_keysym(sym: u32) -> Option<Key> {
+    use keysym as k;
+    Some(match sym {
+        // NumLock off: the layout has already decided these are editing keys.
+        k::KP_LEFT => Key::Left,
+        k::KP_RIGHT => Key::Right,
+        k::KP_UP => Key::Up,
+        k::KP_DOWN => Key::Down,
+        k::KP_HOME => Key::Home,
+        k::KP_END => Key::End,
+        k::KP_PRIOR => Key::PageUp,
+        k::KP_NEXT => Key::PageDown,
+        k::KP_INSERT => Key::Insert,
+        k::KP_DELETE => Key::Delete,
+        k::KP_BEGIN => Key::Keypad(KeypadKey::Begin),
+        // NumLock on: the numeric keypad proper.
+        k::KP_0..=k::KP_9 => {
+            let n = u8::try_from(sym - k::KP_0).unwrap_or(0);
+            Key::Keypad(KeypadKey::Digit(n))
+        }
+        k::KP_DECIMAL => Key::Keypad(KeypadKey::Decimal),
+        k::KP_SEPARATOR => Key::Keypad(KeypadKey::Separator),
+        k::KP_ADD => Key::Keypad(KeypadKey::Add),
+        k::KP_SUBTRACT => Key::Keypad(KeypadKey::Subtract),
+        k::KP_MULTIPLY => Key::Keypad(KeypadKey::Multiply),
+        k::KP_DIVIDE => Key::Keypad(KeypadKey::Divide),
+        k::KP_EQUAL => Key::Keypad(KeypadKey::Equal),
+        _ => return None,
+    })
+}
+
+/// The X keysyms this encoder names, from `X11/keysymdef.h`. Only the keypad: every
+/// other key is identified by its evdev code (a named key) or by the character the
+/// layout produces (text), and neither needs a keysym.
+mod keysym {
+    pub const KP_HOME: u32 = 0xff95;
+    pub const KP_LEFT: u32 = 0xff96;
+    pub const KP_UP: u32 = 0xff97;
+    pub const KP_RIGHT: u32 = 0xff98;
+    pub const KP_DOWN: u32 = 0xff99;
+    pub const KP_PRIOR: u32 = 0xff9a;
+    pub const KP_NEXT: u32 = 0xff9b;
+    pub const KP_END: u32 = 0xff9c;
+    pub const KP_BEGIN: u32 = 0xff9d;
+    pub const KP_INSERT: u32 = 0xff9e;
+    pub const KP_DELETE: u32 = 0xff9f;
+    pub const KP_MULTIPLY: u32 = 0xffaa;
+    pub const KP_ADD: u32 = 0xffab;
+    pub const KP_SEPARATOR: u32 = 0xffac;
+    pub const KP_SUBTRACT: u32 = 0xffad;
+    pub const KP_DECIMAL: u32 = 0xffae;
+    pub const KP_DIVIDE: u32 = 0xffaf;
+    pub const KP_0: u32 = 0xffb0;
+    pub const KP_9: u32 = 0xffb9;
+    pub const KP_EQUAL: u32 = 0xffbd;
 }
 
 /// Raw Linux evdev keycodes (`linux/input-event-codes.h`), the layout-independent
@@ -1302,6 +1482,142 @@ mod tests {
             ..Modes::default()
         };
         assert_eq!(encoded(Key::KeypadEnter, Mods::NONE, app), b"\x1bOM");
+    }
+
+    /// The whole keypad, in both NumLock states and both keypad modes, against the byte
+    /// sequences terminfo names.
+    ///
+    /// Exhaustive because it is a table, and because every single one of these used to
+    /// be wrong in one of two ways: with NumLock off the cluster sent **nothing at all**
+    /// (`xkb_keysym_to_utf32(XK_KP_Left)` is 0, so the key resolved to no key), and with
+    /// NumLock on it sent the bare digit whatever the mode — so `DECKPAM` was parsed,
+    /// stored, DECRQM-reported, reset correctly, and about 95% inert. It is not an exotic
+    /// mode: `smkx` for `xterm-256color` is `\E[?1h\E=`, so every ncurses program that
+    /// calls `keypad(true)` turns it on.
+    #[test]
+    fn the_keypad_encodes_in_both_numlock_states_and_both_modes() {
+        let app = Modes {
+            app_keypad: true,
+            ..Modes::default()
+        };
+
+        // NumLock *off*. The layout has resolved these to editing keysyms, so they are
+        // genuinely the editing keys and send exactly what those send — including under
+        // DECKPAM, which says nothing about a key that is not a keypad key any more.
+        for (sym, key, bytes) in [
+            (0xff96u32, Key::Left, b"\x1b[D".as_slice()),
+            (0xff98, Key::Right, b"\x1b[C"),
+            (0xff97, Key::Up, b"\x1b[A"),
+            (0xff99, Key::Down, b"\x1b[B"),
+            (0xff95, Key::Home, b"\x1b[H"),
+            (0xff9c, Key::End, b"\x1b[F"),
+            (0xff9a, Key::PageUp, b"\x1b[5~"),
+            (0xff9b, Key::PageDown, b"\x1b[6~"),
+            (0xff9e, Key::Insert, b"\x1b[2~"),
+            (0xff9f, Key::Delete, b"\x1b[3~"),
+        ] {
+            assert_eq!(key_from_keysym(sym), Some(key), "keysym {sym:#x}");
+            assert_eq!(enc(key, Mods::NONE), bytes, "{key:?} with NumLock off");
+            assert_eq!(
+                encoded(key, Mods::NONE, app),
+                bytes,
+                "{key:?} under DECKPAM"
+            );
+        }
+
+        // NumLock *on*: the numeric keypad proper. Numeric mode sends the character
+        // printed on the key; application mode gives each one its own SS3 form.
+        for (sym, key, numeric, application) in [
+            (0xffb0u32, KeypadKey::Digit(0), "0", b"\x1bOp".as_slice()),
+            (0xffb1, KeypadKey::Digit(1), "1", b"\x1bOq"),
+            (0xffb2, KeypadKey::Digit(2), "2", b"\x1bOr"),
+            (0xffb3, KeypadKey::Digit(3), "3", b"\x1bOs"),
+            (0xffb4, KeypadKey::Digit(4), "4", b"\x1bOt"),
+            (0xffb5, KeypadKey::Digit(5), "5", b"\x1bOu"),
+            (0xffb6, KeypadKey::Digit(6), "6", b"\x1bOv"),
+            (0xffb7, KeypadKey::Digit(7), "7", b"\x1bOw"),
+            (0xffb8, KeypadKey::Digit(8), "8", b"\x1bOx"),
+            (0xffb9, KeypadKey::Digit(9), "9", b"\x1bOy"),
+            (0xffaa, KeypadKey::Multiply, "*", b"\x1bOj"),
+            (0xffab, KeypadKey::Add, "+", b"\x1bOk"),
+            (0xffac, KeypadKey::Separator, ",", b"\x1bOl"),
+            (0xffad, KeypadKey::Subtract, "-", b"\x1bOm"),
+            (0xffae, KeypadKey::Decimal, ".", b"\x1bOn"),
+            (0xffaf, KeypadKey::Divide, "/", b"\x1bOo"),
+            (0xffbd, KeypadKey::Equal, "=", b"\x1bOX"),
+        ] {
+            let k = Key::Keypad(key);
+            assert_eq!(key_from_keysym(sym), Some(k), "keysym {sym:#x}");
+            assert_eq!(enc(k, Mods::NONE), numeric.as_bytes(), "{key:?} numeric");
+            assert_eq!(encoded(k, Mods::NONE, app), application, "{key:?} DECKPAM");
+        }
+
+        // The five terminfo names for the keypad, which is what an ncurses program is
+        // actually matching against: the four corners and the centre.
+        let ss3 = |k: KeypadKey| encoded(Key::Keypad(k), Mods::NONE, app);
+        assert_eq!(ss3(KeypadKey::Digit(7)), b"\x1bOw", "ka1, upper left");
+        assert_eq!(ss3(KeypadKey::Digit(9)), b"\x1bOy", "ka3, upper right");
+        assert_eq!(ss3(KeypadKey::Digit(5)), b"\x1bOu", "kb2, centre");
+        assert_eq!(ss3(KeypadKey::Digit(1)), b"\x1bOq", "kc1, lower left");
+        assert_eq!(ss3(KeypadKey::Digit(3)), b"\x1bOs", "kc3, lower right");
+        assert_eq!(
+            encoded(Key::KeypadEnter, Mods::NONE, app),
+            b"\x1bOM",
+            "kent"
+        );
+
+        // The centre key with NumLock off is `KP_Begin`, the one keypad key whose
+        // NumLock-off role is not an editing key.
+        let begin = Key::Keypad(KeypadKey::Begin);
+        assert_eq!(key_from_keysym(0xff9d), Some(begin));
+        assert_eq!(enc(begin, Mods::NONE), b"\x1b[E");
+        assert_eq!(encoded(begin, Mods::NONE, app), b"\x1bOE");
+
+        // Not a keypad keysym: an ordinary key is text, and resolves through the layout.
+        assert_eq!(key_from_keysym(0x0061), None, "XK_a");
+        assert_eq!(key_from_keysym(0xff0d), None, "XK_Return");
+    }
+
+    #[test]
+    fn a_keypad_key_in_numeric_mode_is_just_that_character() {
+        // Numeric mode goes through the ordinary text encoder, so Ctrl and Alt fold the
+        // way they do everywhere else rather than being silently dropped.
+        let k = Key::Keypad(KeypadKey::Digit(4));
+        assert_eq!(enc(k, Mods::ALT), b"\x1b4");
+        assert_eq!(enc(Key::Keypad(KeypadKey::Divide), Mods::NONE), b"/");
+
+        // Application mode has no parameter slot to put a modifier in, so a modified
+        // keypad key sends the bare SS3 sequence. A program that wants modified keypad
+        // keys asks for a CSI-u protocol instead.
+        let app = Modes {
+            app_keypad: true,
+            ..Modes::default()
+        };
+        assert_eq!(encoded(k, Mods::CTRL, app), b"\x1bOt");
+    }
+
+    #[test]
+    fn the_keypad_reports_no_release_because_it_has_nowhere_to_put_one() {
+        // Under `REPORT_EVENT_TYPES` a key that reports a release must be able to *say*
+        // it is a release. The keypad's SS3 forms have no parameters, so reporting one
+        // would re-send the press byte for byte and a program counting keypad presses
+        // would see two for every one.
+        let mut screen = Screen::new(20, 4);
+        let mut parser = crate::vt::Parser::new();
+        parser.advance_bytes(&mut screen, b"\x1b[>3u"); // DISAMBIGUATE | REPORT_EVENT_TYPES
+        let modes = Modes {
+            app_keypad: true,
+            ..Modes::from_screen(&screen)
+        };
+        let k = Key::Keypad(KeypadKey::Digit(7));
+        assert_eq!(enc_event(k, Mods::NONE, KeyEvent::Press, modes), b"\x1bOw");
+        assert!(enc_event(k, Mods::NONE, KeyEvent::Release, modes).is_empty());
+        assert!(enc_event(Key::KeypadEnter, Mods::NONE, KeyEvent::Release, modes).is_empty());
+        // An arrow, which *does* have a parameter to carry the event, still reports.
+        assert_eq!(
+            enc_event(Key::Up, Mods::NONE, KeyEvent::Release, modes),
+            b"\x1b[1;1:3A"
+        );
     }
 
     #[test]
