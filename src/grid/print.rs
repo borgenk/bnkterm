@@ -13,7 +13,7 @@
 //! column left (wrap, or back up under `DECAWM` off), a combining mark attaching to the
 //! cell behind the cursor, and a grapheme cluster growing a cell from one column to two
 //! *after* its base was already placed. Every path ends at
-//! [`Buffer::advance_cursor`](super::buffer), which states xterm's last-column rule once.
+//! [`Buffer::advance_cursor`](crate::grid::buffer), which states xterm's last-column rule once.
 
 // The grid's shared vocabulary: the types in `grid/mod.rs` and the imports it makes.
 // `Screen`'s operations are split across these sibling modules, so each one works on
@@ -388,6 +388,14 @@ impl Screen {
                 link: leader.link,
             };
             let b = self.active_mut();
+            // The column being grown into is not empty just because the cluster was
+            // narrow: it may hold the leader of the *next* wide pair, whose spacer would
+            // be stranded at `col + 2` by a raw write. Go through `write_cell` so that
+            // pair is broken the way any other overwriting print breaks one, and so the
+            // marks the displaced cell carried go with it. This runs first: it can blank
+            // `col` when the neighbour is a spacer, and the promotion below writes the
+            // cluster back over it.
+            b.write_cell(row, col + 1, spacer);
             b.set_raw(
                 row,
                 col,
@@ -396,7 +404,6 @@ impl Screen {
                     ..leader
                 },
             );
-            b.set_raw(row, col + 1, spacer);
             b.cursor.col = (col + 2).min(cols.saturating_sub(1));
             b.cursor.pending_wrap = col + 2 >= cols;
         }

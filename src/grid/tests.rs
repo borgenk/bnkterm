@@ -1043,6 +1043,29 @@ fn a_cluster_that_grows_wide_takes_the_column_beside_it() {
 }
 
 #[test]
+fn a_cluster_growing_wide_does_not_orphan_the_pair_it_grows_into() {
+    // Growing is a *write* into the column beside the cluster, and that column may be
+    // occupied. Here it holds the leader of a wide pair, so laying the spacer over it
+    // would strand the old pair's own spacer one column further right — an orphan, which
+    // draws as garbage and is precisely what `wide_pair_break` calls corruption.
+    let mut s = clustering(10, 1);
+    feed(&mut s, b"\x1b[2G"); // 世 at columns 1-2...
+    print_str(&mut s, "\u{4E16}");
+    feed(&mut s, b"\x1b[1G"); // ...and back to column 0
+    print_str(&mut s, "\u{2600}\u{FE0F}"); // ☀ then the selector: the cell grows into 1
+
+    assert!(s.cell(0, 0).is_wide_leader());
+    assert!(s.cell(0, 1).is_wide_spacer());
+    assert_eq!(
+        wide_pair_break(&s.primary.lines[0].cells),
+        None,
+        "the pair the cluster grew into must be broken cleanly, not half-overwritten"
+    );
+    assert_eq!(s.cell(0, 2).rune, ' ', "世's stranded half is blanked");
+    assert!(s.marks_at(0, 1).next().is_none(), "and its marks are gone");
+}
+
+#[test]
 fn a_flag_is_two_narrow_scalars_that_add_up_to_a_wide_character() {
     // Neither regional indicator is wide. The pair of them is an emoji, and there is
     // nothing in either scalar's width that says so — which is exactly why the width of

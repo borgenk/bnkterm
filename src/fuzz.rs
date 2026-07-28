@@ -275,6 +275,10 @@ impl Stream {
             // Wide glyphs and combining marks: the cell-pair and side-table paths that a
             // printable-ASCII stream never touches.
             93..=96 => {
+                if self.0.below(6) == 0 {
+                    self.promotion_beside_a_wide_glyph(out);
+                    return;
+                }
                 let s = match self.0.below(5) {
                     0 => "\u{4e00}",
                     1 => "\u{3000}",
@@ -290,6 +294,42 @@ impl Stream {
                     out.push(self.0.byte());
                 }
             }
+        }
+    }
+
+    /// A narrow cluster sitting immediately left of a wide glyph, then the selector that
+    /// makes it two columns wide.
+    ///
+    /// Every other arm emits its glyphs where the cursor happens to be, which is almost
+    /// never *one column left of a wide pair* — so the column a growing cluster expands
+    /// into was, in practice, always blank. That made the promotion a write into empty
+    /// space and left the case where it displaces a leader (stranding that leader's spacer
+    /// one column further right) unreachable at any stream length. The composite is
+    /// deliberate: the placement, not the glyphs, is what the corpus could not produce.
+    ///
+    /// ```text
+    ///   col:    n     n+1   n+2
+    ///         [ ☀ ] [ 世 ] [spc]      ... then U+FE0F grows ☀ into n+1
+    /// ```
+    fn promotion_beside_a_wide_glyph(&mut self, out: &mut Vec<u8>) {
+        let col = 1 + self.0.below(6);
+        out.extend_from_slice(b"\x1b[");
+        out.extend_from_slice((col + 1).to_string().as_bytes());
+        out.push(b'G');
+        out.extend_from_slice(match self.0.below(3) {
+            0 => "\u{4e00}".as_bytes(),
+            1 => "\u{3000}".as_bytes(),
+            _ => "\u{1f980}".as_bytes(),
+        });
+        out.extend_from_slice(b"\x1b[");
+        out.extend_from_slice(col.to_string().as_bytes());
+        out.push(b'G');
+        // A base that is narrow alone and wide once its selector lands, and a regional
+        // indicator pair, which is the same promotion reached by a different rule.
+        match self.0.below(3) {
+            0 => out.extend_from_slice("\u{2600}\u{fe0f}".as_bytes()),
+            1 => out.extend_from_slice("\u{1f1f3}\u{1f1f4}".as_bytes()),
+            _ => out.extend_from_slice("#\u{fe0f}\u{20e3}".as_bytes()),
         }
     }
 
@@ -547,6 +587,16 @@ mod tests {
         // The modes that switch the grid off its bulk paths.
         assert!(count(b"2027") > 20, "?2027: {}", count(b"2027"));
         assert!(count(b"\x1b[4h") > 5, "insert mode: {}", count(b"\x1b[4h"));
+
+        // A promotable cluster placed one column left of a wide glyph. Reachability here
+        // is about *placement*, not alphabet: wide glyphs and selectors were always in
+        // the stream, but never arranged so that a growing cluster had to displace one.
+        let beside =
+            count(b"G\xe4\xb8\x80") + count(b"G\xe3\x80\x80") + count(b"G\xf0\x9f\xa6\x80");
+        assert!(
+            beside > 200,
+            "cluster promotion beside a wide glyph: {beside}"
+        );
 
         // The bytes whose entire job is to interact with a sequence in flight.
         for (name, b) in [("NUL", 0x00), ("CAN", 0x18), ("SUB", 0x1a), ("DEL", 0x7f)] {
