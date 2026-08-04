@@ -374,15 +374,21 @@ impl Screen {
     }
 
     /// The text of a linear selection, `a`..`b` inclusive in absolute `(row, col)`
-    /// cells (either order). Rows join with `\n`, except a soft-wrapped row joins with
-    /// nothing (the two rows are one logical line, so a selection across a wrap copies
-    /// as unbroken text). Trailing blanks on a row are dropped, wide spacers skipped,
-    /// combining marks kept.
+    /// cells (either order), **appended** to `out`. Rows join with `\n`, except a
+    /// soft-wrapped row joins with nothing (the two rows are one logical line, so a
+    /// selection across a wrap copies as unbroken text). Trailing blanks on a row are
+    /// dropped, wide spacers skipped, combining marks kept.
     ///
     /// Absolute rows, so it copies the lines the user picked no matter where the
     /// viewport has drifted to since — including lines that have scrolled out of sight
     /// entirely. Rows that have aged out of history read blank.
-    pub fn selection_text(&self, a: (AbsRow, usize), b: (AbsRow, usize)) -> String {
+    ///
+    /// Appends into a caller-owned buffer rather than returning a fresh `String`
+    /// because the capture is re-taken on every cell a drag crosses; `TerminalCore`
+    /// keeps one buffer for the life of the tab and this allocates nothing once it has
+    /// grown. Trailing blanks are trimmed no further back than where each row began, so
+    /// an existing prefix in `out` is never touched.
+    pub fn selection_text_into(&self, a: (AbsRow, usize), b: (AbsRow, usize), out: &mut String) {
         let (start, end) = if a <= b { (a, b) } else { (b, a) };
         let cols = self.dimensions().0;
         let last_col = cols.saturating_sub(1);
@@ -391,9 +397,8 @@ impl Screen {
         // out of history, and its tail cannot run past the live bottom.
         let start_row = start.0.max(buf.abs_of(0));
         let Some(end_row) = buf.abs_end().prev().map(|last| end.0.min(last)) else {
-            return String::new();
+            return;
         };
-        let mut out = String::new();
         let mut row = start_row;
         while row <= end_row {
             let first = if row == start.0 { start.1 } else { 0 };
@@ -422,7 +427,6 @@ impl Screen {
             let Some(next) = row.next() else { break };
             row = next;
         }
-        out
     }
 
     /// Whether absolute `row` soft-wrapped into the next one, so the two are one

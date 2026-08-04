@@ -3518,19 +3518,27 @@ fn at(s: &Screen, row: usize, col: usize) -> (AbsRow, usize) {
     (s.abs_row(row), col)
 }
 
+/// The selected text as a value. The terminal appends into a buffer it reuses across a
+/// drag; a test wants the string on its own to compare against.
+fn selection_text(s: &Screen, a: (AbsRow, usize), b: (AbsRow, usize)) -> String {
+    let mut out = String::new();
+    s.selection_text_into(a, b, &mut out);
+    out
+}
+
 #[test]
 fn selection_text_extracts_and_joins_rows() {
     let mut s = Screen::new(10, 3);
     feed(&mut s, b"hello\r\nworld\r\nfoo");
     // A single-row partial selection: cols 0..=4 of row 0.
-    assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 0, 4)), "hello");
+    assert_eq!(selection_text(&s, at(&s, 0, 0), at(&s, 0, 4)), "hello");
     // Across rows: end of row 0 through part of row 1, joined by a newline;
     // trailing blanks on the first row are trimmed.
-    assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 1, 2)), "hello\nwor");
+    assert_eq!(selection_text(&s, at(&s, 0, 0), at(&s, 1, 2)), "hello\nwor");
     // A mid-row start.
-    assert_eq!(s.selection_text(at(&s, 0, 2), at(&s, 0, 4)), "llo");
+    assert_eq!(selection_text(&s, at(&s, 0, 2), at(&s, 0, 4)), "llo");
     // Either order: the endpoints sort into reading order.
-    assert_eq!(s.selection_text(at(&s, 1, 2), at(&s, 0, 0)), "hello\nwor");
+    assert_eq!(selection_text(&s, at(&s, 1, 2), at(&s, 0, 0)), "hello\nwor");
 }
 
 #[test]
@@ -3540,7 +3548,7 @@ fn selection_joins_a_soft_wrapped_line() {
     let mut s = Screen::new(4, 3);
     feed(&mut s, b"abcdef"); // wraps: "abcd" | "ef"
     assert!(s.row_wraps(0));
-    assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 1, 1)), "abcdef");
+    assert_eq!(selection_text(&s, at(&s, 0, 0), at(&s, 1, 1)), "abcdef");
 }
 
 #[test]
@@ -3573,13 +3581,13 @@ fn a_resized_wrapped_line_copies_unbroken() {
     feed(&mut s, b"abcdef"); // "abcd" | "ef"
     s.resize(6, 3); // widen: rejoins onto one row
     assert!(!s.row_wraps(0));
-    assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 0, 5)), "abcdef");
+    assert_eq!(selection_text(&s, at(&s, 0, 0), at(&s, 0, 5)), "abcdef");
 
     let mut s = Screen::new(4, 3);
     feed(&mut s, b"abcdef");
     s.resize(3, 3); // narrow: re-wraps to "abc" | "def"
     assert!(s.row_wraps(0));
-    assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 1, 2)), "abcdef");
+    assert_eq!(selection_text(&s, at(&s, 0, 0), at(&s, 1, 2)), "abcdef");
 }
 
 #[test]
@@ -3596,7 +3604,7 @@ fn a_recycled_row_never_inherits_a_wrap() {
     assert!(!s.row_wraps(2), "the recycled row is not still wrapped");
     // Two fresh lines in the recycled rows copy as two lines, not one.
     feed(&mut s, b"\x1b[2;1Hxy\r\nzw");
-    assert_eq!(s.selection_text(at(&s, 1, 0), at(&s, 2, 1)), "xy\nzw");
+    assert_eq!(selection_text(&s, at(&s, 1, 0), at(&s, 2, 1)), "xy\nzw");
 }
 
 #[test]
@@ -3608,7 +3616,7 @@ fn rewriting_the_last_column_ends_the_wrap() {
     feed(&mut s, b"abcdef"); // "abcd" wraps into "ef"
     feed(&mut s, b"\x1b[1;4Hz"); // print 'z' over the last column of row 0
     assert!(!s.row_wraps(0));
-    assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 1, 1)), "abcz\nef");
+    assert_eq!(selection_text(&s, at(&s, 0, 0), at(&s, 1, 1)), "abcz\nef");
 }
 
 #[test]
@@ -3632,7 +3640,7 @@ fn a_hard_newline_at_the_margin_is_not_a_wrap() {
     let mut s = Screen::new(4, 3);
     feed(&mut s, b"abcd\r\nef");
     assert!(!s.row_wraps(0));
-    assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 1, 1)), "abcd\nef");
+    assert_eq!(selection_text(&s, at(&s, 0, 0), at(&s, 1, 1)), "abcd\nef");
 }
 
 #[test]
@@ -3640,7 +3648,7 @@ fn selection_reads_scrollback_when_scrolled() {
     let mut s = Screen::new(6, 2);
     feed(&mut s, b"one\r\ntwo\r\nthree\r\nfour");
     s.scroll_view_up(2); // top: "one" over "two"
-    assert_eq!(s.selection_text(at(&s, 0, 0), at(&s, 0, 2)), "one");
+    assert_eq!(selection_text(&s, at(&s, 0, 0), at(&s, 0, 2)), "one");
 }
 
 #[test]
@@ -3651,13 +3659,13 @@ fn a_selection_copies_its_rows_after_output_scrolls_them_away() {
     let mut s = Screen::new(6, 2);
     feed(&mut s, b"one\r\ntwo");
     let (start, end) = (at(&s, 0, 0), at(&s, 0, 2)); // "one", on the live screen
-    assert_eq!(s.selection_text(start, end), "one");
+    assert_eq!(selection_text(&s, start, end), "one");
 
     feed(&mut s, b"\r\nthree\r\nfour\r\nfive"); // "one" is pushed deep into history
 
     assert_eq!(s.display_row(start.0), None, "it is off screen now");
     assert_eq!(
-        s.selection_text(start, end),
+        selection_text(&s, start, end),
         "one",
         "but the ids still name the line it was made over"
     );
@@ -3896,7 +3904,7 @@ fn word_at_spans_a_token_and_stops_at_boundaries() {
     assert_eq!(s.word_at(abs, 1), ((abs, 0), (abs, 1)));
     // The path is one word: '/' is not a boundary, so double-click grabs it whole.
     let path = s.word_at(abs, 5);
-    assert_eq!(s.selection_text(path.0, path.1), "/usr/bin");
+    assert_eq!(selection_text(&s, path.0, path.1), "/usr/bin");
     // A parenthesis bounds the token, and clicking the space between words
     // selects just that cell.
     assert_eq!(
@@ -3905,7 +3913,7 @@ fn word_at_spans_a_token_and_stops_at_boundaries() {
         "the space is its own cell"
     );
     let ok = s.word_at(abs, 13);
-    assert_eq!(s.selection_text(ok.0, ok.1), "ok");
+    assert_eq!(selection_text(&s, ok.0, ok.1), "ok");
 }
 
 #[test]
@@ -3918,7 +3926,7 @@ fn line_at_spans_a_soft_wrapped_logical_line() {
     assert_eq!(s.line_at(r0), ((r0, 0), (r1, 3)));
     assert_eq!(s.line_at(r1), ((r0, 0), (r1, 3)));
     let line = s.line_at(r1);
-    assert_eq!(s.selection_text(line.0, line.1), "abcdef");
+    assert_eq!(selection_text(&s, line.0, line.1), "abcdef");
 }
 
 #[test]
@@ -3934,7 +3942,7 @@ fn line_at_follows_a_wrap_that_starts_above_the_visible_band() {
     let tail = s.abs_row(0); // "efgh", now the top visible row
     let line = s.line_at(tail);
     assert_eq!(
-        s.selection_text(line.0, line.1),
+        selection_text(&s, line.0, line.1),
         "abcdefgh",
         "the line was taken whole, across the top of the screen"
     );

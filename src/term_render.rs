@@ -275,8 +275,8 @@ impl Default for CursorRender {
 /// ends). The painter paints the whole geometric span, blank cells included (see
 /// `Painter::selection_cols`), so dragging over the empty area below the prompt
 /// highlights it; the copy still trims each line's trailing blanks (see
-/// [`crate::grid::Screen::selection_text`]), so the paint is deliberately wider than what
-/// lands on the clipboard.
+/// [`crate::grid::Screen::selection_text_into`]), so the paint is deliberately wider than
+/// what lands on the clipboard.
 ///
 /// [`AbsRow`] and not a display row, so that a printing child cannot drag the selection
 /// off the text it was made over: output scrolls the grid, the rows keep their ids, and
@@ -1372,7 +1372,7 @@ impl Painter<'_> {
     /// The inclusive column span of `row` the selection highlights: the whole
     /// geometric span the drag covers, blank cells included, so dragging across the
     /// empty area below the prompt highlights it, the way xterm/wezterm/ghostty do.
-    /// The paint is deliberately wider than [`Screen::selection_text`] copies: it
+    /// The paint is deliberately wider than [`Screen::selection_text_into`] copies: it
     /// shows the drag for feedback while the copy trims trailing blanks.
     ///
     /// The selection is held in absolute rows, so it is resolved against the display
@@ -2571,7 +2571,7 @@ mod tests {
     fn selection_highlights_the_full_span_including_trailing_blanks() {
         // "abc" in a 6-wide row, selected edge to edge. The highlight spans all six
         // cells, the trailing blanks (cols 3..=5) included, matching wezterm/ghostty;
-        // the copy still trims them (see grid::selection_text), so paint is wider.
+        // the copy still trims them (see grid::selection_text_into), so paint is wider.
         let mut s = Screen::new(6, 1);
         feed(&mut s, b"abc");
         let list = list_selecting(&s, sel(&s, (0, 0), (0, 5)));
@@ -2678,6 +2678,35 @@ mod tests {
         assert!(
             crate::render::display::damage(&a, &b, w, h).is_empty(),
             "an unchanged frame emits no damage"
+        );
+    }
+
+    #[test]
+    fn dropping_a_selection_damages_the_band_it_leaves_behind() {
+        // Typing clears the selection, and the rows it covered are usually nowhere near
+        // the row the keystroke echoes on. If the diff did not see the band disappear,
+        // nothing would damage those rows and the highlight would sit there until
+        // something else happened to repaint them.
+        let mut s = Screen::new(20, 5);
+        feed(&mut s, b"hello world\r\nsecond line");
+        let selection = sel(&s, (0, 0), (0, 4)); // "hello", well above any prompt
+        let with = list_selecting(&s, selection);
+        let without = list_of(&s);
+        let (w, h) = (20 * M.w, 5 * M.h);
+
+        let d = crate::render::display::damage(&with, &without, w, h);
+
+        assert!(!d.is_empty(), "the band vanishing has to damage something");
+        let band = fills(&with)
+            .into_iter()
+            .find(|(_, c)| *c == SELECTION_BG.to_u32())
+            .expect("a band was painted");
+        assert!(
+            d.iter()
+                .any(|r| r.y <= band.0.y && r.y + r.h >= band.0.y + band.0.h),
+            "the damage has to cover the row the band was on: band {:?}, damage {:?}",
+            band.0,
+            d
         );
     }
 

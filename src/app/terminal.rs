@@ -271,7 +271,26 @@ pub(super) struct TerminalCore {
     /// The active text selection (a left-drag), or `None`. In absolute rows, so child
     /// output scrolling the grid does not drag it off the text it was made over; see
     /// [`Self::prune_selection`] for the (short) list of things that do end it.
+    ///
+    /// The region alone, because that is all the painter needs. What a copy hands over
+    /// lives in [`Self::selection_text`], and the two are only ever written together by
+    /// [`Self::set_selection`].
     selection: Option<Selection>,
+    /// The text the grid held under [`Self::selection`] at the moment the *user* last
+    /// set that region, and what any later copy hands over. Empty with no selection, or
+    /// with one that covers only blanks.
+    ///
+    /// A selection is a region on a grid the child keeps writing to, so the cells under
+    /// it are not the user's to keep: a prompt redraw, a progress bar rewinding with
+    /// `\r`, any in-place repaint leaves the highlight where it was and puts something
+    /// else beneath it. Reading the grid at copy time meant Ctrl+Shift+C could hand over
+    /// text that was never highlighted — the clipboard changing under the user with no
+    /// action of theirs. Capturing at selection time makes the highlight and the
+    /// clipboard the same promise.
+    ///
+    /// One buffer for the life of the tab, cleared and refilled rather than replaced, so
+    /// a drag across a screenful of cells allocates only while it grows.
+    selection_text: String,
     /// The left-drag in progress (the button is down), or `None`. Absolute, like the
     /// selection it pivots: output during a drag must not move the anchor.
     drag: Option<Drag>,
@@ -361,6 +380,7 @@ impl TerminalCore {
             mouse_held: None,
             reported_cell: None,
             selection: None,
+            selection_text: String::new(),
             drag: None,
             hover: None,
             hover_cell: None,
@@ -611,6 +631,20 @@ impl TerminalCore {
                 if self.key_buf.is_empty() {
                     return Ok(false);
                 }
+                // Typing ends the selection. Gated on the encoder having produced
+                // something, so a key the child will never hear about leaves it alone,
+                // and so do the chords the window swallows before this seam: local
+                // scrollback keys, tab switching, and Ctrl+Shift+C itself, which would
+                // otherwise wipe the selection it was pressed to copy.
+                //
+                // A *release* is excluded, and must be. Under kitty's
+                // `REPORT_EVENT_TYPES` a release encodes to bytes of its own, and
+                // `App::on_key_release` forwards one for every key whose press a binding
+                // consumed — so counting releases as typing would have letting go of
+                // Ctrl+Shift+C undo the copy that pressing it just made.
+                if event != input::KeyEvent::Release {
+                    self.end_selection_on_input();
+                }
                 // Typing snaps the view back to the live bottom before the bytes go
                 // out, so a keystroke never lands "blind" while reading history.
                 if self.screen.is_scrolled() {
@@ -650,7 +684,7 @@ impl TerminalCore {
                     // The grid is replaced wholesale, so no row id minted against the
                     // old one survives it.
                     self.screen = demo_screen(cols, rows);
-                    self.selection = None;
+                    self.set_selection(None);
                     self.drag = None;
                 } else {
                     // A width reflow re-wraps the grid and renumbers its rows; the returned
@@ -659,7 +693,8 @@ impl TerminalCore {
                     // window that is being resized — so it goes regardless.
                     let effect = self.screen.resize(cols, rows);
                     self.drag = None;
-                    self.selection = self.carry_selection(effect);
+                    let carried = self.carry_selection(effect);
+                    self.set_selection(carried);
                     self.screen.set_pixel_size(width, height);
                     // Reflow the grid now (above) for smooth visuals, but debounce the child's
                     // winsize: telling the shell on every configure floods it with prompt
@@ -708,6 +743,11 @@ impl TerminalCore {
                 if bracketed {
                     self.key_buf.extend_from_slice(b"\x1b[201~");
                 }
+                // A paste is input like any other, so it ends the selection too. It costs
+                // the middle-click-repeatedly workflow nothing: the primary offer was
+                // handed to the window when the drag ended and stands on its own, so the
+                // highlight going away does not retract what middle-click pastes.
+                self.end_selection_on_input();
                 if self.screen.is_scrolled() {
                     self.screen.scroll_view_to_bottom();
                     self.dirty = true;
@@ -971,17 +1011,51 @@ impl TerminalCore {
         true
     }
 
-    /// Copy the current selection's text into the outbox for the window to own on
-    /// the clipboard (no-op without a selection or with empty text). The grid holds
-    /// the text; the window makes the data-device request.
+    /// Set the selected region and capture the text under it in the same breath.
+    ///
+    /// The only writer of either field, and that is the point: the highlight and the
+    /// text a copy yields are one promise, and a call site that could move one without
+    /// the other would be free to break it. Everything that ends a selection (a prune,
+    /// a keystroke, a resize that cannot carry it) passes `None` through here.
+    ///
+    /// Re-captures on a carry too, which is not redundant: a reflow rewraps the rows, so
+    /// the same picked text can join or split across a soft wrap and copy with a
+    /// different set of newlines than it did before.
+    fn set_selection(&mut self, sel: Option<Selection>) {
+        self.selection_text.clear();
+        if let Some(sel) = sel {
+            self.screen
+                .selection_text_into(sel.anchor, sel.head, &mut self.selection_text);
+        }
+        self.selection = sel;
+    }
+
+    /// Copy the selection's captured text into the outbox for the window to own on the
+    /// clipboard (no-op without a selection or with empty text). The window makes the
+    /// data-device request.
+    ///
+    /// Hands over what was under the highlight when the user drew it, not what is under
+    /// it now — see [`Self::selection_text`].
     pub(super) fn copy_selection(&mut self) {
-        let Some(sel) = self.selection else {
+        if self.selection_text.is_empty() {
             return;
-        };
-        let text = self.screen.selection_text(sel.anchor, sel.head);
-        if !text.is_empty() {
-            self.outbox
-                .push(ToWindow::OfferSelection(text.into_bytes()));
+        }
+        let bytes = self.selection_text.as_bytes().to_vec();
+        self.outbox.push(ToWindow::OfferSelection(bytes));
+    }
+
+    /// Drop the selection because the user just sent the child input, matching xterm,
+    /// ghostty and alacritty: a keystroke means they have moved on, and leaving a
+    /// highlight over cells the child is about to rewrite promises a copy the terminal
+    /// would then have to keep.
+    ///
+    /// The drag is deliberately left alone. If a button is still physically down the
+    /// user is still selecting, and cancelling a gesture mid-motion is the more
+    /// surprising of the two; the next motion re-draws the highlight from the anchor.
+    fn end_selection_on_input(&mut self) {
+        if self.selection.is_some() {
+            self.set_selection(None);
+            self.dirty = true;
         }
     }
 
@@ -1007,11 +1081,11 @@ impl TerminalCore {
         };
         let epoch = self.screen.row_epoch();
         self.drag = Some(Drag { mode, epoch });
-        self.selection = unit.map(|(anchor, head)| Selection {
+        self.set_selection(unit.map(|(anchor, head)| Selection {
             anchor,
             head,
             epoch,
-        });
+        }));
     }
 
     /// Extend the in-progress drag to display `(row, col)`, snapped to its
@@ -1045,7 +1119,7 @@ impl TerminalCore {
             epoch: drag.epoch,
         });
         if self.selection != sel {
-            self.selection = sel;
+            self.set_selection(sel);
             self.dirty = true;
         }
     }
@@ -1055,17 +1129,19 @@ impl TerminalCore {
     /// clipboard` convention), so Ctrl+V and middle-click both paste it. A plain
     /// click leaves no selection at all. A drag over only blank cells keeps its
     /// highlight (so selecting the empty space below the prompt sticks, the way
-    /// wezterm/ghostty leave it until the next click or output clears it) but offers
-    /// nothing, since there is no text to copy.
+    /// wezterm/ghostty leave it until the next click or keystroke) but offers nothing,
+    /// since there is no text to copy.
     fn finish_selection(&mut self) {
-        let Some(sel) = self.selection else {
-            return;
-        };
-        let text = self.screen.selection_text(sel.anchor, sel.head);
-        if text.is_empty() {
+        // Re-capture as the button comes up. The release is the last instant the gesture
+        // is the user's, and it is what they were looking at when they let go: a drag
+        // left paused over a line the child rewrites in place should copy what was under
+        // it then, not what was under it when the pointer last moved.
+        let sel = self.selection;
+        self.set_selection(sel);
+        if self.selection_text.is_empty() {
             return;
         }
-        let bytes = text.into_bytes();
+        let bytes = self.selection_text.as_bytes().to_vec();
         self.outbox.push(ToWindow::OfferPrimary(bytes.clone()));
         self.outbox.push(ToWindow::OfferSelection(bytes));
     }
@@ -1239,8 +1315,9 @@ impl TerminalCore {
     /// ([`Screen::follow_history`](crate::grid::Screen::follow_history)), and the
     /// selection is held in absolute rows so the text under it keeps its identity as the
     /// grid scrolls beneath it. Only the user returns the view to the live bottom (by
-    /// typing, pasting, or pressing End), and only a genuine loss of row identity ends a
-    /// selection (see [`Self::prune_selection`]).
+    /// typing, pasting, or pressing End). Output ends a selection only on a genuine loss
+    /// of row identity (see [`Self::prune_selection`]); what *does* end one outright is
+    /// the user sending the child input (see [`Self::end_selection_on_input`]).
     fn after_output(&mut self) {
         self.prune_selection();
         self.refresh_hover();
@@ -1409,8 +1486,10 @@ impl TerminalCore {
     /// a row the user never touched.
     ///
     /// Everything else — a printing child, a scroll, a program overwriting the cells
-    /// underneath — leaves both alone. A selection is a region, not a snapshot: it copies
-    /// whatever those cells hold when you ask for them.
+    /// underneath — leaves both alone. What a copy yields is unaffected either way: the
+    /// text was captured when the region was drawn ([`Self::selection_text`]), so a
+    /// child rewriting those cells changes what is painted under the highlight but never
+    /// what the clipboard gets.
     fn prune_selection(&mut self) {
         let epoch = self.screen.row_epoch();
 
@@ -1424,7 +1503,7 @@ impl TerminalCore {
             .selection
             .is_some_and(|sel| sel.epoch != epoch || !self.screen.row_exists(sel.ordered().1 .0));
         if stale {
-            self.selection = None;
+            self.set_selection(None);
             self.drag = None;
             self.dirty = true;
         }
@@ -2525,6 +2604,14 @@ mod tests {
         .unwrap();
     }
 
+    /// What the cells between `a` and `b` hold *now*, which is the thing a capture is
+    /// deliberately not: the tests that assert the two have diverged need both.
+    fn grid_text(screen: &Screen, a: (AbsRow, usize), b: (AbsRow, usize)) -> String {
+        let mut out = String::new();
+        screen.selection_text_into(a, b, &mut out);
+        out
+    }
+
     /// The text of the sole primary offer in `core`'s outbox, if any.
     fn primary_offer(core: &mut TerminalCore) -> Option<String> {
         core.take_outbox().into_iter().find_map(|m| match m {
@@ -2869,7 +2956,7 @@ mod tests {
         // blanks trimmed.
         let mut core = pointer_core();
         let row = core.screen.abs_row(0);
-        let expected = core.screen.selection_text((row, 0), (row, 79));
+        let expected = grid_text(&core.screen, (row, 0), (row, 79));
         click(&mut core, MouseButton::Left, true, 5, 0, 3, Side::Left);
         click(&mut core, MouseButton::Left, false, 5, 0, 1, Side::Left);
         let offered = primary_offer(&mut core);
@@ -2962,6 +3049,152 @@ mod tests {
     }
 
     #[test]
+    fn typing_ends_the_selection() {
+        // What xterm, ghostty and alacritty all do, for the reason the capture exists: a
+        // keystroke is the user moving on, and a highlight left sitting over cells the
+        // shell is about to redraw is a promise the terminal then has to keep.
+        let mut core = core_showing("hello world");
+        select_word(&mut core, 6, 0);
+        assert_eq!(copied(&mut core).as_deref(), Some("world"));
+
+        core.apply(ToTerminal::Key {
+            key: input::Key::plain('x'),
+            mods: input::Mods::NONE,
+            event: input::KeyEvent::Press,
+        })
+        .unwrap();
+
+        assert!(core.selection.is_none(), "typing left the highlight up");
+        assert_eq!(copied(&mut core), None, "and left something to copy");
+    }
+
+    #[test]
+    fn typing_ends_a_dragged_selection() {
+        // The gesture the user actually performs: press, drag, release, then type. The
+        // word-click path is a different route into `set_selection`, so it is worth
+        // walking the drag one too.
+        let mut core = core_showing("hello world");
+        press_in(&mut core, 0, 0, Side::Left);
+        drag_in(&mut core, 4, 0, Side::Right);
+        press(&mut core, MouseButton::Left, false, 4, 0);
+        core.take_outbox();
+        assert_eq!(copied(&mut core).as_deref(), Some("hello"));
+
+        core.apply(ToTerminal::Key {
+            key: input::Key::plain('x'),
+            mods: input::Mods::NONE,
+            event: input::KeyEvent::Press,
+        })
+        .unwrap();
+
+        assert!(core.selection.is_none(), "typing left the highlight up");
+    }
+
+    #[test]
+    fn letting_go_of_a_key_does_not_end_the_selection() {
+        // The window swallows Ctrl+Shift+C as a copy chord, but `App::on_key_release`
+        // forwards its *release* like any other key's, and under kitty's
+        // `REPORT_EVENT_TYPES` that release encodes to bytes of its own. Treating "the
+        // encoder produced something" as typing would therefore have the copy chord wipe
+        // the selection it was pressed to copy — alacritty's #8509 by another route.
+        let mut core = core_showing("hello world");
+        core.feed_test_bytes(b"\x1b[>3u"); // disambiguate + report event types
+        select_word(&mut core, 6, 0);
+
+        let sent = core
+            .apply(ToTerminal::Key {
+                key: input::Key::plain('c'),
+                mods: input::Mods::CTRL | input::Mods::SHIFT,
+                event: input::KeyEvent::Release,
+            })
+            .unwrap();
+
+        assert!(sent, "the release must encode, or this proves nothing");
+        assert_eq!(copied(&mut core).as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn scrolling_back_to_look_at_a_selection_keeps_it() {
+        // The scrollback chords are handled in the window and never reach the child, so
+        // they are not typing. Scrolling up to check what you picked must not destroy it.
+        let mut core = core_showing("hello world");
+        select_word(&mut core, 6, 0);
+        core.feed_test_bytes(&[b'\n'; 40]); // into history, so there is somewhere to scroll
+
+        assert!(core.handle_scroll_key(input::Key::PageUp, input::Mods::SHIFT));
+
+        assert_eq!(copied(&mut core).as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn a_paste_ends_the_selection_too() {
+        // A paste is input the child acts on, so it ends the highlight like a keystroke.
+        // Middle-click-repeatedly is unharmed: the primary offer went to the window when
+        // the drag ended and stands on its own, so losing the highlight retracts nothing.
+        let mut core = core_showing("hello world");
+        select_word(&mut core, 6, 0);
+
+        core.apply(ToTerminal::Paste(b"ls".to_vec())).unwrap();
+
+        assert!(core.selection.is_none());
+    }
+
+    #[test]
+    fn the_clipboard_keeps_what_was_highlighted_when_the_child_rewrites_the_cells() {
+        // Why the text is captured when the region is drawn rather than read back at copy
+        // time. Output deliberately does not end a selection, so a program repainting a
+        // line in place — a prompt redraw, a progress bar rewinding with `\r` — used to
+        // swap out what Ctrl+Shift+C handed over with the user having done nothing.
+        let mut core = core_showing("hello world");
+        select_word(&mut core, 6, 0);
+        assert_eq!(copied(&mut core).as_deref(), Some("world"));
+
+        // Same rows and same epoch, different characters underneath.
+        core.feed_test_bytes(b"\x1b[Hgoodbye moon");
+        let sel = core
+            .selection
+            .expect("an in-place repaint is not one of the things that ends a selection");
+        assert_eq!(
+            grid_text(&core.screen, sel.anchor, sel.head),
+            "e moo",
+            "the cells under the highlight really did change"
+        );
+
+        assert_eq!(copied(&mut core).as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn a_paused_drag_copies_what_the_release_showed() {
+        // The capture is re-taken as the button comes up: that is the last instant the
+        // gesture belongs to the user, and it is what they were looking at when they let
+        // go, rather than what the pointer last happened to pass over.
+        let mut core = core_showing("abc");
+        press_in(&mut core, 0, 0, Side::Left);
+        drag_in(&mut core, 2, 0, Side::Right); // across all three, capturing "abc"
+        core.feed_test_bytes(b"\x1b[Hxyz");
+        core.take_outbox();
+
+        press(&mut core, MouseButton::Left, false, 2, 0);
+
+        assert_eq!(primary_offer(&mut core).as_deref(), Some("xyz"));
+    }
+
+    #[test]
+    fn a_drag_over_blank_cells_keeps_its_highlight_and_offers_nothing() {
+        // Selecting the empty space below the prompt sticks, the way wezterm and ghostty
+        // leave it — but blanks trim away to nothing, so the capture is empty and there
+        // is no text to put on either clipboard.
+        let mut core = core_showing("");
+        press_in(&mut core, 0, 3, Side::Left);
+        drag_in(&mut core, 4, 3, Side::Right);
+        press(&mut core, MouseButton::Left, false, 4, 3);
+
+        assert!(core.selection.is_some(), "the highlight stays");
+        assert_eq!(primary_offer(&mut core), None, "with nothing to offer");
+        assert_eq!(copied(&mut core), None);
+    }
+
+    #[test]
     fn a_resize_carries_the_selection() {
         // A width change reflows and renumbers the rows, but the selection is translated to
         // the cells it was made over rather than dropped: "world" stays selected across it.
@@ -2970,10 +3203,7 @@ mod tests {
         let mut core = core_showing("hello world");
         select_word(&mut core, 6, 0);
         let picked = core.selection.expect("word selected");
-        assert_eq!(
-            core.screen.selection_text(picked.anchor, picked.head),
-            "world"
-        );
+        assert_eq!(grid_text(&core.screen, picked.anchor, picked.head), "world");
 
         core.apply(ToTerminal::Resize {
             cols: 40,
@@ -2990,7 +3220,7 @@ mod tests {
         let sel = core
             .selection
             .expect("the selection was carried across the reflow");
-        assert_eq!(core.screen.selection_text(sel.anchor, sel.head), "world");
+        assert_eq!(grid_text(&core.screen, sel.anchor, sel.head), "world");
     }
 
     #[test]
