@@ -2466,6 +2466,33 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_report_retires_what_the_last_command_left_behind() {
+        // The `ssh` case, end to end. The remote shell names the tab after its host and
+        // reports its own directory, and both are right while the connection is up: a
+        // directory three thousand miles away is exactly what `refresh_process` prefers
+        // over /proc. Neither survives `exit`, and nothing in the protocol says so — the
+        // local prompt has to say what is true again, which is what the injected
+        // `_bnkterm_report` hook emits (see crate::shell_integration).
+        let cfg = TabBarConfig::default();
+        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        core.cwd = Some(std::path::PathBuf::from("/opt/service"));
+
+        core.feed_test_bytes(b"\x1b]0;ada@remote: ~/srv\x07\x1b]7;file://remote/srv\x07");
+        core.refresh_process();
+        assert_eq!(core.tab_label(&cfg), "ada@remote: ~/srv");
+        assert_eq!(
+            core.cwd.as_deref(),
+            Some(std::path::Path::new("/srv")),
+            "the remote's directory is adopted while it is the one you are in"
+        );
+
+        // `exit`, then the first local prompt: an empty title and this machine's directory.
+        core.feed_test_bytes(b"\x1b]0;\x07\x1b]7;file://local/opt/service\x07");
+        core.refresh_process();
+        assert_eq!(core.tab_label(&cfg), "/opt/service");
+    }
+
+    #[test]
     fn a_configured_program_prefixes_the_title_with_its_directory() {
         // The `claude` case: a program that names its own tab still reveals its
         // directory, because it is in the default `path_prefix_programs` list. The

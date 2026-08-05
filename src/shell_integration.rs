@@ -9,6 +9,14 @@
 //! kitty and ghostty do, and the only reason they "just work" where alacritty (which
 //! reflows but ships no integration) still mangles the prompt.
 //!
+//! The same hook answers a second question the terminal cannot answer alone: *whose* title
+//! is on the tab. A window title (OSC 0/2) and a reported directory (OSC 7) are set by
+//! whatever is running, and nothing takes them back when it exits — `ssh` is where that
+//! shows, because the remote shell names the tab after the remote host and the tab keeps
+//! that name long after `exit` returned you to your own machine. No sequence says "that was
+//! the last command's, not mine"; the shell simply has to say what is true again at every
+//! prompt, which is what the `_bnkterm_report` hook does.
+//!
 //! ## The mechanism: `ZDOTDIR` redirection
 //!
 //! zsh reads its startup files from `$ZDOTDIR` (default `$HOME`). Point it at a generated
@@ -198,8 +206,9 @@ ZDOTDIR=\"${{BNKTERM_INT_ZDOTDIR}}\"
 }
 
 /// `.zshrc`: the hand-off stage, then the actual integration — OSC 133 `precmd`/`preexec`
-/// hooks, and a one-shot `precmd` that restores the user's ZDOTDIR once startup is done (it
-/// runs after `.zlogin`, so a login shell's last stage is still found first).
+/// hooks, the per-prompt report of the shell's own title and directory, and a one-shot
+/// `precmd` that restores the user's ZDOTDIR once startup is done (it runs after `.zlogin`,
+/// so a login shell's last stage is still found first).
 fn zshrc() -> String {
     format!(
         "{handoff}
@@ -210,6 +219,22 @@ if [[ -o interactive ]] && autoload -Uz add-zsh-hook 2>/dev/null && (( $+functio
   _bnkterm_preexec() {{ print -rn -- $'\\e]133;C\\a' }}
   add-zsh-hook precmd  _bnkterm_precmd
   add-zsh-hook preexec _bnkterm_preexec
+  # --- The prompt reports its own title (OSC 0, cleared) and directory (OSC 7), because
+  # --- what the last command left behind belongs to that command and not to this prompt:
+  # --- ssh names the tab after the remote host, and exiting never took the name back.
+  # --- Prepended, so a user's own title-setting precmd runs after this one and still wins;
+  # --- `return $ret` keeps the exit status intact for _bnkterm_precmd, which runs later
+  # --- and reads it from $? for the D mark.
+  _bnkterm_report() {{
+    local ret=$?
+    # Percent-encode $PWD bytewise: a directory name may hold any byte but `/` and NUL,
+    # this sequence's own terminator included, and `nomultibyte` is what makes the encoding
+    # the UTF-8 bytes the terminal decodes rather than the code points it does not.
+    setopt localoptions extendedglob nomultibyte
+    print -rn -- $'\\e]0;\\a\\e]7;file://'\"${{HOST}}${{PWD//(#m)[^A-Za-z0-9\\/._~-]/%${{(l:2::0:)$(([##16]#MATCH))}}}}\"$'\\a'
+    return $ret
+  }}
+  (( ${{precmd_functions[(I)_bnkterm_report]}} )) || precmd_functions=(_bnkterm_report $precmd_functions)
   _bnkterm_restore_zdotdir() {{
     export ZDOTDIR=\"${{BNKTERM_USER_ZDOTDIR:-$HOME}}\"
     unset BNKTERM_USER_ZDOTDIR BNKTERM_INT_ZDOTDIR
@@ -258,6 +283,30 @@ mod tests {
     }
 
     #[test]
+    fn the_prompt_reports_its_own_title_and_directory() {
+        let rc = zshrc();
+        // The title a command left behind is cleared, and the directory re-reported, so a
+        // tab named by a remote shell goes back to naming this machine after `exit`.
+        assert!(
+            rc.contains(r"$'\e]0;\a\e]7;file://'"),
+            "title clear + cwd report"
+        );
+        // Prepended, not appended: a user's own precmd that sets a title runs afterwards
+        // and keeps it, and `_bnkterm_precmd` still runs last (its `A` mark belongs next
+        // to the prompt). Guarded on the hook not already being there, so sourcing this
+        // twice in one shell leaves one hook, as `add-zsh-hook` does for the marks.
+        assert!(rc.contains("precmd_functions=(_bnkterm_report $precmd_functions)"));
+        assert!(rc.contains("${precmd_functions[(I)_bnkterm_report]}"));
+        // The `D` mark reports the command's exit status, and it is read from `$?` in a
+        // later hook — so this one has to hand the status on rather than report its own.
+        assert!(rc.contains("local ret=$?"), "captures the status");
+        assert!(rc.contains("return $ret"), "and hands it on");
+        // The directory is percent-encoded bytewise; without `nomultibyte` the encoding
+        // would be of code points, which is not what the terminal decodes.
+        assert!(rc.contains("setopt localoptions extendedglob nomultibyte"));
+    }
+
+    #[test]
     fn the_zshenv_restores_the_users_zdotdir_before_sourcing_theirs() {
         // The bootstrap must consult the sentinel bnkterm sets, source the user's .zshenv,
         // and hand control back — or the user's environment silently vanishes.
@@ -296,7 +345,8 @@ mod tests {
         std::env::set_var("ZDOTDIR", &dir);
 
         const MARK: &[u8] = b"\x1b]133;A"; // OSC 133 prompt-start
-        let has_mark = |v: &[u8]| v.windows(MARK.len()).any(|w| w == MARK);
+        let contains = |v: &[u8], needle: &[u8]| v.windows(needle.len()).any(|w| w == needle);
+        let has_mark = |v: &[u8]| contains(v, MARK);
 
         let pty = Pty::spawn_command(80, 24, &[&zsh, "-i"]).expect("spawn zsh");
         let mut out = Vec::new();
@@ -314,6 +364,35 @@ mod tests {
         assert!(
             has_mark(&out),
             "zsh did not emit the injected OSC 133 prompt mark; got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        // The report runs first in `precmd_functions`, so reaching the `A` mark above means
+        // the prompt already said whose title and directory these are.
+        assert!(
+            contains(&out, b"\x1b]0;\x07"),
+            "the prompt did not retire the last command's title; got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        // The directory, percent-encoded here independently of the shim so the encoding is
+        // checked and not merely echoed. Everything outside the unreserved set (plus the
+        // path separator) is an escaped byte, which is what makes a directory named with a
+        // BEL in it report as text rather than as the end of this sequence.
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut expected = String::from("\x1b]7;file://");
+        for byte in cwd.as_os_str().as_encoded_bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'~' | b'-' => {
+                    expected.push(char::from(*byte));
+                }
+                _ => expected.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        expected.push('\x07');
+        // The host sits between the scheme and the path, so match the two halves.
+        let (scheme, path) = expected.split_at("\x1b]7;file://".len());
+        assert!(
+            contains(&out, scheme.as_bytes()) && contains(&out, path.as_bytes()),
+            "the prompt did not report {cwd:?}; got {:?}",
             String::from_utf8_lossy(&out)
         );
     }
