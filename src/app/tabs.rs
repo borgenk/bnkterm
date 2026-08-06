@@ -22,9 +22,10 @@ use std::time::{Duration, Instant};
 
 use super::message::{ToTerminal, ToWindow};
 use super::terminal::{PumpOutcome, TerminalCore};
-use crate::config::TabBarConfig;
+use crate::config::{ShellStartupConfig, TabBarConfig};
 use crate::error::Result;
 use crate::gather::GatherEnd;
+use crate::notice::Notice;
 use crate::platform::freetype::Fonts;
 use crate::platform::geom::Scale;
 use crate::pty::ZombieChild;
@@ -97,14 +98,27 @@ pub(super) struct Tabs {
     /// (see [`crate::shell_integration::Session::shell_args`]). Held here because a tab
     /// opened an hour in has to load the same shims as the first one did.
     shell_args: Vec<String>,
+    /// When a shell's own startup is slow enough to say so. Held beside `shell_args`
+    /// for the same reason: it is a property of the session, not of a tab.
+    shell_startup: ShellStartupConfig,
+    /// The transient corner notice, when one stands. Window-level rather than per-core
+    /// because it is chrome over the window, and because the tab it speaks for is the
+    /// one that just opened, which is the active one by the time it is raised.
+    notice: Option<Notice>,
     /// Messages already translated from per-core facts into window actions.
     outbox: Vec<ToWindow>,
 }
 
 impl Tabs {
     /// Wrap the initial terminal core as tab zero, under the given strip config, with the
-    /// shell arguments every tab in this session will be spawned with.
-    pub(super) fn new(core: TerminalCore, cfg: TabBarConfig, shell_args: Vec<String>) -> Self {
+    /// shell arguments every tab in this session will be spawned with and the budget a
+    /// shell's own startup is held to.
+    pub(super) fn new(
+        core: TerminalCore,
+        cfg: TabBarConfig,
+        shell_args: Vec<String>,
+        shell_startup: ShellStartupConfig,
+    ) -> Self {
         let mut tabs = Self {
             entries: Vec::new(),
             active: 0,
@@ -117,6 +131,8 @@ impl Tabs {
             drag: None,
             cfg,
             shell_args,
+            shell_startup,
+            notice: None,
             outbox: Vec::new(),
         };
         let id = tabs.allocate_id();
@@ -531,6 +547,10 @@ impl Tabs {
         }
         self.pump_cursor = (self.pump_cursor + 1) % len;
 
+        // Read the startup measurements while their cores are still here: a shell that
+        // marks its prompt and exits in the same turn (a startup script, or `exit` typed
+        // into a slow shell) is closed below, and taking this afterwards would lose it.
+        self.raise_slow_startup_notice();
         // Preserve final title/selection messages before an ended core is removed.
         self.route_core_outboxes();
         for (id, end) in ended {
@@ -543,6 +563,64 @@ impl Tabs {
 
         more |= self.entries.iter().any(|entry| entry.core.has_pending());
         Ok(more)
+    }
+
+    /// Raise the corner notice for any tab whose shell has just reached its first prompt
+    /// slower than the budget allows.
+    ///
+    /// Every core is asked, not only the active one: a tab opened and switched away from
+    /// still answers, and its shell was still slow. The last one to answer in a turn wins
+    /// the corner, which only arises when two tabs open in the same few milliseconds.
+    fn raise_slow_startup_notice(&mut self) {
+        for index in 0..self.entries.len() {
+            let Some(took) = self.entries[index].core.take_startup_time() else {
+                continue;
+            };
+            if let Some(notice) = Notice::shell_startup(took, &self.shell_startup) {
+                self.notice = Some(notice);
+                // Chrome draws over the active tab's frame, so that is the core whose
+                // repaint puts it on screen — whichever tab's shell was the slow one.
+                self.mark_active_dirty();
+            }
+        }
+    }
+
+    /// Advance the notice: repaint through its fade, and drop it once the fade is done.
+    ///
+    /// A standing notice needs nothing — its colours are the same as last frame's — so
+    /// only the fade and its end mark the frame dirty. Without that, the hold would
+    /// repaint every loop turn for no visible difference.
+    pub(super) fn tick_notice_if_due(&mut self) {
+        let now = Instant::now();
+        let Some(notice) = self.notice.as_ref() else {
+            return;
+        };
+        let (fading, expired) = (notice.fading(now), notice.expired(now));
+        if !fading && !expired {
+            return;
+        }
+        if expired {
+            self.notice = None;
+        }
+        self.mark_active_dirty();
+    }
+
+    /// Mark the visible core's frame for a rebuild, the lever window chrome has for
+    /// getting itself painted.
+    fn mark_active_dirty(&mut self) {
+        if let Some(entry) = self.entries.get_mut(self.active) {
+            entry.core.dirty = true;
+        }
+    }
+
+    /// When the notice next needs a repaint (the end of its hold, then each fade frame).
+    pub(super) fn notice_retry_at(&self) -> Option<Instant> {
+        self.notice.as_ref()?.retry_at(Instant::now())
+    }
+
+    /// The notice the window should paint, if one stands.
+    pub(super) fn notice(&self) -> Option<&Notice> {
+        self.notice.as_ref()
     }
 
     /// Drain and route every core's outbound facts, then return the translated
@@ -884,7 +962,12 @@ mod tests {
 
     fn demo_tabs(count: usize) -> Tabs {
         assert!(count > 0);
-        let mut tabs = Tabs::new(core(true, 80, 24), TabBarConfig::default(), Vec::new());
+        let mut tabs = Tabs::new(
+            core(true, 80, 24),
+            TabBarConfig::default(),
+            Vec::new(),
+            ShellStartupConfig::default(),
+        );
         for _ in 1..count {
             let id = tabs.allocate_id();
             tabs.entries.push(TabEntry {
@@ -923,6 +1006,76 @@ mod tests {
             .any(|message| matches!(message, ToWindow::Closed)));
     }
 
+    /// Drive `tabs` for up to `within` or until its notice is raised, answering whether
+    /// one appeared. A real child on a real PTY marks the prompt, so this covers the whole
+    /// chain the window relies on: fork → gather → parse → mark → raise.
+    fn pump_for_notice(tabs: &mut Tabs, within: Duration) -> bool {
+        let stop = Instant::now() + within;
+        while Instant::now() < stop {
+            let _ = tabs.pump_all(true);
+            if tabs.notice().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// A core whose child marks one prompt and then stays up, as a shell sitting at its
+    /// first prompt does. The sleep bounds it so no stray child can outlive the suite;
+    /// hanging up the PTY at drop ends it sooner. `None` where fork/exec is unavailable.
+    fn core_marking_a_prompt() -> Option<TerminalCore> {
+        let mut core = core(false, 40, 10);
+        core.spawn_program(&["/bin/sh", "-c", "printf '\\033]133;A\\007'; sleep 2"])
+            .ok()?;
+        Some(core)
+    }
+
+    #[test]
+    fn a_shell_slower_than_the_budget_raises_the_corner_notice() {
+        // Budget zero: every startup is over it, so this asserts the wiring rather than
+        // the threshold (which `notice` tests directly). Without the `pump_all` hook the
+        // measurement would be taken and never reach the window.
+        let Some(core) = core_marking_a_prompt() else {
+            eprintln!("fork/exec unavailable; skipping the slow-startup notice test");
+            return;
+        };
+        let cfg = ShellStartupConfig {
+            warn_after: Some(Duration::ZERO),
+            ..ShellStartupConfig::default()
+        };
+        let mut tabs = Tabs::new(core, TabBarConfig::default(), Vec::new(), cfg);
+        assert!(
+            pump_for_notice(&mut tabs, Duration::from_secs(5)),
+            "a shell over the budget never raised its notice"
+        );
+        // Raising it dirties the visible frame, or the panel would wait for the next
+        // unrelated repaint to appear.
+        assert!(tabs.active().dirty, "the frame was marked for a rebuild");
+    }
+
+    #[test]
+    fn a_disabled_budget_stays_silent_through_the_same_pump() {
+        // The opt-out, driven through the identical path: same child, same marks, no
+        // notice. A user who pays a startup cost on purpose is never told about it.
+        let Some(core) = core_marking_a_prompt() else {
+            eprintln!("fork/exec unavailable; skipping the disabled-budget test");
+            return;
+        };
+        let cfg = ShellStartupConfig {
+            warn_after: None,
+            ..ShellStartupConfig::default()
+        };
+        let mut tabs = Tabs::new(core, TabBarConfig::default(), Vec::new(), cfg);
+        // A window far longer than the test above needs to see its notice, driving the
+        // identical child through the identical path: silence here is the opt-out
+        // working, not the prompt failing to arrive.
+        assert!(
+            !pump_for_notice(&mut tabs, Duration::from_millis(1_500)),
+            "a disabled budget raised a notice anyway"
+        );
+    }
+
     /// Typing `exit` in the only tab ends its child, and the pump is where that is
     /// noticed. The pump must reap the tab and leave the list empty, because the event
     /// loop reads exactly that to end the turn before it sizes, shapes, or paints a
@@ -939,7 +1092,12 @@ mod tests {
             eprintln!("fork/exec unavailable here; skipping the child-exit pump test");
             return;
         }
-        let mut tabs = Tabs::new(core, TabBarConfig::default(), Vec::new());
+        let mut tabs = Tabs::new(
+            core,
+            TabBarConfig::default(),
+            Vec::new(),
+            ShellStartupConfig::default(),
+        );
         assert!(!tabs.is_empty());
 
         // The child exits at once, but the gather thread still has to see the EOF, so
@@ -1333,7 +1491,12 @@ mod tests {
             eprintln!("fork/exec unavailable; skipping multi-tab PTY test");
             return;
         }
-        let mut tabs = Tabs::new(first, TabBarConfig::default(), Vec::new());
+        let mut tabs = Tabs::new(
+            first,
+            TabBarConfig::default(),
+            Vec::new(),
+            ShellStartupConfig::default(),
+        );
         if tabs.open(40, 10, METRICS, 320, 160, 0, false).is_err() {
             eprintln!("second PTY unavailable; skipping multi-tab PTY test");
             return;

@@ -246,6 +246,16 @@ pub(super) struct TerminalCore {
     sync_until: Option<Instant>,
     /// When the visual bell stops flashing. `None` when it is not ringing.
     bell_until: Option<Instant>,
+    /// When the shell was forked, held until its first prompt mark answers and then
+    /// dropped — a stopwatch, not a history. The interval it yields is the shell's own
+    /// startup, which is the one part of a slow tab the terminal can attribute but not
+    /// explain (see [`crate::config::ShellStartupConfig`]).
+    ///
+    /// A shell that emits no `OSC 133;A` never answers, so this simply stays armed and
+    /// nothing is ever reported. That is the intended shape: without the integration the
+    /// terminal cannot know when a prompt appeared, and guessing from output bytes would
+    /// mean warning about programs that are not prompts at all.
+    spawned_at: Option<Instant>,
     /// What the child's tty is doing, as of the last time its output settled (see
     /// [`refresh_tty_mode`](Self::refresh_tty_mode)). Cached rather than probed per
     /// frame because it changes only when the child calls `tcsetattr`, and because a
@@ -376,6 +386,7 @@ impl TerminalCore {
             winsize_settle: resize_settle(),
             sync_until: None,
             bell_until: None,
+            spawned_at: None,
             tty_mode: TtyMode::Cooked,
             mouse_held: None,
             reported_cell: None,
@@ -443,6 +454,10 @@ impl TerminalCore {
         };
         self.gatherer = Some(gatherer);
         self.pty = Some(pty);
+        // Start the clock at the fork rather than at the first byte: the wait the user
+        // sits through starts here, and a shell that is slow before it prints anything
+        // is exactly the case worth catching.
+        self.spawned_at = Some(Instant::now());
         // Seed the directory label so a fresh tab shows its cwd before the shell
         // has printed a thing.
         self.cwd = self.pty.as_ref().and_then(Pty::cwd);
@@ -1339,6 +1354,22 @@ impl TerminalCore {
         }
     }
 
+    /// How long the shell took to reach its first prompt, answered once and only once,
+    /// the first time this is called after that prompt's `OSC 133;A` has landed.
+    ///
+    /// Reading the grid's prompt marks rather than watching the byte stream keeps the
+    /// parser and the grid unaware of any of this: the mark is already recorded for the
+    /// reflow freeze, and "has this shell ever marked a prompt" is a question the screen
+    /// can already answer.
+    pub(super) fn take_startup_time(&mut self) -> Option<Duration> {
+        let spawned = self.spawned_at?;
+        if self.screen.prompts().is_empty() {
+            return None;
+        }
+        self.spawned_at = None;
+        Some(spawned.elapsed())
+    }
+
     /// Whether the visual bell is mid-flash.
     pub(super) fn bell_flashing(&self) -> bool {
         self.bell_until.is_some_and(|until| Instant::now() < until)
@@ -2188,6 +2219,82 @@ mod tests {
         assert_eq!(core.tty_mode, TtyMode::Cooked);
         assert!(core.dirty, "letting go of the lock repaints too");
         assert!(!locked(&core), "the padlock is gone");
+    }
+
+    #[test]
+    fn the_startup_clock_answers_once_and_only_after_a_prompt_mark() {
+        // The contract the corner notice rests on. Before the shell marks a prompt there
+        // is no answer at all — not a zero, not a guess from output bytes — because until
+        // then the terminal genuinely does not know whether a prompt has appeared.
+        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        core.spawned_at = Some(Instant::now() - Duration::from_millis(120));
+        assert_eq!(
+            core.take_startup_time(),
+            None,
+            "output alone says nothing; only a prompt mark does"
+        );
+        core.feed_test_bytes(b"printing away, still no prompt\r\n");
+        assert_eq!(core.take_startup_time(), None);
+
+        core.feed_test_bytes(b"\x1b]133;A\x07");
+        let took = core.take_startup_time().expect("the mark stops the clock");
+        assert!(
+            took >= Duration::from_millis(120),
+            "measured from the fork, not from the first byte: {took:?}"
+        );
+        // Once and only once: a shell marks a prompt before every command it runs, and a
+        // notice per prompt would be a notice per command.
+        assert_eq!(core.take_startup_time(), None, "answered once");
+        core.feed_test_bytes(b"\x1b]133;A\x07");
+        assert_eq!(core.take_startup_time(), None, "and stays answered");
+    }
+
+    #[test]
+    fn a_shell_that_never_marks_a_prompt_is_never_measured() {
+        // The no-integration case, which must stay silent rather than guess. A shell with
+        // no OSC 133 prints plenty and marks nothing, and a terminal that timed *that*
+        // would be warning about programs that are not prompts.
+        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        core.spawned_at = Some(Instant::now() - Duration::from_secs(30));
+        core.feed_test_bytes(b"$ ls\r\nCargo.toml  src\r\n$ ");
+        assert_eq!(
+            core.take_startup_time(),
+            None,
+            "30 seconds of output is still not a prompt anyone marked"
+        );
+    }
+
+    #[test]
+    fn a_live_child_marking_a_prompt_stops_the_startup_clock() {
+        // End to end through a real fork, PTY, gather thread, and parser: the clock starts
+        // at the fork and the child's own `OSC 133;A` is what stops it. This is the path
+        // the shell integration drives, with the shim's one byte sequence standing in for
+        // the shim.
+        let mut core = TerminalCore::new(false, 40, 10, METRICS, 320, 160, 0);
+        if core
+            .spawn_program(&["/bin/sh", "-c", "printf '\\033]133;A\\007'"])
+            .is_err()
+        {
+            eprintln!("fork/exec unavailable; skipping the live startup-clock test");
+            return;
+        }
+
+        let stop = Instant::now() + Duration::from_secs(5);
+        let mut took = None;
+        while Instant::now() < stop && took.is_none() {
+            let _ = core.pump(1 << 20, Instant::now() + Duration::from_millis(50));
+            took = core.take_startup_time();
+            if took.is_none() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let took = took.expect("the child's prompt mark never stopped the clock");
+        assert!(
+            took > Duration::ZERO && took < Duration::from_secs(5),
+            "a real fork-to-prompt interval: {took:?}"
+        );
+        // Hang up the PTY and hand the child off, so nothing outlives the test.
+        let _ = core.into_child();
     }
 
     #[test]

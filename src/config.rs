@@ -13,6 +13,7 @@ use crate::color::Rgb;
 use crate::platform::freetype::{FontConfig, FontFamily};
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// A font file in the XDG user font directory (`$XDG_DATA_HOME/fonts`, else
 /// `$HOME/.local/share/fonts`). Used for fonts a user installs themselves, e.g.
@@ -204,6 +205,54 @@ pub enum TabBarPosition {
 pub struct TabColors {
     pub fg: Rgb,
     pub bg: Rgb,
+}
+
+/// When a shell takes long enough reaching its first prompt to be worth saying so,
+/// and how long the notice then stands.
+///
+/// A terminal cannot see *why* a shell is slow — that is the shell's own startup, and
+/// diagnosing it means knowing what `compinit` or a plugin manager is doing, which is
+/// knowledge a terminal has no business holding. What it can do is separate its own
+/// cost from the shell's and say which one the wait belonged to, because the user
+/// staring at an empty tab cannot tell them apart. The clock is exact rather than
+/// guessed: `fork` to the first `OSC 133;A` the injected integration emits (see
+/// [`crate::shell_integration`]), so a shell with no marks is never measured and never
+/// warned about.
+///
+/// [`Self::warn_after`] is a plain absolute threshold, deliberately: a *relative* one
+/// would mean the terminal keeping a history of what "normal" is for this machine, and
+/// a slow shell that is slow every time is exactly the case that history would learn to
+/// call normal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ShellStartupConfig {
+    /// How long a shell may take to reach its first prompt before the notice appears.
+    /// `None` disables it outright, which is what a `0` in a future config file means:
+    /// a startup cost paid on purpose (a plugin manager, a version-manager hook) is a
+    /// choice, and a terminal that keeps second-guessing it is a terminal you turn off.
+    pub warn_after: Option<Duration>,
+    /// How long the notice stands at full strength before it starts fading.
+    pub hold: Duration,
+    /// How long it then takes to fade out. The display list carries no alpha, so this
+    /// is the panel and its text mixing toward the background (see
+    /// [`crate::notice::paint`]), which is also how the overlay scrollbar fades.
+    pub fade: Duration,
+}
+
+impl Default for ShellStartupConfig {
+    fn default() -> Self {
+        Self {
+            // 150ms. A zsh with an empty rc reaches its prompt in ~5ms and a healthy one
+            // with completion cached in ~40ms, so this is "not snappy" rather than
+            // "broken", and it is meant to fire while the cause is still fresh. The whole
+            // point is catching a config that quietly got expensive, which a threshold
+            // set at the pain point (half a second) would sit under forever. It sits high
+            // enough above a healthy shell to leave room for an ordinary rc — a couple of
+            // `eval`ed hooks, a version manager — without calling that a fault.
+            warn_after: Some(Duration::from_millis(150)),
+            hold: Duration::from_millis(1_800),
+            fade: Duration::from_millis(400),
+        }
+    }
 }
 
 /// Tab-strip appearance and layout. These were the hardcoded constants the tab

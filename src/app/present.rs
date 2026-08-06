@@ -630,6 +630,17 @@ impl State {
                 sw,
                 sh,
             );
+            // The corner notice sits above both, and above the leader overlay it can
+            // never collide with (that one is centered). Nothing at all when none stands.
+            crate::notice::paint(
+                self.tabs.notice(),
+                out,
+                strings,
+                self.metrics,
+                self.tabs.active().theme(),
+                sw,
+                sh,
+            );
         }
 
         // Nothing changed since the on-screen frame: nothing to present (idle). The

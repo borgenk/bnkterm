@@ -39,7 +39,7 @@ use self::message::{PointerEvent, Side, ToTerminal, ToWindow};
 use self::present::GpuPresentation;
 use self::tabs::{Reorder, Tabs};
 use self::terminal::TerminalCore;
-use crate::config::{TabBarConfig, TabBarPosition};
+use crate::config::{ShellStartupConfig, TabBarConfig, TabBarPosition};
 // The app orchestrates the platform/render layers (which carry their own error
 // type) and the terminal core (which uses the crate-level one). It speaks the
 // crate-level `Error`/`Result` throughout; a `?` on a platform call converts
@@ -474,7 +474,12 @@ impl State {
             conn,
             fonts,
             xkb: Xkb::new()?,
-            tabs: Tabs::new(core, tab_bar_config.clone(), shell_args),
+            tabs: Tabs::new(
+                core,
+                tab_bar_config.clone(),
+                shell_args,
+                ShellStartupConfig::default(),
+            ),
             poll_set: pty::PollSet::new(),
             metrics,
             label_metrics,
@@ -793,6 +798,8 @@ impl State {
         self.tabs.tick_bell_if_due();
         self.tabs.tick_sync_if_due();
         self.tabs.tick_scrollbar();
+        // Carry the corner notice through its fade, and take it off when it is spent.
+        self.tabs.tick_notice_if_due();
         // Deliver any resize that has now settled to the children (debounced SIGWINCH).
         self.tabs.flush_winsize_if_due()?;
         if self.repeat_at.is_some_and(|at| at <= Instant::now()) {
@@ -802,9 +809,9 @@ impl State {
     }
 
     /// How long to block for input: the soonest of the pending cursor-blink, scrollbar
-    /// fade, and key-repeat deadlines, or `None` (block indefinitely) when none is armed.
-    /// The blink and fade deadlines are the core's; the key-repeat deadline is the
-    /// window's.
+    /// fade, corner-notice, and key-repeat deadlines, or `None` (block indefinitely) when
+    /// none is armed. The blink and fade deadlines are the core's; the key-repeat
+    /// deadline is the window's.
     fn next_wake(&self) -> Option<Duration> {
         let now = Instant::now();
         let due = |at: Instant| {
@@ -823,6 +830,7 @@ impl State {
             self.tabs.sync_deadline(),
             self.tabs.bell_deadline(),
             self.tabs.winsize_deadline(),
+            self.tabs.notice_retry_at(),
         ]
         .into_iter()
         .flatten()

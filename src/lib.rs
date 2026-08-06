@@ -24,6 +24,7 @@ pub mod grid;
 pub mod input;
 mod keymode;
 pub mod mouse;
+mod notice;
 pub mod pty;
 pub mod shell_integration;
 mod tab_bar;
