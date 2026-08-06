@@ -1,4 +1,4 @@
-//! Auto-injected zsh shell integration.
+//! Auto-injected shell integration for zsh, bash and fish.
 //!
 //! A terminal that reflows text on resize and a shell that repaints its prompt on
 //! `SIGWINCH` disagree unless the shell tells the terminal where its prompt is: without
@@ -9,15 +9,38 @@
 //! kitty and ghostty do, and the only reason they "just work" where alacritty (which
 //! reflows but ships no integration) still mangles the prompt.
 //!
-//! The same hook answers a second question the terminal cannot answer alone: *whose* title
+//! The same hooks answer a second question the terminal cannot answer alone: *whose* title
 //! is on the tab. A window title (OSC 0/2) and a reported directory (OSC 7) are set by
 //! whatever is running, and nothing takes them back when it exits — `ssh` is where that
 //! shows, because the remote shell names the tab after the remote host and the tab keeps
 //! that name long after `exit` returned you to your own machine. No sequence says "that was
 //! the last command's, not mine"; the shell simply has to say what is true again at every
-//! prompt, which is what the `_bnkterm_report` hook does.
+//! prompt, which is what each shell's `_bnkterm_report` does.
 //!
-//! ## The mechanism: `ZDOTDIR` redirection
+//! ## Three shells, three mechanisms
+//!
+//! No shell agreed with any other on how a terminal gets code into it, and the differences
+//! are not cosmetic: they decide how much of the user's own startup we have to re-create by
+//! hand, which is the part that can go wrong.
+//!
+//! ```text
+//!   zsh    ZDOTDIR -> our directory    displaces all four startup files; we source them
+//!   bash   --rcfile <our file>         displaces ~/.bashrc alone; we source that
+//!   fish   XDG_DATA_DIRS += our dir    displaces nothing: a vendor_conf.d drop-in
+//! ```
+//!
+//! bash is the one that needs an argument rather than an environment variable, which is why
+//! [`Session::shell_args`] exists and why the spawn path threads it: there is no `ZDOTDIR`
+//! for bash, and the alternatives (`BASH_ENV`, `ENV` with `--posix`) are either
+//! non-interactive-only or destroy the startup order outright.
+//!
+//! Their hooks differ as much as their loading. zsh has `precmd`/`preexec` built in; fish
+//! has the `fish_prompt`/`fish_preexec`/`fish_postexec` events; bash has neither, so
+//! `PROMPT_COMMAND` stands in for the first and `PS0` (expanded after a command is read,
+//! before it runs) for the second. `PS0` is why this needs no `DEBUG` trap, and so cannot
+//! fight a debugger hook the user installed.
+//!
+//! ## zsh: `ZDOTDIR` redirection
 //!
 //! zsh reads its startup files from `$ZDOTDIR` (default `$HOME`). Point it at a generated
 //! directory whose files source the user's real startup and then add the marks, and the
@@ -36,8 +59,22 @@
 //!   [.zlogin if login]
 //! ```
 //!
-//! Best-effort throughout: a missing `$SHELL`, a non-zsh shell, an opt-out, or any I/O
-//! failure leaves the environment exactly as it was. The child inherits the process
+//! ## bash: `--rcfile`
+//!
+//! `bash --rcfile <ours>` is read *instead of* `~/.bashrc`, so ours sources theirs first
+//! thing. `/etc/bash.bashrc` is untouched either way: bash reads it before the rcfile, so
+//! it is not ours to load, and a distro that sets the tab title there (Arch does) still
+//! wins over our own report because it runs later in `PROMPT_COMMAND`.
+//!
+//! ## fish: a `vendor_conf.d` drop-in
+//!
+//! fish scans `$XDG_DATA_DIRS/fish/vendor_conf.d/` at startup, which is a hook designed for
+//! exactly this, so nothing of the user's is displaced and there is nothing to source back.
+//! Our directory is prepended to the list (never replacing it, or fish would lose its own
+//! vendor files), and the drop-in takes it back out so a child sees the session as it was.
+//!
+//! Best-effort throughout: a missing `$SHELL`, a shell none of the three, an opt-out, or
+//! any I/O failure leaves the environment exactly as it was. The child inherits the process
 //! environment at `fork`, so [`install`] mutates it and therefore **must** run before any
 //! thread starts (as [`crate::app::run`] does, beside the other capability exports).
 
@@ -48,12 +85,89 @@ use std::path::PathBuf;
 /// Set to `0` to disable auto-injection, for a user whose exotic startup it disturbs.
 const OPT_OUT_VAR: &str = "BNKTERM_SHELL_INTEGRATION";
 
-/// Holds the generated integration directory alive for the process and removes it on drop.
-/// zsh sources the files once at a child's startup and never reads them again, so the
-/// directory only has to outlive the session, which this does by living in
-/// [`crate::app::run`]'s stack frame.
+/// A shell the integration can reach. One variant per *startup protocol*, which is the
+/// only axis on which these differ from the terminal's point of view: what the child is
+/// told, and whether it is told through the environment or through an argument.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shell {
+    Zsh,
+    Bash,
+    Fish,
+}
+
+impl Shell {
+    /// Which shell `$SHELL` names, by the final path component so `/usr/bin/zsh`,
+    /// `/bin/zsh` and a bare `zsh` all match. `None` for a shell with no integration
+    /// (ksh, nushell, a login shell that is not a shell at all), which is a no-op and not
+    /// an error.
+    fn named(shell: Option<&OsStr>) -> Option<Self> {
+        match shell
+            .map(std::path::Path::new)
+            .and_then(std::path::Path::file_name)
+            .and_then(OsStr::to_str)?
+        {
+            "zsh" => Some(Self::Zsh),
+            "bash" => Some(Self::Bash),
+            "fish" => Some(Self::Fish),
+            _ => None,
+        }
+    }
+
+    /// Write this shell's shims into the already-created private `dir` and export whatever
+    /// the child needs to find them, answering with the extra arguments its `exec` needs.
+    /// Empty for the two shells reachable through the environment alone; bash is the one
+    /// that has to be *told*, so it answers `--rcfile <path>`.
+    fn install_into(self, dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+        match self {
+            Self::Zsh => {
+                write_zsh_files(dir)?;
+                export_zsh(dir);
+                Ok(Vec::new())
+            }
+            Self::Bash => {
+                let rc = dir.join("bnkterm.bash");
+                // The path becomes an argv entry, so it has to be a `str`. A non-UTF-8 base
+                // directory is refused here rather than lossily mangled: bash given an
+                // `--rcfile` it cannot open sources *nothing*, not even the user's
+                // `~/.bashrc`, so a half-right path is worse than no integration at all.
+                let arg = rc
+                    .to_str()
+                    .ok_or_else(|| std::io::Error::other("non-UTF-8 integration path"))?
+                    .to_string();
+                write_new(rc, BASHRC.as_bytes())?;
+                Ok(vec!["--rcfile".to_string(), arg])
+            }
+            Self::Fish => {
+                write_fish_files(dir)?;
+                export_fish(dir);
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
+/// Holds the generated integration directory alive for the process and removes it on drop,
+/// and carries the arguments the child shell needs (see [`Self::shell_args`]).
+///
+/// A shell sources these files once at startup and never reads them again, so the directory
+/// only has to outlive the session, which this does by living in [`crate::app::run`]'s
+/// stack frame.
 pub struct Session {
     dir: PathBuf,
+    args: Vec<String>,
+}
+
+impl Session {
+    /// Extra arguments every shell this process spawns must be given for the integration to
+    /// load. Empty for zsh and fish, which are reached through the environment; `--rcfile
+    /// <path>` for bash, which has no environment variable that works for an interactive
+    /// shell.
+    ///
+    /// These are a property of the *session*, not of a tab, so every tab passes the same
+    /// ones and a tab opened an hour in loads the same shims as the first.
+    pub fn shell_args(&self) -> &[String] {
+        &self.args
+    }
 }
 
 impl Drop for Session {
@@ -62,11 +176,11 @@ impl Drop for Session {
     }
 }
 
-/// Point `$ZDOTDIR` at a generated integration directory for the zsh children this process
-/// will spawn, so their prompts carry OSC 133 marks. Returns a [`Session`] the caller keeps
-/// alive (dropping it removes the directory), or `None` when nothing was installed: not
-/// zsh, opted out, or an I/O failure. Never errors — integration is a nicety, never a
-/// reason the terminal fails to open.
+/// Generate the integration for `$SHELL` and point this process's future children at it.
+/// Returns a [`Session`] the caller keeps alive (dropping it removes the directory), or
+/// `None` when nothing was installed: a shell we do not speak, opted out, or an I/O
+/// failure. Never errors — integration is a nicety, never a reason the terminal fails to
+/// open.
 ///
 /// Must be called before the first thread starts: it mutates the process environment, which
 /// is unsound once other threads run.
@@ -74,36 +188,15 @@ pub fn install() -> Option<Session> {
     if std::env::var_os(OPT_OUT_VAR).as_deref() == Some(OsStr::new("0")) {
         return None;
     }
-    if !shell_is_zsh(std::env::var_os("SHELL").as_deref()) {
-        return None;
-    }
+    let shell = Shell::named(std::env::var_os("SHELL").as_deref())?;
     let dir = create_integration_dir().ok()?;
-    if write_zsh_files(&dir).is_err() {
-        let _ = std::fs::remove_dir_all(&dir);
-        return None;
+    match shell.install_into(&dir) {
+        Ok(args) => Some(Session { dir, args }),
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            None
+        }
     }
-
-    // Hand the child the user's current ZDOTDIR (so our .zshenv can restore it) and point
-    // ZDOTDIR at our directory. `BNKTERM_INT_ZDOTDIR` is our directory, which the stages
-    // return to after each hand-off.
-    match std::env::var_os("ZDOTDIR") {
-        Some(orig) => std::env::set_var("BNKTERM_ORIG_ZDOTDIR", orig),
-        // No sentinel means "the user had none, fall back to $HOME"; make sure a stale one
-        // inherited from a parent bnkterm cannot masquerade as the user's.
-        None => std::env::remove_var("BNKTERM_ORIG_ZDOTDIR"),
-    }
-    std::env::set_var("BNKTERM_INT_ZDOTDIR", &dir);
-    std::env::set_var("ZDOTDIR", &dir);
-    Some(Session { dir })
-}
-
-/// Whether `$SHELL` names zsh, by the final path component so `/usr/bin/zsh`, `/bin/zsh`,
-/// and a bare `zsh` all match while `/bin/bash` does not.
-fn shell_is_zsh(shell: Option<&OsStr>) -> bool {
-    shell
-        .map(std::path::Path::new)
-        .and_then(std::path::Path::file_name)
-        .is_some_and(|name| name == OsStr::new("zsh"))
 }
 
 /// Create a fresh, private directory for the generated startup files and return its path.
@@ -146,6 +239,20 @@ fn random_token() -> std::io::Result<String> {
         }
     }
     Ok(token)
+}
+
+/// Point the child's `ZDOTDIR` at `dir`, handing it the user's own value in a sentinel so
+/// the first stage can restore it before sourcing their startup.
+fn export_zsh(dir: &std::path::Path) {
+    match std::env::var_os("ZDOTDIR") {
+        Some(orig) => std::env::set_var("BNKTERM_ORIG_ZDOTDIR", orig),
+        // No sentinel means "the user had none, fall back to $HOME"; make sure a stale one
+        // inherited from a parent bnkterm cannot masquerade as the user's.
+        None => std::env::remove_var("BNKTERM_ORIG_ZDOTDIR"),
+    }
+    // Our directory, which the stages return to after each hand-off.
+    std::env::set_var("BNKTERM_INT_ZDOTDIR", dir);
+    std::env::set_var("ZDOTDIR", dir);
 }
 
 /// Write the four zsh startup shims into the already-created private `dir`. The
@@ -248,25 +355,205 @@ fi
     )
 }
 
+/// The bash shim, reached by `bash --rcfile <this>`.
+///
+/// bash has neither of zsh's hooks, so both are stood in for:
+///
+/// ```text
+///   precmd   PROMPT_COMMAND   runs before each prompt; a string, or an array from 5.1
+///   preexec  PS0              expanded after a command is read, before it runs (4.4+)
+/// ```
+///
+/// `PS0` is the part worth knowing about. The usual bash `preexec` is a `DEBUG` trap, which
+/// fires before *every* simple command (so it needs a latch to find the first one) and is a
+/// single global slot a user's debugger hook may already own. `PS0` is neither: it is
+/// expanded exactly once per command line, and appending to it cannot take anything away
+/// from anyone. On bash before 4.4 it is an unused variable and the `C` mark simply does not
+/// appear, which costs nothing the terminal consumes today.
+///
+/// Written as a raw string so the shell reads what is written here: `\e` is bash's escape,
+/// not Rust's.
+const BASHRC: &str = r#"# bnkterm shell integration (auto-injected). Source the user's bash startup untouched,
+# then add OSC 133 prompt marks. See crate::shell_integration.
+#
+# bash reads this *instead of* ~/.bashrc, which is what --rcfile means, so the user's file
+# is sourced here by hand. /etc/bash.bashrc is not ours to load: bash reads it before this.
+if [[ -f "${HOME}/.bashrc" ]]; then
+  source "${HOME}/.bashrc"
+fi
+
+# Interactive shells only (a script has no prompt to mark), and once per shell: a nested
+# bnkterm re-runs this file in a *new* bash, where the guard is unset again.
+if [[ $- == *i* && -z "${_BNKTERM_INTEGRATED:-}" ]]; then
+  _BNKTERM_INTEGRATED=1
+
+  # Percent-encode $1 into _bnkterm_encoded. A directory name may hold any byte but `/` and
+  # NUL, this sequence's own terminator included, so the path is encoded rather than trusted.
+  # LC_ALL=C makes the indexing bytewise, which is what makes the escapes the UTF-8 bytes the
+  # terminal decodes rather than code points it does not. It answers through a variable
+  # because $(...) is a fork and this runs at every prompt.
+  _bnkterm_encode() {
+    local LC_ALL=C str=$1 out= i char
+    for (( i = 0; i < ${#str}; i++ )); do
+      char=${str:i:1}
+      case $char in
+        [-A-Za-z0-9._~/]) out+=$char ;;
+        *) printf -v char '%%%02X' "'$char"; out+=$char ;;
+      esac
+    done
+    _bnkterm_encoded=$out
+  }
+
+  # The prompt's own title (cleared) and directory, because what the last command left
+  # behind belongs to that command: ssh names the tab after the remote host and exiting
+  # never took the name back. First in PROMPT_COMMAND, so a config that sets its own title
+  # runs after this and still wins, and it returns the status it was handed so the D mark
+  # below still reports the command's rather than its own.
+  _bnkterm_report() {
+    local ret=$?
+    _bnkterm_encode "${PWD}"
+    printf '\e]0;\a\e]7;file://%s%s\a' "${HOSTNAME}" "${_bnkterm_encoded}"
+    return $ret
+  }
+
+  # D (how the command ended) and A (a prompt starts here), last so the A mark sits closest
+  # to the prompt itself.
+  _bnkterm_marks() {
+    local ret=$?
+    printf '\e]133;D;%s\a\e]133;A\a' "$ret"
+    return $ret
+  }
+
+  # PROMPT_COMMAND is a string, and from bash 5.1 may be an array (Arch's /etc/bash.bashrc
+  # makes it one). Splice ours around whatever is there rather than replacing it.
+  if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == 'declare -a'* ]]; then
+    PROMPT_COMMAND=(_bnkterm_report "${PROMPT_COMMAND[@]}" _bnkterm_marks)
+  elif [[ -n "${PROMPT_COMMAND}" ]]; then
+    PROMPT_COMMAND=$'_bnkterm_report\n'"${PROMPT_COMMAND}"$'\n_bnkterm_marks'
+  else
+    PROMPT_COMMAND=$'_bnkterm_report\n_bnkterm_marks'
+  fi
+
+  # C: the command's output starts here. Appended, so a PS0 the user set still prints.
+  PS0=${PS0}'\e]133;C\a'
+fi
+"#;
+
+/// Write the fish drop-in under `dir`, in the `fish/vendor_conf.d/` layout fish looks for
+/// inside each `$XDG_DATA_DIRS` entry. The subdirectories are ours alone (0700), created
+/// inside a directory that is already unpredictable and private, so the guarantee
+/// [`create_integration_dir`] establishes still holds for what lands under them.
+fn write_fish_files(dir: &std::path::Path) -> std::io::Result<()> {
+    let conf_d = dir.join("fish").join("vendor_conf.d");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&conf_d)?;
+    write_new(conf_d.join("bnkterm.fish"), FISH_CONF.as_bytes())
+}
+
+/// Prepend `dir` to `XDG_DATA_DIRS` so fish finds the drop-in, leaving a sentinel the
+/// drop-in uses to take it back out again.
+///
+/// The list is *prepended to*, never replaced: it is where fish finds its own vendor
+/// completions and functions, and a session that set none still means the two spec defaults
+/// rather than nothing at all — an empty `XDG_DATA_DIRS` would hide them.
+fn export_fish(dir: &std::path::Path) {
+    /// What the XDG base directory specification says an unset `XDG_DATA_DIRS` means.
+    const XDG_DATA_DIRS_DEFAULT: &str = "/usr/local/share:/usr/share";
+    let mut value = dir.as_os_str().to_owned();
+    value.push(":");
+    match std::env::var_os("XDG_DATA_DIRS").filter(|dirs| !dirs.is_empty()) {
+        Some(existing) => value.push(existing),
+        None => value.push(XDG_DATA_DIRS_DEFAULT),
+    }
+    std::env::set_var("XDG_DATA_DIRS", value);
+    std::env::set_var("BNKTERM_INT_DATA_DIR", dir);
+}
+
+/// The fish drop-in: `$XDG_DATA_DIRS/fish/vendor_conf.d/bnkterm.fish`.
+///
+/// The easiest of the three. fish designed a hook for exactly this, so nothing of the
+/// user's is displaced and there is nothing to source back, and its `fish_prompt` /
+/// `fish_preexec` / `fish_postexec` events map onto the marks one for one. `postexec`
+/// carries the status, which is why `D` is emitted there rather than at the prompt.
+const FISH_CONF: &str = r#"# bnkterm shell integration (auto-injected). See crate::shell_integration.
+
+# Take our directory back out of the inherited list, so a child of this shell sees the
+# session as it was. The sentinel names the one entry to drop, and goes with it.
+if set -q BNKTERM_INT_DATA_DIR
+    if set -q XDG_DATA_DIRS
+        set -l kept
+        for dir in (string split : -- $XDG_DATA_DIRS)
+            if test "$dir" != "$BNKTERM_INT_DATA_DIR"
+                set -a kept $dir
+            end
+        end
+        set -gx XDG_DATA_DIRS (string join : -- $kept)
+    end
+    set -e BNKTERM_INT_DATA_DIR
+end
+
+# conf.d files are read by every fish, script or not; only a shell with a prompt has
+# anything to mark.
+if status is-interactive
+    # The prompt's own title (cleared) and directory, because what the last command left
+    # behind belongs to that command: ssh names the tab after the remote host and exiting
+    # never took the name back. Then A, marking where this prompt starts.
+    function _bnkterm_report --on-event fish_prompt -d "bnkterm: the prompt's own title and directory"
+        # Encoded per component and rejoined, rather than in one pass over the whole path:
+        # the terminal splits the host from the path at the first separator, so those have
+        # to survive whether or not `--style=url` treats them as reserved. The leading one
+        # is written here because splitting an absolute path yields an empty first field.
+        set -l parts (string split / -- $PWD)
+        set -e parts[1]
+        printf '\e]0;\a\e]7;file://%s/%s\a\e]133;A\a' $hostname (string join / -- (string escape --style=url -- $parts))
+    end
+
+    # C: the command's output starts here.
+    function _bnkterm_preexec --on-event fish_preexec -d "bnkterm: where a command's output starts"
+        printf '\e]133;C\a'
+    end
+
+    # D: how it ended. $status is read first, before anything here can overwrite it.
+    function _bnkterm_postexec --on-event fish_postexec -d "bnkterm: how a command ended"
+        printf '\e]133;D;%s\a' $status
+    end
+end
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn detects_zsh_by_the_final_path_component() {
-        for yes in ["/usr/bin/zsh", "/bin/zsh", "zsh", "/opt/homebrew/bin/zsh"] {
-            assert!(shell_is_zsh(Some(OsStr::new(yes))), "{yes}");
+    fn detects_each_shell_by_the_final_path_component() {
+        // Whatever prefix a distro installs a shell under, the name is the last component.
+        for (path, shell) in [
+            ("/usr/bin/zsh", Shell::Zsh),
+            ("/bin/zsh", Shell::Zsh),
+            ("zsh", Shell::Zsh),
+            ("/opt/homebrew/bin/zsh", Shell::Zsh),
+            ("/bin/bash", Shell::Bash),
+            ("/usr/local/bin/bash", Shell::Bash),
+            ("/usr/bin/fish", Shell::Fish),
+            ("fish", Shell::Fish),
+        ] {
+            assert_eq!(Shell::named(Some(OsStr::new(path))), Some(shell), "{path}");
         }
+        // A shell with no integration is not an error, it is nothing at all. `/bin/sh` is
+        // in this list on purpose: it is usually dash or a bash in POSIX mode, and neither
+        // reads what the bash shim would be handed.
         for no in [
-            "/bin/bash",
             "/bin/sh",
-            "/usr/bin/fish",
+            "/usr/bin/ksh",
+            "/usr/bin/nu",
             "zsh-completions",
             "",
         ] {
-            assert!(!shell_is_zsh(Some(OsStr::new(no))), "{no}");
+            assert_eq!(Shell::named(Some(OsStr::new(no))), None, "{no}");
         }
-        assert!(!shell_is_zsh(None));
+        assert_eq!(Shell::named(None), None);
     }
 
     #[test]
@@ -317,18 +604,207 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spawns a real zsh under a PTY; run manually: cargo test --lib \
-                injected_integration_marks_a_real_zsh_prompt -- --ignored --test-threads=1"]
-    fn injected_integration_marks_a_real_zsh_prompt() {
+    fn the_bash_shim_sources_the_user_and_hooks_both_ends_of_a_command() {
+        // --rcfile displaces ~/.bashrc, so the shim owes the user their own file back.
+        assert!(BASHRC.contains(r#"source "${HOME}/.bashrc""#));
+        // The marks, and the prompt's own report of what a command may have overwritten.
+        assert!(BASHRC.contains(r"\e]133;D;%s\a\e]133;A\a"), "D then A");
+        assert!(
+            BASHRC.contains(r"PS0=${PS0}'\e]133;C\a'"),
+            "C, appended to PS0"
+        );
+        assert!(
+            BASHRC.contains(r"\e]0;\a\e]7;file://%s%s\a"),
+            "title clear + cwd"
+        );
+        // Spliced around whatever is already there, in both forms PROMPT_COMMAND takes:
+        // the report first (so a config that sets its own title still wins) and the marks
+        // last (so the A mark sits closest to the prompt).
+        assert!(BASHRC
+            .contains(r#"PROMPT_COMMAND=(_bnkterm_report "${PROMPT_COMMAND[@]}" _bnkterm_marks)"#));
+        assert!(BASHRC.contains(
+            "PROMPT_COMMAND=$'_bnkterm_report\\n'\"${PROMPT_COMMAND}\"$'\\n_bnkterm_marks'"
+        ));
+        // The D mark reports the command's status, and reads it from $? in a later hook.
+        assert!(BASHRC.contains("return $ret"));
+        // Interactive shells only, once per shell.
+        assert!(BASHRC.contains(r#"if [[ $- == *i* && -z "${_BNKTERM_INTEGRATED:-}" ]]"#));
+    }
+
+    #[test]
+    fn the_fish_shim_hooks_the_events_and_gives_the_data_dirs_back() {
+        // One event per mark. D rides fish_postexec because that is where the status is.
+        assert!(FISH_CONF.contains("--on-event fish_prompt"));
+        assert!(FISH_CONF.contains("--on-event fish_preexec"));
+        assert!(FISH_CONF.contains("--on-event fish_postexec"));
+        assert!(FISH_CONF.contains(r"printf '\e]133;D;%s\a' $status"));
+        assert!(FISH_CONF.contains(r"printf '\e]0;\a\e]7;file://%s/%s\a\e]133;A\a'"));
+        // The directory is encoded per component, so the separators the terminal splits
+        // host from path on survive whatever `--style=url` considers reserved.
+        assert!(FISH_CONF.contains("string join / -- (string escape --style=url -- $parts)"));
+        // Our entry comes back out of the inherited list, and the sentinel with it.
+        assert!(FISH_CONF.contains("set -gx XDG_DATA_DIRS (string join : -- $kept)"));
+        assert!(FISH_CONF.contains("set -e BNKTERM_INT_DATA_DIR"));
+        // conf.d is read by every fish; only one with a prompt has anything to mark.
+        assert!(FISH_CONF.contains("if status is-interactive"));
+    }
+
+    #[test]
+    fn each_shell_lays_down_what_it_alone_needs() {
+        // The files and the argv are the whole of what differs between the three, so this
+        // pins each mechanism against the others rather than each in isolation.
+        let dir = create_integration_dir().expect("create dir");
+
+        let zsh_args = Shell::Zsh.install_into(&dir).expect("zsh");
+        assert!(zsh_args.is_empty(), "zsh is reached through ZDOTDIR");
+        assert!(dir.join(".zshenv").is_file() && dir.join(".zshrc").is_file());
+
+        let bash_args = Shell::Bash.install_into(&dir).expect("bash");
+        let rc = dir.join("bnkterm.bash");
+        assert!(rc.is_file(), "the rcfile is written");
+        assert_eq!(
+            bash_args,
+            vec!["--rcfile".to_string(), rc.to_string_lossy().into_owned()],
+            "bash has no environment variable that works, so it is told in argv"
+        );
+
+        let fish_args = Shell::Fish.install_into(&dir).expect("fish");
+        assert!(
+            fish_args.is_empty(),
+            "fish is reached through XDG_DATA_DIRS"
+        );
+        assert!(dir.join("fish/vendor_conf.d/bnkterm.fish").is_file());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_fish_data_dirs_keep_what_was_already_there() {
+        // Replacing the list rather than prepending to it would hide fish's own vendor
+        // files, and an unset one still means the two spec defaults, never nothing.
+        let dir = create_integration_dir().expect("create dir");
+        let restore = std::env::var_os("XDG_DATA_DIRS");
+
+        std::env::set_var("XDG_DATA_DIRS", "/opt/share:/usr/share");
+        export_fish(&dir);
+        let with_existing = std::env::var("XDG_DATA_DIRS").expect("set");
+        assert_eq!(
+            with_existing,
+            format!("{}:/opt/share:/usr/share", dir.display()),
+            "ours leads, theirs survives"
+        );
+
+        std::env::remove_var("XDG_DATA_DIRS");
+        export_fish(&dir);
+        assert_eq!(
+            std::env::var("XDG_DATA_DIRS").expect("set"),
+            format!("{}:/usr/local/share:/usr/share", dir.display()),
+            "an unset list means the spec's defaults, not an empty one"
+        );
+        assert_eq!(
+            std::env::var_os("BNKTERM_INT_DATA_DIR").as_deref(),
+            Some(dir.as_os_str()),
+            "the sentinel names what the drop-in takes back out"
+        );
+
+        match restore {
+            Some(value) => std::env::set_var("XDG_DATA_DIRS", value),
+            None => std::env::remove_var("XDG_DATA_DIRS"),
+        }
+        std::env::remove_var("BNKTERM_INT_DATA_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Whether `haystack` holds `needle` anywhere.
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// The first interpreter of `names` that exists, for a live-shell test to drive.
+    fn find_shell(names: &[&str]) -> Option<String> {
+        let shell = std::env::var("SHELL").unwrap_or_default();
+        if names.contains(&std::path::Path::new(&shell).file_name()?.to_str()?) {
+            return Some(shell);
+        }
+        names
+            .iter()
+            .flat_map(|name| [format!("/usr/bin/{name}"), format!("/bin/{name}")])
+            .find(|path| std::path::Path::new(path).exists())
+    }
+
+    /// Spawn `argv` on a PTY and read until it emits the prompt-start mark or three seconds
+    /// pass, answering everything it printed.
+    ///
+    /// The mark is the right thing to wait for: every shim emits its report *before* the
+    /// `A` of the same prompt, so seeing `A` means the whole prompt-time contract has
+    /// already been exercised and the buffer holds all of it.
+    fn drive_until_prompt(argv: &[&str]) -> Vec<u8> {
         use crate::pty::{Pty, ReadOutcome};
         use std::time::{Duration, Instant};
 
-        let shell = std::env::var("SHELL").unwrap_or_default();
-        let zsh = if shell_is_zsh(Some(OsStr::new(&shell))) {
-            shell
-        } else if std::path::Path::new("/usr/bin/zsh").exists() {
-            "/usr/bin/zsh".to_string()
-        } else {
+        const MARK: &[u8] = b"\x1b]133;A"; // OSC 133 prompt-start
+        let Ok(pty) = Pty::spawn_command(80, 24, argv) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline && !contains(&out, MARK) {
+            match pty.read(&mut buf) {
+                Ok(ReadOutcome::Data(n)) => out.extend_from_slice(&buf[..n]),
+                Ok(ReadOutcome::WouldBlock) => std::thread::sleep(Duration::from_millis(20)),
+                Ok(ReadOutcome::Eof) | Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// What this process's working directory must look like in an `OSC 7`, percent-encoded
+    /// here independently of every shim so the encoding is checked rather than echoed:
+    /// everything outside the unreserved set (plus the separator) is an escaped byte, which
+    /// is what makes a directory named with a BEL in it report as text rather than as the
+    /// end of the sequence. Answers the `(scheme, path)` halves, because the host each
+    /// shell reports sits between them.
+    fn expected_osc7() -> (String, String) {
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut path = String::new();
+        for byte in cwd.as_os_str().as_encoded_bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'~' | b'-' => {
+                    path.push(char::from(*byte));
+                }
+                _ => path.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        path.push('\x07');
+        ("\x1b]7;file://".to_string(), path)
+    }
+
+    /// The prompt-time contract every shell's shim owes, asserted against what a live one
+    /// printed: the marks, the cleared title, and this directory reported as an `OSC 7`.
+    fn assert_prompt_contract(shell: &str, out: &[u8]) {
+        let seen = String::from_utf8_lossy(out);
+        assert!(
+            contains(out, b"\x1b]133;A"),
+            "{shell} did not emit the injected OSC 133 prompt mark; got {seen:?}"
+        );
+        assert!(
+            contains(out, b"\x1b]0;\x07"),
+            "{shell} did not retire the last command's title; got {seen:?}"
+        );
+        let (scheme, path) = expected_osc7();
+        assert!(
+            contains(out, scheme.as_bytes()) && contains(out, path.as_bytes()),
+            "{shell} did not report this directory; got {seen:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "spawns a real zsh under a PTY and mutates the environment; run manually: \
+                cargo test --lib injected_integration_marks_a_real -- --ignored \
+                --test-threads=1"]
+    fn injected_integration_marks_a_real_zsh_prompt() {
+        let Some(zsh) = find_shell(&["zsh"]) else {
             eprintln!("no zsh available; skipping");
             return;
         };
@@ -336,65 +812,59 @@ mod tests {
         // Lay down the shims and point the child at them, exactly as `install` does. The
         // child inherits this environment across the fork.
         let dir = create_integration_dir().expect("create dir");
-        write_zsh_files(&dir).expect("write shims");
-        match std::env::var_os("ZDOTDIR") {
-            Some(orig) => std::env::set_var("BNKTERM_ORIG_ZDOTDIR", orig),
-            None => std::env::remove_var("BNKTERM_ORIG_ZDOTDIR"),
-        }
-        std::env::set_var("BNKTERM_INT_ZDOTDIR", &dir);
-        std::env::set_var("ZDOTDIR", &dir);
+        Shell::Zsh.install_into(&dir).expect("install");
 
-        const MARK: &[u8] = b"\x1b]133;A"; // OSC 133 prompt-start
-        let contains = |v: &[u8], needle: &[u8]| v.windows(needle.len()).any(|w| w == needle);
-        let has_mark = |v: &[u8]| contains(v, MARK);
-
-        let pty = Pty::spawn_command(80, 24, &[&zsh, "-i"]).expect("spawn zsh");
-        let mut out = Vec::new();
-        let mut buf = [0u8; 4096];
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && !has_mark(&out) {
-            match pty.read(&mut buf) {
-                Ok(ReadOutcome::Data(n)) => out.extend_from_slice(&buf[..n]),
-                Ok(ReadOutcome::WouldBlock) => std::thread::sleep(Duration::from_millis(20)),
-                Ok(ReadOutcome::Eof) | Err(_) => break,
-            }
-        }
+        let out = drive_until_prompt(&[&zsh]);
         std::fs::remove_dir_all(&dir).ok();
+        assert_prompt_contract("zsh", &out);
+    }
 
+    #[test]
+    #[ignore = "spawns a real bash under a PTY and sources the user's ~/.bashrc; run \
+                manually: cargo test --lib injected_integration_marks_a_real -- --ignored \
+                --test-threads=1"]
+    fn injected_integration_marks_a_real_bash_prompt() {
+        let Some(bash) = find_shell(&["bash"]) else {
+            eprintln!("no bash available; skipping");
+            return;
+        };
+
+        // bash takes its instructions in argv rather than the environment, so this is the
+        // whole of what `install` hands the child.
+        let dir = create_integration_dir().expect("create dir");
+        let args = Shell::Bash.install_into(&dir).expect("install");
+        let argv: Vec<&str> = std::iter::once(bash.as_str())
+            .chain(args.iter().map(String::as_str))
+            .collect();
+
+        let out = drive_until_prompt(&argv);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_prompt_contract("bash", &out);
+        // PS0 is expanded when a command is read, so the mark for it cannot appear before
+        // one is: what this pins is that the shim reached the prompt with PS0 armed.
         assert!(
-            has_mark(&out),
-            "zsh did not emit the injected OSC 133 prompt mark; got {:?}",
+            contains(&out, b"\x1b]133;D;"),
+            "bash did not report how the last command ended; got {:?}",
             String::from_utf8_lossy(&out)
         );
-        // The report runs first in `precmd_functions`, so reaching the `A` mark above means
-        // the prompt already said whose title and directory these are.
-        assert!(
-            contains(&out, b"\x1b]0;\x07"),
-            "the prompt did not retire the last command's title; got {:?}",
-            String::from_utf8_lossy(&out)
-        );
-        // The directory, percent-encoded here independently of the shim so the encoding is
-        // checked and not merely echoed. Everything outside the unreserved set (plus the
-        // path separator) is an escaped byte, which is what makes a directory named with a
-        // BEL in it report as text rather than as the end of this sequence.
-        let cwd = std::env::current_dir().expect("cwd");
-        let mut expected = String::from("\x1b]7;file://");
-        for byte in cwd.as_os_str().as_encoded_bytes() {
-            match byte {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'~' | b'-' => {
-                    expected.push(char::from(*byte));
-                }
-                _ => expected.push_str(&format!("%{byte:02X}")),
-            }
-        }
-        expected.push('\x07');
-        // The host sits between the scheme and the path, so match the two halves.
-        let (scheme, path) = expected.split_at("\x1b]7;file://".len());
-        assert!(
-            contains(&out, scheme.as_bytes()) && contains(&out, path.as_bytes()),
-            "the prompt did not report {cwd:?}; got {:?}",
-            String::from_utf8_lossy(&out)
-        );
+    }
+
+    #[test]
+    #[ignore = "spawns a real fish under a PTY and mutates the environment; run manually: \
+                cargo test --lib injected_integration_marks_a_real -- --ignored \
+                --test-threads=1"]
+    fn injected_integration_marks_a_real_fish_prompt() {
+        let Some(fish) = find_shell(&["fish"]) else {
+            eprintln!("no fish available; skipping");
+            return;
+        };
+
+        let dir = create_integration_dir().expect("create dir");
+        Shell::Fish.install_into(&dir).expect("install");
+
+        let out = drive_until_prompt(&[&fish]);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_prompt_contract("fish", &out);
     }
 
     #[test]

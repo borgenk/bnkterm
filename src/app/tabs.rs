@@ -93,13 +93,18 @@ pub(super) struct Tabs {
     drag: Option<TabDrag>,
     /// Strip appearance and layout, the source of truth for `layout`/`fill_bar`.
     cfg: TabBarConfig,
+    /// Arguments every shell this session spawns is given, from the shell integration
+    /// (see [`crate::shell_integration::Session::shell_args`]). Held here because a tab
+    /// opened an hour in has to load the same shims as the first one did.
+    shell_args: Vec<String>,
     /// Messages already translated from per-core facts into window actions.
     outbox: Vec<ToWindow>,
 }
 
 impl Tabs {
-    /// Wrap the initial terminal core as tab zero, under the given strip config.
-    pub(super) fn new(core: TerminalCore, cfg: TabBarConfig) -> Self {
+    /// Wrap the initial terminal core as tab zero, under the given strip config, with the
+    /// shell arguments every tab in this session will be spawned with.
+    pub(super) fn new(core: TerminalCore, cfg: TabBarConfig, shell_args: Vec<String>) -> Self {
         let mut tabs = Self {
             entries: Vec::new(),
             active: 0,
@@ -111,11 +116,19 @@ impl Tabs {
             bar_geom: None,
             drag: None,
             cfg,
+            shell_args,
             outbox: Vec::new(),
         };
         let id = tabs.allocate_id();
         tabs.entries.push(TabEntry { id, core });
         tabs
+    }
+
+    /// Spawn the first tab's shell, once the window has its granted size. Later tabs get
+    /// theirs from [`open`](Self::open); both go through the session's shell arguments,
+    /// which is why neither caller has to know them.
+    pub(super) fn spawn_active_shell(&mut self) -> Result<(usize, usize)> {
+        self.entries[self.active].core.spawn_shell(&self.shell_args)
     }
 
     /// Number of live tabs.
@@ -162,7 +175,7 @@ impl Tabs {
         window_focused: bool,
     ) -> Result<TabId> {
         let mut core = TerminalCore::new(false, cols, rows, metrics, width, height, pad);
-        if let Err(error) = core.spawn_shell() {
+        if let Err(error) = core.spawn_shell(&self.shell_args) {
             if let Some(child) = core.into_child() {
                 self.reaping.push(child);
             }
@@ -871,7 +884,7 @@ mod tests {
 
     fn demo_tabs(count: usize) -> Tabs {
         assert!(count > 0);
-        let mut tabs = Tabs::new(core(true, 80, 24), TabBarConfig::default());
+        let mut tabs = Tabs::new(core(true, 80, 24), TabBarConfig::default(), Vec::new());
         for _ in 1..count {
             let id = tabs.allocate_id();
             tabs.entries.push(TabEntry {
@@ -926,7 +939,7 @@ mod tests {
             eprintln!("fork/exec unavailable here; skipping the child-exit pump test");
             return;
         }
-        let mut tabs = Tabs::new(core, TabBarConfig::default());
+        let mut tabs = Tabs::new(core, TabBarConfig::default(), Vec::new());
         assert!(!tabs.is_empty());
 
         // The child exits at once, but the gather thread still has to see the EOF, so
@@ -1320,7 +1333,7 @@ mod tests {
             eprintln!("fork/exec unavailable; skipping multi-tab PTY test");
             return;
         }
-        let mut tabs = Tabs::new(first, TabBarConfig::default());
+        let mut tabs = Tabs::new(first, TabBarConfig::default(), Vec::new());
         if tabs.open(40, 10, METRICS, 320, 160, 0, false).is_err() {
             eprintln!("second PTY unavailable; skipping multi-tab PTY test");
             return;

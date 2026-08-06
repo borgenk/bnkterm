@@ -96,14 +96,21 @@ pub struct ZombieChild {
 
 impl Pty {
     /// Open a PTY, size it to `cols` x `rows`, and fork `$SHELL` (or `/bin/sh`) on
-    /// the slave. The master is non-blocking (so the event loop can drain it
-    /// without stalling) and close-on-exec (so it is never inherited by another
-    /// tab's shell). The caller sets process-wide terminal capability
+    /// the slave, passing it `args`. The master is non-blocking (so the event loop
+    /// can drain it without stalling) and close-on-exec (so it is never inherited by
+    /// another tab's shell). The caller sets process-wide terminal capability
     /// variables once, before any gather threads start, so every child inherits
     /// them without mutating the environment from a multi-threaded process.
-    pub fn spawn(cols: usize, rows: usize) -> Result<Pty> {
+    ///
+    /// `args` comes from [`crate::shell_integration::Session::shell_args`] and is empty
+    /// for every shell but bash, which cannot be reached through the environment and so
+    /// is handed `--rcfile <path>` here.
+    pub fn spawn(cols: usize, rows: usize, args: &[String]) -> Result<Pty> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        Self::spawn_command(cols, rows, &[&shell])
+        let mut argv = Vec::with_capacity(1 + args.len());
+        argv.push(shell.as_str());
+        argv.extend(args.iter().map(String::as_str));
+        Self::spawn_command(cols, rows, &argv)
     }
 
     /// The general form of [`spawn`](Self::spawn): fork `argv` (with `argv[0]` the

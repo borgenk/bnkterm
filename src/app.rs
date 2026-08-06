@@ -214,12 +214,18 @@ pub fn run(verbosity: Verbosity) -> crate::error::Result<()> {
     // `grid::Screen::set_hyperlink`) — rather than impersonating a terminal on the
     // list to get the same answer.
     std::env::set_var("FORCE_HYPERLINK", "1");
-    // Auto-inject zsh shell integration (OSC 133 prompt marks) so a resize reflow does not
+    // Auto-inject shell integration (OSC 133 prompt marks) so a resize reflow does not
     // fight the shell's prompt redraw — the reason kitty/ghostty "just work" and alacritty
-    // does not. Held for the process lifetime; dropping it removes the generated directory.
-    // Must precede any thread, like the exports above, since it mutates the environment.
-    let _shell_integration = crate::shell_integration::install();
-    let mut state = State::new(false, verbosity)?;
+    // does not. Held for the process lifetime; dropping it removes the generated directory,
+    // so it must outlive the state that spawns shells against it (declared first, dropped
+    // last). Must precede any thread, like the exports above, since it mutates the
+    // environment.
+    let shell_integration = crate::shell_integration::install();
+    let shell_args = shell_integration
+        .as_ref()
+        .map(|session| session.shell_args().to_vec())
+        .unwrap_or_default();
+    let mut state = State::new(false, verbosity, shell_args)?;
     state.bring_up()?;
     Ok(())
 }
@@ -227,7 +233,7 @@ pub fn run(verbosity: Verbosity) -> crate::error::Result<()> {
 /// `--demo`: open the window on a static styled grid, without a PTY. The phase-2
 /// bring-up, kept for isolating a render question from the live shell.
 pub fn run_demo(verbosity: Verbosity) -> crate::error::Result<()> {
-    let mut state = State::new(true, verbosity)?;
+    let mut state = State::new(true, verbosity, Vec::new())?;
     state.bring_up()?;
     Ok(())
 }
@@ -236,7 +242,7 @@ pub fn run_demo(verbosity: Verbosity) -> crate::error::Result<()> {
 /// presentation path, without opening a window. Its report *is* its output, so it
 /// prints at any verbosity.
 pub fn gpu_probe() -> crate::error::Result<()> {
-    State::new(true, Verbosity::Quiet)?.probe_dmabuf()?;
+    State::new(true, Verbosity::Quiet, Vec::new())?.probe_dmabuf()?;
     Ok(())
 }
 
@@ -443,7 +449,10 @@ struct State {
 }
 
 impl State {
-    fn new(demo: bool, verbosity: Verbosity) -> Result<Self> {
+    /// `shell_args` is the shell integration's, threaded to every tab this window opens
+    /// (see [`crate::shell_integration::Session::shell_args`]); the paths that never spawn
+    /// a shell (`--demo`, `--gpu-probe`) pass none.
+    fn new(demo: bool, verbosity: Verbosity, shell_args: Vec<String>) -> Result<Self> {
         let conn = Connection::connect()?;
         // Open at unity scale; the compositor's real scale arrives after bring-up
         // and reopens the fonts (see `apply_scale`).
@@ -465,7 +474,7 @@ impl State {
             conn,
             fonts,
             xkb: Xkb::new()?,
-            tabs: Tabs::new(core, tab_bar_config.clone()),
+            tabs: Tabs::new(core, tab_bar_config.clone(), shell_args),
             poll_set: pty::PollSet::new(),
             metrics,
             label_metrics,
@@ -648,7 +657,7 @@ impl State {
         // Under `--verbose` bring-up says what it landed on; quiet by default, so
         // the first thing on stderr is the shell's, not ours.
         if !self.tabs.active().is_demo() {
-            let (cols, rows) = self.tabs.active_mut().spawn_shell()?;
+            let (cols, rows) = self.tabs.spawn_active_shell()?;
             if self.verbosity.verbose() {
                 eprintln!("bnkterm: shell on a {cols}x{rows} grid.");
             }
