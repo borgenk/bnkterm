@@ -233,6 +233,35 @@ impl Row {
         }
     }
 
+    /// A row with no cells at all, holding no heap. [`Buffer::reflow`] leaves one behind
+    /// where it has moved a row out of the old stream, so the stream can still be indexed
+    /// (the next row's wrap padding is decided by looking at it) without the moved row
+    /// being copied or the placeholder costing an allocation.
+    pub(super) fn empty() -> Self {
+        Row {
+            cells: Vec::new(),
+            combining: Vec::new(),
+            wrapped: false,
+        }
+    }
+
+    /// Whether every column from `col` on is padding rather than text: plain blanks, no
+    /// combining marks. This is [`LogicalLine::trim_trailing_blanks`]'s notion of padding
+    /// asked as a question — a blank carrying a mark or a non-default background is content
+    /// to both — so [`Buffer::reflow`] can ask "does this row's text still fit?" without
+    /// measuring where the text ends.
+    ///
+    /// Deliberately not `content_len`: the answer costs only the columns being asked about,
+    /// which is what makes it free on the path that matters. A widen asks about nothing at
+    /// all (`col` past the end), and a one-column narrow asks about one cell, where finding
+    /// the last non-blank column would have scanned back over the whole row's padding.
+    pub(super) fn is_blank_from(&self, col: usize) -> bool {
+        self.cells
+            .get(col..)
+            .is_none_or(|tail| tail.iter().all(|c| *c == PackedCell::BLANK))
+            && !self.combining.iter().any(|m| m.col >= col)
+    }
+
     /// Reset every cell to `blank` and drop combining marks, reusing the existing
     /// allocation so a recycled scroll row never allocates. The wrap link goes with
     /// the content: a recycled row must not inherit one and glue two unrelated lines
@@ -385,6 +414,24 @@ impl LogicalLine {
         self.cells.truncate(end);
         self.combining.retain(|m| m.col < end);
     }
+}
+
+/// Whether row `idx` of `rows` ends in wrap padding: a blank last column the printer left
+/// because the wide glyph that continues the line on the next row could not fit there.
+/// [`Buffer::reflow`] drops that cell when it joins the two, so a widen pulls the glyph
+/// flush against the text before it instead of keeping a phantom space.
+///
+/// An index past the end (or a row the reflow has already moved out, which is empty) is not
+/// padding, so a caller may ask about any row of the stream.
+pub(super) fn wrap_padding_at(rows: &[Row], idx: usize) -> bool {
+    rows.get(idx).is_some_and(|row| {
+        row.wrapped
+            && row.cells.last() == Some(&PackedCell::BLANK)
+            && rows
+                .get(idx + 1)
+                .and_then(|next| next.cells.first())
+                .is_some_and(|c| c.is_wide_leader())
+    })
 }
 
 /// Take a row from the recycle `pool` (or allocate one when it is empty) and fill it from
@@ -971,7 +1018,7 @@ impl Buffer {
         let track_view = view_offset > 0;
         let view_idx = self.scrollback.len().saturating_sub(view_offset);
 
-        // Drain the whole stream into one Vec so every Row is ours to recycle.
+        // Drain the whole stream into one Vec so every Row is ours to move or recycle.
         let mut old_rows: Vec<Row> = Vec::with_capacity(self.scrollback.len() + self.lines.len());
         old_rows.extend(self.scrollback.drain(..));
         old_rows.extend(self.lines.drain(..));
@@ -980,49 +1027,169 @@ impl Buffer {
         // Split off the live prompt region; the head is what actually reflows.
         let frozen_rows: Vec<Row> = old_rows.split_off(frozen_from);
 
-        // --- unwrap the reflowed head: join soft-wrapped runs into logical lines, recording
-        // for every old row the logical line it joined and the offset its first column sits
-        // at (`old`), so any id can later be resolved to a logical position ---
-        let mut lines: Vec<LogicalLine> = Vec::new();
+        // --- rewrap the head one logical line at a time ---
+        //
+        // A logical line is a *run*: the rows the soft-wrap links join together. Walking run
+        // by run, rather than unwrapping the whole stream into logical lines and then laying
+        // all of them back out, is what keeps an interactive drag cheap. A run that is a
+        // single unwrapped row whose text already fits the new width wraps identically at
+        // both widths, so it is handed over untouched — no copy, no logical line, no
+        // allocation — and an ordinary session's scrollback is almost entirely such rows.
+        // Only a run whose wrapping actually changes pays for the unwrap and the relay-out.
+        //
+        // ```text
+        //   old stream            run scan          emit
+        //   ─────────────         ─────────         ────────────────────────────────
+        //   "make -j8"      ──▶   1 row, fits  ──▶  the row itself, width-adjusted
+        //   "a long line…"  ──▶   3 rows       ──▶  unwrap into `logical`, re-lay out
+        // ```
+        //
+        // Both arms record the same two things every [`RowRemap`] lookup needs: for each old
+        // row, the line it joined and the offset its first column sits at (`old`); and for
+        // each new row, where in that line it starts (`new_start`, indexed by `line_first`).
+        let mut pool: Vec<Row> = Vec::new();
+        let mut logical = LogicalLine::default(); // one reused buffer, not one per line
+        let mut new_stream: Vec<Row> = Vec::with_capacity(old_count);
         let mut old: Vec<(usize, usize)> = Vec::with_capacity(old_rows.len());
-        let mut cur = LogicalLine::default();
-        let mut pending = false; // `cur` has rows not yet closed into `lines`
-        for (idx, row) in old_rows.iter().enumerate() {
-            old.push((lines.len(), cur.cells.len()));
-            let base = cur.cells.len();
-            cur.cells.extend_from_slice(&row.cells);
-            for m in &row.combining {
-                cur.combining.push(CombiningMark {
-                    col: base + m.col,
-                    ch: m.ch,
-                });
+        let mut line_first: Vec<usize> = Vec::with_capacity(old_rows.len() + 1);
+        let mut new_start: Vec<usize> = Vec::with_capacity(old_count);
+        // How many logical lines at the end of the stream held nothing, for the trailing
+        // screen-padding trim below.
+        let mut empty_tail = 0;
+
+        let mut idx = 0;
+        while idx < old_rows.len() {
+            // Scan the run: which rows it spans, and where each row's first column lands in
+            // the logical line. That offset is all the unwrap is needed for when the run
+            // turns out not to need one.
+            let line = line_first.len();
+            let start = idx;
+            let mut len = 0;
+            loop {
+                old.push((line, len));
+                let row = &old_rows[idx];
+                len += row.cells.len();
+                // A soft-wrapped row whose continuation begins with a wide glyph left its last
+                // column blank because the pair could not fit there (the printer's last-column
+                // rule). That blank is wrap padding, not text: drop it so a widen rejoins the
+                // glyph flush against the text before it instead of keeping a phantom space.
+                if wrap_padding_at(&old_rows, idx) {
+                    len -= 1;
+                }
+                let wrapped = row.wrapped;
+                idx += 1;
+                // Close on a hard newline, or when the run reaches the cap (a forced seam). A
+                // trailing wrapped run with no terminator cannot arise (the bottom live row is
+                // never wrapped past the screen), but close any remainder rather than lose it.
+                if !wrapped || len >= MAX_LOGICAL_COLS || idx >= old_rows.len() {
+                    break;
+                }
             }
-            // A soft-wrapped row whose continuation begins with a wide glyph left its last
-            // column blank because the pair could not fit there (the printer's last-column
-            // rule). That blank is wrap padding, not text: drop it so a widen rejoins the glyph
-            // flush against the text before it instead of preserving it as a phantom space.
-            if row.wrapped
-                && cur.cells.last() == Some(&PackedCell::BLANK)
-                && old_rows
-                    .get(idx + 1)
-                    .and_then(|next| next.cells.first())
-                    .is_some_and(|c| c.is_wide_leader())
+            line_first.push(new_stream.len());
+
+            // A single unwrapped row whose text stops before the new width wraps identically
+            // at both widths: keep the row and adjust only its width. Trimming and re-laying
+            // it out would pad the same text back into the same single row, so the cells
+            // never need to move, and this is the shape of nearly every scrollback row.
+            if idx == start + 1
+                && !old_rows[start].wrapped
+                && old_rows[start].is_blank_from(new_cols)
             {
-                cur.cells.pop();
+                let empty = old_rows[start].is_blank_from(0);
+                let mut row = std::mem::replace(&mut old_rows[start], Row::empty());
+                row.resize_cols(new_cols);
+                new_start.push(0);
+                new_stream.push(row);
+                empty_tail = if empty { empty_tail + 1 } else { 0 };
+                continue;
             }
-            pending = true;
-            // Close on a hard newline, or when the run reaches the cap (a forced seam).
-            if !row.wrapped || cur.cells.len() >= MAX_LOGICAL_COLS {
-                cur.trim_trailing_blanks();
-                lines.push(std::mem::take(&mut cur));
-                pending = false;
+
+            // Unwrap the run into the reused buffer: one flat cell sequence with the marks
+            // re-keyed from per-row columns to the logical column.
+            logical.cells.clear();
+            logical.combining.clear();
+            for i in start..idx {
+                let base = logical.cells.len();
+                logical.cells.extend_from_slice(&old_rows[i].cells);
+                for m in &old_rows[i].combining {
+                    logical.combining.push(CombiningMark {
+                        col: base + m.col,
+                        ch: m.ch,
+                    });
+                }
+                if wrap_padding_at(&old_rows, i) {
+                    logical.cells.pop();
+                }
             }
-        }
-        // A trailing wrapped run with no terminator cannot arise (the bottom live row is
-        // never wrapped past the screen), but close any remainder rather than lose it.
-        if pending {
-            cur.trim_trailing_blanks();
-            lines.push(cur);
+            logical.trim_trailing_blanks();
+            // The run's own rows are the buffers its new rows are written into, so a rewrap
+            // reuses the cell allocations it just consumed.
+            for row in old_rows.iter_mut().take(idx).skip(start) {
+                pool.push(std::mem::replace(row, Row::empty()));
+            }
+            empty_tail = if logical.cells.is_empty() {
+                empty_tail + 1
+            } else {
+                0
+            };
+
+            // Lay the logical line back out in new_cols-wide rows.
+            let cells = &logical.cells;
+            if cells.is_empty() {
+                // An empty logical line is a bare newline: it still shows one blank row.
+                new_start.push(0);
+                new_stream.push(take_row(&mut pool, new_cols, &[], false));
+                continue;
+            }
+            let mut i = 0;
+            while i < cells.len() {
+                let mut end = (i + new_cols).min(cells.len());
+                // Never split a wide glyph from its spacer at the wrap: if a leader would be
+                // this row's last column with its spacer on the next, push the whole pair
+                // down (the printer's own last-column rule).
+                if end < cells.len() && cells[end - 1].is_wide_leader() {
+                    end -= 1;
+                }
+                // Degenerate new_cols == 1 against a wide glyph: place it alone rather than
+                // loop forever.
+                if end <= i {
+                    end = i + 1;
+                }
+                // A wide glyph whose spacer cannot share its row (only at new_cols == 1) is
+                // stored clipped: the leader alone with its WIDE_LEADER attr stripped, and its
+                // spacer dropped, exactly as the printer records a wide glyph at a single
+                // column. Leaving the leader marked would strand it without the spacer the
+                // grid's invariant demands, and copying the spacer would orphan it onto the
+                // next row.
+                let clip_wide = cells[i].is_wide_leader() && end == i + 1;
+                let next_i = if clip_wide && cells.get(i + 1).is_some_and(|c| c.is_wide_spacer()) {
+                    i + 2
+                } else {
+                    end
+                };
+                let wrapped = next_i < cells.len();
+                let mut row = if clip_wide {
+                    take_row(
+                        &mut pool,
+                        new_cols,
+                        &[cells[i].with_width(CellWidth::Narrow)],
+                        wrapped,
+                    )
+                } else {
+                    take_row(&mut pool, new_cols, &cells[i..end], wrapped)
+                };
+                for m in &logical.combining {
+                    if m.col >= i && m.col < end {
+                        row.combining.push(CombiningMark {
+                            col: m.col - i,
+                            ch: m.ch,
+                        });
+                    }
+                }
+                new_start.push(i);
+                new_stream.push(row);
+                i = next_i;
+            }
         }
 
         // Empty rows below the cursor are screen padding, not content. Drop the trailing ones
@@ -1030,80 +1197,17 @@ impl Buffer {
         // stranding it above blank lines (and needlessly into scrollback) when a narrow
         // multiplies the row count. Only when nothing is frozen: with a live prompt below, the
         // cursor is down in it and the blank rows above are the shell's own spacing.
-        if frozen_rows.is_empty() {
+        let mut lines_len = line_first.len();
+        if frozen_rows.is_empty() && empty_tail > 0 {
             let cursor_line = old.get(cursor_idx).map(|a| a.0).unwrap_or(0);
-            let mut keep = lines.len();
-            while keep > cursor_line + 1 && lines[keep - 1].cells.is_empty() {
-                keep -= 1;
-            }
-            lines.truncate(keep);
-        }
-
-        // --- rewrap the head: lay each logical line into new_cols-wide rows, recycling the
-        // drained rows, and record each line's first new index and every new row's start ---
-        let mut pool = old_rows;
-        let mut new_stream: Vec<Row> = Vec::with_capacity(old_count);
-        let mut line_first: Vec<usize> = Vec::with_capacity(lines.len() + 1);
-        let mut new_start: Vec<usize> = Vec::with_capacity(old_count);
-
-        for line in lines.iter() {
-            line_first.push(new_stream.len());
-            let cells = &line.cells;
-            if cells.is_empty() {
-                // An empty logical line is a bare newline: it still shows one blank row.
-                new_start.push(0);
-                new_stream.push(take_row(&mut pool, new_cols, &[], false));
-            } else {
-                let mut i = 0;
-                while i < cells.len() {
-                    let mut end = (i + new_cols).min(cells.len());
-                    // Never split a wide glyph from its spacer at the wrap: if a leader
-                    // would be this row's last column with its spacer on the next, push
-                    // the whole pair down (the printer's own last-column rule).
-                    if end < cells.len() && cells[end - 1].is_wide_leader() {
-                        end -= 1;
-                    }
-                    // Degenerate new_cols == 1 against a wide glyph: place it alone rather
-                    // than loop forever.
-                    if end <= i {
-                        end = i + 1;
-                    }
-                    // A wide glyph whose spacer cannot share its row (only at new_cols == 1)
-                    // is stored clipped: the leader alone with its WIDE_LEADER attr stripped,
-                    // and its spacer dropped, exactly as the printer records a wide glyph at a
-                    // single column. Leaving the leader marked would strand it without the
-                    // spacer the grid's invariant demands, and copying the spacer would orphan
-                    // it onto the next row.
-                    let clip_wide = cells[i].is_wide_leader() && end == i + 1;
-                    let next_i =
-                        if clip_wide && cells.get(i + 1).is_some_and(|c| c.is_wide_spacer()) {
-                            i + 2
-                        } else {
-                            end
-                        };
-                    let wrapped = next_i < cells.len();
-                    let mut row = if clip_wide {
-                        take_row(
-                            &mut pool,
-                            new_cols,
-                            &[cells[i].with_width(CellWidth::Narrow)],
-                            wrapped,
-                        )
-                    } else {
-                        take_row(&mut pool, new_cols, &cells[i..end], wrapped)
-                    };
-                    for m in &line.combining {
-                        if m.col >= i && m.col < end {
-                            row.combining.push(CombiningMark {
-                                col: m.col - i,
-                                ch: m.ch,
-                            });
-                        }
-                    }
-                    new_start.push(i);
-                    new_stream.push(row);
-                    i = next_i;
-                }
+            let keep = lines_len
+                .saturating_sub(empty_tail)
+                .max((cursor_line + 1).min(lines_len));
+            if let Some(&cut) = line_first.get(keep) {
+                new_stream.truncate(cut);
+                new_start.truncate(cut);
+                line_first.truncate(keep);
+                lines_len = keep;
             }
         }
         line_first.push(new_stream.len());
@@ -1119,7 +1223,7 @@ impl Buffer {
         let remap = RowRemap {
             evicted: old_evicted,
             new_cols,
-            lines_len: lines.len(),
+            lines_len,
             old,
             line_first,
             new_start,

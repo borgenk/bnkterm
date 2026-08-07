@@ -2534,6 +2534,92 @@ fn reflow_keeps_coloured_trailing_cells() {
     );
 }
 
+// The reflow hands a row straight over when its text already fits the new width, on the
+// grounds that laying it out again would land it exactly where it is. These pin that the
+// shortcut and the full unwrap/rewrap agree on where a row's text ends — the one thing
+// that decides which of the two a row takes.
+
+#[test]
+fn a_narrow_into_padding_alone_keeps_the_row_whole() {
+    let mut s = Screen::new(20, 3);
+    feed(&mut s, b"hello");
+    // The cut lands in the trailing blanks, so the text is untouched and unwrapped.
+    s.resize(8, 3);
+    assert_eq!(s.row_string(0).trim_end(), "hello");
+    assert_eq!(s.row_string(1).trim_end(), "");
+    assert_eq!(s.scrollback_len(), 0);
+}
+
+#[test]
+fn a_narrow_that_reaches_the_text_still_rewraps() {
+    let mut s = Screen::new(20, 3);
+    feed(&mut s, b"hello world");
+    // One column short of the text's end is a real rewrap, not a padding trim.
+    s.resize(10, 3);
+    assert_eq!(s.row_string(0).trim_end(), "hello worl");
+    assert_eq!(s.row_string(1).trim_end(), "d");
+}
+
+#[test]
+fn a_coloured_blank_past_the_new_width_counts_as_text() {
+    let mut s = Screen::new(12, 3);
+    // Two red spaces at columns 8-9: blank runes, but a coloured cell is content.
+    feed(&mut s, b"abcdefgh\x1b[41m  \x1b[0m");
+    s.resize(9, 3);
+    // Narrowing past them must wrap them onto the next row rather than trim them away.
+    assert_eq!(s.row_string(0).trim_end(), "abcdefgh");
+    assert_eq!(
+        s.cell(1, 0).bg,
+        Color::Ansi(1),
+        "the coloured blank wrapped instead of being dropped as padding"
+    );
+}
+
+#[test]
+fn a_mark_on_a_blank_past_the_new_width_counts_as_text() {
+    let mut s = Screen::new(12, 3);
+    // A combining acute on the space at column 5, so that blank carries content.
+    feed(&mut s, "abcde \u{0301}".as_bytes());
+    s.resize(5, 3);
+    assert_eq!(s.row_string(0).trim_end(), "abcde");
+    assert_eq!(
+        s.marks_at(1, 0).collect::<Vec<_>>(),
+        ['\u{0301}'],
+        "the marked blank wrapped, mark and all"
+    );
+}
+
+#[test]
+fn a_row_whose_text_ends_exactly_at_the_new_width_stays_one_row() {
+    let mut s = Screen::new(12, 3);
+    feed(&mut s, b"abcdefgh");
+    // Eight columns of text into eight columns: the last cell fits, nothing wraps.
+    s.resize(8, 3);
+    assert_eq!(s.row_string(0).trim_end(), "abcdefgh");
+    assert_eq!(s.row_string(1).trim_end(), "");
+}
+
+#[test]
+fn a_narrow_that_would_split_a_wide_glyph_pushes_the_pair_down() {
+    let mut s = Screen::new(12, 3);
+    feed(&mut s, "abc\u{4e00}".as_bytes()); // wide glyph in columns 3-4
+    s.resize(4, 3);
+    // Column 3 is the last, and the pair cannot straddle the edge, so it goes down whole.
+    assert_eq!(s.row_string(0).trim_end(), "abc");
+    assert_eq!(s.cell(1, 0).rune, '\u{4e00}');
+}
+
+#[test]
+fn a_widen_leaves_a_short_row_exactly_where_it_was() {
+    let mut s = Screen::new(8, 3);
+    feed(&mut s, b"one\r\ntwo\r\nthree");
+    s.resize(40, 3);
+    // Nothing wrapped at eight columns, so widening rejoins nothing and moves nothing.
+    assert_eq!(s.row_string(0).trim_end(), "one");
+    assert_eq!(s.row_string(1).trim_end(), "two");
+    assert_eq!(s.row_string(2).trim_end(), "three");
+}
+
 #[test]
 fn reflow_caps_a_giant_logical_line() {
     // A line longer than MAX_LOGICAL_COLS is broken at the cap and never re-joins across

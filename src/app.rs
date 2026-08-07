@@ -443,6 +443,10 @@ struct State {
     /// nonzero the loop holds off redrawing, so bursts coalesce into at most one
     /// frame per refresh (frame pacing).
     frame_callback: u32,
+    /// A grid geometry the window has worked out but not yet handed to the tabs, set by
+    /// [`Self::resize_to`] and delivered by [`Self::flush_layout`] at the next paint. See
+    /// `flush_layout` for why the expensive half of a resize is paced with the frames.
+    pending_layout: bool,
     /// How chatty stderr is: quiet unless the user asked for the bring-up lines
     /// (`--verbose`) or the per-frame stats line (`--stats`).
     verbosity: Verbosity,
@@ -536,6 +540,7 @@ impl State {
             configured: false,
             closed: false,
             frame_callback: 0,
+            pending_layout: false,
             verbosity,
         })
     }
@@ -733,13 +738,14 @@ impl State {
             // Fire any blink toggle or key repeat that has come due.
             self.service_timers()?;
             // Pace to the compositor: only draw when no frame callback is
-            // outstanding, so a burst collapses into a single repaint.
-            if self.configured
-                && self.tabs.needs_frame()
-                && self.frame_callback == 0
-                && self.render_frame()?
-            {
-                self.tabs.clear_dirty();
+            // outstanding, so a burst collapses into a single repaint. A resize the
+            // configures have piled up rides the same pacing, and lands before the
+            // frame that has to show it.
+            if self.configured && self.frame_callback == 0 {
+                self.flush_layout();
+                if self.tabs.needs_frame() && self.render_frame()? {
+                    self.tabs.clear_dirty();
+                }
             }
             if done(self) {
                 return Ok(());
@@ -878,9 +884,9 @@ impl State {
         self.to_device(WINDOW_PADDING as u32) as i32
     }
 
-    /// Record a new *device* surface size, resize the grid to the cells that now fit
-    /// (inside the scaled padding), and tell the child (via `TIOCSWINSZ`, so it gets
-    /// SIGWINCH and repaints). GPU buffers are reallocated lazily in `render_frame`.
+    /// Record a new *device* surface size and the grid geometry that now fits inside the
+    /// scaled padding, leaving [`Self::flush_layout`] to hand it to the tabs at the next
+    /// paint. GPU buffers are reallocated lazily in `render_frame` for the same reason.
     /// A no-op only when neither the device size nor the resulting grid changed (the
     /// grid can change from a scale-driven metrics change at an unchanged size).
     fn resize_to(&mut self, w: u32, h: u32) {
@@ -922,20 +928,37 @@ impl State {
         self.grid_origin_y = origin_y;
         self.bar_y = bar_y;
         self.bar_h = bar_h;
-        // Ship the fresh grid size and geometry to the core: it resizes the grid and
-        // the PTY winsize (best-effort, so this cannot fail from here — see `apply`),
-        // and keeps the geometry copies `fill_frame_list` lays out with.
+        self.pending_layout = true;
+    }
+
+    /// Hand the geometry [`Self::resize_to`] worked out to the tabs: each one resizes its
+    /// grid (a width change rewraps it) and its PTY winsize (best-effort, so this cannot
+    /// fail from here — see `apply`), and the bar takes its strip. A no-op when nothing has
+    /// moved since the last paint.
+    ///
+    /// This is the expensive half of a resize, and it is paced with the frames rather than
+    /// run per configure. A compositor delivers a configure per pointer motion during an
+    /// interactive drag — several per refresh — and rewrapping the scrollback for each one
+    /// throws most of that work away unpainted: measured over one drag, 600 configures
+    /// against 346 frames. The window's own geometry above stays immediate, because it is
+    /// arithmetic and the pointer hit-tests read it.
+    fn flush_layout(&mut self) {
+        if !self.pending_layout {
+            return;
+        }
+        self.pending_layout = false;
+        let (cols, rows) = self.grid_dims;
         let _ = self.tabs.resize_all(
             cols,
             rows,
-            w,
-            h,
+            self.width,
+            self.height,
             self.metrics,
             self.label_metrics,
-            pad,
-            origin_y,
-            bar_y,
-            bar_h,
+            self.device_pad(),
+            self.grid_origin_y,
+            self.bar_y,
+            self.bar_h,
             self.ui_scale(),
         );
     }
