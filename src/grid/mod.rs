@@ -981,16 +981,15 @@ impl RowRemap {
         // A line's rows carry contiguous offset ranges, so the last row whose start is not
         // past `off` is the one holding it; an offset beyond the content clamps to the last.
         let mut chosen = start;
-        for k in start..end {
-            if self.new_start[k] <= off {
-                chosen = k;
-            } else {
+        for (k, &row_start) in (start..end).zip(self.new_start.get(start..end)?) {
+            if row_start > off {
                 break;
             }
+            chosen = k;
         }
         Some((
             chosen,
-            off.saturating_sub(self.new_start[chosen])
+            off.saturating_sub(*self.new_start.get(chosen)?)
                 .min(self.new_cols - 1),
         ))
     }
