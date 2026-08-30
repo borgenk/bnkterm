@@ -259,7 +259,7 @@ impl Atlas {
         self.next_y = 0;
         self.generation += 1;
         self.dirty = None;
-        Ok::<(), ()>(()).is_ok()
+        true
     }
 
     /// Extend the dirty rectangle to cover `slot`, so the next upload carries it.
