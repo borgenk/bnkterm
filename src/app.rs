@@ -1321,10 +1321,6 @@ impl State {
         self.repeat_at = None;
     }
 
-    /// Encode one key press and write it to the child. A named key (an arrow, a
-    /// function key) is mapped by its keycode; anything else takes its layout
-    /// character, and the [`crate::input`] encoder applies Ctrl/Alt. Modifiers
-    /// come from xkb's current state.
     /// A key came back up.
     ///
     /// Almost nothing wants to know: the encoder drops a release unless a program has
@@ -1346,6 +1342,10 @@ impl State {
         Ok(())
     }
 
+    /// Encode one key press and write it to the child. A named key (an arrow, a
+    /// function key) is mapped by its keycode; anything else takes its layout
+    /// character, and the [`crate::input`] encoder applies Ctrl/Alt. Modifiers
+    /// come from xkb's current state.
     fn on_key_press(&mut self, keycode: u32) -> Result<()> {
         let mods = self.current_mods();
         // Resolved once for the whole press, and that is load-bearing rather than tidy:
