@@ -32,6 +32,7 @@ mod tabs;
 mod terminal;
 
 use std::os::fd::AsRawFd;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use self::clipboard::{PendingSend, SelectionState};
@@ -39,7 +40,7 @@ use self::message::{PointerEvent, Side, ToTerminal, ToWindow};
 use self::present::GpuPresentation;
 use self::tabs::{Reorder, Tabs};
 use self::terminal::TerminalCore;
-use crate::config::{ShellStartupConfig, TabBarConfig, TabBarPosition};
+use crate::config::{self, TabBarConfig, TabBarPosition, FONT_SIZE_RANGE};
 // The app orchestrates the platform/render layers (which carry their own error
 // type) and the terminal core (which uses the crate-level one). It speaks the
 // crate-level `Error`/`Result` throughout; a `?` on a platform call converts
@@ -50,7 +51,7 @@ use crate::keymode::{self, Disposition, KeyMode, TabAction};
 use crate::mouse::MouseButton;
 use crate::platform::conn::{Connection, Fill};
 use crate::platform::ffi;
-use crate::platform::freetype::Fonts;
+use crate::platform::freetype::{FontConfig, FontSelection, Fonts};
 use crate::platform::geom::{logical_to_device, Scale};
 use crate::platform::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_data_device_manager, wl_data_offer, wl_display,
@@ -70,9 +71,6 @@ use crate::term_render::CellMetrics;
 /// mainstream terminal configs do. Overridable with `BNKTERM_FONT_POINTS`, or
 /// pinned to explicit pixels with `BNKTERM_FONT_SIZE`.
 const FONT_POINTS: f32 = 10.0;
-
-/// The sane range a resolved device-pixel font size is clamped to.
-const FONT_SIZE_RANGE: std::ops::RangeInclusive<u32> = 6..=72;
 
 /// A compositor scale of 1.0, in the fractional-scale protocol's 120ths unit. The
 /// scale is unknown until the compositor reports it, so the window opens at unity.
@@ -311,6 +309,10 @@ impl Scaling {
 struct State {
     conn: Connection,
     fonts: Fonts,
+    /// An explicit pixel size, unaffected by compositor scale changes.
+    configured_font_size: Option<u32>,
+    /// Resolved font files reused when a scale change reopens the faces.
+    font_selection: FontSelection,
     xkb: Xkb,
     /// The tab manager behind the window seam. It owns the terminal core (and in
     /// Phase 1, every core), routes input/timers, supplies the visible display list,
@@ -457,13 +459,25 @@ impl State {
     /// (see [`crate::shell_integration::Session::shell_args`]); the paths that never spawn
     /// a shell (`--demo`, `--gpu-probe`) pass none.
     fn new(demo: bool, verbosity: Verbosity, shell_args: Vec<String>) -> Result<Self> {
+        let (config, problems) = config::load::load();
+        for problem in &problems {
+            eprintln!("bnkterm: {problem}");
+        }
+        let (font_selection, used_default_prose) = resolve_configured_fonts(&config.fonts)?;
+        if used_default_prose {
+            eprintln!(
+                "bnkterm: config: none of the grid fonts resolved: {:?}; using monospace",
+                config.fonts.families
+            );
+        }
         let conn = Connection::connect()?;
         // Open at unity scale; the compositor's real scale arrives after bring-up
         // and reopens the fonts (see `apply_scale`).
-        let font_size = config_font_px(SCALE_120_UNITY);
-        let tab_bar_config = TabBarConfig::default();
+        let font_size = config_font_px(SCALE_120_UNITY, config.font_size);
+        let tab_bar_config = config.tab_bar.clone();
         let label_size = label_font_px(font_size, tab_bar_config.label_scale_pct);
-        let fonts = Fonts::new(&font_sizes(font_size, label_size))?;
+        let fonts =
+            Fonts::with_selection(&font_selection, &font_sizes(font_size, label_size), 1.0)?;
         let metrics = CellMetrics::from_fonts(&fonts, font_size);
         let label_metrics = CellMetrics::from_ui(&fonts, label_size);
         let (cols, rows) = (DEFAULT_COLS, DEFAULT_ROWS);
@@ -472,17 +486,22 @@ impl State {
         // The terminal core owns the grid/parser/PTY and its own geometry copies.
         // At unity scale the device padding is just `WINDOW_PADDING`; the first
         // configure ships the real geometry over on a `Resize`.
-        let core = TerminalCore::new(demo, cols, rows, metrics, width, height, WINDOW_PADDING);
+        let mut core = TerminalCore::new(demo, cols, rows, metrics, width, height, WINDOW_PADDING);
+        let theme = Rc::new(config.theme);
+        core.set_theme(Rc::clone(&theme));
 
         Ok(Self {
             conn,
             fonts,
+            configured_font_size: config.font_size,
+            font_selection,
             xkb: Xkb::new()?,
             tabs: Tabs::new(
                 core,
                 tab_bar_config.clone(),
+                theme,
                 shell_args,
-                ShellStartupConfig::default(),
+                config.shell_startup,
             ),
             poll_set: pty::PollSet::new(),
             metrics,
@@ -973,7 +992,7 @@ impl State {
         }
         self.scale.factor_120 = factor_120;
         self.scale.synced = false; // geometry + viewport/buffer-scale must be resent
-        let px = config_font_px(factor_120);
+        let px = config_font_px(factor_120, self.configured_font_size);
         self.apply_font_size(px);
         let (lw, lh) = self.scale.logical;
         let (dw, dh) = self.device_size(lw, lh);
@@ -992,7 +1011,8 @@ impl State {
         // On a font-open failure, keep the working fonts (no panic, no blank
         // window); the next scale event may recover.
         let label_size = label_font_px(size, self.tab_bar_config.label_scale_pct);
-        if let Ok(fonts) = Fonts::new(&font_sizes(size, label_size)) {
+        let sizes = font_sizes(size, label_size);
+        if let Ok(fonts) = Fonts::with_selection(&self.font_selection, &sizes, 1.0) {
             self.metrics = CellMetrics::from_fonts(&fonts, size);
             self.label_metrics = CellMetrics::from_ui(&fonts, label_size);
             self.fonts = fonts;
@@ -2118,14 +2138,18 @@ fn points_to_px(points: f32, scale_120: u32) -> u32 {
     px.clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end())
 }
 
-/// The device-pixel font size at compositor scale `scale_120`. `BNKTERM_FONT_SIZE`
-/// pins an explicit pixel height and opts out of scaling (the escape hatch);
-/// otherwise `BNKTERM_FONT_POINTS` (or [`FONT_POINTS`]) is scaled by the display.
-fn config_font_px(scale_120: u32) -> u32 {
+/// The device-pixel font size at compositor scale `scale_120`.
+///
+/// `BNKTERM_FONT_SIZE` overrides the configured pixel size. Without either, the point
+/// size from `BNKTERM_FONT_POINTS` or [`FONT_POINTS`] follows the display scale.
+fn config_font_px(scale_120: u32, configured: Option<u32>) -> u32 {
     if let Some(px) = std::env::var("BNKTERM_FONT_SIZE")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
     {
+        return px.clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end());
+    }
+    if let Some(px) = configured {
         return px.clamp(*FONT_SIZE_RANGE.start(), *FONT_SIZE_RANGE.end());
     }
     let points = std::env::var("BNKTERM_FONT_POINTS")
@@ -2134,6 +2158,19 @@ fn config_font_px(scale_120: u32) -> u32 {
         .filter(|p| p.is_finite() && *p > 0.0)
         .unwrap_or(FONT_POINTS);
     points_to_px(points, scale_120)
+}
+
+/// Resolve configured fonts, using the default prose family when every configured
+/// grid family misses. Other configured font roles remain unchanged.
+fn resolve_configured_fonts(config: &FontConfig) -> Result<(FontSelection, bool)> {
+    match FontSelection::resolve(config) {
+        Ok(selection) => Ok((selection, false)),
+        Err(_) => {
+            let mut fallback = config.clone();
+            fallback.families = FontConfig::default().families;
+            Ok((FontSelection::resolve(&fallback)?, true))
+        }
+    }
 }
 
 /// The tab-label font size in device pixels: the body `size` scaled by the config
@@ -2441,6 +2478,46 @@ mod tests {
         assert_eq!(points_to_px(f32::NAN, 120), lo); // NaN -> range start, no panic
         assert_eq!(points_to_px(-5.0, 120), lo); // negative -> range start
         assert_eq!(points_to_px(0.0, 120), lo);
+    }
+
+    #[test]
+    fn missing_configured_grid_fonts_fall_back_to_the_default_prose() {
+        let defaults = FontConfig::default();
+        let (default, used_default) = match resolve_configured_fonts(&defaults) {
+            Ok(resolved) => resolved,
+            Err(_) => return,
+        };
+        assert!(!used_default);
+
+        let config = FontConfig {
+            families: vec!["NoSuchFamilyExistsAnywhere".into()],
+            ..defaults
+        };
+        let (selection, used_default) =
+            resolve_configured_fonts(&config).expect("the default prose family resolves");
+
+        assert!(used_default);
+        assert_eq!(selection.prose.regular, default.prose.regular);
+    }
+
+    #[test]
+    fn default_prose_fallback_keeps_other_configured_font_roles() {
+        let Some(serif) = crate::platform::freetype::FontFamily::resolve("serif") else {
+            return;
+        };
+        let config = FontConfig {
+            families: vec!["NoSuchFamilyExistsAnywhere".into()],
+            ui: vec!["serif".into()],
+            fallback: vec!["serif".into()],
+            ..FontConfig::default()
+        };
+
+        let (selection, used_default) =
+            resolve_configured_fonts(&config).expect("the default prose family resolves");
+
+        assert!(used_default);
+        assert_eq!(selection.ui.regular, serif.regular);
+        assert_eq!(selection.fallback, [serif.regular]);
     }
 
     #[test]

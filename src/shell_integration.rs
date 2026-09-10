@@ -452,22 +452,31 @@ fn write_fish_files(dir: &std::path::Path) -> std::io::Result<()> {
     write_new(conf_d.join("bnkterm.fish"), FISH_CONF.as_bytes())
 }
 
-/// Prepend `dir` to `XDG_DATA_DIRS` so fish finds the drop-in, leaving a sentinel the
-/// drop-in uses to take it back out again.
+/// Prepend the integration directory to an existing XDG data path.
 ///
 /// The list is *prepended to*, never replaced: it is where fish finds its own vendor
 /// completions and functions, and a session that set none still means the two spec defaults
 /// rather than nothing at all — an empty `XDG_DATA_DIRS` would hide them.
-fn export_fish(dir: &std::path::Path) {
+fn fish_data_dirs(
+    dir: &std::path::Path,
+    existing: Option<std::ffi::OsString>,
+) -> std::ffi::OsString {
     /// What the XDG base directory specification says an unset `XDG_DATA_DIRS` means.
     const XDG_DATA_DIRS_DEFAULT: &str = "/usr/local/share:/usr/share";
     let mut value = dir.as_os_str().to_owned();
     value.push(":");
-    match std::env::var_os("XDG_DATA_DIRS").filter(|dirs| !dirs.is_empty()) {
+    match existing.filter(|dirs| !dirs.is_empty()) {
         Some(existing) => value.push(existing),
         None => value.push(XDG_DATA_DIRS_DEFAULT),
     }
-    std::env::set_var("XDG_DATA_DIRS", value);
+    value
+}
+
+/// Prepend `dir` to `XDG_DATA_DIRS` so fish finds the drop-in, leaving a sentinel the
+/// drop-in uses to take it back out again.
+fn export_fish(dir: &std::path::Path) {
+    let dirs = fish_data_dirs(dir, std::env::var_os("XDG_DATA_DIRS"));
+    std::env::set_var("XDG_DATA_DIRS", dirs);
     std::env::set_var("BNKTERM_INT_DATA_DIR", dir);
 }
 
@@ -682,37 +691,22 @@ mod tests {
     fn the_fish_data_dirs_keep_what_was_already_there() {
         // Replacing the list rather than prepending to it would hide fish's own vendor
         // files, and an unset one still means the two spec defaults, never nothing.
-        let dir = create_integration_dir().expect("create dir");
-        let restore = std::env::var_os("XDG_DATA_DIRS");
+        let dir = std::path::Path::new("/run/user/1000/bnkterm-abc123");
 
-        std::env::set_var("XDG_DATA_DIRS", "/opt/share:/usr/share");
-        export_fish(&dir);
-        let with_existing = std::env::var("XDG_DATA_DIRS").expect("set");
         assert_eq!(
-            with_existing,
-            format!("{}:/opt/share:/usr/share", dir.display()),
+            fish_data_dirs(dir, Some("/opt/share:/usr/share".into())),
+            std::ffi::OsString::from("/run/user/1000/bnkterm-abc123:/opt/share:/usr/share"),
             "ours leads, theirs survives"
         );
-
-        std::env::remove_var("XDG_DATA_DIRS");
-        export_fish(&dir);
-        assert_eq!(
-            std::env::var("XDG_DATA_DIRS").expect("set"),
-            format!("{}:/usr/local/share:/usr/share", dir.display()),
-            "an unset list means the spec's defaults, not an empty one"
-        );
-        assert_eq!(
-            std::env::var_os("BNKTERM_INT_DATA_DIR").as_deref(),
-            Some(dir.as_os_str()),
-            "the sentinel names what the drop-in takes back out"
-        );
-
-        match restore {
-            Some(value) => std::env::set_var("XDG_DATA_DIRS", value),
-            None => std::env::remove_var("XDG_DATA_DIRS"),
+        for empty in [None, Some(std::ffi::OsString::new())] {
+            assert_eq!(
+                fish_data_dirs(dir, empty),
+                std::ffi::OsString::from(
+                    "/run/user/1000/bnkterm-abc123:/usr/local/share:/usr/share"
+                ),
+                "an unset or empty list means the spec's defaults, not an empty one"
+            );
         }
-        std::env::remove_var("BNKTERM_INT_DATA_DIR");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Whether `haystack` holds `needle` anywhere.

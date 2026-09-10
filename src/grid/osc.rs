@@ -216,7 +216,7 @@ impl Screen {
     pub(super) fn osc_reset_palette(&mut self, pt: &[u8]) {
         if pt.is_empty() {
             let (fg, bg, cursor) = (self.theme.fg, self.theme.bg, self.theme.cursor);
-            self.theme.reset_palette();
+            self.theme.reset_palette(&self.base_theme);
             // `OSC 104` is about the *indexed* palette; the three named colours have
             // their own resets (110/111/112) and must survive this one.
             self.theme.fg = fg;
@@ -226,7 +226,7 @@ impl Screen {
         }
         for field in pt.split(|&b| b == b';') {
             if let Some(index) = parse_u8(field) {
-                self.theme.reset_indexed(index);
+                self.theme.reset_indexed(index, &self.base_theme);
             }
         }
     }

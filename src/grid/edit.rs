@@ -927,6 +927,14 @@ impl Screen {
         &self.theme
     }
 
+    /// Configure the live theme and the baseline restored by OSC color resets.
+    ///
+    /// Screens share the immutable baseline while programs modify independent live copies.
+    pub fn set_theme(&mut self, theme: Rc<Theme>) {
+        *self.theme = *theme;
+        self.base_theme = theme;
+    }
+
     /// The window's pixel size, which the in-band resize report carries alongside the
     /// cell count. The grid does not otherwise care about pixels; it is told.
     pub fn set_pixel_size(&mut self, width: u32, height: u32) {

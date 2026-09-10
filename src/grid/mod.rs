@@ -69,6 +69,7 @@ use crate::width::width;
 use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::rc::Rc;
 
 /// Default lines of scrollback the primary screen keeps. Overridable by config
 /// later (phase 4); the alternate screen keeps none.
@@ -1159,6 +1160,8 @@ pub struct Screen {
     /// to the parser and warm only to the painter, so it goes behind a pointer and the hot
     /// fields close ranks. See the note in `perf/` before undoing this.
     theme: Box<Theme>,
+    /// The shared configured theme restored by OSC color resets.
+    base_theme: Rc<Theme>,
     /// The working directory the shell reported (`OSC 7`), if it has.
     ///
     /// The app can also read this out of `/proc/<pid>/cwd`, and does — but only for a child
@@ -1306,6 +1309,7 @@ impl Screen {
             kitty_alt: Vec::new(),
             modify_other_keys: ModifyOtherKeys::default(),
             theme: Box::new(Theme::default()),
+            base_theme: Rc::new(Theme::default()),
             cwd: None,
             prompts: Vec::new(),
             grapheme_clustering: false,

@@ -18,10 +18,12 @@
 //! ```
 
 use std::os::fd::RawFd;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use super::message::{ToTerminal, ToWindow};
 use super::terminal::{PumpOutcome, TerminalCore};
+use crate::color::Theme;
 use crate::config::{ShellStartupConfig, TabBarConfig};
 use crate::error::Result;
 use crate::gather::GatherEnd;
@@ -94,6 +96,8 @@ pub(super) struct Tabs {
     drag: Option<TabDrag>,
     /// Strip appearance and layout, the source of truth for `layout`/`fill_bar`.
     cfg: TabBarConfig,
+    /// The configured grid colours.
+    theme: Rc<Theme>,
     /// Arguments every shell this session spawns is given, from the shell integration
     /// (see [`crate::shell_integration::Session::shell_args`]). Held here because a tab
     /// opened an hour in has to load the same shims as the first one did.
@@ -116,6 +120,7 @@ impl Tabs {
     pub(super) fn new(
         core: TerminalCore,
         cfg: TabBarConfig,
+        theme: Rc<Theme>,
         shell_args: Vec<String>,
         shell_startup: ShellStartupConfig,
     ) -> Self {
@@ -130,6 +135,7 @@ impl Tabs {
             bar_geom: None,
             drag: None,
             cfg,
+            theme,
             shell_args,
             shell_startup,
             notice: None,
@@ -191,6 +197,7 @@ impl Tabs {
         window_focused: bool,
     ) -> Result<TabId> {
         let mut core = TerminalCore::new(false, cols, rows, metrics, width, height, pad);
+        core.set_theme(Rc::clone(&self.theme));
         if let Err(error) = core.spawn_shell(&self.shell_args) {
             if let Some(child) = core.into_child() {
                 self.reaping.push(child);
@@ -965,6 +972,7 @@ mod tests {
         let mut tabs = Tabs::new(
             core(true, 80, 24),
             TabBarConfig::default(),
+            Rc::new(Theme::default()),
             Vec::new(),
             ShellStartupConfig::default(),
         );
@@ -1044,7 +1052,13 @@ mod tests {
             warn_after: Some(Duration::ZERO),
             ..ShellStartupConfig::default()
         };
-        let mut tabs = Tabs::new(core, TabBarConfig::default(), Vec::new(), cfg);
+        let mut tabs = Tabs::new(
+            core,
+            TabBarConfig::default(),
+            Rc::new(Theme::default()),
+            Vec::new(),
+            cfg,
+        );
         assert!(
             pump_for_notice(&mut tabs, Duration::from_secs(5)),
             "a shell over the budget never raised its notice"
@@ -1066,7 +1080,13 @@ mod tests {
             warn_after: None,
             ..ShellStartupConfig::default()
         };
-        let mut tabs = Tabs::new(core, TabBarConfig::default(), Vec::new(), cfg);
+        let mut tabs = Tabs::new(
+            core,
+            TabBarConfig::default(),
+            Rc::new(Theme::default()),
+            Vec::new(),
+            cfg,
+        );
         // A window far longer than the test above needs to see its notice, driving the
         // identical child through the identical path: silence here is the opt-out
         // working, not the prompt failing to arrive.
@@ -1095,6 +1115,7 @@ mod tests {
         let mut tabs = Tabs::new(
             core,
             TabBarConfig::default(),
+            Rc::new(Theme::default()),
             Vec::new(),
             ShellStartupConfig::default(),
         );
@@ -1494,6 +1515,7 @@ mod tests {
         let mut tabs = Tabs::new(
             first,
             TabBarConfig::default(),
+            Rc::new(Theme::default()),
             Vec::new(),
             ShellStartupConfig::default(),
         );

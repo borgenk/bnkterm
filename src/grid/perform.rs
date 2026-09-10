@@ -275,9 +275,9 @@ impl Perform for Screen {
             b"52" => self.osc_clipboard(pt),
             b"104" => self.osc_reset_palette(pt),
             b"133" => self.osc_shell_mark(pt),
-            b"110" => self.theme.fg = Theme::default().fg,
-            b"111" => self.theme.bg = Theme::default().bg,
-            b"112" => self.theme.cursor = Theme::default().cursor,
+            b"110" => self.theme.fg = self.base_theme.fg,
+            b"111" => self.theme.bg = self.base_theme.bg,
+            b"112" => self.theme.cursor = self.base_theme.cursor,
             _ => {}
         }
     }

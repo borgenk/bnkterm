@@ -150,14 +150,14 @@ impl Theme {
     }
 
     /// Put one entry back to its power-on value (`OSC 104 ; i`).
-    pub fn reset_indexed(&mut self, i: u8) {
-        self.palette[usize::from(i)] = Theme::default().palette[usize::from(i)];
+    pub fn reset_indexed(&mut self, i: u8, base: &Theme) {
+        self.palette[usize::from(i)] = base.palette[usize::from(i)];
     }
 
     /// Put the whole palette, and the three named colors, back (`OSC 104` with no
     /// parameter, and `OSC 110`/`111`/`112`).
-    pub fn reset_palette(&mut self) {
-        *self = Theme::default();
+    pub fn reset_palette(&mut self, base: &Theme) {
+        *self = *base;
     }
 }
 
@@ -461,8 +461,26 @@ mod tests {
         let original = t.indexed(200);
         t.set_indexed(200, Rgb::new(1, 2, 3));
         assert_eq!(t.indexed(200), Rgb::new(1, 2, 3));
-        t.reset_indexed(200);
+        t.reset_indexed(200, &Theme::default());
         assert_eq!(t.indexed(200), original, "back to xterm's arithmetic");
+    }
+
+    #[test]
+    fn a_reset_goes_back_to_the_baseline_it_is_given() {
+        let mut configured = Theme::default();
+        configured.set_indexed(1, Rgb::new(9, 9, 9));
+        configured.fg = Rgb::new(8, 8, 8);
+        let base = configured;
+
+        let mut live = configured;
+        live.set_indexed(1, Rgb::new(1, 1, 1));
+        live.reset_indexed(1, &base);
+        assert_eq!(live.indexed(1), Rgb::new(9, 9, 9), "the configured colour");
+
+        live.set_indexed(2, Rgb::new(1, 1, 1));
+        live.reset_palette(&base);
+        assert_eq!(live.indexed(2), base.indexed(2));
+        assert_eq!(live.fg, Rgb::new(8, 8, 8));
     }
 
     #[test]

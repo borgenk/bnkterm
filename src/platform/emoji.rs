@@ -10,6 +10,7 @@ use core::ptr::NonNull;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
+use crate::platform::fontconfig::FontFile;
 use crate::platform::freetype::{
     CacheStats, FT_Load_Glyph, Face, FtBitmap, FT_LOAD_COLOR, FT_LOAD_RENDER, FT_PIXEL_MODE_BGRA,
 };
@@ -61,15 +62,6 @@ pub struct ColorGlyph {
     pub argb: Vec<u32>,
 }
 
-/// Where distros install the Noto color emoji font. Same hardcoded-path policy
-/// as the prose and code fonts in freetype.rs; a machine with none of these
-/// simply has no emoji.
-const EMOJI_FONTS: &[&str] = &[
-    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
-    "/usr/share/fonts/google-noto/NotoColorEmoji.ttf",
-    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
-];
-
 /// A cache of cluster results, keyed by target pixel size then by cluster bytes.
 /// Splitting on the size (a cheap `u32` key) lets the inner lookup borrow the
 /// cluster `&str` directly (`Box<str>: Borrow<str>`), so a cache *hit* allocates
@@ -111,11 +103,9 @@ impl EmojiFont {
     /// Open the first installed emoji font, or `None` when there is none, the
     /// font has no bitmap strikes (an outline-only build), or the shaper cannot
     /// bind to it.
-    pub fn open() -> Option<Self> {
-        let path = EMOJI_FONTS
-            .iter()
-            .find(|p| std::path::Path::new(p).exists())?;
-        let face = Face::from_path(path).ok()?;
+    pub fn open(file: &FontFile) -> Option<Self> {
+        let face = Face::from_file(file).ok()?;
+        // Reject a text face returned for an emoji alias.
         let strike = face.select_first_strike()?;
         // SAFETY: the face handle is valid and has a size selected; the shaper
         // takes its own FreeType reference, so drop order does not matter.
@@ -397,7 +387,12 @@ mod tests {
     use super::*;
 
     fn emoji() -> EmojiFont {
-        EmojiFont::open().expect("a color emoji font should be installed")
+        let file = crate::platform::fontconfig::font_for_family(
+            "emoji",
+            crate::platform::freetype::FontStyle::Regular,
+        )
+        .expect("the emoji alias resolves");
+        EmojiFont::open(&file).expect("a color emoji font should be installed")
     }
 
     #[test]

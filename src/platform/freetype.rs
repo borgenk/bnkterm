@@ -18,108 +18,171 @@ use core::ffi::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_ushort, c_voi
 use core::ptr::{self, NonNull};
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 
 use crate::platform::emoji::{wants_emoji, ColorGlyph, EmojiFont};
 use crate::platform::error::{Error, Result};
-use crate::platform::fontconfig::{FontFile, Fontconfig};
+use crate::platform::fontconfig::{self, FontFile, Fontconfig};
 
-/// A font family and the four style files the editor draws emphasis with. A
-/// missing bold, italic, or bold-italic variant falls back to the regular face
-/// at render time, so a family that ships only some weights still renders (just
-/// without the slant or weight). Paths are owned so a config, the built-in
-/// default now and a loaded file later, can supply them.
+/// A font family resolved to one face per terminal style.
+///
+/// Missing cuts and cuts substituted from another family use the regular face. Each
+/// [`FontFile`] retains collection and variable instance indices selected by fontconfig.
 #[derive(Clone, Debug)]
 pub struct FontFamily {
-    pub regular: String,
-    pub bold: String,
-    pub italic: String,
-    pub bold_italic: String,
+    pub regular: FontFile,
+    pub bold: FontFile,
+    pub italic: FontFile,
+    pub bold_italic: FontFile,
+    matched_families: Vec<String>,
 }
 
 impl FontFamily {
-    /// A family from its four style paths.
-    pub fn new(regular: &str, bold: &str, italic: &str, bold_italic: &str) -> Self {
-        Self {
-            regular: regular.into(),
-            bold: bold.into(),
-            italic: italic.into(),
-            bold_italic: bold_italic.into(),
-        }
+    /// Resolve a real or generic family name, querying each style independently.
+    ///
+    /// Missing cuts use the regular face. An uninstalled named family returns `None`.
+    pub fn resolve(name: &str) -> Option<Self> {
+        let regular = fontconfig::match_family(name, FontStyle::Regular)?;
+        let mut family = Self {
+            bold: regular.file.clone(),
+            italic: regular.file.clone(),
+            bold_italic: regular.file.clone(),
+            regular: regular.file,
+            matched_families: regular.families,
+        };
+        family.bold = family
+            .resolve_style(name, FontStyle::Bold)
+            .unwrap_or_else(|| family.regular.clone());
+        family.italic = family
+            .resolve_style(name, FontStyle::Italic)
+            .unwrap_or_else(|| family.regular.clone());
+        family.bold_italic = family
+            .resolve_style(name, FontStyle::BoldItalic)
+            .unwrap_or_else(|| family.regular.clone());
+        Some(family)
+    }
+
+    /// Resolve a style only when fontconfig keeps it in this family.
+    fn resolve_style(&self, name: &str, style: FontStyle) -> Option<FontFile> {
+        let matched = fontconfig::match_family(name, style)?;
+        style_file_in_family(matched, &self.matched_families)
     }
 }
 
-/// Which fonts the editor opens: an ordered list of prose family candidates, an
-/// ordered list of code face candidates, and an ordered fallback chain for
-/// scalars the chosen family cannot draw. The first prose family whose regular
-/// file exists is used; the first installed code face distinct from that regular
-/// renders code, else code shares the prose face; the fallback chain is consulted
-/// glyph by glyph (see [`Fonts::glyph_face`]) for a character the prose or code
-/// face lacks. The concrete selection is the app's to supply: its `Default` impl
-/// lives with the app config, keeping this portable layer free of per-project
-/// font paths. A loader can later replace it.
+/// Keep a style match only when it shares a family name with the regular face.
+fn style_file_in_family(
+    matched: fontconfig::FamilyMatch,
+    selected_families: &[String],
+) -> Option<FontFile> {
+    matched
+        .families
+        .iter()
+        .any(|family| {
+            selected_families
+                .iter()
+                .any(|selected| selected.eq_ignore_ascii_case(family))
+        })
+        .then_some(matched.file)
+}
+
+/// Font-family preferences for grid text, chrome, code, emoji, and explicit fallbacks.
+///
+/// Fontconfig resolves names to files on the current machine. Candidate lists use the
+/// first installed family.
 #[derive(Clone, Debug)]
 pub struct FontConfig {
-    pub families: Vec<FontFamily>,
-    /// Proportional interface families (first installed wins) for chrome text such
-    /// as the tab bar, which is not grid content and reads better in a real UI sans
-    /// than in the monospace body family. Only `regular` and `bold` are used. Empty
-    /// (or none installed) falls back to the prose family, so UI text always
-    /// resolves.
-    pub ui: Vec<FontFamily>,
-    /// Medium-weight interface face candidates (first installed wins), one file each,
-    /// for the tab-bar label: a touch heavier than regular without bold's thickness.
-    /// Kept separate from [`ui`](Self::ui) because it is a lone weight file, not a
-    /// four-style family. Empty or none installed leaves the label at `ui` regular.
-    pub ui_medium: Vec<String>,
+    /// Prose family candidates for the grid, first installed wins. A list ending in a
+    /// generic alias (`monospace`) resolves on any machine with a font at all.
+    pub families: Vec<String>,
+    /// Proportional families for chrome, first installed wins.
+    /// The prose family is used when none resolve.
+    pub ui: Vec<String>,
+    /// Code-face candidates distinct from the selected prose face.
     pub code: Vec<String>,
-    /// Regular-weight faces consulted, in order, for a scalar the prose or code
-    /// face has no glyph for: a symbols/icon font (a terminal's Nerd Font and
-    /// Powerline glyphs live in the private-use area, which text families do not
-    /// carry) or a wider-coverage Unicode fallback. Only installed files open;
-    /// an empty list means no fallback (a missing glyph renders as the `.notdef`
-    /// tofu box, the pre-fallback behavior). An app with no need for it (a
-    /// text-only editor) leaves this empty.
+    /// The colour emoji family. [`EmojiFont::open`] verifies its bitmap strikes.
+    pub emoji: String,
+    /// Ordered overrides for characters absent from the selected face. Remaining
+    /// characters use system discovery through
+    /// [`Fontconfig::font_for_char`](crate::platform::fontconfig::Fontconfig::font_for_char)).
+    ///
+    /// Private-use symbols need explicit families because their codepoints have no
+    /// universal meaning.
     pub fallback: Vec<String>,
 }
 
-impl FontConfig {
-    /// The first prose family whose regular face is installed on this machine.
-    fn default_family(&self) -> Result<&FontFamily> {
-        self.families
-            .iter()
-            .find(|f| std::path::Path::new(&f.regular).exists())
-            .ok_or_else(|| Error::msg("no usable font family found in the candidate list"))
-    }
+/// A [`FontConfig`] resolved to font files independently of pixel size.
+///
+/// Size changes reopen these files without repeating family discovery.
+#[derive(Clone, Debug)]
+pub struct FontSelection {
+    /// The grid's family.
+    pub prose: FontFamily,
+    /// The chrome family; the prose family when no interface candidate is installed.
+    pub ui: FontFamily,
+    /// The medium cut of the interface family, for the tab label. `None` when the family
+    /// has no such cut, which leaves the label at the UI regular weight.
+    pub ui_medium: Option<FontFile>,
+    /// The code face, or `None` to share the prose face.
+    pub code: Option<FontFile>,
+    /// The pinned fallback faces, in the order they are consulted.
+    pub fallback: Vec<FontFile>,
+    /// The colour emoji family, when one is installed.
+    pub emoji: Option<FontFile>,
+}
 
-    /// The first interface family whose regular face is installed, or the prose
-    /// `fallback` family when none is (so UI text always resolves to something). The
-    /// caller passes the already-resolved prose family as that fallback.
-    fn default_ui_family<'a>(&'a self, prose: &'a FontFamily) -> &'a FontFamily {
-        self.ui
-            .iter()
-            .find(|f| std::path::Path::new(&f.regular).exists())
-            .unwrap_or(prose)
-    }
+impl FontSelection {
+    /// Resolve every candidate list in `config` against the installed fonts.
+    ///
+    /// Errors only when no prose candidate resolves, which for a list ending in a generic
+    /// alias means a machine with no fonts at all.
+    pub fn resolve(config: &FontConfig) -> Result<Self> {
+        let (_, prose) = first_installed(&config.families).ok_or_else(|| {
+            Error::msg(format!(
+                "no usable font family: fontconfig resolves none of {:?}",
+                config.families
+            ))
+        })?;
 
-    /// The first installed medium-weight interface face, or `None` (the label then
-    /// stays at the UI regular weight).
-    fn default_ui_medium(&self) -> Option<&str> {
-        self.ui_medium
-            .iter()
-            .map(String::as_str)
-            .find(|p| std::path::Path::new(p).exists())
-    }
+        // A medium query returning the regular face means the family has no medium cut.
+        let ui = first_installed(&config.ui);
+        let ui_medium = ui.as_ref().and_then(|(name, family)| {
+            family
+                .resolve_style(name, FontStyle::Medium)
+                .filter(|medium| *medium != family.regular)
+        });
+        let ui = ui.map_or_else(|| prose.clone(), |(_, family)| family);
 
-    /// The first installed code face whose path differs from the prose family's
-    /// regular face, or `None` if none is available. A `None` leaves code sharing
-    /// the prose face: still readable, just without the visual distinction.
-    fn code_regular_path(&self, prose: &FontFamily) -> Option<&str> {
-        self.code
+        let code = config
+            .code
             .iter()
-            .map(String::as_str)
-            .find(|&p| p != prose.regular.as_str() && std::path::Path::new(p).exists())
+            .filter_map(|name| fontconfig::font_for_family(name, FontStyle::Regular))
+            .find(|file| *file != prose.regular);
+
+        let fallback = config
+            .fallback
+            .iter()
+            .filter_map(|name| fontconfig::font_for_family(name, FontStyle::Regular))
+            .collect();
+
+        let emoji = fontconfig::font_for_family(&config.emoji, FontStyle::Regular);
+
+        Ok(Self {
+            prose,
+            ui,
+            ui_medium,
+            code,
+            fallback,
+            emoji,
+        })
     }
+}
+
+/// The first candidate in `names` that is installed, with the name that found it.
+fn first_installed(names: &[String]) -> Option<(&str, FontFamily)> {
+    names
+        .iter()
+        .find_map(|name| FontFamily::resolve(name).map(|family| (name.as_str(), family)))
 }
 
 /// Which variant of the font family a run renders in: one open font file each.
@@ -485,8 +548,8 @@ impl Face {
     /// family's variants per size itself.
     #[cfg(test)]
     pub fn open_default(pixel_size: u32) -> Result<Self> {
-        let config = FontConfig::default();
-        let face = Self::from_path(&config.default_family()?.regular)?;
+        let selection = FontSelection::resolve(&FontConfig::default())?;
+        let face = Self::from_file(&selection.prose.regular)?;
         face.set_pixel_size(pixel_size)?;
         Ok(face)
     }
@@ -494,7 +557,12 @@ impl Face {
     /// Build a face from a font file on disk (its first face; see
     /// [`from_path_index`](Self::from_path_index) for a collection).
     pub fn from_path(path: &str) -> Result<Self> {
-        Self::from_path_index(path, 0)
+        Self::from_path_index(Path::new(path), 0)
+    }
+
+    /// Open the path and face index selected by fontconfig.
+    pub fn from_file(file: &FontFile) -> Result<Self> {
+        Self::from_path_index(&file.path, file.index)
     }
 
     /// Build face `index` of a font file on disk. The index is 0 for an ordinary font
@@ -502,8 +570,9 @@ impl Face {
     /// file: Noto's CJK fonts ship that way, and taking face 0 of a collection quietly
     /// gives the wrong language. Font discovery ([`Fontconfig`](crate::platform::fontconfig))
     /// reports the index alongside the path, so it is carried rather than assumed.
-    pub fn from_path_index(path: &str, index: i32) -> Result<Self> {
-        let data = std::fs::read(path).map_err(|e| Error::msg(format!("read font {path}: {e}")))?;
+    pub fn from_path_index(path: &Path, index: i32) -> Result<Self> {
+        let data = std::fs::read(path)
+            .map_err(|e| Error::msg(format!("read font {}: {e}", path.display())))?;
 
         let mut library: FtLibrary = ptr::null_mut();
         // SAFETY: alibrary points at a live local; FT writes the handle through
@@ -531,7 +600,10 @@ impl Face {
             None => {
                 // SAFETY: library came from FT_Init_FreeType and is freed once.
                 unsafe { FT_Done_FreeType(library.as_ptr()) };
-                return Err(Error::msg(format!("FT_New_Memory_Face failed for {path}")));
+                return Err(Error::msg(format!(
+                    "FT_New_Memory_Face failed for {}",
+                    path.display()
+                )));
             }
         };
 
@@ -934,7 +1006,7 @@ impl SizedFaces {
         if let Some(face) = self.opened.borrow().get(&file) {
             return Some(Rc::clone(face));
         }
-        let face = Face::from_path_index(file.path.to_str()?, file.index).ok()?;
+        let face = Face::from_file(&file).ok()?;
         face.set_pixel_size(self.size).ok()?;
         let face = Rc::new(face);
         self.opened.borrow_mut().insert(file, Rc::clone(&face));
@@ -953,10 +1025,8 @@ pub struct Fonts {
     /// The color emoji font, opened once and shared by every face, or `None`
     /// when no emoji font is installed (emoji then render as tofu, as before).
     emoji: Option<Rc<EmojiFont>>,
-    /// The system font configuration, built on first use and never before: it reads the
-    /// font cache, and a session that prints only Latin text has no reason to pay for it.
-    /// The inner `None` is a machine where fontconfig will not start, which is not fatal —
-    /// the pinned fonts still answer, exactly as they did before discovery existed.
+    /// The lazily ranked system fallback set. The inner `None` means fontconfig was
+    /// unavailable; selected and explicit fallback faces remain usable.
     fc: OnceCell<Option<Fontconfig>>,
 }
 
@@ -970,18 +1040,29 @@ impl Fonts {
         Self::with_config(&FontConfig::default(), sizes, 1.0)
     }
 
-    /// Open `config`'s prose family and code face at each of `sizes` (zeros and
+    /// Resolve `config` against the installed fonts and open it at each of `sizes` (zeros and
     /// duplicates skipped), loading every available style per size. Each size's
     /// line box is grown to at least `line_height_scale` times the size (the CSS
     /// line-height model), never below the font's own line height, so lines can
     /// be spaced out without overlapping. At least one nonzero size is required;
     /// the first opened becomes the fallback.
     pub fn with_config(config: &FontConfig, sizes: &[u32], line_height_scale: f32) -> Result<Self> {
-        let family = config.default_family()?;
-        let code_path = config.code_regular_path(family);
-        let ui_family = config.default_ui_family(family);
-        let ui_medium_path = config.default_ui_medium();
-        let emoji = EmojiFont::open().map(Rc::new);
+        Self::with_selection(&FontSelection::resolve(config)?, sizes, line_height_scale)
+    }
+
+    /// Open an already-resolved [`FontSelection`] at each requested size.
+    pub fn with_selection(
+        selection: &FontSelection,
+        sizes: &[u32],
+        line_height_scale: f32,
+    ) -> Result<Self> {
+        let family = &selection.prose;
+        let ui_family = &selection.ui;
+        let emoji = selection
+            .emoji
+            .as_ref()
+            .and_then(EmojiFont::open)
+            .map(Rc::new);
         let mut sized: Vec<SizedFaces> = Vec::new();
         for &size in sizes {
             if size == 0 || sized.iter().any(|s| s.size == size) {
@@ -1014,10 +1095,10 @@ impl Fonts {
             // thus re-rasterizing smaller) a natively larger icon. That is an
             // inference from observed output, not confirmed against their source;
             // treat it as a lead if this policy is ever revisited.
-            let fallback = config
+            let fallback = selection
                 .fallback
                 .iter()
-                .filter_map(|p| open_variant(p, size, None))
+                .filter_map(|file| open_variant(file, size, None))
                 .collect();
             // The interface face draws proportional chrome text, so it carries no
             // emoji font (chrome is text) and keeps its own vertical metrics. When
@@ -1031,9 +1112,15 @@ impl Fonts {
                 bold: open_variant(&family.bold, size, emoji.as_ref()),
                 italic: open_variant(&family.italic, size, emoji.as_ref()),
                 bold_italic: open_variant(&family.bold_italic, size, emoji.as_ref()),
-                code: code_path.and_then(|p| open_variant(p, size, emoji.as_ref())),
+                code: selection
+                    .code
+                    .as_ref()
+                    .and_then(|file| open_variant(file, size, emoji.as_ref())),
                 ui_regular,
-                ui_medium: ui_medium_path.and_then(|p| open_variant(p, size, None)),
+                ui_medium: selection
+                    .ui_medium
+                    .as_ref()
+                    .and_then(|file| open_variant(file, size, None)),
                 ui_bold: open_variant(&ui_family.bold, size, None),
                 ui_metrics,
                 fallback,
@@ -1156,8 +1243,7 @@ impl Fonts {
             .unwrap_or_else(|| Rc::clone(primary))
     }
 
-    /// The system font configuration, built on the first character the pinned fonts
-    /// cannot draw. A terminal that only ever shows Latin text never builds it.
+    /// Rank system fallback fonts when the selected faces first miss a character.
     fn fontconfig(&self) -> Option<&Fontconfig> {
         self.fc.get_or_init(Fontconfig::new).as_ref()
     }
@@ -1224,8 +1310,8 @@ impl Fonts {
 /// Open `path` at `size` with the shared `emoji` font attached: the three-step
 /// face open (read the file, fix the pixel size, share the emoji font) that
 /// both the required regular face and the optional variants go through.
-fn open_face(path: &str, size: u32, emoji: Option<&Rc<EmojiFont>>) -> Result<Rc<Face>> {
-    let mut face = Face::from_path(path)?;
+fn open_face(file: &FontFile, size: u32, emoji: Option<&Rc<EmojiFont>>) -> Result<Rc<Face>> {
+    let mut face = Face::from_file(file)?;
     face.set_pixel_size(size)?;
     face.emoji = emoji.cloned();
     Ok(Rc::new(face))
@@ -1234,11 +1320,11 @@ fn open_face(path: &str, size: u32, emoji: Option<&Rc<EmojiFont>>) -> Result<Rc<
 /// Open a style variant at `size`, or `None` if the file is absent or fails to
 /// load, leaving the caller to fall back to the regular face. Keeps a family
 /// that ships only some weights from being a hard error.
-fn open_variant(path: &str, size: u32, emoji: Option<&Rc<EmojiFont>>) -> Option<Rc<Face>> {
-    if !std::path::Path::new(path).exists() {
+fn open_variant(file: &FontFile, size: u32, emoji: Option<&Rc<EmojiFont>>) -> Option<Rc<Face>> {
+    if !file.path.exists() {
         return None;
     }
-    open_face(path, size, emoji).ok()
+    open_face(file, size, emoji).ok()
 }
 
 /// Copy a FreeType bitmap into a tightly packed top-down coverage buffer of
@@ -1272,6 +1358,160 @@ mod tests {
 
     fn open() -> Face {
         Face::open_default(16).expect("a default font should be available")
+    }
+
+    /// A test config with a portable fallback.
+    fn config_of(names: &[&str]) -> FontConfig {
+        FontConfig {
+            families: names.iter().map(|n| (*n).to_string()).collect(),
+            ..FontConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_candidate_nobody_has_installed_falls_through_to_the_next() {
+        if fontconfig::font_for_family("monospace", FontStyle::Regular).is_none() {
+            eprintln!("no usable fontconfig in this environment; skipping");
+            return;
+        }
+        let selection = FontSelection::resolve(&config_of(&["NoSuchFamilyAtAll", "monospace"]))
+            .expect("the alias answers where the named family could not");
+        assert!(selection.prose.regular.path.exists());
+        Face::from_file(&selection.prose.regular).expect("the face fontconfig named opens");
+    }
+
+    #[test]
+    fn a_face_opens_from_a_non_utf8_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let Some(source) = fontconfig::font_for_family("monospace", FontStyle::Regular) else {
+            return;
+        };
+        let mut name = format!("bnkterm-font-{}-", std::process::id()).into_bytes();
+        name.push(0xff);
+        name.extend_from_slice(b".font");
+        let path = std::env::temp_dir().join(std::ffi::OsString::from_vec(name));
+        std::fs::copy(&source.path, &path).expect("copy a font to the test path");
+
+        let opened = Face::from_file(&FontFile {
+            path: path.clone(),
+            index: source.index,
+        });
+        let _ = std::fs::remove_file(path);
+        opened.expect("open the copied face without converting its path to UTF-8");
+    }
+
+    #[test]
+    fn the_first_installed_candidate_wins() {
+        let (Some(sans), Some(mono)) = (
+            fontconfig::font_for_family("sans-serif", FontStyle::Regular),
+            fontconfig::font_for_family("monospace", FontStyle::Regular),
+        ) else {
+            return;
+        };
+        if sans == mono {
+            return;
+        }
+        let first = FontSelection::resolve(&config_of(&["sans-serif", "monospace"]))
+            .expect("resolves")
+            .prose
+            .regular;
+        assert_eq!(first, sans, "the leading candidate is the one used");
+        let second = FontSelection::resolve(&config_of(&["monospace", "sans-serif"]))
+            .expect("resolves")
+            .prose
+            .regular;
+        assert_eq!(second, mono, "and order is the only thing that decides it");
+    }
+
+    #[test]
+    fn a_config_naming_nothing_installed_is_an_error_not_a_panic() {
+        let err = FontSelection::resolve(&config_of(&["NoSuchFamilyAtAll", "NorThisOne"]))
+            .expect_err("nothing resolves");
+        assert!(
+            format!("{err}").contains("NoSuchFamilyAtAll"),
+            "the error names what was asked for: {err}"
+        );
+    }
+
+    #[test]
+    fn fonts_build_from_the_generic_alias_alone() {
+        if fontconfig::font_for_family("monospace", FontStyle::Regular).is_none() {
+            return;
+        }
+        let fonts = Fonts::with_config(&config_of(&["NoSuchFamilyAtAll", "monospace"]), &[16], 1.0)
+            .expect("fonts open");
+        let face = fonts.face_for(FaceKey::Prose {
+            size: 16,
+            style: FontStyle::Regular,
+        });
+        assert!(
+            face.metrics().line_height > 0,
+            "a face opened from the alias has real metrics"
+        );
+    }
+
+    #[test]
+    fn the_code_face_never_repeats_the_prose_face() {
+        if fontconfig::font_for_family("monospace", FontStyle::Regular).is_none() {
+            return;
+        }
+        let config = FontConfig {
+            families: vec!["monospace".into()],
+            code: vec!["monospace".into()],
+            ..FontConfig::default()
+        };
+        let selection = FontSelection::resolve(&config).expect("resolves");
+        assert!(
+            selection.code.is_none(),
+            "a code face identical to the prose face is no code face"
+        );
+    }
+
+    #[test]
+    fn the_ui_medium_cut_is_none_when_the_family_has_none() {
+        if fontconfig::font_for_family("monospace", FontStyle::Regular).is_none() {
+            return;
+        }
+        let selection = FontSelection::resolve(&FontConfig::default()).expect("resolves");
+        if let Some(medium) = &selection.ui_medium {
+            assert_ne!(
+                *medium, selection.ui.regular,
+                "a medium cut that is the regular file must be reported as absent"
+            );
+        }
+    }
+
+    #[test]
+    fn a_style_substituted_from_another_family_is_refused() {
+        let selected = vec!["Grid Face".to_string(), "Localized Grid Face".to_string()];
+        let expected = FontFile::at("/same-family.ttf");
+        let same_family = fontconfig::FamilyMatch {
+            file: expected.clone(),
+            families: vec!["localized grid face".to_string()],
+        };
+        assert_eq!(style_file_in_family(same_family, &selected), Some(expected));
+
+        let foreign = fontconfig::FamilyMatch {
+            file: FontFile::at("/foreign-family.ttf"),
+            families: vec!["Foreign Face".to_string()],
+        };
+        assert_eq!(style_file_in_family(foreign, &selected), None);
+    }
+
+    #[test]
+    fn a_resolved_family_carries_a_cut_for_every_style() {
+        let Some(family) = FontFamily::resolve("monospace") else {
+            return;
+        };
+        for file in [
+            &family.regular,
+            &family.bold,
+            &family.italic,
+            &family.bold_italic,
+        ] {
+            assert!(file.path.exists(), "{} is missing", file.path.display());
+        }
     }
 
     #[test]
@@ -1644,20 +1884,18 @@ mod tests {
     }
 
     #[test]
-    fn discovery_is_memoized_and_never_wakes_for_latin() {
+    fn fallback_discovery_is_memoized_and_stays_idle_for_latin() {
         let fonts = Fonts::new(&[16]).expect("a default font");
         let key = FaceKey::Prose {
             size: 16,
             style: FontStyle::Regular,
         };
 
-        // Latin resolves in the primary face's own cmap, so the system is never asked and
-        // the font cache is never built. This is the whole reason discovery is lazy: a
-        // terminal that shows only ASCII must not pay for fontconfig at all.
+        // Latin resolves before the ranked fallback set is needed.
         let _ = fonts.glyph_face(key, 'A');
         assert!(
             fonts.fc.get().is_none(),
-            "an ASCII glyph woke the system font cache"
+            "an ASCII glyph built the fallback set"
         );
 
         // The same character twice hands back the same face, from the memo rather than a

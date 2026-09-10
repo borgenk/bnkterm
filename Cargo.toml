@@ -1,5 +1,3 @@
-# panic = "immediate-abort" on the release profile is still unstable, so the
-# manifest has to opt in. That is what pins this project to nightly.
 cargo-features = ["panic-immediate-abort"]
 
 [package]
@@ -7,21 +5,6 @@ name = "bnkterm"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
-
-# opt-level stays at 3: this is a terminal, and the perf gate is the arbiter of any
-# size-for-speed trade.
-#
-# immediate-abort is where the size goes: no unwinding, no panic formatter, and none
-# of std's backtrace symbolizer. A release panic prints nothing and aborts, which is
-# the whole cost of it, and it is a cost this codebase is unusually well placed to
-# pay: no `unwrap`/`expect`/`panic!` outside tests is a prime directive, so a release
-# panic is a bug in bnkterm either way. Debug builds and the test harness keep
-# unwinding panics with their messages, because the strategy is set on the profile
-# rather than through RUSTFLAGS.
-#
-# For a profile with symbols, build with --config profile.release.strip=false
-# --config profile.release.debug=1. A readable panic needs a debug build.
 [profile.release]
 opt-level = 3
 lto = true

@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfreetype-dev \
+            libharfbuzz-dev \
+            libfontconfig1-dev \
+            libxkbcommon-dev \
+            fonts-dejavu-core \
+            fonts-noto-core \
+            fonts-noto-color-emoji
+
+      - name: Confirm the runner has the fonts the tests resolve
+        run: |
+          set -eu
+          status=0
+          for role in monospace sans-serif emoji; do
+            printf '%-11s -> %s\n' "$role" "$(fc-match -f '%{family[0]}' "$role")"
+          done
+          for cp in 23FA 23BF 2713 2717 273B 2801 1F600; do
+            family=$(fc-list ":charset=$cp" family | head -1)
+            if [ -z "$family" ]; then
+              echo "::error::no installed font covers U+$cp"
+              status=1
+            else
+              printf 'U+%-6s -> %s\n' "$cp" "$family"
+            fi
+          done
+          exit $status
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Test the installer and the ABI floor
+        run: make test-install test-abi
+
+      - name: Gate
+        run: make test

@@ -19,6 +19,7 @@
 //! reads move off the main thread; the parser, grid, and every write stay here.
 
 use std::os::fd::RawFd;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::app::message::{PointerEvent, Side, ToTerminal, ToWindow};
@@ -409,6 +410,11 @@ impl TerminalCore {
             cwd: None,
             foreground: None,
         }
+    }
+
+    /// Adopt the configured colours (see [`Screen::set_theme`]).
+    pub(super) fn set_theme(&mut self, theme: Rc<Theme>) {
+        self.screen.set_theme(theme);
     }
 
     /// Spawn the shell on a PTY sized to the current grid, returning the grid it

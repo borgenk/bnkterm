@@ -4418,6 +4418,78 @@ fn osc_11_answers_what_the_background_actually_is() {
 }
 
 #[test]
+fn a_program_reset_returns_to_the_configured_colours() {
+    let mut s = Screen::new(10, 2);
+    let mut configured = Theme::default();
+    configured.fg = Rgb::new(0x11, 0x22, 0x33);
+    configured.bg = Rgb::new(0x44, 0x55, 0x66);
+    configured.cursor = Rgb::new(0x77, 0x88, 0x99);
+    configured.set_indexed(1, Rgb::new(0xaa, 0xbb, 0xcc));
+    s.set_theme(std::rc::Rc::new(configured));
+
+    feed(
+        &mut s,
+        b"\x1b]10;#ff0000\x07\x1b]11;#00ff00\x07\x1b]12;#0000ff\x07",
+    );
+    feed(&mut s, b"\x1b]4;1;#010203\x07");
+    assert_eq!(s.theme().fg, Rgb::new(0xff, 0, 0));
+    assert_eq!(s.theme().indexed(1), Rgb::new(1, 2, 3));
+
+    feed(&mut s, b"\x1b]110\x07\x1b]111\x07\x1b]112\x07");
+    assert_eq!(s.theme().fg, Rgb::new(0x11, 0x22, 0x33), "configured fg");
+    assert_eq!(s.theme().bg, Rgb::new(0x44, 0x55, 0x66), "configured bg");
+    assert_eq!(
+        s.theme().cursor,
+        Rgb::new(0x77, 0x88, 0x99),
+        "configured cursor"
+    );
+
+    feed(&mut s, b"\x1b]104\x07");
+    assert_eq!(
+        s.theme().indexed(1),
+        Rgb::new(0xaa, 0xbb, 0xcc),
+        "a whole-palette reset lands on the configured palette too"
+    );
+    assert_eq!(
+        s.theme().fg,
+        Rgb::new(0x11, 0x22, 0x33),
+        "and leaves the named colours alone, as OSC 104 must"
+    );
+}
+
+#[test]
+fn screens_share_one_baseline_but_never_a_live_palette() {
+    let mut base = Theme::default();
+    base.fg = Rgb::new(0x11, 0x22, 0x33);
+    let base = std::rc::Rc::new(base);
+
+    let mut first = Screen::new(4, 2);
+    let mut second = Screen::new(4, 2);
+    first.set_theme(std::rc::Rc::clone(&base));
+    second.set_theme(std::rc::Rc::clone(&base));
+    assert_eq!(
+        std::rc::Rc::strong_count(&base),
+        3,
+        "one allocation, held here and by both screens"
+    );
+
+    feed(&mut first, b"\x1b]10;#ff0000\x07");
+    assert_eq!(first.theme().fg, Rgb::new(0xff, 0, 0));
+    assert_eq!(
+        second.theme().fg,
+        Rgb::new(0x11, 0x22, 0x33),
+        "the neighbouring tab is untouched"
+    );
+
+    feed(&mut first, b"\x1b]110\x07");
+    assert_eq!(
+        first.theme().fg,
+        Rgb::new(0x11, 0x22, 0x33),
+        "and the reset lands on the shared baseline"
+    );
+}
+
+#[test]
 fn a_color_reply_uses_the_terminator_it_was_asked_with() {
     // A client that asked with ST may not be listening for BEL, and vice versa.
     // Mirroring the request is the one answer that is right for both.
