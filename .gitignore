@@ -8,3 +8,6 @@ dist/
 # Machine-local generated data: each perf run's latest, the lab time series, and
 # the fetched/generated corpora. The committed baseline lives in stats/, tracked.
 data/
+.flatpak-builder/
+build-dir/
+flatpak-repo/

@@ -63,6 +63,7 @@ use crate::platform::protocol::{
 use crate::platform::wire::{Arg, Message, Reader};
 use crate::platform::xkb::Xkb;
 use crate::pty;
+use crate::pty::{EnvVar, Launch, Target};
 use crate::render::gpu::TextGamma;
 use crate::term_render::CellMetrics;
 
@@ -191,47 +192,84 @@ impl Verbosity {
     }
 }
 
-/// Open the window, spawn `$SHELL`, and run the terminal until the shell exits or
+/// Open the window, spawn the user's shell, and run the terminal until the shell exits or
 /// the window is closed.
 pub fn run(verbosity: Verbosity) -> crate::error::Result<()> {
-    // Export terminal capabilities once, before State construction and before any
-    // gather thread can exist. Every shell opened by the process inherits them.
-    std::env::set_var("TERM", "xterm-256color");
-    std::env::set_var("COLORTERM", "truecolor");
-    // Who we are. Nothing consumes this yet — the CLIs that sniff `TERM_PROGRAM` all
-    // match it against a hardcoded list of terminals they know, and we are on nobody's
-    // list — but it is what a terminal is supposed to say, and it is how anything ever
-    // *could* recognise us.
-    std::env::set_var("TERM_PROGRAM", "bnkterm");
-    std::env::set_var("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-    // And the capability that list is standing in for. The `supports-hyperlinks`
-    // family (Node's, and so most JS CLIs) has no capability query for OSC 8: it
-    // decides by *name*, from a fixed allowlist of iTerm/WezTerm/vscode/ghostty/VTE,
-    // and everyone else is told no forever. `FORCE_HYPERLINK` is the one door out, so
-    // we assert what is now simply true — bnkterm renders OSC 8 (see
-    // `grid::Screen::set_hyperlink`) — rather than impersonating a terminal on the
-    // list to get the same answer.
-    std::env::set_var("FORCE_HYPERLINK", "1");
-    // Auto-inject shell integration (OSC 133 prompt marks) so a resize reflow does not
-    // fight the shell's prompt redraw — the reason kitty/ghostty "just work" and alacritty
-    // does not. Held for the process lifetime; dropping it removes the generated directory,
-    // so it must outlive the state that spawns shells against it (declared first, dropped
-    // last). Must precede any thread, like the exports above, since it mutates the
-    // environment.
-    let shell_integration = crate::shell_integration::install();
-    let shell_args = shell_integration
-        .as_ref()
-        .map(|session| session.shell_args().to_vec())
-        .unwrap_or_default();
-    let mut state = State::new(false, verbosity, shell_args)?;
+    let host = flatpak_host();
+    let shell = match &host {
+        Some(host) => host.var("SHELL"),
+        None => std::env::var_os("SHELL"),
+    }
+    .and_then(|shell| shell.into_string().ok())
+    .unwrap_or_else(|| "/bin/sh".to_string());
+    // Shell integration (OSC 133 prompt marks), so a resize reflow does not fight the
+    // shell's prompt redraw. Dropping it removes the generated directory, so it is declared
+    // before the state that spawns shells against it and outlives it.
+    let shell_integration = match &host {
+        Some(host) => crate::flatpak::shared_dir().and_then(|base| {
+            crate::shell_integration::install(&shell, &|name| host.var(name), &[base])
+        }),
+        None => crate::shell_integration::install(
+            &shell,
+            &|name| std::env::var_os(name),
+            &crate::shell_integration::local_bases(),
+        ),
+    };
+    let mut env = terminal_env();
+    let mut argv = vec![shell];
+    if let Some(session) = &shell_integration {
+        argv.extend_from_slice(session.shell_args());
+        env.extend_from_slice(session.env());
+    }
+    let launch = if host.is_some() {
+        Launch::new(crate::flatpak::host_argv(&argv, &env), Target::FlatpakHost)
+    } else {
+        // Before State exists, so before any gather thread: every local shell inherits these.
+        env.iter().for_each(EnvVar::apply);
+        Launch::new(argv, Target::Local)
+    };
+    let mut state = State::new(false, verbosity, launch)?;
     state.bring_up()?;
     Ok(())
+}
+
+/// The host side of the Flatpak sandbox this process runs in, or `None` outside one. A
+/// sandbox that cannot reach its host keeps the shell inside, which still works, and says
+/// why.
+fn flatpak_host() -> Option<crate::flatpak::Host> {
+    if !crate::flatpak::sandboxed() {
+        return None;
+    }
+    crate::flatpak::Host::query()
+        .map_err(|error| eprintln!("bnkterm: {error}; the shell runs inside the sandbox"))
+        .ok()
+}
+
+/// The terminal's side of every shell's environment: what it can do and what it is.
+fn terminal_env() -> Vec<EnvVar> {
+    let set = |name: &'static str, value: &str| EnvVar {
+        name,
+        value: Some(value.to_string()),
+    };
+    vec![
+        set("TERM", "xterm-256color"),
+        set("COLORTERM", "truecolor"),
+        // Who we are. Nothing consumes this yet: the CLIs that sniff `TERM_PROGRAM` match it
+        // against a hardcoded list, and bnkterm is on nobody's. It is still what a terminal
+        // is supposed to say.
+        set("TERM_PROGRAM", "bnkterm"),
+        set("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION")),
+        // Hyperlink support in most JS CLIs is decided by terminal name, from a fixed
+        // allowlist, with no capability query for OSC 8. `FORCE_HYPERLINK` is the one way
+        // past it, and bnkterm does render OSC 8 (see `grid::Screen::set_hyperlink`).
+        set("FORCE_HYPERLINK", "1"),
+    ]
 }
 
 /// `--demo`: open the window on a static styled grid, without a PTY. The phase-2
 /// bring-up, kept for isolating a render question from the live shell.
 pub fn run_demo(verbosity: Verbosity) -> crate::error::Result<()> {
-    let mut state = State::new(true, verbosity, Vec::new())?;
+    let mut state = State::new(true, verbosity, Launch::new(Vec::new(), Target::Local))?;
     state.bring_up()?;
     Ok(())
 }
@@ -240,7 +278,12 @@ pub fn run_demo(verbosity: Verbosity) -> crate::error::Result<()> {
 /// presentation path, without opening a window. Its report *is* its output, so it
 /// prints at any verbosity.
 pub fn gpu_probe() -> crate::error::Result<()> {
-    State::new(true, Verbosity::Quiet, Vec::new())?.probe_dmabuf()?;
+    State::new(
+        true,
+        Verbosity::Quiet,
+        Launch::new(Vec::new(), Target::Local),
+    )?
+    .probe_dmabuf()?;
     Ok(())
 }
 
@@ -455,10 +498,9 @@ struct State {
 }
 
 impl State {
-    /// `shell_args` is the shell integration's, threaded to every tab this window opens
-    /// (see [`crate::shell_integration::Session::shell_args`]); the paths that never spawn
-    /// a shell (`--demo`, `--gpu-probe`) pass none.
-    fn new(demo: bool, verbosity: Verbosity, shell_args: Vec<String>) -> Result<Self> {
+    /// `launch` is how every tab this window opens starts its shell; the paths that never
+    /// spawn one (`--demo`, `--gpu-probe`) pass an empty one.
+    fn new(demo: bool, verbosity: Verbosity, launch: Launch) -> Result<Self> {
         let (config, problems) = config::load::load();
         for problem in &problems {
             eprintln!("bnkterm: {problem}");
@@ -500,7 +542,7 @@ impl State {
                 core,
                 tab_bar_config.clone(),
                 theme,
-                shell_args,
+                launch,
                 config.shell_startup,
             ),
             poll_set: pty::PollSet::new(),

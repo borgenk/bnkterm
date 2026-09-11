@@ -1,0 +1,10 @@
+{
+  "io.github.borgenk.BnkTerm": [
+    "appstream-missing-project-license",
+    "appstream-screenshots-not-mirrored-in-ostree",
+    "finish-args-flatpak-spawn-access",
+    "finish-args-only-wayland",
+    "finish-args-unnecessary-xdg-config-bnkterm-ro-access",
+    "metainfo-missing-screenshots"
+  ]
+}

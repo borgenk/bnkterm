@@ -74,13 +74,16 @@
 //! vendor files), and the drop-in takes it back out so a child sees the session as it was.
 //!
 //! Best-effort throughout: a missing `$SHELL`, a shell none of the three, an opt-out, or
-//! any I/O failure leaves the environment exactly as it was. The child inherits the process
-//! environment at `fork`, so [`install`] mutates it and therefore **must** run before any
-//! thread starts (as [`crate::app::run`] does, beside the other capability exports).
+//! any I/O failure installs nothing. [`install`] returns the variables and arguments a shell
+//! needs rather than setting them: [`crate::app::run`] applies them to its own environment
+//! for a local shell, before any thread starts, and passes them to `flatpak-spawn` for one
+//! on the host.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
+
+use crate::pty::EnvVar;
 
 /// Set to `0` to disable auto-injection, for a user whose exotic startup it disturbs.
 const OPT_OUT_VAR: &str = "BNKTERM_SHELL_INTEGRATION";
@@ -93,6 +96,12 @@ enum Shell {
     Zsh,
     Bash,
     Fish,
+}
+
+/// What a shell has to be started with to find its shims.
+struct Shims {
+    args: Vec<String>,
+    env: Vec<EnvVar>,
 }
 
 impl Shell {
@@ -113,41 +122,45 @@ impl Shell {
         }
     }
 
-    /// Write this shell's shims into the already-created private `dir` and export whatever
-    /// the child needs to find them, answering with the extra arguments its `exec` needs.
-    /// Empty for the two shells reachable through the environment alone; bash is the one
-    /// that has to be *told*, so it answers `--rcfile <path>`.
-    fn install_into(self, dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+    /// Write this shell's shims into the already-created private `dir`, answering with what
+    /// the shell must be started with to find them. `env` answers for the environment it
+    /// starts in. Bash is the one that has to be told in argv (`--rcfile <path>`); zsh and
+    /// fish are reached through variables.
+    fn install_into(
+        self,
+        dir: &std::path::Path,
+        env: &dyn Fn(&str) -> Option<OsString>,
+    ) -> std::io::Result<Shims> {
         match self {
             Self::Zsh => {
                 write_zsh_files(dir)?;
-                export_zsh(dir);
-                Ok(Vec::new())
+                Ok(Shims {
+                    args: Vec::new(),
+                    env: zsh_env(dir, env("ZDOTDIR"))?,
+                })
             }
             Self::Bash => {
                 let rc = dir.join("bnkterm.bash");
-                // The path becomes an argv entry, so it has to be a `str`. A non-UTF-8 base
-                // directory is refused here rather than lossily mangled: bash given an
-                // `--rcfile` it cannot open sources *nothing*, not even the user's
-                // `~/.bashrc`, so a half-right path is worse than no integration at all.
-                let arg = rc
-                    .to_str()
-                    .ok_or_else(|| std::io::Error::other("non-UTF-8 integration path"))?
-                    .to_string();
+                let arg = utf8(&rc)?;
                 write_new(rc, BASHRC.as_bytes())?;
-                Ok(vec!["--rcfile".to_string(), arg])
+                Ok(Shims {
+                    args: vec!["--rcfile".to_string(), arg],
+                    env: Vec::new(),
+                })
             }
             Self::Fish => {
                 write_fish_files(dir)?;
-                export_fish(dir);
-                Ok(Vec::new())
+                Ok(Shims {
+                    args: Vec::new(),
+                    env: fish_env(dir, env("XDG_DATA_DIRS"))?,
+                })
             }
         }
     }
 }
 
 /// Holds the generated integration directory alive for the process and removes it on drop,
-/// and carries the arguments the child shell needs (see [`Self::shell_args`]).
+/// and carries what the child shell needs to find it ([`Self::shell_args`], [`Self::env`]).
 ///
 /// A shell sources these files once at startup and never reads them again, so the directory
 /// only has to outlive the session, which this does by living in [`crate::app::run`]'s
@@ -155,6 +168,7 @@ impl Shell {
 pub struct Session {
     dir: PathBuf,
     args: Vec<String>,
+    env: Vec<EnvVar>,
 }
 
 impl Session {
@@ -168,6 +182,12 @@ impl Session {
     pub fn shell_args(&self) -> &[String] {
         &self.args
     }
+
+    /// Variables every shell this session spawns must start with, or without, for the
+    /// integration to load.
+    pub fn env(&self) -> &[EnvVar] {
+        &self.env
+    }
 }
 
 impl Drop for Session {
@@ -176,22 +196,39 @@ impl Drop for Session {
     }
 }
 
-/// Generate the integration for `$SHELL` and point this process's future children at it.
-/// Returns a [`Session`] the caller keeps alive (dropping it removes the directory), or
-/// `None` when nothing was installed: a shell we do not speak, opted out, or an I/O
-/// failure. Never errors — integration is a nicety, never a reason the terminal fails to
+/// Generate the integration for `shell` and return what every shell must be started with to
+/// load it: a [`Session`] the caller keeps alive (dropping it removes the directory), or
+/// `None` when nothing was installed (a shell we do not speak, opted out, or an I/O
+/// failure). Never errors: integration is a nicety, never a reason the terminal fails to
 /// open.
 ///
-/// Must be called before the first thread starts: it mutates the process environment, which
-/// is unsound once other threads run.
-pub fn install() -> Option<Session> {
+/// `env` answers for the environment the shell will start in, which is this process's own
+/// for a local shell and the host session's under Flatpak. The files go under the first of
+/// `bases` a directory can be made in. Nothing here touches the process environment.
+pub fn install(
+    shell: &str,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    bases: &[PathBuf],
+) -> Option<Session> {
     if std::env::var_os(OPT_OUT_VAR).as_deref() == Some(OsStr::new("0")) {
         return None;
     }
-    let shell = Shell::named(std::env::var_os("SHELL").as_deref())?;
-    let dir = create_integration_dir().ok()?;
-    match shell.install_into(&dir) {
-        Ok(args) => Some(Session { dir, args }),
+    generate(Shell::named(Some(OsStr::new(shell)))?, env, bases)
+}
+
+/// [`install`] past the opt-out, which reads this process's own environment.
+fn generate(
+    shell: Shell,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    bases: &[PathBuf],
+) -> Option<Session> {
+    let dir = create_integration_dir(bases).ok()?;
+    match shell.install_into(&dir, env) {
+        Ok(shims) => Some(Session {
+            dir,
+            args: shims.args,
+            env: shims.env,
+        }),
         Err(_) => {
             let _ = std::fs::remove_dir_all(&dir);
             None
@@ -199,20 +236,24 @@ pub fn install() -> Option<Session> {
     }
 }
 
-/// Create a fresh, private directory for the generated startup files and return its path.
-/// Under `$XDG_RUNTIME_DIR` when the session has one (already a per-user 0700 directory),
-/// otherwise the temp dir. Either way the name carries 128 bits from the kernel CSPRNG so it
-/// is unpredictable, and it is made with `create_dir` (not `_all`) at mode 0700, so a name an
-/// attacker raced to pre-create is rejected rather than silently reused. On a shared `/tmp`
-/// that is what stops another user from planting the files bnkterm's zsh then sources.
-fn create_integration_dir() -> std::io::Result<PathBuf> {
+/// Where a local shell's integration directory goes: `$XDG_RUNTIME_DIR` when the session has
+/// one (already a per-user 0700 directory), else the temp dir.
+pub fn local_bases() -> Vec<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(std::iter::once(std::env::temp_dir()))
+        .collect()
+}
+
+/// Create a fresh, private directory for the generated startup files under the first of
+/// `bases` that takes one, and return its path. The name carries 128 bits from the kernel
+/// CSPRNG so it is unpredictable, and it is made with `create_dir` (not `_all`) at mode
+/// 0700, so a name an attacker raced to pre-create is rejected rather than silently reused.
+/// On a shared `/tmp` that is what stops another user from planting the files bnkterm's zsh
+/// then sources.
+fn create_integration_dir(bases: &[PathBuf]) -> std::io::Result<PathBuf> {
     let name = format!("bnkterm-shell-{}-{}", std::process::id(), random_token()?);
-    // Prefer $XDG_RUNTIME_DIR (already a per-user 0700 dir); fall back to the temp dir when it
-    // is unset or unusable. Security does not rest on the base: the unpredictable name, the
-    // 0700 `create_dir` that fails on a pre-created name, and the O_EXCL file writes hold on a
-    // shared /tmp too.
-    let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-    let bases = xdg.into_iter().chain(std::iter::once(std::env::temp_dir()));
     let mut last_err: Option<std::io::Error> = None;
     for base in bases {
         let dir = base.join(&name);
@@ -241,18 +282,44 @@ fn random_token() -> std::io::Result<String> {
     Ok(token)
 }
 
-/// Point the child's `ZDOTDIR` at `dir`, handing it the user's own value in a sentinel so
-/// the first stage can restore it before sourcing their startup.
-fn export_zsh(dir: &std::path::Path) {
-    match std::env::var_os("ZDOTDIR") {
-        Some(orig) => std::env::set_var("BNKTERM_ORIG_ZDOTDIR", orig),
-        // No sentinel means "the user had none, fall back to $HOME"; make sure a stale one
-        // inherited from a parent bnkterm cannot masquerade as the user's.
-        None => std::env::remove_var("BNKTERM_ORIG_ZDOTDIR"),
-    }
-    // Our directory, which the stages return to after each hand-off.
-    std::env::set_var("BNKTERM_INT_ZDOTDIR", dir);
-    std::env::set_var("ZDOTDIR", dir);
+/// Point the shell's `ZDOTDIR` at `dir`, handing it the user's own (`user`, from the
+/// environment it starts in) in a sentinel so the first stage can restore it before sourcing
+/// their startup.
+fn zsh_env(dir: &std::path::Path, user: Option<OsString>) -> std::io::Result<Vec<EnvVar>> {
+    let dir = utf8(dir)?;
+    let user = user
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| std::io::Error::other("non-UTF-8 ZDOTDIR"))
+        })
+        .transpose()?;
+    Ok(vec![
+        // Removed when the user had none, meaning "fall back to $HOME": a stale sentinel
+        // inherited from a parent bnkterm must not masquerade as the user's.
+        EnvVar {
+            name: "BNKTERM_ORIG_ZDOTDIR",
+            value: user,
+        },
+        // Our directory, which the stages return to after each hand-off.
+        EnvVar {
+            name: "BNKTERM_INT_ZDOTDIR",
+            value: Some(dir.clone()),
+        },
+        EnvVar {
+            name: "ZDOTDIR",
+            value: Some(dir),
+        },
+    ])
+}
+
+/// `path` as a `str`, since it ends up in a variable or an argv entry. A non-UTF-8 path is
+/// refused rather than lossily mangled: a shell pointed at a half-right path loads nothing,
+/// not even the user's own startup.
+fn utf8(path: &std::path::Path) -> std::io::Result<String> {
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| std::io::Error::other("non-UTF-8 integration path"))
 }
 
 /// Write the four zsh startup shims into the already-created private `dir`. The
@@ -472,12 +539,22 @@ fn fish_data_dirs(
     value
 }
 
-/// Prepend `dir` to `XDG_DATA_DIRS` so fish finds the drop-in, leaving a sentinel the
-/// drop-in uses to take it back out again.
-fn export_fish(dir: &std::path::Path) {
-    let dirs = fish_data_dirs(dir, std::env::var_os("XDG_DATA_DIRS"));
-    std::env::set_var("XDG_DATA_DIRS", dirs);
-    std::env::set_var("BNKTERM_INT_DATA_DIR", dir);
+/// Prepend `dir` to the shell's `XDG_DATA_DIRS` (`existing`, from the environment it starts
+/// in) so fish finds the drop-in, leaving a sentinel the drop-in uses to take it back out.
+fn fish_env(dir: &std::path::Path, existing: Option<OsString>) -> std::io::Result<Vec<EnvVar>> {
+    let dirs = fish_data_dirs(dir, existing)
+        .into_string()
+        .map_err(|_| std::io::Error::other("non-UTF-8 XDG_DATA_DIRS"))?;
+    Ok(vec![
+        EnvVar {
+            name: "XDG_DATA_DIRS",
+            value: Some(dirs),
+        },
+        EnvVar {
+            name: "BNKTERM_INT_DATA_DIR",
+            value: Some(utf8(dir)?),
+        },
+    ])
 }
 
 /// The fish drop-in: `$XDG_DATA_DIRS/fish/vendor_conf.d/bnkterm.fish`.
@@ -662,24 +739,33 @@ mod tests {
     fn each_shell_lays_down_what_it_alone_needs() {
         // The files and the argv are the whole of what differs between the three, so this
         // pins each mechanism against the others rather than each in isolation.
-        let dir = create_integration_dir().expect("create dir");
+        let dir = create_integration_dir(&local_bases()).expect("create dir");
 
-        let zsh_args = Shell::Zsh.install_into(&dir).expect("zsh");
-        assert!(zsh_args.is_empty(), "zsh is reached through ZDOTDIR");
+        let none = |_: &str| None::<OsString>;
+        let zsh = Shell::Zsh.install_into(&dir, &none).expect("zsh");
+        assert!(zsh.args.is_empty(), "zsh is reached through ZDOTDIR");
+        assert!(zsh.env.contains(&EnvVar {
+            name: "ZDOTDIR",
+            value: dir.to_str().map(String::from),
+        }));
         assert!(dir.join(".zshenv").is_file() && dir.join(".zshrc").is_file());
 
-        let bash_args = Shell::Bash.install_into(&dir).expect("bash");
+        let bash = Shell::Bash.install_into(&dir, &none).expect("bash");
+        assert!(
+            bash.env.is_empty(),
+            "bash is told in argv, so needs no variables"
+        );
         let rc = dir.join("bnkterm.bash");
         assert!(rc.is_file(), "the rcfile is written");
         assert_eq!(
-            bash_args,
+            bash.args,
             vec!["--rcfile".to_string(), rc.to_string_lossy().into_owned()],
             "bash has no environment variable that works, so it is told in argv"
         );
 
-        let fish_args = Shell::Fish.install_into(&dir).expect("fish");
+        let fish = Shell::Fish.install_into(&dir, &none).expect("fish");
         assert!(
-            fish_args.is_empty(),
+            fish.args.is_empty(),
             "fish is reached through XDG_DATA_DIRS"
         );
         assert!(dir.join("fish/vendor_conf.d/bnkterm.fish").is_file());
@@ -707,6 +793,54 @@ mod tests {
                 "an unset or empty list means the spec's defaults, not an empty one"
             );
         }
+    }
+
+    #[test]
+    fn zsh_starts_in_the_shims_with_the_users_zdotdir_set_aside() {
+        let dir = std::path::Path::new("/run/user/1000/bnkterm-abc123");
+        let var = |name: &'static str, value: Option<&str>| EnvVar {
+            name,
+            value: value.map(String::from),
+        };
+
+        assert_eq!(
+            zsh_env(dir, Some("/home/u/.config/zsh".into())).expect("utf-8"),
+            vec![
+                var("BNKTERM_ORIG_ZDOTDIR", Some("/home/u/.config/zsh")),
+                var("BNKTERM_INT_ZDOTDIR", Some("/run/user/1000/bnkterm-abc123")),
+                var("ZDOTDIR", Some("/run/user/1000/bnkterm-abc123")),
+            ]
+        );
+        assert_eq!(
+            zsh_env(dir, None).expect("utf-8")[0],
+            var("BNKTERM_ORIG_ZDOTDIR", None),
+            "a user with no ZDOTDIR gets the sentinel removed, never a stale one"
+        );
+    }
+
+    #[test]
+    fn the_shell_is_set_up_from_the_environment_it_starts_in() {
+        // Under Flatpak that is the host's, which this process cannot see in its own, so
+        // every answer has to come from the lookup it is handed.
+        let host = |name: &str| match name {
+            "XDG_DATA_DIRS" => Some(OsString::from("/host/share")),
+            _ => None,
+        };
+        let session = generate(Shell::Fish, &host, &[std::env::temp_dir()]).expect("installed");
+        let dir = session.dir.to_str().expect("utf-8").to_string();
+        assert_eq!(
+            session.env(),
+            [
+                EnvVar {
+                    name: "XDG_DATA_DIRS",
+                    value: Some(format!("{dir}:/host/share")),
+                },
+                EnvVar {
+                    name: "BNKTERM_INT_DATA_DIR",
+                    value: Some(dir.clone()),
+                },
+            ]
+        );
     }
 
     /// Whether `haystack` holds `needle` anywhere.
@@ -803,10 +937,13 @@ mod tests {
             return;
         };
 
-        // Lay down the shims and point the child at them, exactly as `install` does. The
-        // child inherits this environment across the fork.
-        let dir = create_integration_dir().expect("create dir");
-        Shell::Zsh.install_into(&dir).expect("install");
+        // Lay down the shims and point the child at them, as a local launch does: the child
+        // inherits this environment across the fork.
+        let dir = create_integration_dir(&local_bases()).expect("create dir");
+        let shims = Shell::Zsh
+            .install_into(&dir, &|name| std::env::var_os(name))
+            .expect("install");
+        shims.env.iter().for_each(EnvVar::apply);
 
         let out = drive_until_prompt(&[&zsh]);
         std::fs::remove_dir_all(&dir).ok();
@@ -825,10 +962,12 @@ mod tests {
 
         // bash takes its instructions in argv rather than the environment, so this is the
         // whole of what `install` hands the child.
-        let dir = create_integration_dir().expect("create dir");
-        let args = Shell::Bash.install_into(&dir).expect("install");
+        let dir = create_integration_dir(&local_bases()).expect("create dir");
+        let shims = Shell::Bash
+            .install_into(&dir, &|name| std::env::var_os(name))
+            .expect("install");
         let argv: Vec<&str> = std::iter::once(bash.as_str())
-            .chain(args.iter().map(String::as_str))
+            .chain(shims.args.iter().map(String::as_str))
             .collect();
 
         let out = drive_until_prompt(&argv);
@@ -853,8 +992,11 @@ mod tests {
             return;
         };
 
-        let dir = create_integration_dir().expect("create dir");
-        Shell::Fish.install_into(&dir).expect("install");
+        let dir = create_integration_dir(&local_bases()).expect("create dir");
+        let shims = Shell::Fish
+            .install_into(&dir, &|name| std::env::var_os(name))
+            .expect("install");
+        shims.env.iter().for_each(EnvVar::apply);
 
         let out = drive_until_prompt(&[&fish]);
         std::fs::remove_dir_all(&dir).ok();
@@ -863,7 +1005,7 @@ mod tests {
 
     #[test]
     fn writes_the_four_startup_shims() {
-        let dir = create_integration_dir().expect("create dir");
+        let dir = create_integration_dir(&local_bases()).expect("create dir");
         write_zsh_files(&dir).expect("write shims");
         for f in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
             assert!(dir.join(f).is_file(), "missing {f}");
@@ -882,8 +1024,8 @@ mod tests {
     #[test]
     fn the_integration_dir_is_private_and_unpredictable() {
         use std::os::unix::fs::PermissionsExt;
-        let a = create_integration_dir().expect("dir a");
-        let b = create_integration_dir().expect("dir b");
+        let a = create_integration_dir(&local_bases()).expect("dir a");
+        let b = create_integration_dir(&local_bases()).expect("dir b");
         // Two directories never collide, so the name cannot be guessed from the pid alone.
         assert_ne!(a, b);
         let mode = std::fs::metadata(&a).unwrap().permissions().mode() & 0o777;
@@ -896,7 +1038,7 @@ mod tests {
     fn write_new_refuses_to_clobber_a_pre_placed_path() {
         // The clobbering guard: a file already at the target makes the write fail rather than
         // truncate it (and, being O_EXCL, a symlink there is not followed either).
-        let dir = create_integration_dir().expect("create dir");
+        let dir = create_integration_dir(&local_bases()).expect("create dir");
         let target = dir.join(".zshenv");
         std::fs::write(&target, b"pre-existing").expect("plant a file");
         assert!(

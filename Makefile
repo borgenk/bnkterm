@@ -1,7 +1,8 @@
 .PHONY: all build build-release install uninstall build-linux test test-install \
-	test-abi check fix shaders clean size
+	test-abi check flatpak flatpak-lint fix shaders clean size
 
 APP_NAME := bnkterm
+APP_ID := io.github.borgenk.BnkTerm
 TARGET := x86_64-unknown-linux-gnu
 VERSION := $(shell grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 BUILD_PATH := target/$(TARGET)/release
@@ -13,6 +14,12 @@ ICON_DIR := ~/.local/share/icons/hicolor/scalable/apps
 # The oldest glibc a downloaded tarball runs on, which is Debian 12's. The
 # release builds in that image and checks the binary against this.
 GLIBC_FLOOR := 2.36
+
+FLATPAK_BUILDER := $(shell command -v flatpak-builder 2>/dev/null || echo "flatpak run org.flatpak.Builder")
+FLATPAK_BUILDER_LINT := $(shell command -v flatpak-builder-lint 2>/dev/null \
+	|| echo "flatpak run --command=flatpak-builder-lint org.flatpak.Builder")
+LINT_EXCEPTIONS := --exceptions --user-exceptions .github/flatpak-lint-exceptions.json
+RUNTIME_REPO := https://flathub.org/repo/flathub.flatpakrepo
 
 all: test build
 
@@ -54,6 +61,20 @@ build-linux: build-release
 	cd dist && sha256sum $(TARBALL) > $(TARBALL).sha256
 	@echo "Built dist/$(TARBALL), with a .sha256"
 	@echo "Publish with: gh release create v$(VERSION) dist/$(TARBALL)*"
+
+# The bundle the release workflow publishes, into dist/.
+flatpak:
+	mkdir -p dist
+	$(FLATPAK_BUILDER) --force-clean --repo=flatpak-repo build-dir $(APP_ID).yml
+	flatpak build-bundle --runtime-repo=$(RUNTIME_REPO) flatpak-repo \
+		dist/$(APP_NAME)-v$(VERSION)-x86_64.flatpak $(APP_ID)
+	@echo "Built dist/$(APP_NAME)-v$(VERSION)-x86_64.flatpak"
+	@echo "Install with: flatpak install --user dist/$(APP_NAME)-v$(VERSION)-x86_64.flatpak"
+
+# The manifest and the built repo, against Flathub's rules.
+flatpak-lint: flatpak
+	$(FLATPAK_BUILDER_LINT) $(LINT_EXCEPTIONS) manifest $(APP_ID).yml
+	$(FLATPAK_BUILDER_LINT) $(LINT_EXCEPTIONS) repo flatpak-repo
 
 # The gate. rustdoc is in it because it is what checks the intra-doc links.
 test:

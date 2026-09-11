@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.borgenk.BnkTerm</id>
+  <name>BNK Term</name>
+  <summary>Terminal emulator for Wayland</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <developer id="io.github.borgenk">
+    <name>BNK Term contributors</name>
+  </developer>
+
+  <description>
+    <p>
+      BNK Term is a terminal emulator for Wayland that draws with Vulkan. It has
+      tabs, reflows text when the window is resized, and marks shell prompts so a
+      resize never mangles them.
+    </p>
+    <p>
+      Fonts come from fontconfig, and fonts, colours and the tab bar are set in a
+      plain configuration file. The shell runs on the host, so every tool
+      installed there is available.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.borgenk.BnkTerm.desktop</launchable>
+  <provides>
+    <binary>bnkterm</binary>
+  </provides>
+  <url type="homepage">https://github.com/borgenk/bnkterm</url>
+  <url type="bugtracker">https://github.com/borgenk/bnkterm/issues</url>
+
+  <releases>
+    <release version="0.1.0" date="2026-09-11"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>

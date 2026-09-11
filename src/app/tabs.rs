@@ -30,7 +30,7 @@ use crate::gather::GatherEnd;
 use crate::notice::Notice;
 use crate::platform::freetype::Fonts;
 use crate::platform::geom::Scale;
-use crate::pty::ZombieChild;
+use crate::pty::{Launch, ZombieChild};
 use crate::render::display::DisplayList;
 use crate::tab_bar::{self, BarGeom, Lift, Slot, TabLabel};
 use crate::term_render::CellMetrics;
@@ -98,12 +98,11 @@ pub(super) struct Tabs {
     cfg: TabBarConfig,
     /// The configured grid colours.
     theme: Rc<Theme>,
-    /// Arguments every shell this session spawns is given, from the shell integration
-    /// (see [`crate::shell_integration::Session::shell_args`]). Held here because a tab
-    /// opened an hour in has to load the same shims as the first one did.
-    shell_args: Vec<String>,
-    /// When a shell's own startup is slow enough to say so. Held beside `shell_args`
-    /// for the same reason: it is a property of the session, not of a tab.
+    /// How every shell this session spawns is started. Held here because a tab opened an
+    /// hour in has to start the way the first one did, integration shims included.
+    launch: Launch,
+    /// When a shell's own startup is slow enough to say so. Held beside `launch` for the
+    /// same reason: it is a property of the session, not of a tab.
     shell_startup: ShellStartupConfig,
     /// The transient corner notice, when one stands. Window-level rather than per-core
     /// because it is chrome over the window, and because the tab it speaks for is the
@@ -115,13 +114,13 @@ pub(super) struct Tabs {
 
 impl Tabs {
     /// Wrap the initial terminal core as tab zero, under the given strip config, with the
-    /// shell arguments every tab in this session will be spawned with and the budget a
-    /// shell's own startup is held to.
+    /// launch every tab in this session starts its shell with and the budget a shell's own
+    /// startup is held to.
     pub(super) fn new(
         core: TerminalCore,
         cfg: TabBarConfig,
         theme: Rc<Theme>,
-        shell_args: Vec<String>,
+        launch: Launch,
         shell_startup: ShellStartupConfig,
     ) -> Self {
         let mut tabs = Self {
@@ -136,7 +135,7 @@ impl Tabs {
             drag: None,
             cfg,
             theme,
-            shell_args,
+            launch,
             shell_startup,
             notice: None,
             outbox: Vec::new(),
@@ -147,10 +146,10 @@ impl Tabs {
     }
 
     /// Spawn the first tab's shell, once the window has its granted size. Later tabs get
-    /// theirs from [`open`](Self::open); both go through the session's shell arguments,
+    /// theirs from [`open`](Self::open); both go through the session's launch,
     /// which is why neither caller has to know them.
     pub(super) fn spawn_active_shell(&mut self) -> Result<(usize, usize)> {
-        self.entries[self.active].core.spawn_shell(&self.shell_args)
+        self.entries[self.active].core.spawn_shell(&self.launch)
     }
 
     /// Number of live tabs.
@@ -198,7 +197,7 @@ impl Tabs {
     ) -> Result<TabId> {
         let mut core = TerminalCore::new(false, cols, rows, metrics, width, height, pad);
         core.set_theme(Rc::clone(&self.theme));
-        if let Err(error) = core.spawn_shell(&self.shell_args) {
+        if let Err(error) = core.spawn_shell(&self.launch) {
             if let Some(child) = core.into_child() {
                 self.reaping.push(child);
             }
@@ -942,7 +941,7 @@ impl Tabs {
 mod tests {
     use super::*;
     use crate::input::{Key, Mods};
-    use crate::pty::PollSet;
+    use crate::pty::{Launch, PollSet, Target};
     use crate::render::display::DrawCmd;
 
     const METRICS: CellMetrics = CellMetrics {
@@ -973,7 +972,7 @@ mod tests {
             core(true, 80, 24),
             TabBarConfig::default(),
             Rc::new(Theme::default()),
-            Vec::new(),
+            Launch::new(Vec::new(), Target::Local),
             ShellStartupConfig::default(),
         );
         for _ in 1..count {
@@ -1056,7 +1055,7 @@ mod tests {
             core,
             TabBarConfig::default(),
             Rc::new(Theme::default()),
-            Vec::new(),
+            Launch::new(Vec::new(), Target::Local),
             cfg,
         );
         assert!(
@@ -1084,7 +1083,7 @@ mod tests {
             core,
             TabBarConfig::default(),
             Rc::new(Theme::default()),
-            Vec::new(),
+            Launch::new(Vec::new(), Target::Local),
             cfg,
         );
         // A window far longer than the test above needs to see its notice, driving the
@@ -1116,7 +1115,7 @@ mod tests {
             core,
             TabBarConfig::default(),
             Rc::new(Theme::default()),
-            Vec::new(),
+            Launch::new(Vec::new(), Target::Local),
             ShellStartupConfig::default(),
         );
         assert!(!tabs.is_empty());
@@ -1502,11 +1501,6 @@ mod tests {
 
     #[test]
     fn two_live_pty_streams_land_on_their_own_grids() {
-        // The second tab comes up through `Tabs::open`, which spawns `$SHELL` by design,
-        // so this one test does still set it. Safe because it is now the only writer left
-        // in the suite: every other test names its program (see the reap test above), so
-        // there is no longer a second value to race against.
-        std::env::set_var("SHELL", "/bin/cat");
         let mut first = core(false, 40, 10);
         if first.spawn_program(&["/bin/cat"]).is_err() {
             eprintln!("fork/exec unavailable; skipping multi-tab PTY test");
@@ -1516,7 +1510,7 @@ mod tests {
             first,
             TabBarConfig::default(),
             Rc::new(Theme::default()),
-            Vec::new(),
+            Launch::new(vec!["/bin/cat".to_string()], Target::Local),
             ShellStartupConfig::default(),
         );
         if tabs.open(40, 10, METRICS, 320, 160, 0, false).is_err() {

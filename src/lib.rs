@@ -15,6 +15,7 @@ pub mod app;
 pub mod color;
 pub mod config;
 pub mod error;
+pub mod flatpak;
 /// The property lane's shared machinery (a seeded generator and a shrinker), compiled
 /// only under test so none of it can reach the shipping binary.
 #[cfg(test)]

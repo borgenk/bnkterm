@@ -22,3 +22,12 @@ curl -fsSL https://raw.githubusercontent.com/borgenk/bnkterm/main/install.sh | s
 ```
 
 This drops the binary in `~/.local/bin` and installs the desktop entry and icon.
+
+### Flatpak
+
+Download the bundle from the
+[releases page](https://github.com/borgenk/bnkterm/releases/latest):
+
+```sh
+flatpak install --user ./bnkterm-*.flatpak
+```

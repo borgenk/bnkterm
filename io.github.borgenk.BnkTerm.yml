@@ -1,0 +1,53 @@
+id: io.github.borgenk.BnkTerm
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-nightly
+command: bnkterm
+rename-desktop-file: bnkterm.desktop
+rename-icon: bnkterm
+
+finish-args:
+  - --socket=wayland
+  - --device=dri
+  - --talk-name=org.freedesktop.Flatpak
+  - --filesystem=xdg-config/bnkterm:ro
+
+build-options:
+  append-path: /usr/lib/sdk/rust-nightly/bin
+  env:
+    CARGO_HOME: /run/build/bnkterm/cargo
+    CARGO_PROFILE_RELEASE_PANIC: abort
+
+modules:
+  - name: bnkterm
+    buildsystem: simple
+    build-commands:
+      - cargo --offline --locked build --release --target x86_64-unknown-linux-gnu
+      - install -Dm755 target/x86_64-unknown-linux-gnu/release/bnkterm /app/bin/bnkterm
+      - install -Dm644 assets/bnkterm.desktop /app/share/applications/bnkterm.desktop
+      - install -Dm644 assets/bnkterm.svg /app/share/icons/hicolor/scalable/apps/bnkterm.svg
+      - install -Dm644 assets/io.github.borgenk.BnkTerm.metainfo.xml
+        /app/share/metainfo/io.github.borgenk.BnkTerm.metainfo.xml
+    sources:
+      - type: dir
+        path: .
+        skip:
+          - .cargo
+          - .claude
+          - .flatpak-builder
+          - .git
+          - .github
+          - build-dir
+          - data
+          - dist
+          - docs
+          - docs-internal
+          - flatpak-repo
+          - rust-toolchain.toml
+          - stats
+          - target
+          - tests
+          - tools
+          - ucd

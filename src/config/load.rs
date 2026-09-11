@@ -36,14 +36,28 @@ impl fmt::Display for Problem {
     }
 }
 
-/// The config path under an absolute `$XDG_CONFIG_HOME` or `$HOME`.
+/// The config path under an absolute `$XDG_CONFIG_HOME` or `$HOME`. Inside a Flatpak
+/// sandbox `$XDG_CONFIG_HOME` is the app's private directory, so the host's own, when it
+/// set one, comes from `$HOST_XDG_CONFIG_HOME` instead.
 pub fn path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+    let config_home = if crate::flatpak::sandboxed() {
+        "HOST_XDG_CONFIG_HOME"
+    } else {
+        "XDG_CONFIG_HOME"
+    };
+    path_from(std::env::var_os(config_home), std::env::var_os("HOME"))
+}
+
+/// [`path`] from the two variables it reads.
+fn path_from(
+    config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let base = config_home
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute())
         .or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
+            home.map(PathBuf::from)
                 .filter(|dir| dir.is_absolute())
                 .map(|home| home.join(".config"))
         })?;
@@ -451,5 +465,26 @@ mod tests {
         let path = path().expect("a home directory in the test environment");
         assert!(path.is_absolute(), "{path:?}");
         assert!(path.ends_with("bnkterm/config"), "{path:?}");
+    }
+
+    #[test]
+    fn the_path_follows_xdg_then_home() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        let config = |p: &str| Some(PathBuf::from(p));
+        assert_eq!(
+            path_from(os("/cfg"), os("/home/u")),
+            config("/cfg/bnkterm/config")
+        );
+        assert_eq!(
+            path_from(None, os("/home/u")),
+            config("/home/u/.config/bnkterm/config")
+        );
+        // A relative directory would resolve against wherever the process started.
+        assert_eq!(
+            path_from(os("cfg"), os("/home/u")),
+            config("/home/u/.config/bnkterm/config")
+        );
+        assert_eq!(path_from(os("cfg"), os("home")), None);
+        assert_eq!(path_from(None, None), None);
     }
 }

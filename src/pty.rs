@@ -27,10 +27,12 @@
 //!
 //! # Process environment
 //!
-//! `TERM` and `COLORTERM` are process-wide settings inherited by every spawned
-//! child. The app exports them once at startup, before a gather thread exists;
+//! `TERM` and `COLORTERM` are process-wide settings inherited by every local child.
+//! The app exports them once at startup, before a gather thread exists;
 //! [`Pty::spawn`] deliberately never mutates the environment because later calls
-//! happen while the process is multi-threaded.
+//! happen while the process is multi-threaded. A shell on the Flatpak host inherits
+//! nothing from this process, so it gets them as `flatpak-spawn` arguments instead
+//! (see [`crate::flatpak`]).
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -39,6 +41,48 @@ use std::time::Duration;
 use core::ffi::{c_char, c_int, c_short, c_ulong, c_void};
 
 use crate::error::{Error, Result};
+
+/// One variable of the environment a shell starts with: set to `value`, or removed when
+/// `value` is `None`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct EnvVar {
+    pub name: &'static str,
+    pub value: Option<String>,
+}
+
+impl EnvVar {
+    /// Set or remove this variable in the process environment, which every local child
+    /// inherits. Sound only before any other thread exists.
+    pub fn apply(&self) {
+        match &self.value {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
+/// Where the shell a [`Launch`] starts ends up running.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Target {
+    /// A child of this process, which claims the PTY as its controlling terminal.
+    Local,
+    /// On the host, started through `flatpak-spawn --host` from inside a Flatpak sandbox.
+    /// The host side claims the PTY, so the child here leaves it unclaimed.
+    FlatpakHost,
+}
+
+/// How every tab's shell is started: the whole argv, program first, and where it runs.
+#[derive(Clone, Debug)]
+pub struct Launch {
+    argv: Vec<String>,
+    target: Target,
+}
+
+impl Launch {
+    pub fn new(argv: Vec<String>, target: Target) -> Self {
+        Self { argv, target }
+    }
+}
 
 /// The outcome of a non-blocking read from the master fd.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -85,6 +129,7 @@ pub enum TtyMode {
 pub struct Pty {
     master: OwnedFd,
     pid: i32,
+    target: Target,
 }
 
 /// A child whose PTY master has been closed but whose process may not have exited
@@ -95,22 +140,15 @@ pub struct ZombieChild {
 }
 
 impl Pty {
-    /// Open a PTY, size it to `cols` x `rows`, and fork `$SHELL` (or `/bin/sh`) on
-    /// the slave, passing it `args`. The master is non-blocking (so the event loop
-    /// can drain it without stalling) and close-on-exec (so it is never inherited by
-    /// another tab's shell). The caller sets process-wide terminal capability
-    /// variables once, before any gather threads start, so every child inherits
-    /// them without mutating the environment from a multi-threaded process.
-    ///
-    /// `args` comes from [`crate::shell_integration::Session::shell_args`] and is empty
-    /// for every shell but bash, which cannot be reached through the environment and so
-    /// is handed `--rcfile <path>` here.
-    pub fn spawn(cols: usize, rows: usize, args: &[String]) -> Result<Pty> {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut argv = Vec::with_capacity(1 + args.len());
-        argv.push(shell.as_str());
-        argv.extend(args.iter().map(String::as_str));
-        Self::spawn_command(cols, rows, &argv)
+    /// Open a PTY, size it to `cols` x `rows`, and start `launch` on the slave. The master
+    /// is non-blocking (so the event loop can drain it without stalling) and close-on-exec
+    /// (so it is never inherited by another tab's shell). The caller sets process-wide
+    /// terminal capability variables once, before any gather threads start, so every
+    /// local child inherits them without mutating the environment from a multi-threaded
+    /// process.
+    pub fn spawn(cols: usize, rows: usize, launch: &Launch) -> Result<Pty> {
+        let argv: Vec<&str> = launch.argv.iter().map(String::as_str).collect();
+        Self::spawn_on(cols, rows, &argv, launch.target)
     }
 
     /// The general form of [`spawn`](Self::spawn): fork `argv` (with `argv[0]` the
@@ -119,6 +157,12 @@ impl Pty {
     /// both share this one fork/exec dance so the `unsafe` never leaves this module.
     /// Errors on an empty `argv` or an argument carrying an interior NUL.
     pub fn spawn_command(cols: usize, rows: usize, argv: &[&str]) -> Result<Pty> {
+        Self::spawn_on(cols, rows, argv, Target::Local)
+    }
+
+    /// Open the PTY and start `argv` on it, claiming the slave as the child's controlling
+    /// terminal unless `target` leaves that to the host side of `flatpak-spawn`.
+    fn spawn_on(cols: usize, rows: usize, argv: &[&str], target: Target) -> Result<Pty> {
         if argv.is_empty() {
             return Err(Error::msg("spawn_command needs a program to run"));
         }
@@ -174,11 +218,22 @@ impl Pty {
         // SAFETY: all pointers outlive the call; slave_path and the argv strings are
         // NUL-terminated and stay alive through the fork. The child branch runs
         // only async-signal-safe syscalls before exec (see the module header).
-        let pid = unsafe { fork_child_in_pty(master.as_raw_fd(), slave_path.as_ptr(), &ptrs) };
+        let pid = unsafe {
+            fork_child_in_pty(
+                master.as_raw_fd(),
+                slave_path.as_ptr(),
+                &ptrs,
+                target == Target::Local,
+            )
+        };
         if pid < 0 {
             return Err(errno_error("fork"));
         }
-        Ok(Pty { master, pid })
+        Ok(Pty {
+            master,
+            pid,
+            target,
+        })
     }
 
     /// The master fd, for the event loop to `poll` alongside the Wayland socket.
@@ -256,7 +311,13 @@ impl Pty {
     /// permission edge). This is how a tab labels itself with its shell's directory
     /// without depending on the shell emitting OSC 7; it is read only when a tab's
     /// output settles, never on the byte path, so a plain `read_link` is fine.
+    ///
+    /// `None` for a shell on the Flatpak host: this process's `/proc` sees `flatpak-spawn`
+    /// there, not the shell.
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        if self.target != Target::Local {
+            return None;
+        }
         std::fs::read_link(format!("/proc/{}/cwd", self.pid)).ok()
     }
 
@@ -272,7 +333,12 @@ impl Pty {
     /// contain spaces or `)`, so the fixed fields are parsed from *after the last*
     /// `)`. Counting from there: state, ppid, pgrp, session, tty_nr, tpgid — so
     /// `tpgid` is the sixth whitespace token.
+    ///
+    /// `None` for a shell on the Flatpak host, for the same reason as [`cwd`](Self::cwd).
     pub fn foreground_program(&self) -> Option<String> {
+        if self.target != Target::Local {
+            return None;
+        }
         let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)).ok()?;
         let tpgid = parse_tpgid(&stat)?;
         if tpgid <= 0 {
@@ -698,8 +764,9 @@ fn set_winsize(master: RawFd, cols: usize, rows: usize) -> Result<()> {
     Ok(())
 }
 
-/// Fork, and in the child set up the slave as the controlling terminal and exec
-/// the shell. Returns the child pid to the parent, or -1 on a fork failure.
+/// Fork, and in the child put the slave on stdio, claim it as the controlling terminal
+/// when `claim_tty`, and exec `argv`. Returns the child pid to the parent, or -1 on a fork
+/// failure.
 ///
 /// # Safety
 ///
@@ -712,6 +779,7 @@ unsafe fn fork_child_in_pty(
     master: RawFd,
     slave_path: *const c_char,
     argv: &[*const c_char],
+    claim_tty: bool,
 ) -> c_int {
     let pid = fork();
     if pid != 0 {
@@ -733,7 +801,10 @@ unsafe fn fork_child_in_pty(
     let empty = SigSet { words: [0; 16] };
     sigprocmask(SIG_SETMASK, &empty as *const SigSet, core::ptr::null_mut());
     setsid();
-    let slave = open(slave_path, O_RDWR);
+    // Without O_NOCTTY a session leader opening a tty takes it as its controlling terminal,
+    // which has to be left to the host side when that side is to claim it.
+    let flags = if claim_tty { O_RDWR } else { O_RDWR | O_NOCTTY };
+    let slave = open(slave_path, flags);
     if slave < 0 {
         _exit(127);
     }
@@ -742,7 +813,7 @@ unsafe fn fork_child_in_pty(
     // controlling terminal, so job control does not work, `Ctrl+C` reaches nothing, and
     // no error is ever printed. Failing to `_exit(127)` here is the difference between a
     // tab that visibly refuses to open and one that opens subtly broken.
-    if ioctl(slave, TIOCSCTTY, 0 as c_ulong) < 0 {
+    if claim_tty && ioctl(slave, TIOCSCTTY, 0 as c_ulong) < 0 {
         _exit(127);
     }
     for fd in [0, 1, 2] {
@@ -1011,7 +1082,11 @@ mod tests {
     /// callers skip rather than fail. The child is expected to be short-lived; the
     /// deadline only stops a wedged one from hanging the suite.
     fn output_of(argv: &[&str]) -> Option<String> {
-        let pty = Pty::spawn_command(80, 24, argv).ok()?;
+        Pty::spawn_command(80, 24, argv).ok().map(drain)
+    }
+
+    /// Everything `pty`'s child writes before it exits, within a deadline.
+    fn drain(pty: Pty) -> String {
         let mut poll_set = PollSet::new();
         poll_set.add(pty.fd());
         let mut got = Vec::new();
@@ -1026,7 +1101,41 @@ mod tests {
                 ReadOutcome::Eof => break,
             }
         }
-        Some(String::from_utf8_lossy(&got).into_owned())
+        String::from_utf8_lossy(&got).into_owned()
+    }
+
+    #[test]
+    fn only_a_local_child_claims_the_pty_as_its_controlling_terminal() {
+        // A shell on the Flatpak host can take the PTY only if this side left it unclaimed.
+        // Field 7 of /proc/<pid>/stat, `tty_nr`, is 0 for a process with none. `cat` is
+        // exec'd directly because bash, started as a session leader with no controlling
+        // terminal, claims its stdin's tty itself.
+        let tty_nr = |target| {
+            let argv = ["/bin/cat", "/proc/self/stat"].map(String::from).to_vec();
+            let pty = Pty::spawn(80, 24, &Launch::new(argv, target)).ok()?;
+            let stat = drain(pty);
+            let (_, fields) = stat.rsplit_once(')')?;
+            fields.split_whitespace().nth(4)?.parse::<i64>().ok()
+        };
+        let (Some(local), Some(host)) = (tty_nr(Target::Local), tty_nr(Target::FlatpakHost)) else {
+            eprintln!("fork/exec unavailable; skipping");
+            return;
+        };
+        assert_ne!(local, 0, "a local child owns its terminal");
+        assert_eq!(host, 0, "the far side of flatpak-spawn is left to claim it");
+    }
+
+    #[test]
+    fn a_shell_on_the_flatpak_host_reports_no_local_process_state() {
+        // This process's /proc describes flatpak-spawn there, not the shell, so the tab
+        // falls back to what the shell itself reports rather than showing a wrong answer.
+        let launch = Launch::new(vec!["/bin/cat".to_string()], Target::FlatpakHost);
+        let Ok(pty) = Pty::spawn(80, 24, &launch) else {
+            eprintln!("fork/exec unavailable; skipping");
+            return;
+        };
+        assert_eq!(pty.cwd(), None);
+        assert_eq!(pty.foreground_program(), None);
     }
 
     /// The value of a `/proc/<pid>/status` signal-mask line, as the 64-bit mask it

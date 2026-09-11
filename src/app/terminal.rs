@@ -35,7 +35,7 @@ use crate::mouse::{self, MouseButton, MouseKind};
 use crate::platform::browser;
 use crate::platform::geom::{Rect, Scale};
 use crate::platform::scroll::{self, Scrollbar};
-use crate::pty::{Pty, TtyMode, ZombieChild};
+use crate::pty::{Launch, Pty, TtyMode, ZombieChild};
 use crate::render::display::DisplayList;
 use crate::term_render::{self, CellMetrics, CellSpan, CursorRender, CursorShape, Selection};
 use crate::vt::Parser;
@@ -418,16 +418,15 @@ impl TerminalCore {
     }
 
     /// Spawn the shell on a PTY sized to the current grid, returning the grid it
-    /// was sized to (for the startup log), with `args` the shell integration's (see
-    /// [`crate::shell_integration::Session::shell_args`]). Only the live path calls
+    /// was sized to (for the startup log), started as `launch` says. Only the live path calls
     /// this; demo mode never spawns a child. A gather thread is started on a
     /// duplicate of the master
     /// fd to drain the child's output; if it cannot start (no eventfd or thread,
     /// which on Linux means the process is already out of descriptors or threads),
     /// shell startup fails cleanly rather than limping on.
-    pub(super) fn spawn_shell(&mut self, args: &[String]) -> Result<(usize, usize)> {
+    pub(super) fn spawn_shell(&mut self, launch: &Launch) -> Result<(usize, usize)> {
         let (cols, rows) = self.screen.dimensions();
-        self.spawn_pty(Pty::spawn(cols, rows, args)?)
+        self.spawn_pty(Pty::spawn(cols, rows, launch)?)
     }
 
     /// [`spawn_shell`](Self::spawn_shell) against an explicitly named program instead of
