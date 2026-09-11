@@ -95,7 +95,7 @@ PATH="$TEST_DIR/fake-bin:/usr/bin:/bin" \
     sh "$ROOT/install.sh" > "$TEST_DIR/install.log"
 
 [ -x "$home/.local/bin/bnkterm" ] || fail "the binary was not installed"
-expected="$(printf 'Exec="%s/Home space%%%%quote\\\"/.local/bin/bnkterm"' "$TEST_DIR")"
+expected="Exec=\"$TEST_DIR/Home space%%quote\\\"/.local/bin/bnkterm\""
 desktop="$data_home/applications/bnkterm.desktop"
 grep -Fqx -- "$expected" "$desktop" \
     || fail "the installed desktop entry does not contain the escaped absolute path"
