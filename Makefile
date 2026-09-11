@@ -1,4 +1,4 @@
-.PHONY: all build build-release install uninstall build-linux test test-install \
+.PHONY: all build build-release install uninstall bump build-linux test test-install \
 	test-abi check flatpak flatpak-lint fix shaders clean size
 
 APP_NAME := bnkterm
@@ -46,6 +46,19 @@ uninstall:
 	rm -f $(BIN_DIR)/$(APP_NAME) $(APPS_DIR)/$(APP_NAME).desktop $(ICON_DIR)/$(APP_NAME).svg
 	-update-desktop-database $(APPS_DIR)
 	@echo "Removed $(APP_NAME) from $(BIN_DIR)/ and ~/.local/share/"
+
+# Bump the version, commit, and tag: make bump V=0.2.0
+# The release workflow rejects a tag that does not match this version, and the
+# metainfo entry is the release history the Flatpak reports.
+bump:
+	@test -n "$(V)" || (echo "Current: $(VERSION). Usage: make bump V=0.2.0" && exit 1)
+	sed -i '0,/^version = ".*"/{s//version = "$(V)"/}' Cargo.toml
+	sed -i 's|<releases>|<releases>\n    <release version="$(V)" date="'"$$(date -u +%F)"'"/>|' assets/$(APP_ID).metainfo.xml
+	cargo update --workspace
+	git add Cargo.toml Cargo.lock assets/$(APP_ID).metainfo.xml
+	git commit -m "Bump version to $(V)"
+	git tag "v$(V)"
+	@echo "Bumped to v$(V). Push with: git push origin main --tags"
 
 # Build a release tarball into dist/ for upload to a GitHub Release, with the
 # checksum install.sh verifies beside it. The layout is install.sh's contract.

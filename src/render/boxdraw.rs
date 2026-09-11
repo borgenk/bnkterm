@@ -1,37 +1,15 @@
-//! Procedural rasterization of the Box Drawing (U+2500..=U+257F) and Block
-//! Elements (U+2580..=U+259F) blocks, so a terminal never depends on the font
-//! for them.
+//! Procedural rasterization of the Box Drawing (U+2500..=U+257F), Block Elements
+//! (U+2580..=U+259F), and Braille Patterns (U+2800..=U+28FF) blocks.
 //!
-//! # Drawn here, not taken from the font
+//! Fonts cover these ranges unevenly (Consolas lacks the quadrants, so `▛` is
+//! tofu), draw them against their own em box rather than the cell (hairline seams
+//! between neighbours), and may draw braille's unraised dots as hollow rings.
+//! Drawing them at the cell size avoids all three.
 //!
-//! Two independent reasons, either one decisive:
-//!
-//! 1. **Coverage.** Fonts carry this range unevenly. Consolas, for one, ships the
-//!    half and full blocks but not the quadrants (U+2596..=U+259F), so a glyph
-//!    like `▛` renders as the `.notdef` tofu box even though `█` beside it does
-//!    not. A TUI (or the Claude CLI's `▐▛███▜▌` logo) then comes out full of
-//!    holes. There is no font-fallback fix that is guaranteed complete.
-//! 2. **Tiling.** These glyphs are meant to abut seamlessly: a run of `─` must be
-//!    one unbroken rule, `└` under `┌` one unbroken corner, `▀` over `▄` one solid
-//!    column. A font designs its glyphs against its own em box, not the terminal's
-//!    cell, so its block glyphs land a fraction of a pixel off and leave hairline
-//!    seams. Drawing at the exact cell size is the only way the grid stays solid.
-//!
-//! Every serious terminal (xterm is the exception, kitty/foot/alacritty/wezterm/
-//! ghostty the rule) draws this range procedurally for exactly these reasons.
-//!
-//! # The seam
-//!
-//! This module is a pure function of `(char, cell_w, cell_h)` and nothing else:
-//! it returns a top-down `cell_w * cell_h` R8 coverage buffer, the same shape a
-//! FreeType raster hands the atlas. The GPU batcher packs it into the coverage
-//! atlas and places it at `left = 0, top = baseline` so it fills the cell box
-//! exactly. Keying the raster on the cell size (which the [`crate::render::gpu`]
-//! batcher derives from the same metrics the grid lays out on) is what makes the
-//! glyph land pixel-for-pixel on its cell. No GPU, PTY, or font is needed to test
-//! it: feed a char and a size, assert the bytes.
-//!
-//! # How each family is drawn
+//! [`coverage`] is a pure function of `(char, cell_w, cell_h)` returning a top-down
+//! `cell_w * cell_h` R8 buffer, the same shape as a FreeType raster. The
+//! [`crate::render::gpu`] batcher places it at `left = 0, top = baseline`, so it
+//! fills the cell box exactly.
 //!
 //! ```text
 //!   Box Drawing U+2500..=U+257F
@@ -47,17 +25,17 @@
 //!     ├─ eighth blocks     ▀ ▁ ▌ ▐ …    → one rectangle, a fraction of the cell
 //!     ├─ shades            ░ ▒ ▓        → a uniform partial coverage over the cell
 //!     └─ quadrants         ▘ ▙ ▚ ▟ …    → a union of the four cell quarters
+//!   Braille Patterns U+2800..=U+28FF
+//!     └─ dot matrix        ⠁ ⠂ ⡀ ⣿ …    → one square per raised dot on a 2x4 grid
 //! ```
 //!
-//! The line families fill crisp 0/255 rectangles (a box rule wants hard edges);
-//! only the arcs and diagonals antialias, because a sloped edge without it
-//! stair-steps. Complementary blocks partition the cell exactly (`▀` and `▄`
-//! together cover every row) so they tile without a gap or a doubled pixel.
+//! Everything but the arcs and diagonals is crisp 0/255 rectangles; those two
+//! antialias because a sloped edge stair-steps without it. Complementary blocks
+//! partition the cell exactly (`▀` and `▄` cover every row once), so they tile.
 
-/// Whether `ch` is rasterized here rather than by the font. Exactly the Box
-/// Drawing and Block Elements blocks, contiguous as U+2500..=U+259F.
+/// Whether `ch` is drawn here rather than by the font.
 pub fn is_glyph(ch: char) -> bool {
-    matches!(ch, '\u{2500}'..='\u{259F}')
+    matches!(ch, '\u{2500}'..='\u{259F}' | '\u{2800}'..='\u{28FF}')
 }
 
 /// A `w * h` top-down R8 coverage buffer for `ch` at a `w`-by-`h` pixel cell.
@@ -159,6 +137,7 @@ fn draw(cv: &mut Canvas, ch: char) {
     match c {
         0x2500..=0x257F => draw_box(cv, c),
         0x2580..=0x259F => draw_block(cv, c),
+        0x2800..=0x28FF => draw_braille(cv, c),
         _ => {}
     }
 }
@@ -640,9 +619,109 @@ fn quadrants(cv: &mut Canvas, c: u32) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Braille patterns (U+2800..=U+28FF)
+// ---------------------------------------------------------------------------
+
+/// `(bit, column, row)` of each dot on the 2x4 grid. Dots 7 and 8 (`0x40`, `0x80`)
+/// are the bottom row.
+const BRAILLE_DOTS: [(u32, i32, i32); 8] = [
+    (0x01, 0, 0),
+    (0x02, 0, 1),
+    (0x04, 0, 2),
+    (0x08, 1, 0),
+    (0x10, 1, 1),
+    (0x20, 1, 2),
+    (0x40, 0, 3),
+    (0x80, 1, 3),
+];
+
+/// One square per raised dot, nothing else. The codepoint's low byte is the dot mask.
+fn draw_braille(cv: &mut Canvas, c: u32) {
+    let grid = BrailleGrid::new(cv.w, cv.h);
+    let raised = c & 0xFF;
+    for (bit, col, row) in BRAILLE_DOTS {
+        if raised & bit != 0 {
+            let (x, y) = grid.dot_at(col, row);
+            cv.rect(x, x + grid.dot, y, y + grid.dot, 255);
+        }
+    }
+}
+
+/// Dot size and spacing for one braille cell: an even split of the cell, then the
+/// pixels lost to rounding go, in order, to a dot of at least 1px, a margin of at
+/// least 1px (so adjacent cells' dots never touch), a wider gap, wider margins, and a
+/// bigger dot.
+struct BrailleGrid {
+    dot: i32,
+    x_margin: i32,
+    x_gap: i32,
+    y_margin: i32,
+    y_gap: i32,
+}
+
+impl BrailleGrid {
+    fn new(w: i32, h: i32) -> Self {
+        let mut dot = (w / 4).min(h / 8);
+        let mut x_gap = w / 4;
+        let mut y_gap = h / 8;
+        let mut x_margin = x_gap / 2;
+        let mut y_margin = y_gap / 2;
+        let mut x_left = w - 2 * x_margin - 2 * dot - x_gap;
+        let mut y_left = h - 2 * y_margin - 4 * dot - 3 * y_gap;
+        if dot == 0 && x_left >= 2 && y_left >= 4 {
+            dot = 1;
+            x_left -= 2;
+            y_left -= 4;
+        }
+        if x_margin == 0 && x_left >= 2 {
+            x_margin = 1;
+            x_left -= 2;
+        }
+        if y_margin == 0 && y_left >= 2 {
+            y_margin = 1;
+            y_left -= 2;
+        }
+        if x_left >= 1 {
+            x_gap += 1;
+            x_left -= 1;
+        }
+        if y_left >= 3 {
+            y_gap += 1;
+            y_left -= 3;
+        }
+        if x_left >= 2 {
+            x_margin += 1;
+            x_left -= 2;
+        }
+        if y_left >= 2 {
+            y_margin += 1;
+            y_left -= 2;
+        }
+        if x_left >= 2 && y_left >= 4 {
+            dot += 1;
+        }
+        Self {
+            dot,
+            x_margin,
+            x_gap,
+            y_margin,
+            y_gap,
+        }
+    }
+
+    /// The top-left pixel of the dot in `col` (0 or 1) and `row` (0 to 3).
+    fn dot_at(&self, col: i32, row: i32) -> (i32, i32) {
+        (
+            self.x_margin + col * (self.dot + self.x_gap),
+            self.y_margin + row * (self.dot + self.y_gap),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::render::boxdraw::*;
 
     /// Coverage at `(x, y)` in a `w`-wide buffer.
     fn at(buf: &[u8], w: usize, x: usize, y: usize) -> u8 {
@@ -664,19 +743,23 @@ mod tests {
     }
 
     #[test]
-    fn is_glyph_covers_exactly_the_two_blocks() {
+    fn is_glyph_covers_exactly_the_three_blocks() {
         assert!(is_glyph('\u{2500}')); // first box drawing
         assert!(is_glyph('\u{259F}')); // last block element
         assert!(is_glyph('█'));
         assert!(is_glyph('▛'));
+        assert!(is_glyph('\u{2800}')); // blank braille pattern
+        assert!(is_glyph('\u{28FF}')); // all eight dots
         assert!(!is_glyph('\u{24FF}'));
         assert!(!is_glyph('\u{25A0}')); // black square, just past the range
+        assert!(!is_glyph('\u{27FF}')); // just before braille
+        assert!(!is_glyph('\u{2900}')); // just after it
         assert!(!is_glyph('A'));
     }
 
     #[test]
     fn coverage_is_exactly_cell_sized() {
-        for ch in ['█', '─', '╬', '╭', '╱', '▟', '░'] {
+        for ch in ['█', '─', '╬', '╭', '╱', '▟', '░', '⠂', '⣿'] {
             let buf = coverage(ch, 9, 20);
             assert_eq!(buf.len(), 9 * 20, "{ch} must fill a 9x20 cell");
         }
@@ -684,7 +767,7 @@ mod tests {
 
     #[test]
     fn a_degenerate_cell_never_panics() {
-        for ch in ['█', '┼', '╬', '╭', '╳', '▚'] {
+        for ch in ['█', '┼', '╬', '╭', '╳', '▚', '⣿'] {
             assert!(coverage(ch, 0, 0).is_empty());
             assert_eq!(coverage(ch, 1, 1).len(), 1);
         }
@@ -948,9 +1031,156 @@ mod tests {
         assert_eq!(at(&buf, w, 0, 0), 0, "top-left clear");
     }
 
+    /// The inked pixels' bounding box as half-open `(x0, y0, x1, y1)`, or `None` for
+    /// a blank buffer.
+    fn ink_box(buf: &[u8], w: usize) -> Option<(usize, usize, usize, usize)> {
+        let mut bounds: Option<(usize, usize, usize, usize)> = None;
+        for (i, _) in buf.iter().enumerate().filter(|&(_, &v)| v != 0) {
+            let (x, y) = (i % w, i / w);
+            bounds = Some(match bounds {
+                None => (x, y, x + 1, y + 1),
+                Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1)),
+            });
+        }
+        bounds
+    }
+
+    fn braille(bits: u32) -> char {
+        char::from_u32(0x2800 + bits).unwrap()
+    }
+
+    #[test]
+    fn the_blank_braille_pattern_draws_nothing() {
+        for (w, h) in [(9, 20), (18, 40)] {
+            assert!(coverage('\u{2800}', w, h).iter().all(|&v| v == 0));
+        }
+    }
+
+    /// Dots 7 and 8 hold the two highest bits but sit in the bottom row.
+    #[test]
+    fn each_braille_dot_lands_in_its_unicode_position() {
+        let (w, h) = (9, 20);
+        let dot_box =
+            |bits: u32| ink_box(&coverage(braille(bits), w, h), w).expect("a raised dot inks");
+        // Each column, top to bottom.
+        for column in [[0x01, 0x02, 0x04, 0x40], [0x08, 0x10, 0x20, 0x80]] {
+            let boxes = column.map(dot_box);
+            for pair in boxes.windows(2) {
+                assert_eq!(pair[0].0, pair[1].0, "one column: {boxes:?}");
+                assert!(pair[0].3 <= pair[1].1, "each dot below the last: {boxes:?}");
+            }
+        }
+        // Each row, left to right.
+        for (left, right) in [(0x01, 0x08), (0x02, 0x10), (0x04, 0x20), (0x40, 0x80)] {
+            let (l, r) = (dot_box(left), dot_box(right));
+            assert_eq!(l.1, r.1, "dots {left:#04x} and {right:#04x} share a row");
+            assert!(l.2 <= r.0, "dot {right:#04x} is right of dot {left:#04x}");
+        }
+        // Each dot is a solid square with no ink outside it.
+        for bits in [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80] {
+            let buf = coverage(braille(bits), w, h);
+            let (x0, y0, x1, y1) = dot_box(bits);
+            assert_eq!(x1 - x0, y1 - y0, "dot {bits:#04x} is square");
+            let inked = buf.iter().filter(|&&v| v != 0).count();
+            assert_eq!(
+                inked,
+                (x1 - x0) * (y1 - y0),
+                "dot {bits:#04x} is solid, no stray ink"
+            );
+            assert!(
+                buf.iter().all(|&v| v == 0 || v == 255),
+                "dot {bits:#04x} is crisp"
+            );
+        }
+    }
+
+    /// Each of the 256 patterns is the pixelwise union of its single-dot rasters.
+    #[test]
+    fn every_braille_pattern_is_the_union_of_its_dots() {
+        for (w, h) in [(9, 20), (18, 40), (7, 15)] {
+            let dots: Vec<Vec<u8>> = (0..8)
+                .map(|bit| coverage(braille(1 << bit), w, h))
+                .collect();
+            for bits in 0u32..=0xFF {
+                let buf = coverage(braille(bits), w, h);
+                for i in 0..w * h {
+                    let raised = (0..8).any(|bit| bits & (1 << bit) != 0 && dots[bit][i] == 255);
+                    let want = if raised { 255 } else { 0 };
+                    assert_eq!(
+                        buf[i],
+                        want,
+                        "{} at pixel {i} of a {w}x{h} cell",
+                        braille(bits)
+                    );
+                }
+            }
+        }
+    }
+
+    /// `⣿` inks exactly eight whole dots at every size, none clipped or overlapping.
+    /// Cells smaller than 2x4 stay blank.
+    #[test]
+    fn the_braille_grid_fits_every_cell_without_overlap() {
+        for w in 1..=40 {
+            for h in 1..=80 {
+                let dot = BrailleGrid::new(w as i32, h as i32).dot as usize;
+                assert_eq!(dot > 0, w >= 2 && h >= 4, "dot size {dot} at {w}x{h}");
+                let ink = coverage('⣿', w, h).iter().filter(|&&v| v == 255).count();
+                assert_eq!(
+                    ink,
+                    8 * dot * dot,
+                    "⣿ is eight whole, disjoint dots at {w}x{h}"
+                );
+            }
+        }
+    }
+
+    /// From 5x10 up (at least as tall as wide), dots keep 1px from the cell edge and
+    /// from each other, so dots in neighbouring cells never fuse.
+    #[test]
+    fn braille_dots_stay_clear_of_the_cell_edges_and_each_other() {
+        for w in 5..=40 {
+            for h in w.max(10)..=100 {
+                let buf = coverage('⣿', w, h);
+                let clear = |x: usize, y: usize| at(&buf, w, x, y) == 0;
+                assert!(
+                    (0..w).all(|x| clear(x, 0) && clear(x, h - 1)),
+                    "⣿ touches the top or bottom edge of a {w}x{h} cell"
+                );
+                assert!(
+                    (0..h).all(|y| clear(0, y) && clear(w - 1, y)),
+                    "⣿ touches the left or right edge of a {w}x{h} cell"
+                );
+                let (x, y) = BrailleGrid::new(w as i32, h as i32).dot_at(0, 0);
+                let (x, y) = (x as usize, y as usize);
+                let across = runs((0..w).map(|c| !clear(c, y)));
+                let down = runs((0..h).map(|r| !clear(x, r)));
+                assert_eq!(across, 2, "two separate dots across a {w}x{h} cell");
+                assert_eq!(down, 4, "four separate dots down a {w}x{h} cell");
+            }
+        }
+    }
+
+    /// Pins the layout at a few cell sizes.
+    #[test]
+    fn the_braille_layout_is_pinned() {
+        // (w, h) -> (dot, x_margin, x_gap, y_margin, y_gap)
+        let cases = [
+            ((9, 20), (2, 1, 3, 1, 3)),
+            ((18, 40), (4, 2, 5, 3, 6)),
+            ((8, 17), (2, 1, 2, 1, 2)),
+            ((7, 15), (1, 1, 2, 2, 2)),
+        ];
+        for ((w, h), want) in cases {
+            let g = BrailleGrid::new(w, h);
+            let got = (g.dot, g.x_margin, g.x_gap, g.y_margin, g.y_gap);
+            assert_eq!(got, want, "braille layout of a {w}x{h} cell");
+        }
+    }
+
     #[test]
     fn coverage_never_panics_over_the_whole_range() {
-        for c in 0x2500u32..=0x259F {
+        for c in (0x2500u32..=0x259F).chain(0x2800..=0x28FF) {
             if let Some(ch) = char::from_u32(c) {
                 for (w, h) in [(1, 1), (3, 5), (9, 20), (16, 32)] {
                     let buf = coverage(ch, w, h);

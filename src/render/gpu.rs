@@ -409,7 +409,7 @@ pub struct GlyphCache {
     /// the defended map underneath.
     ascii_slots: Vec<AsciiRow>,
     scalar_slots: HashMap<(FaceKey, char), PackedGlyph>,
-    /// Procedurally-drawn box/block rasters, held apart from the font ones.
+    /// [`boxdraw`] rasters, held apart from the font ones.
     ///
     /// A separate map rather than a shared key, because the same character genuinely has
     /// two different rasters and both are correct in their place: on the grid `─` is drawn
@@ -421,8 +421,8 @@ pub struct GlyphCache {
     /// drawing should tile. It was a comment asserting "a given char is always a box glyph
     /// or never one"; now it is two maps, and no path can reach the other's entry.
     ///
-    /// Bounded by construction: [`boxdraw::is_glyph`] is 160 codepoints, so this holds at
-    /// most `160 * faces` and needs no cap of its own.
+    /// Bounded by construction: [`boxdraw::is_glyph`] is 416 codepoints, so this holds at
+    /// most `416 * faces` and needs no cap of its own.
     box_slots: HashMap<(FaceKey, char), PackedGlyph>,
     /// Nested so lookups borrow the cluster as `&str` (no per-frame `String`).
     /// A `None` value records a cluster that is not color emoji, so a
@@ -777,7 +777,7 @@ impl Batcher<'_> {
     }
 
     /// [`Self::cells`] for a run that needs real segmentation: anything carrying
-    /// combining marks, box/block glyphs, or emoji.
+    /// combining marks, [`boxdraw`] glyphs, or emoji.
     fn cells_segmented(
         &mut self,
         face_key: FaceKey,
@@ -787,7 +787,7 @@ impl Batcher<'_> {
         text: &str,
         paint: Paint,
     ) {
-        // The cell box a procedurally-drawn box/block glyph fills: its height and
+        // The cell box a procedurally-drawn glyph fills: its height and
         // the baseline offset that seats it, both from the same metrics the grid
         // laid out on (read once, not per cluster).
         let m = self.fonts.metrics(face_key.size());
@@ -795,10 +795,9 @@ impl Batcher<'_> {
         let face = self.fonts.face_for(face_key);
         for (i, (_, cluster)) in grapheme::graphemes(text).enumerate() {
             let pen = (x + i as i32 * cell_w) as f32;
-            // Box Drawing and Block Elements are rasterized here, not by the font,
-            // so they cover the cell exactly and tile (see `render::boxdraw`).
-            // They are single-width BMP scalars, so they only ever arrive as a
-            // lone-char cluster on this fixed-pitch path, never through `text`.
+            // `render::boxdraw` glyphs cover the cell exactly, so they tile. They are
+            // single-width BMP scalars, so they only ever arrive as a lone-char cluster
+            // on this fixed-pitch path, never through `text`.
             if let Some(ch) = box_glyph(cluster) {
                 let packed = self.packed_box(face_key, ch, cell_w, cell_h, baseline_offset);
                 self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, paint);
@@ -878,7 +877,7 @@ impl Batcher<'_> {
         packed
     }
 
-    /// The cached placement for a procedurally-drawn box/block glyph, sized to the
+    /// The cached placement for a [`boxdraw`] glyph, sized to the
     /// `w`-by-`h` cell. Its coverage comes from [`boxdraw::coverage`] instead of a
     /// FreeType raster, and it is anchored at `left = 0, top = baseline_offset` (the
     /// metrics' baseline, i.e. the distance from the cell's top edge down to the
@@ -913,8 +912,8 @@ impl Batcher<'_> {
             advance: w as f32,
         };
         // Not `cache_scalar`: that routes ASCII into the direct-mapped rows and caps the
-        // font map, neither of which applies here (box glyphs are U+2500..=U+259F, a
-        // closed set of 160).
+        // font map, neither of which applies here (`boxdraw::is_glyph` is a closed set
+        // of 416 codepoints).
         self.cache.box_slots.insert((face_key, ch), packed);
         packed
     }
@@ -1053,7 +1052,7 @@ fn center_in_cell(packed: PackedGlyph, cell_w: i32) -> PackedGlyph {
 ///   `SpacingMark`, so nothing merges with a neighbour. `CR`/`LF` are the one ASCII
 ///   pair a segmenter *does* join (UAX #29, GB3), and excluding the controls keeps
 ///   them out rather than betting they never reach a run.
-/// - **Never a box/block glyph.** Those are `U+2500`-`U+259F`, well outside ASCII.
+/// - **Never a box glyph.** Those start at `U+2500`, well outside ASCII.
 /// - **Never emoji.** `wants_emoji` routes a lone char on `Extended_Pictographic`,
 ///   which no ASCII scalar is, so the cluster probe can only ever answer `None`.
 ///
@@ -1075,7 +1074,7 @@ fn is_plain_ascii(text: &str) -> bool {
     bytes::all_printable(text.as_bytes())
 }
 
-/// The lone box/block scalar in `cluster`, or `None` if the cluster is not
+/// The lone [`boxdraw`] scalar in `cluster`, or `None` if the cluster is not
 /// exactly one such character. A box glyph never carries combining marks, so a
 /// multi-char cluster is disqualified outright.
 fn box_glyph(cluster: &str) -> Option<char> {
@@ -1655,57 +1654,54 @@ mod tests {
 
     #[test]
     fn box_glyph_fills_its_cell_from_boxdraw_not_the_font() {
-        // `▛` (U+259B) is a quadrant block many monospace fonts lack, so through
-        // the font it would be `.notdef` tofu. It must instead be rasterized by
-        // `render::boxdraw` into a quad that covers the whole cell box exactly, so
-        // it tiles: top-left at (pen, baseline - m.baseline), size (cell_w, cell_h).
-        // Seating it on the ascent instead would float the quad above its cell by
-        // the font's line gap, leaving a seam between stacked block rows.
+        // Through the font, `▛` is tofu in many monospace fonts and `⠂` can come with
+        // rings for its unraised dots. Both must be rasterized by `render::boxdraw` into
+        // a quad covering exactly the cell box: top-left at (pen, baseline - m.baseline),
+        // size (cell_w, cell_h). Seated on the ascent instead, it would float above its
+        // cell by the line gap and leave a seam between rows.
         let fonts = Fonts::new(&[16]).expect("default font");
-        let mut cache = GlyphCache::new();
         let m = fonts.metrics(16);
         let (baseline_offset, cell_h) = (m.baseline, m.line_height.max(1));
         let cell_w = 11;
         let (x, baseline) = (7, 16);
-        let list = vec![DrawCmd::Cells {
-            bounds: Rect {
-                x: 0,
-                y: 0,
-                w: 100,
-                h: 40,
-            },
-            x,
-            baseline,
-            cell_w,
-            face: FaceKey::Code { size: 16 },
-            color: 0x00ff_ffff,
-            bg: 0,
-            text: "▛".to_string(),
-        }];
-        let f = build_frame(&fonts, &list, &mut cache, GAMMA);
-        assert_eq!(
-            f.vertices.len(),
-            6,
-            "one full-cell quad for the block glyph"
-        );
-        assert!(
-            f.vertices.iter().all(|v| v.mode == MODE_GLYPH),
-            "drawn as a coverage glyph, not tofu or a solid fill"
-        );
-        // The quad is the cell box: top-left corner and bottom-right corner.
-        assert_eq!(
-            f.vertices[0].pos,
-            [x as f32, (baseline - baseline_offset) as f32],
-            "top-left seats the glyph at the cell origin"
-        );
-        assert_eq!(
-            f.vertices[4].pos,
-            [
-                (x + cell_w) as f32,
-                (baseline - baseline_offset + cell_h) as f32
-            ],
-            "bottom-right fills the whole cell, so the glyph tiles"
-        );
+        for glyph in ["▛", "⠂"] {
+            let mut cache = GlyphCache::new();
+            let list = vec![DrawCmd::Cells {
+                bounds: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 100,
+                    h: 40,
+                },
+                x,
+                baseline,
+                cell_w,
+                face: FaceKey::Code { size: 16 },
+                color: 0x00ff_ffff,
+                bg: 0,
+                text: glyph.to_string(),
+            }];
+            let f = build_frame(&fonts, &list, &mut cache, GAMMA);
+            assert_eq!(f.vertices.len(), 6, "one full-cell quad for {glyph}");
+            assert!(
+                f.vertices.iter().all(|v| v.mode == MODE_GLYPH),
+                "{glyph} drawn as a coverage glyph, not tofu or a solid fill"
+            );
+            // The quad is the cell box: top-left corner and bottom-right corner.
+            assert_eq!(
+                f.vertices[0].pos,
+                [x as f32, (baseline - baseline_offset) as f32],
+                "top-left seats {glyph} at the cell origin"
+            );
+            assert_eq!(
+                f.vertices[4].pos,
+                [
+                    (x + cell_w) as f32,
+                    (baseline - baseline_offset + cell_h) as f32
+                ],
+                "bottom-right fills the whole cell, so {glyph} tiles"
+            );
+        }
     }
 
     #[test]
@@ -1714,10 +1710,8 @@ mod tests {
         // drawn by `render::boxdraw` to fill the cell edge to edge and tile with its
         // neighbours, and as prose it comes from the font at the font's own bearing and
         // advance. Cached under one key, whichever arrived first decided how `─` drew
-        // everywhere for the rest of the process's life. Reaching the prose path with one
-        // was never hypothetical: the cursor's inverted stamp emits `DrawCmd::Text`, so a
-        // single box char under the cursor left every box glyph on the grid at font
-        // metrics — tofu, or hairline seams where the drawing should tile.
+        // everywhere for the rest of the process's life: tofu, or hairline seams where the
+        // drawing should tile. Any `DrawCmd::Text` under a grid face can carry one.
         let fonts = Fonts::new(&[16]).expect("default font");
         let mut cache = GlyphCache::new();
         let face = FaceKey::Prose {

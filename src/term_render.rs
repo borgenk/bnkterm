@@ -696,7 +696,7 @@ impl Painter<'_> {
                 col += 1;
                 continue;
             }
-            if cell.is_wide_leader() || !cells_safe(cell.rune) {
+            if stands_alone(cell) {
                 // Wide glyphs and astral runes stand alone at their exact column,
                 // so their non-uniform advance can never shift a following cell.
                 self.push_glyph(row, col, cell, baseline);
@@ -1174,6 +1174,9 @@ impl Painter<'_> {
     /// Re-draw the glyph beneath a focused block cursor in the cell's background
     /// colour, so the character shows as a cutout in the cursor block.
     ///
+    /// Drawn through the same command as the row ([`stands_alone`]), so a box, block, or
+    /// braille glyph stays procedural under the cursor.
+    ///
     /// A concealed cell has no glyph to cut out: [`Shown`] returns a space with no ink,
     /// and this draws nothing. That is the point of asking rather than reading the cell
     /// directly — the cursor is the one place a masked field is guaranteed to have a
@@ -1196,19 +1199,25 @@ impl Painter<'_> {
         // stamped over the cursor block, so that colour is the background the glyph
         // anti-aliasing is weighted against.
         let (_, ink) = self.resolve(cell, false);
-        self.list.push(DrawCmd::Text {
-            bounds: text_bounds(x, baseline, width_cells * m.w, m),
-            x,
-            baseline,
-            face: FaceKey::Prose {
-                size: m.size,
-                style: style_of(cell.attrs),
-            },
-            color: ink.to_u32(),
-            bg: self.theme.cursor.to_u32(),
-            fade: None,
-            text,
-        });
+        let face = FaceKey::Prose {
+            size: m.size,
+            style: style_of(cell.attrs),
+        };
+        let (color, bg) = (ink.to_u32(), self.theme.cursor.to_u32());
+        if stands_alone(cell) {
+            self.list.push(DrawCmd::Text {
+                bounds: text_bounds(x, baseline, width_cells * m.w, m),
+                x,
+                baseline,
+                face,
+                color,
+                bg,
+                fade: None,
+                text,
+            });
+        } else {
+            push_owned_cells(self.list, text, x, baseline, 1, m, face, color, bg);
+        }
     }
 
     /// The block cursor: filled with the glyph inverted out of it when the window has
@@ -1646,6 +1655,12 @@ fn text_bounds(x: i32, baseline: i32, run_w: i32, m: CellMetrics) -> Rect {
 /// An excluded rune is drawn standalone, the same treatment a wide rune already gets.
 fn cells_safe(rune: char) -> bool {
     (rune as u32) <= 0xFFFF && !grapheme::joins_across_cells(rune)
+}
+
+/// Whether a cell draws as its own [`DrawCmd::Text`] instead of in a fixed-pitch run.
+/// Shared by the row painter and the cursor stamp, so both draw a cell the same way.
+fn stands_alone(cell: Cell) -> bool {
+    cell.is_wide_leader() || !cells_safe(cell.rune)
 }
 
 /// The font style a cell's bold/italic attributes select. Takes the attributes rather
@@ -2167,9 +2182,9 @@ mod tests {
                 h: M.h
             }
         );
-        // The inverted 'X' is a Text in the background colour, drawn last.
+        // The inverted 'X' is drawn last, in the background colour.
         match list.last().unwrap() {
-            DrawCmd::Text { text, color, .. } => {
+            DrawCmd::Cells { text, color, .. } => {
                 assert_eq!(text, "X");
                 assert_eq!(*color, t.bg.to_u32(), "the cursor glyph is inverted");
             }
@@ -2203,12 +2218,12 @@ mod tests {
                 t.bg.to_u32()
             )
         );
-        // Glyph run and cursor block both ride the origin, so they stay aligned:
-        // the run at (ox, oy + ascent), the cursor block at (ox, oy).
+        // The run, its inverted stamp, and the cursor block all ride the origin: the
+        // glyphs at (ox, oy + ascent), the block at (ox, oy).
         assert_eq!(
             cells_runs(&list),
-            vec![(ox, oy + M.baseline, "X".to_string())],
-            "the run is shifted by the content origin"
+            vec![(ox, oy + M.baseline, "X".to_string()); 2],
+            "the run and its inverted stamp are shifted by the content origin"
         );
         let cursor_fill = fills(&list)
             .into_iter()
@@ -2296,9 +2311,42 @@ mod tests {
             ..inputs(&plain, &t)
         });
         assert!(
-            matches!(list.last(), Some(DrawCmd::Text { text, .. }) if text == "s"),
+            matches!(list.last(), Some(DrawCmd::Cells { text, .. }) if text == "s"),
             "an unconcealed cell still stamps: {list:?}"
         );
+    }
+
+    /// The cursor stamp is the row's own command for the cell, with inverted colours.
+    #[test]
+    fn the_cursor_stamps_a_cell_through_the_command_its_row_draws_it_with() {
+        let t = Theme::default();
+        for glyph in ["X", "⠂", "─", "▛", "⚠", "漢", "\u{1D400}"] {
+            let mut s = Screen::new(4, 1);
+            feed(&mut s, glyph.as_bytes());
+            s.move_to(0, 0);
+            let row = list_of(&s);
+            let mut want = row
+                .iter()
+                .find(|c| matches!(c, DrawCmd::Cells { .. } | DrawCmd::Text { .. }))
+                .unwrap_or_else(|| panic!("{glyph:?} draws a glyph: {row:?}"))
+                .clone();
+            match &mut want {
+                DrawCmd::Cells { color, bg, .. } | DrawCmd::Text { color, bg, .. } => {
+                    *color = t.bg.to_u32();
+                    *bg = t.cursor.to_u32();
+                }
+                other => panic!("not a glyph command: {other:?}"),
+            }
+            let stamped = build_display_list(&FrameInputs {
+                cursor: CursorRender::default(),
+                ..inputs(&s, &t)
+            });
+            assert_eq!(
+                stamped.last(),
+                Some(&want),
+                "{glyph:?}: the stamp must be the row's own command, inverted"
+            );
+        }
     }
 
     /// A `Lock` cursor over a cell holding 'X', at `metrics`. Returns the display list.
@@ -2399,7 +2447,7 @@ mod tests {
             "the cursor falls back to a block, not to nothing"
         );
         match list.last() {
-            Some(DrawCmd::Text { text, color, .. }) => {
+            Some(DrawCmd::Cells { text, color, .. }) => {
                 assert_eq!(text, "X", "the inverted glyph of a normal block cursor");
                 assert_eq!(*color, t.bg.to_u32());
             }
