@@ -1841,10 +1841,8 @@ mod tests {
         );
     }
 
-    /// The characters the Claude CLI prints that a monospace terminal font has no cell
-    /// for, and that no font we pin carries either. Before discovery these were the
-    /// `.notdef` tofu box; each one is now the system's answer, the same answer every
-    /// other application on the machine gets.
+    /// Characters the Claude CLI prints that monospace fonts often have no cell for.
+    /// Which of them the grid's family lacks depends on what `monospace` is here.
     const HOMELESS: [char; 6] = [
         '\u{23FA}', '\u{23BF}', '\u{2713}', '\u{2717}', '\u{273B}', '\u{2801}',
     ];
@@ -1858,15 +1856,16 @@ mod tests {
         };
         let primary = fonts.face_for(key);
 
-        for ch in HOMELESS {
-            // The premise: nothing we chose ourselves can draw these. If a future font
-            // list *does* cover one, this assert is the reminder to re-pick the sample,
-            // not a failure -- but the test below would then be proving nothing.
-            assert!(
-                !primary.has_scalar(ch),
-                "the primary family now covers {ch:?}; pick a character it does not"
-            );
+        let missing: Vec<char> = HOMELESS
+            .into_iter()
+            .filter(|&ch| !primary.has_scalar(ch))
+            .collect();
+        assert!(
+            !missing.is_empty(),
+            "the grid family draws every sample, so fallback goes untested; add one it lacks"
+        );
 
+        for ch in missing {
             let face = fonts.glyph_face(key, ch);
             assert!(
                 face.has_scalar(ch),
