@@ -2027,12 +2027,12 @@ fn random_bytes_into_screen_keep_invariants() {
     // a few characters of wherever the cursor is, so the interesting collisions
     // happen constantly instead of once a megabyte.
     let (cols, rows) = (24, 8);
-    let bytes = crate::fuzz::Stream::new(0xDEAD_BEEF_CAFE_1234).bytes(300 * 4096);
+    let bytes = crate::dev::fuzz::Stream::new(0xDEAD_BEEF_CAFE_1234).bytes(300 * 4096);
 
     let Some(why) = invariant_break(&bytes, cols, rows) else {
         return;
     };
-    let minimal = crate::fuzz::shrink(&bytes, |b| invariant_break(b, cols, rows).is_some());
+    let minimal = crate::dev::fuzz::shrink(&bytes, |b| invariant_break(b, cols, rows).is_some());
     let because = invariant_break(&minimal, cols, rows).unwrap_or_else(|| why.clone());
     panic!(
         "the grid's structural invariants broke: {because}\n\n\
@@ -2043,7 +2043,7 @@ fn random_bytes_into_screen_keep_invariants() {
          so the seed that found it never has to find it twice.",
         bytes.len(),
         minimal.len(),
-        crate::fuzz::as_byte_literal(&minimal),
+        crate::dev::fuzz::as_byte_literal(&minimal),
     );
 }
 
@@ -2153,7 +2153,7 @@ fn bulk_ascii_matches_per_char_under_fuzz() {
 
     // The structured one sets the modes, walks the DCS states, and interrupts sequences
     // mid-flight, so the comparison actually spans the slow paths.
-    let structured = crate::fuzz::Stream::new(0x5EED_1234_ABCD_0001).bytes(300 * 4096);
+    let structured = crate::dev::fuzz::Stream::new(0x5EED_1234_ABCD_0001).bytes(300 * 4096);
     assert_bulk_equiv_over(&structured, "structured");
 }
 

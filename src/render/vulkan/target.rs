@@ -59,6 +59,9 @@ pub struct GpuImage {
     /// once the slot's fence has signaled.
     vertices: HostBuffer,
     staging: HostBuffer,
+    /// Where a captured frame lands on its way to the CPU. Grown on the first
+    /// capture, so an image that is never captured holds nothing.
+    readback: HostBuffer,
     width: u32,
     height: u32,
     stride: u32,
@@ -103,6 +106,7 @@ struct PendingImage<'a> {
     framebuffer: VkFramebuffer,
     vertices: HostBuffer,
     staging: HostBuffer,
+    readback: HostBuffer,
 }
 
 impl Drop for PendingImage<'_> {
@@ -123,6 +127,8 @@ impl Drop for PendingImage<'_> {
             .destroy_host_buffer(std::mem::take(&mut self.vertices));
         self.gpu
             .destroy_host_buffer(std::mem::take(&mut self.staging));
+        self.gpu
+            .destroy_host_buffer(std::mem::take(&mut self.readback));
         // SAFETY: as above; the fd (if exported) closes with its OwnedFd owner.
         unsafe {
             if !self.cmd.is_null() {
@@ -227,6 +233,7 @@ impl Gpu {
             framebuffer: 0,
             vertices: HostBuffer::default(),
             staging: HostBuffer::default(),
+            readback: HostBuffer::default(),
         };
 
         // The image: renderable, clearable, exportable, laid out by one of the
@@ -266,7 +273,7 @@ impl Gpu {
             array_layers: 1,
             samples: VK_SAMPLE_COUNT_1_BIT,
             tiling: VK_IMAGE_TILING_DRM_FORMAT_MODIFIER,
-            // Rendered into by the pipeline; read back by the parity harness.
+            // Rendered into by the pipeline; the transfer source is the capture copy.
             usage: VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
             sharing_mode: VK_SHARING_MODE_EXCLUSIVE,
             queue_family_index_count: 0,
@@ -463,6 +470,7 @@ impl Gpu {
             framebuffer: pending.framebuffer,
             vertices: std::mem::take(&mut pending.vertices),
             staging: std::mem::take(&mut pending.staging),
+            readback: std::mem::take(&mut pending.readback),
             width,
             height,
             stride,
@@ -494,6 +502,7 @@ impl Gpu {
             framebuffer,
             vertices,
             staging,
+            readback,
             ..
         } = img;
         drop(PendingImage {
@@ -508,6 +517,7 @@ impl Gpu {
             framebuffer,
             vertices,
             staging,
+            readback,
         });
     }
 
@@ -521,6 +531,7 @@ impl Gpu {
         img: &mut GpuImage,
         frame: &FrameData,
         background: [f32; 4],
+        capture: bool,
     ) -> Result<()> {
         let d = self.device.raw;
         let f = &self.fns;
@@ -574,7 +585,13 @@ impl Gpu {
             }
         }
 
-        self.record_frame(img, frame, &uploads, background)?;
+        // Sized to the copy's tight packing, not the dmabuf stride.
+        if capture {
+            let bytes = img.width as usize * img.height as usize * 4;
+            self.grow_host_buffer(&mut img.readback, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
+        }
+
+        self.record_frame(img, frame, &uploads, background, capture)?;
         Ok(())
     }
 
@@ -588,8 +605,9 @@ impl Gpu {
         img: &mut GpuImage,
         frame: &FrameData,
         background: [f32; 4],
+        capture: bool,
     ) -> Result<()> {
-        self.prepare_frame(img, frame, background)?;
+        self.prepare_frame(img, frame, background, capture)?;
         // Acquire: the compositor's unfinished reads become a wait semaphore.
         let wait_acquire = self.import_read_fences(img)?;
         self.submit_frame(img, wait_acquire)
@@ -608,10 +626,44 @@ impl Gpu {
         frame: &FrameData,
         background: [f32; 4],
         release_wait: Option<OwnedFd>,
+        capture: bool,
     ) -> Result<Option<OwnedFd>> {
-        self.prepare_frame(img, frame, background)?;
+        self.prepare_frame(img, frame, background, capture)?;
         let wait_acquire = self.import_acquire(img, release_wait)?;
         self.submit_frame_explicit(img, wait_acquire)
+    }
+
+    /// The frame captured into `img`, as ARGB8888 words. Errors when no capture was
+    /// recorded, rather than handing back a blank image.
+    ///
+    /// The capture's memory barrier makes the copy visible to host reads; the fence
+    /// wait ensures that dependency has completed. The buffer is `HOST_COHERENT`,
+    /// so nothing needs invalidating.
+    #[cfg(test)]
+    pub fn read_pixels(&self, img: &GpuImage) -> Result<Vec<u32>> {
+        let pixels = img.width as usize * img.height as usize;
+        let bytes = pixels * 4;
+        if img.readback.ptr.is_null() || img.readback.capacity < bytes {
+            return Err(Error::msg("no captured frame to read back"));
+        }
+        self.wait_fence(img, "vkWaitForFences (capture)")?;
+        // SAFETY: the buffer is mapped and holds at least `bytes` (checked above),
+        // and the submission's copy and host-read barrier have completed (the fence
+        // wait). HOST_COHERENT makes those host-available writes visible here.
+        let raw = unsafe { core::slice::from_raw_parts(img.readback.ptr, bytes) };
+        // The image is B8G8R8A8_UNORM rendered through an sRGB view, so these bytes
+        // are already in the space PNG stores. Only the channel order changes.
+        Ok(raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| {
+                u32::from(p[3]) << 24
+                    | u32::from(p[2]) << 16
+                    | u32::from(p[1]) << 8
+                    | u32::from(p[0])
+            })
+            .collect())
     }
 
     /// The acquire side of the per-frame ownership dance: where the image is
@@ -778,6 +830,7 @@ impl Gpu {
         frame: &FrameData,
         uploads: &[PendingUpload],
         background: [f32; 4],
+        capture: bool,
     ) -> Result<()> {
         let f = &self.fns;
         let begin = VkCommandBufferBeginInfo {
@@ -904,12 +957,32 @@ impl Gpu {
 
             (f.cmd_end_render_pass)(img.cmd);
 
+            // Before the release below: after it the image is the compositor's, and
+            // reading it would mean acquiring it back mid-flight.
+            if capture {
+                self.record_capture(img, range);
+            }
+
+            // Where the image is coming from: the render pass, or the capture copy.
+            let (from_stage, from_access, from_layout) = if capture {
+                (
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                )
+            } else {
+                (
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                )
+            };
             let release = VkImageMemoryBarrier {
                 s_type: VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
                 p_next: core::ptr::null(),
-                src_access_mask: VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                src_access_mask: from_access,
                 dst_access_mask: 0,
-                old_layout: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                old_layout: from_layout,
                 new_layout: VK_IMAGE_LAYOUT_GENERAL,
                 src_queue_family_index: self.queue_family,
                 dst_queue_family_index: VK_QUEUE_FAMILY_FOREIGN,
@@ -918,7 +991,7 @@ impl Gpu {
             };
             (f.cmd_pipeline_barrier)(
                 img.cmd,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                from_stage,
                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                 0,
                 0,
@@ -934,6 +1007,89 @@ impl Gpu {
             unsafe { (f.end_command_buffer)(img.cmd) },
             "vkEndCommandBuffer",
         )
+    }
+
+    /// Copy the finished image into the readback buffer and make the writes visible
+    /// to the host, leaving the image in `TRANSFER_SRC_OPTIMAL` for the release barrier.
+    ///
+    /// Tight packing (`buffer_row_length`/`buffer_image_height` of 0) is what makes
+    /// the readback independent of the modifier: a tiled image lands as plain rows.
+    fn record_capture(&self, img: &GpuImage, range: VkImageSubresourceRange) {
+        let f = &self.fns;
+        let to_src = VkImageMemoryBarrier {
+            s_type: VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            p_next: core::ptr::null(),
+            src_access_mask: VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            dst_access_mask: VK_ACCESS_TRANSFER_READ_BIT,
+            old_layout: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            new_layout: VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
+            image: img.image,
+            subresource_range: range,
+        };
+        let region = VkBufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: VkImageSubresourceLayers {
+                aspect_mask: VK_IMAGE_ASPECT_COLOR_BIT,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: VkOffset3D { x: 0, y: 0, z: 0 },
+            image_extent: VkExtent3D {
+                width: img.width,
+                height: img.height,
+                depth: 1,
+            },
+        };
+        // The fence orders completion; this dependency brings the copy's
+        // writes into the host domain, including on HOST_COHERENT memory.
+        let to_host = VkMemoryBarrier {
+            s_type: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            p_next: core::ptr::null(),
+            src_access_mask: VK_ACCESS_TRANSFER_WRITE_BIT,
+            dst_access_mask: VK_ACCESS_HOST_READ_BIT,
+        };
+        // SAFETY: cmd is in the recording state; the structs outlive their calls;
+        // the image and the readback buffer are live, and the buffer was grown to
+        // the copy's full extent in `prepare_frame`.
+        unsafe {
+            (f.cmd_pipeline_barrier)(
+                img.cmd,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0,
+                0,
+                core::ptr::null(),
+                0,
+                core::ptr::null(),
+                1,
+                &to_src,
+            );
+            (f.cmd_copy_image_to_buffer)(
+                img.cmd,
+                img.image,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                img.readback.buf,
+                1,
+                &region,
+            );
+            (f.cmd_pipeline_barrier)(
+                img.cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_HOST_BIT,
+                0,
+                1,
+                &to_host,
+                0,
+                core::ptr::null(),
+                0,
+                core::ptr::null(),
+            );
+        }
     }
 
     /// Record one texture upload (or a bare initialization barrier when the

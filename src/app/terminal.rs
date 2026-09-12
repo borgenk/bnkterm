@@ -1909,9 +1909,7 @@ fn demo_screen(cols: usize, rows: usize) -> Screen {
     };
 
     at(&mut out, 1, 1);
-    out.extend_from_slice(
-        b"\x1b[1;36mbnkterm\x1b[0m \x1b[2m-- Wayland + Vulkan terminal, phase 2 static demo\x1b[0m",
-    );
+    out.extend_from_slice(b"\x1b[1;36mbnkterm\x1b[0m \x1b[2m-- Wayland + Vulkan terminal\x1b[0m");
 
     at(&mut out, 3, 1);
     out.extend_from_slice(b"ANSI: ");
@@ -1964,9 +1962,12 @@ fn demo_screen(cols: usize, rows: usize) -> Screen {
     }
     out.extend_from_slice(b"\x1b[0m");
 
-    // Park the cursor somewhere visible for the block-cursor demo.
+    // A two-line prompt, with the cursor parked after the caret for the block demo.
     at(&mut out, 17, 1);
-    out.extend_from_slice(b"prompt$ ");
+    out.extend_from_slice(b"\x1b[1;38;5;212mborgenk@bnk-desktop\x1b[0m ~/projects/bnkterm");
+    out.extend_from_slice("\x1b[38;5;114m \u{f418} main\x1b[0m".as_bytes());
+    at(&mut out, 18, 1);
+    out.extend_from_slice(b"\x1b[1;38;5;159m>\x1b[0m ");
 
     p.advance_bytes(&mut s, &out);
     s

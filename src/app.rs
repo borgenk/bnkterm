@@ -274,6 +274,30 @@ pub fn run_demo(verbosity: Verbosity) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// Open the demo window, write its first frame to `path` as a PNG, and close.
+/// The demo grid rather than a live shell, so the image is the same every run.
+#[cfg(test)]
+pub(crate) fn capture_demo_frame(path: &std::path::Path) -> crate::error::Result<()> {
+    let mut state = State::new(
+        true,
+        Verbosity::Quiet,
+        Launch::new(Vec::new(), Target::Local),
+    )?;
+    state.bring_up_surface()?;
+    // The strip needs two tabs or more (`Tabs::shows_bar`).
+    state.stage_demo_tabs(&["~/projects/bnkterm", "nvim", "~"]);
+    state.capture_to = Some(path.to_path_buf());
+    state.request_capture();
+    // Only a successful write clears the destination; closing early is a failure.
+    state.run_until(|s| s.closed || s.capture_to.is_none())?;
+    if state.capture_to.is_some() {
+        return Err(crate::error::Error::msg(
+            "window closed before the capture was written",
+        ));
+    }
+    Ok(())
+}
+
 /// `--gpu-probe`: report what the compositor and GPU offer the dmabuf
 /// presentation path, without opening a window. Its report *is* its output, so it
 /// prints at any verbosity.
@@ -483,6 +507,10 @@ struct State {
     /// deferred to `render_frame` so it commits with the matching-size buffer.
     pending_configure: Option<u32>,
     configured: bool,
+    /// Where the screenshot harness wants the next captured frame written. Cleared
+    /// only after a successful write, which is how the harness knows it is done.
+    #[cfg(test)]
+    capture_to: Option<std::path::PathBuf>,
     closed: bool,
     /// The in-flight frame callback's id, or 0 when none is pending. While it is
     /// nonzero the loop holds off redrawing, so bursts coalesce into at most one
@@ -599,6 +627,8 @@ impl State {
             pending_size: None,
             pending_configure: None,
             configured: false,
+            #[cfg(test)]
+            capture_to: None,
             closed: false,
             frame_callback: 0,
             pending_layout: false,
@@ -615,6 +645,16 @@ impl State {
     }
 
     fn bring_up(&mut self) -> Result<()> {
+        self.bring_up_surface()?;
+        self.run_until(|s| s.closed)?;
+        Ok(())
+    }
+
+    /// Everything [`bring_up`](Self::bring_up) does before it starts running: bind the
+    /// globals, bring Vulkan up, build the surface stack, and wait out the first
+    /// configure. Split out so a caller can run the window to a different finish (the
+    /// screenshot harness runs it until the capture is written).
+    fn bring_up_surface(&mut self) -> Result<()> {
         // Discover and bind globals.
         self.registry = self.alloc_id();
         self.conn.request(
@@ -742,7 +782,6 @@ impl State {
             }
         }
 
-        self.run_until(|s| s.closed)?;
         Ok(())
     }
 
@@ -2068,6 +2107,33 @@ impl State {
         Ok(())
     }
 
+    /// Name the active demo tab and open the rest beside it. The first title goes
+    /// to the tab already open, so it is the active one.
+    #[cfg(test)]
+    fn stage_demo_tabs(&mut self, titles: &[&str]) {
+        let Some((active, rest)) = titles.split_first() else {
+            return;
+        };
+        self.tabs
+            .active_mut()
+            .feed_test_bytes(format!("\x1b]2;{active}\x07").as_bytes());
+        for title in rest {
+            self.tabs
+                .push_demo_tab(self.metrics, self.width, self.height, WINDOW_PADDING, title);
+        }
+    }
+
+    /// Arm a capture of the next frame.
+    ///
+    /// The pool is reset and the tabs marked dirty so the diff sees a full repaint:
+    /// an idle terminal presents nothing, and a capture needs a frame to ride.
+    #[cfg(test)]
+    fn request_capture(&mut self) {
+        self.presentation.capture = true;
+        self.presentation.lists.reset();
+        self.tabs.mark_dirty();
+    }
+
     /// Set the toplevel title. The core deduplicates on the sending side (it only
     /// emits a `Title` when the child's title actually changes), so this just makes
     /// the request; bring-up calls it once for the initial app name.
@@ -2323,7 +2389,7 @@ fn pointer_button(code: u32) -> Option<MouseButton> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::app::*;
 
     /// The pointer resting on plain, unclaimed grid text.
     const OVER_TEXT: PointerFacts = PointerFacts {

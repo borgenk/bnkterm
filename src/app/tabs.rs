@@ -217,6 +217,28 @@ impl Tabs {
         Ok(id)
     }
 
+    /// Add a tab on a static demo grid under `title`. Not [`open`](Self::open),
+    /// which spawns a shell and would put the environment into the picture.
+    #[cfg(test)]
+    pub(super) fn push_demo_tab(
+        &mut self,
+        metrics: CellMetrics,
+        width: u32,
+        height: u32,
+        pad: i32,
+        title: &str,
+    ) {
+        // The grid size the tabs already agree on, so a new one lands the same shape.
+        let (cols, rows) = self.active().dimensions();
+        let mut core = TerminalCore::new(true, cols, rows, metrics, width, height, pad);
+        core.set_theme(Rc::clone(&self.theme));
+        core.feed_test_bytes(format!("\x1b]2;{title}\x07").as_bytes());
+        let id = self.allocate_id();
+        self.entries.push(TabEntry { id, core });
+        self.bar_dirty = true;
+        self.rebuild_bar();
+    }
+
     /// Close `id`, repairing the active index and handing its child to the zombie
     /// sweep. Returns true when this removed the last tab.
     pub(super) fn close(&mut self, id: TabId, window_focused: bool) -> bool {

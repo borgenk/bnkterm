@@ -32,8 +32,7 @@ impl Rgb {
         Self { r, g, b }
     }
 
-    /// Pack into `0x00RRGGBB`, the pixel convention the GPU path uses. The seam
-    /// where a resolved cell color meets the renderer in phase 2.
+    /// Pack into `0x00RRGGBB`, the pixel convention the GPU path uses.
     pub fn to_u32(self) -> u32 {
         (u32::from(self.r) << 16) | (u32::from(self.g) << 8) | u32::from(self.b)
     }

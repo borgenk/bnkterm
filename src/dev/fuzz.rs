@@ -429,7 +429,7 @@ pub(crate) fn as_byte_literal(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::fuzz::{as_byte_literal, shrink, Rng, Stream, INTERRUPTERS};
+    use crate::dev::fuzz::{as_byte_literal, shrink, Rng, Stream, INTERRUPTERS};
 
     /// The stream has to replay exactly, or a seed in a failure report is worthless.
     #[test]

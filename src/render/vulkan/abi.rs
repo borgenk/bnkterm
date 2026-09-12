@@ -76,6 +76,7 @@ pub(super) const VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO: u32 = 40;
 pub(super) const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: u32 = 42;
 pub(super) const VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO: u32 = 43;
 pub(super) const VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER: u32 = 45;
+pub(super) const VK_STRUCTURE_TYPE_MEMORY_BARRIER: u32 = 46;
 pub(super) const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2: u32 = 1000059001;
 pub(super) const VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2: u32 = 1000059002;
 pub(super) const VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: u32 = 1000072001;
@@ -126,7 +127,7 @@ pub(super) const VK_IMAGE_USAGE_TRANSFER_DST_BIT: u32 = 0x2;
 pub(super) const VK_IMAGE_USAGE_SAMPLED_BIT: u32 = 0x4;
 pub(super) const VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT: u32 = 0x10;
 /// The format features a presentable image's modifier must support: rendering
-/// plus both transfer directions (the pixel-parity readback uses the source
+/// plus both transfer directions (the screenshot readback uses the source
 /// direction; clears use the destination).
 pub(super) const VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT: u32 = 0x80;
 pub(super) const VK_FORMAT_FEATURE_TRANSFER_SRC_BIT: u32 = 0x4000;
@@ -138,16 +139,20 @@ pub(super) const VK_IMAGE_LAYOUT_UNDEFINED: u32 = 0;
 pub(super) const VK_IMAGE_LAYOUT_GENERAL: u32 = 1;
 pub(super) const VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: u32 = 2;
 pub(super) const VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: u32 = 5;
+pub(super) const VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: u32 = 6;
 pub(super) const VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: u32 = 7;
 
 pub(super) const VK_ACCESS_SHADER_READ_BIT: u32 = 0x20;
 pub(super) const VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT: u32 = 0x100;
+pub(super) const VK_ACCESS_TRANSFER_READ_BIT: u32 = 0x800;
 pub(super) const VK_ACCESS_TRANSFER_WRITE_BIT: u32 = 0x1000;
+pub(super) const VK_ACCESS_HOST_READ_BIT: u32 = 0x2000;
 pub(super) const VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: u32 = 0x1;
 pub(super) const VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT: u32 = 0x80;
 pub(super) const VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT: u32 = 0x400;
 pub(super) const VK_PIPELINE_STAGE_TRANSFER_BIT: u32 = 0x1000;
 pub(super) const VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: u32 = 0x2000;
+pub(super) const VK_PIPELINE_STAGE_HOST_BIT: u32 = 0x4000;
 
 pub(super) const VK_BUFFER_USAGE_TRANSFER_SRC_BIT: u32 = 0x1;
 pub(super) const VK_BUFFER_USAGE_TRANSFER_DST_BIT: u32 = 0x2;
@@ -652,6 +657,14 @@ pub(super) struct VkImageSubresourceRange {
     pub(super) level_count: u32,
     pub(super) base_array_layer: u32,
     pub(super) layer_count: u32,
+}
+
+#[repr(C)]
+pub(super) struct VkMemoryBarrier {
+    pub(super) s_type: u32,
+    pub(super) p_next: *const c_void,
+    pub(super) src_access_mask: u32,
+    pub(super) dst_access_mask: u32,
 }
 
 #[repr(C)]
@@ -1226,7 +1239,7 @@ pub(super) type PfnCmdPipelineBarrier = unsafe extern "C" fn(
     u32,
     u32,
     u32,
-    *const c_void,
+    *const VkMemoryBarrier,
     u32,
     *const c_void,
     u32,
@@ -1372,6 +1385,8 @@ pub(super) type PfnCmdSetScissor = unsafe extern "C" fn(VkCommandBuffer, u32, u3
 pub(super) type PfnCmdDraw = unsafe extern "C" fn(VkCommandBuffer, u32, u32, u32, u32);
 pub(super) type PfnCmdCopyBufferToImage =
     unsafe extern "C" fn(VkCommandBuffer, VkBuffer, VkImage, u32, u32, *const VkBufferImageCopy);
+pub(super) type PfnCmdCopyImageToBuffer =
+    unsafe extern "C" fn(VkCommandBuffer, VkImage, u32, VkBuffer, u32, *const VkBufferImageCopy);
 
 /// Fetch an instance-level command by name, as a specific pointer type.
 ///
@@ -1469,6 +1484,7 @@ pub(super) struct DeviceFns {
     pub(super) cmd_set_scissor: PfnCmdSetScissor,
     pub(super) cmd_draw: PfnCmdDraw,
     pub(super) cmd_copy_buffer_to_image: PfnCmdCopyBufferToImage,
+    pub(super) cmd_copy_image_to_buffer: PfnCmdCopyImageToBuffer,
 }
 
 impl DeviceFns {
@@ -1562,6 +1578,7 @@ impl DeviceFns {
                 cmd_set_scissor: load_device(gdpa, device, c"vkCmdSetScissor")?,
                 cmd_draw: load_device(gdpa, device, c"vkCmdDraw")?,
                 cmd_copy_buffer_to_image: load_device(gdpa, device, c"vkCmdCopyBufferToImage")?,
+                cmd_copy_image_to_buffer: load_device(gdpa, device, c"vkCmdCopyImageToBuffer")?,
             })
         }
     }
@@ -1586,7 +1603,7 @@ pub(super) unsafe fn load_device<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::render::vulkan::abi::*;
 
     /// The transcription's one real hazard is a struct size drifting from the
     /// C ABI: the driver writes past what we allocated. These sizes are from
@@ -1619,10 +1636,25 @@ mod tests {
         assert_eq!(size_of::<VkMemoryGetFdInfoKHR>(), 32);
         assert_eq!(size_of::<VkSubresourceLayout>(), 40);
         assert_eq!(size_of::<VkCommandBufferAllocateInfo>(), 32);
+        assert_eq!(size_of::<VkMemoryBarrier>(), 24);
         assert_eq!(size_of::<VkImageMemoryBarrier>(), 72);
         assert_eq!(size_of::<VkSubmitInfo>(), 72);
         assert_eq!(size_of::<VkSemaphoreGetFdInfoKHR>(), 32);
         assert_eq!(size_of::<VkImportSemaphoreFdInfoKHR>(), 40);
+    }
+
+    /// Offsets and enum values emitted by a C compiler against vulkan_core.h (LP64).
+    #[test]
+    fn host_readback_barrier_matches_the_c_abi() {
+        assert_eq!(std::mem::offset_of!(VkMemoryBarrier, s_type), 0);
+        assert_eq!(std::mem::offset_of!(VkMemoryBarrier, p_next), 8);
+        assert_eq!(std::mem::offset_of!(VkMemoryBarrier, src_access_mask), 16);
+        assert_eq!(std::mem::offset_of!(VkMemoryBarrier, dst_access_mask), 20);
+        assert_eq!(VK_STRUCTURE_TYPE_MEMORY_BARRIER, 46);
+        assert_eq!(VK_ACCESS_TRANSFER_WRITE_BIT, 0x1000);
+        assert_eq!(VK_ACCESS_HOST_READ_BIT, 0x2000);
+        assert_eq!(VK_PIPELINE_STAGE_TRANSFER_BIT, 0x1000);
+        assert_eq!(VK_PIPELINE_STAGE_HOST_BIT, 0x4000);
     }
 
     #[test]

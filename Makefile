@@ -1,5 +1,5 @@
 .PHONY: all build build-release install uninstall bump build-linux test test-install \
-	test-abi check flatpak flatpak-lint fix shaders clean size
+	test-abi check flatpak flatpak-lint fix shaders screenshot clean size
 
 APP_NAME := bnkterm
 APP_ID := io.github.borgenk.BnkTerm
@@ -109,6 +109,9 @@ check: test test-install test-abi
 fix:
 	cargo fmt
 	cargo clippy --all --benches --tests --examples --all-features --fix --allow-dirty
+
+screenshot:
+	cargo test -- --ignored --nocapture write_screenshot
 
 # Recompile the committed SPIR-V. Needs glslc, and only when a shader changes.
 shaders:

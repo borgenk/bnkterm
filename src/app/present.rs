@@ -17,7 +17,7 @@
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::time::Instant;
 
-use super::State;
+use crate::app::State;
 // Crate-level error type throughout (see the note in `app.rs`); `?` on a
 // platform/render call converts via the `From` bridge in `crate::error`.
 use crate::error::{Error, Result};
@@ -176,6 +176,8 @@ pub(super) struct GpuPresentation {
     /// The reused damage-diff scratch, so computing the changed regions each frame
     /// refills one rectangle buffer instead of allocating a fresh one.
     pub(super) damage_scratch: display::DamageScratch,
+    /// Record the capture copy into the next frame. Cleared once it is written.
+    pub(super) capture: bool,
     pub(super) frame_count: u64,
     pub(super) last_present: Option<Instant>,
     pub(super) explicit_fence_frames: u64,
@@ -203,6 +205,7 @@ impl GpuPresentation {
             lists: term_render::DisplayListPool::default(),
             frame_scratch: gpu::FrameData::default(),
             damage_scratch: display::DamageScratch::default(),
+            capture: false,
             frame_count: 0,
             last_present: None,
             explicit_fence_frames: 0,
@@ -687,6 +690,9 @@ impl State {
             self.presentation.text_gamma,
             &mut self.presentation.frame_scratch,
         );
+        // Read before the borrow below, which takes the backend and the image
+        // mutably for the whole render.
+        let capture = self.presentation.capture;
         // Render, returning the render-done fence under explicit sync (`None` on
         // the bridge path, or when the driver could not export one).
         let render_done = {
@@ -700,10 +706,10 @@ impl State {
             match self.presentation.explicit_sync.as_ref() {
                 Some(es) => {
                     let release_wait = es.release_fence(idx)?;
-                    gpu.render_list_explicit(img, frame, background, release_wait)?
+                    gpu.render_list_explicit(img, frame, background, release_wait, capture)?
                 }
                 None => {
-                    gpu.render_list(img, frame, background)?;
+                    gpu.render_list(img, frame, background, capture)?;
                     None
                 }
             }
@@ -755,8 +761,34 @@ impl State {
             self.log_frame_stats(started);
             self.presentation.last_present = Some(started);
         }
+        // The capture is complete only when the GPU readback and file write succeed.
+        #[cfg(test)]
+        if capture {
+            self.save_capture(idx)?;
+            self.presentation.capture = false;
+        }
         self.presentation.frame_count += 1;
         Ok(true)
+    }
+
+    /// Write the frame captured into image `idx` out as a PNG.
+    #[cfg(test)]
+    fn save_capture(&mut self, idx: usize) -> Result<()> {
+        let Some(path) = self.capture_to.as_deref() else {
+            return Err(Error::msg("a frame was captured with nowhere to put it"));
+        };
+        let Some(gpu) = self.presentation.backend.as_ref() else {
+            return Err(Error::msg("capture without a gpu backend"));
+        };
+        let Some(img) = self.presentation.images.get(idx) else {
+            return Err(Error::msg("capture without gpu buffers"));
+        };
+        let pixels = gpu.read_pixels(img)?;
+        let (width, height) = self.presentation.buffer_size;
+        crate::dev::screenshot::write(path, &pixels, width, height)?;
+        eprintln!("bnkterm: screenshot: wrote {}", path.display());
+        self.capture_to = None;
+        Ok(())
     }
 
     /// Print the per-frame stats line under `--stats`: the build+submit
@@ -949,7 +981,7 @@ fn color_f32(color: u32) -> [f32; 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::app::present::*;
 
     #[test]
     fn sync_status_formats_without_allocating_a_string() {

@@ -1887,7 +1887,7 @@ mod tests {
         // the DCS states, sets the modes, and lands abort/skip/restart bytes *inside*
         // sequences rather than between them. Without it this compared the two roads
         // almost entirely on text and well-formed CSI.
-        let structured = crate::fuzz::Stream::new(0x5EED_1234_ABCD_0002).bytes(200_000);
+        let structured = crate::dev::fuzz::Stream::new(0x5EED_1234_ABCD_0002).bytes(200_000);
         check_batched_matches_scalar(&structured, "structured");
     }
 

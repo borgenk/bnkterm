@@ -3277,7 +3277,7 @@ mod tests {
     #[test]
     fn damage_covers_every_cell_that_changed() {
         let theme = Theme::default();
-        let mut stream = crate::fuzz::Stream::new(0x0DA3_40E0_1234_5678);
+        let mut stream = crate::dev::fuzz::Stream::new(0x0DA3_40E0_1234_5678);
         let (cols, rows) = (12, 5);
 
         let mut screen = Screen::new(cols, rows);
