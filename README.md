@@ -5,6 +5,8 @@
 
 A native Wayland + Vulkan terminal emulator written in Rust, with no crate dependencies.
 
+![bnkterm](assets/screenshot.png)
+
 _Disclaimer: learning project, non-standard Rust (nightly, unsafe FFI),
 built mainly for my own use, AI-assisted._
 

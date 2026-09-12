@@ -28,6 +28,13 @@
   <url type="homepage">https://github.com/borgenk/bnkterm</url>
   <url type="bugtracker">https://github.com/borgenk/bnkterm/issues</url>
 
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/borgenk/bnkterm/main/assets/screenshot.png</image>
+      <caption>A shell session showing ANSI colours, text styles and the tab bar</caption>
+    </screenshot>
+  </screenshots>
+
   <releases>
     <release version="0.2.0" date="2026-09-11"/>
     <release version="0.1.0" date="2026-09-11"/>
