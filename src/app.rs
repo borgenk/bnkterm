@@ -274,6 +274,14 @@ pub fn run_demo(verbosity: Verbosity) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// The window the screenshot is taken in. Wide enough that the asset fills a README
+/// column at the default font size, and only as tall as the demo. The size is pinned
+/// rather than taken from the config so the asset does not shift per machine.
+#[cfg(test)]
+const CAPTURE_COLS: usize = 120;
+#[cfg(test)]
+const CAPTURE_FONT_PX: u32 = 13;
+
 /// Open the demo window, write its first frame to `path` as a PNG, and close.
 /// The demo grid rather than a live shell, so the image is the same every run.
 #[cfg(test)]
@@ -283,6 +291,11 @@ pub(crate) fn capture_demo_frame(path: &std::path::Path) -> crate::error::Result
         Verbosity::Quiet,
         Launch::new(Vec::new(), Target::Local),
     )?;
+    // A terminal's shape comes from its columns, not from how far the text reaches.
+    state.configured_font_size = Some(CAPTURE_FONT_PX);
+    state.apply_font_size(CAPTURE_FONT_PX);
+    // Pinned before bring-up so the first configure already lands on that size.
+    state.capture_cells = Some((CAPTURE_COLS, terminal::DEMO_ROWS + 1));
     state.bring_up_surface()?;
     // The strip needs two tabs or more (`Tabs::shows_bar`).
     state.stage_demo_tabs(&["~/projects/bnkterm", "nvim", "~"]);
@@ -309,6 +322,24 @@ pub fn gpu_probe() -> crate::error::Result<()> {
     )?
     .probe_dmabuf()?;
     Ok(())
+}
+
+/// The device buffer a capture pinned to `wanted` uses at `factor_120`, and the logical
+/// geometry to declare with it. Rounded up to the integer scale: the fallback path
+/// declares that with `set_buffer_scale`, which rejects a buffer not divisible by it.
+#[cfg(test)]
+fn capture_surface(wanted: (u32, u32), factor_120: u32) -> ((u32, u32), (u32, u32)) {
+    let factor = factor_120.max(1);
+    let n = (factor / 120).max(1);
+    let device = (
+        wanted.0.max(1).next_multiple_of(n),
+        wanted.1.max(1).next_multiple_of(n),
+    );
+    let logical = (
+        (device.0 * 120 / factor).max(1),
+        (device.1 * 120 / factor).max(1),
+    );
+    (device, logical)
 }
 
 /// Compositor scale tracking and the objects that deliver it.
@@ -511,6 +542,10 @@ struct State {
     /// only after a successful write, which is how the harness knows it is done.
     #[cfg(test)]
     capture_to: Option<std::path::PathBuf>,
+    /// The grid a capture holds the window at, in place of the configured size. In
+    /// cells, so a scale change re-derives the pixels instead of clipping the demo.
+    #[cfg(test)]
+    capture_cells: Option<(usize, usize)>,
     closed: bool,
     /// The in-flight frame callback's id, or 0 when none is pending. While it is
     /// nonzero the loop holds off redrawing, so bursts coalesce into at most one
@@ -629,6 +664,8 @@ impl State {
             configured: false,
             #[cfg(test)]
             capture_to: None,
+            #[cfg(test)]
+            capture_cells: None,
             closed: false,
             frame_callback: 0,
             pending_layout: false,
@@ -984,26 +1021,51 @@ impl State {
         self.to_device(WINDOW_PADDING as u32) as i32
     }
 
+    /// The device pixels the strip and its gap take out of the window. Floored at one
+    /// text row, so a label cannot clip on a small configured height or a large font.
+    fn strip_reservation(&self) -> (i32, i32) {
+        if !self.tabs.shows_bar() {
+            return (0, 0);
+        }
+        let cfg = &self.tab_bar_config;
+        (
+            (self.to_device(cfg.height_px) as i32).max(self.metrics.h),
+            self.to_device(cfg.gap_px) as i32,
+        )
+    }
+
+    /// Hold the surface at a `cols` x `rows` grid, padding and strip included, and
+    /// declare the matching logical geometry with it.
+    #[cfg(test)]
+    fn pin_surface_to_cells(&mut self, cols: usize, rows: usize) -> (u32, u32) {
+        let pad = self.device_pad();
+        let (bar_h, gap) = self.strip_reservation();
+        let w = cols as i32 * self.metrics.w + 2 * pad;
+        let h = rows as i32 * self.metrics.h + 2 * pad + bar_h + gap;
+        let wanted = (w.max(1) as u32, h.max(1) as u32);
+        let (device, logical) = capture_surface(wanted, self.scale.factor_120);
+        if self.scale.logical != logical {
+            self.scale.logical = logical;
+            self.scale.synced = false;
+        }
+        device
+    }
+
     /// Record a new *device* surface size and the grid geometry that now fits inside the
     /// scaled padding, leaving [`Self::flush_layout`] to hand it to the tabs at the next
     /// paint. GPU buffers are reallocated lazily in `render_frame` for the same reason.
     /// A no-op only when neither the device size nor the resulting grid changed (the
     /// grid can change from a scale-driven metrics change at an unchanged size).
     fn resize_to(&mut self, w: u32, h: u32) {
+        #[cfg(test)]
+        let (w, h) = match self.capture_cells {
+            Some((cols, rows)) => self.pin_surface_to_cells(cols, rows),
+            None => (w, h),
+        };
         // Reserve the padding on all sides, so the grid fits inside the margins.
         let pad = self.device_pad();
         let cfg = &self.tab_bar_config;
-        let (bar_h, gap) = if self.tabs.shows_bar() {
-            // The configured logical height, DPI-scaled, floored at one text row so
-            // the label can never clip on a small height or a large font, plus the
-            // configured breathing room between the strip and the grid.
-            (
-                (self.to_device(cfg.height_px) as i32).max(self.metrics.h),
-                self.to_device(cfg.gap_px) as i32,
-            )
-        } else {
-            (0, 0)
-        };
+        let (bar_h, gap) = self.strip_reservation();
         let usable_w = (w as i32 - 2 * pad).max(0);
         let usable_h = (h as i32 - 2 * pad - bar_h - gap).max(0);
         let (cols, rows) = self.metrics.columns_rows(usable_w, usable_h);
@@ -2121,6 +2183,10 @@ impl State {
             self.tabs
                 .push_demo_tab(self.metrics, self.width, self.height, WINDOW_PADDING, title);
         }
+        // The strip appears at two tabs and takes its height from the grid; only a
+        // resize re-derives that split.
+        let (w, h) = (self.width, self.height);
+        self.resize_to(w, h);
     }
 
     /// Arm a capture of the next frame.
@@ -2389,6 +2455,34 @@ fn pointer_button(code: u32) -> Option<MouseButton> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A pinned capture hands the fallback path a buffer that divides by the integer
+    /// scale, or the compositor answers `invalid_size` and bring-up dies.
+    #[test]
+    fn a_pinned_capture_surface_divides_by_the_buffer_scale() {
+        assert_eq!(
+            capture_surface((395, 321), 120),
+            ((395, 321), (395, 321)),
+            "unity takes the demo's size as it is"
+        );
+        assert_eq!(
+            capture_surface((395, 321), 240),
+            ((396, 322), (198, 161)),
+            "an odd buffer rounds up at scale 2, and logical is half of it"
+        );
+        assert_eq!(
+            capture_surface((396, 322), 180),
+            ((396, 322), (264, 214)),
+            "the fractional path has no divisibility rule to satisfy"
+        );
+        let (device, logical) = capture_surface((0, 0), 0);
+        assert_eq!(device, (1, 1), "a degenerate size still yields a buffer");
+        assert!(
+            logical.0 >= 1 && logical.1 >= 1,
+            "and a geometry the compositor can accept, with no divide by zero"
+        );
+    }
+
     use crate::app::*;
 
     /// The pointer resting on plain, unclaimed grid text.

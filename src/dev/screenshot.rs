@@ -3,7 +3,8 @@
 //! `make screenshot` opens the demo window, captures the frame off the GPU, and
 //! writes it to `assets/screenshot.png` for the README and the AppStream metainfo.
 //! The demo grid rather than a live shell, so the image does not depend on whatever
-//! the user's shell happened to print.
+//! the user's shell happened to print. The window is held at the demo's size
+//! (`State::capture_cells`), so the asset is the same shape on any desktop.
 //!
 //! There is no runtime path to this. Capturing is reached only from the ignored test
 //! below, so nothing a child prints can make the terminal write a file.

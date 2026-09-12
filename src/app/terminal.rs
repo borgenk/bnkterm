@@ -1893,6 +1893,11 @@ fn sanitize_paste(out: &mut Vec<u8>, text: &str) {
     }
 }
 
+/// The rows [`demo_screen`] writes into. A capture opens the window this tall plus a
+/// blank row under the prompt; `demo_screen_fits_its_declared_extent` holds it here.
+#[cfg(test)]
+pub(super) const DEMO_ROWS: usize = 23;
+
 /// Fill a fresh grid with a static demo that exercises the phase-2 acceptance
 /// list: the 16 ANSI colors, the text styles, DEC box drawing, a CJK wide char,
 /// an emoji cluster, a combining mark, and truecolor. Driven through the real
@@ -1963,10 +1968,11 @@ fn demo_screen(cols: usize, rows: usize) -> Screen {
     out.extend_from_slice(b"\x1b[0m");
 
     // A two-line prompt, with the cursor parked after the caret for the block demo.
-    at(&mut out, 17, 1);
+    // Set off from the samples above by more than the one row that separates them.
+    at(&mut out, 22, 1);
     out.extend_from_slice(b"\x1b[1;38;5;212mborgenk@bnk-desktop\x1b[0m ~/projects/bnkterm");
     out.extend_from_slice("\x1b[38;5;114m \u{f418} main\x1b[0m".as_bytes());
-    at(&mut out, 18, 1);
+    at(&mut out, 23, 1);
     out.extend_from_slice(b"\x1b[1;38;5;159m>\x1b[0m ");
 
     p.advance_bytes(&mut s, &out);
@@ -2652,6 +2658,31 @@ mod tests {
         }
         // At a comfortable size the title sits untouched on the top-left.
         assert_eq!(demo_screen(80, 24).cell(0, 0).rune, 'b');
+    }
+
+    /// A line past either bound is cropped out of the asset by the capture window.
+    #[test]
+    fn demo_screen_fits_its_declared_extent() {
+        let (cols, rows) = (crate::app::CAPTURE_COLS, DEMO_ROWS + 6);
+        let s = demo_screen(cols + 20, rows);
+        let blank = |row: usize, col: usize| s.cell(row, col) == crate::grid::Cell::BLANK;
+
+        assert!(
+            (0..cols).any(|col| !blank(DEMO_ROWS - 1, col)),
+            "the prompt is the last row the demo writes"
+        );
+        for row in DEMO_ROWS..rows {
+            assert!(
+                (0..cols).all(|col| blank(row, col)),
+                "row {row} is past DEMO_ROWS and must be empty"
+            );
+        }
+        for col in cols..cols + 20 {
+            assert!(
+                (0..rows).all(|row| blank(row, col)),
+                "column {col} is past the capture width and must be empty"
+            );
+        }
     }
 
     #[test]
