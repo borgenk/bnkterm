@@ -274,13 +274,15 @@ pub fn run_demo(verbosity: Verbosity) -> crate::error::Result<()> {
     Ok(())
 }
 
-/// The window the screenshot is taken in. Wide enough that the asset fills a README
-/// column at the default font size, and only as tall as the demo. The size is pinned
-/// rather than taken from the config so the asset does not shift per machine.
+/// The window the screenshot is taken in.
 #[cfg(test)]
 const CAPTURE_COLS: usize = 120;
+
+/// The scale the screenshot renders at, in 120ths. Twice unity, so the asset is a 2x
+/// raster: a hidpi display draws it sharply and everything else scales it down. Scale
+/// rather than a larger font, so the padding and the tab strip grow with the text.
 #[cfg(test)]
-const CAPTURE_FONT_PX: u32 = 13;
+const CAPTURE_SCALE_120: u32 = 240;
 
 /// Open the demo window, write its first frame to `path` as a PNG, and close.
 /// The demo grid rather than a live shell, so the image is the same every run.
@@ -291,9 +293,12 @@ pub(crate) fn capture_demo_frame(path: &std::path::Path) -> crate::error::Result
         Verbosity::Quiet,
         Launch::new(Vec::new(), Target::Local),
     )?;
+    // Derive the font from the point size rather than this machine's configured pixels,
+    // so the asset is the same everywhere, and take the scale before pinning the grid:
+    // `set_scale_120` ignores later changes once `capture_cells` is set.
+    state.configured_font_size = None;
+    state.set_scale_120(CAPTURE_SCALE_120);
     // A terminal's shape comes from its columns, not from how far the text reaches.
-    state.configured_font_size = Some(CAPTURE_FONT_PX);
-    state.apply_font_size(CAPTURE_FONT_PX);
     // Pinned before bring-up so the first configure already lands on that size.
     state.capture_cells = Some((CAPTURE_COLS, terminal::DEMO_ROWS + 1));
     state.bring_up_surface()?;
@@ -1129,6 +1134,11 @@ impl State {
     /// calls for, re-derive the device buffer size from the logical window, and
     /// resize the grid. A no-op if the scale is unchanged.
     fn set_scale_120(&mut self, factor_120: u32) {
+        // A capture renders at its own scale, whatever this display reports.
+        #[cfg(test)]
+        if self.capture_cells.is_some() {
+            return;
+        }
         let factor_120 = factor_120.max(1);
         if factor_120 == self.scale.factor_120 {
             return;
