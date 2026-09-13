@@ -19,7 +19,7 @@
 //!     ├─ double lines      ═ ╔ ╬ ╫ …    → two parallel rails per axis; each rail's
 //!     │                                   middle segment is drawn only where no arm
 //!     │                                   opens, which carves every junction
-//!     ├─ rounded corners   ╭ ╮ ╯ ╰      → a supersampled quarter ellipse (AA)
+//!     ├─ rounded corners   ╭ ╮ ╯ ╰      → straight arms and a quarter circle (AA)
 //!     └─ diagonals         ╱ ╲ ╳        → a supersampled corner-to-corner line (AA)
 //!   Block Elements U+2580..=U+259F
 //!     ├─ eighth blocks     ▀ ▁ ▌ ▐ …    → one rectangle, a fraction of the cell
@@ -470,23 +470,31 @@ const DOUBLE_ARMS: [[u8; 4]; 29] = [
     [2, 2, 2, 2], // 256C ╬
 ];
 
-/// A rounded corner: a quarter of the ellipse inscribed in the cell and centered
-/// on the corner `(cx_corner, cy_corner)` (a cell corner in pixels). The ellipse
-/// passes through the two edge midpoints where the straight neighbours attach
-/// (`(w/2, top-or-bottom)` and `(left-or-right, h/2)`), so `╰──╯` closes a box
-/// with no kink. Supersampled because a curve without antialiasing stair-steps.
+/// Join two straight arms with a constant-width quarter circle. The arm centers
+/// come from the same pixel bands as the straight neighbours, including the
+/// half-pixel offset of odd stroke widths. Each arm keeps a full pixel of straight
+/// coverage at the cell edge so antialiasing the bend cannot dim the seam.
+/// Cells too small for the bend use a square junction.
 fn arc(cv: &mut Canvas, corner_x: i32, corner_y: i32) {
     let (w, h) = (cv.w, cv.h);
-    let (cx, cy) = (w / 2, h / 2);
-    // Ellipse radii: the distance from the corner to each edge midpoint.
-    let rx = (corner_x - cx).abs().max(1) as f32;
-    let ry = (corner_y - cy).abs().max(1) as f32;
-    let t = light(w, h) as f32;
-    // Stroke half-width converted from pixels into the normalized radius the
-    // distance test uses (d == 1 is the curve); divide by the mean radius.
-    let hw = (t / 2.0) / ((rx + ry) / 2.0);
-    let cxf = corner_x as f32;
-    let cyf = corner_y as f32;
+    let t = light(w, h);
+    let (x0, x1) = band(w / 2, t);
+    let (y0, y1) = band(h / 2, t);
+    let cx = (x0 + x1) as f32 / 2.0;
+    let cy = (y0 + y1) as f32 / 2.0;
+    // Share a radius across orientations even when the pixel band is off-center.
+    let r = (cx.min(w as f32 - cx).min(cy).min(h as f32 - cy) - 1.0).max(0.0);
+    let hw = t as f32 / 2.0;
+    if r <= hw {
+        let u = if corner_y == 0 { W::Light } else { W::None };
+        let d = if corner_y == 0 { W::None } else { W::Light };
+        let l = if corner_x == 0 { W::Light } else { W::None };
+        let right = if corner_x == 0 { W::None } else { W::Light };
+        arms(cv, u, d, l, right);
+        return;
+    }
+    let direction_x = if corner_x == 0 { -1.0 } else { 1.0 };
+    let direction_y = if corner_y == 0 { -1.0 } else { 1.0 };
     const SS: i32 = 4;
     for y in 0..h {
         for x in 0..w {
@@ -495,10 +503,16 @@ fn arc(cv: &mut Canvas, corner_x: i32, corner_y: i32) {
                 for sx in 0..SS {
                     let px = x as f32 + (sx as f32 + 0.5) / SS as f32;
                     let py = y as f32 + (sy as f32 + 0.5) / SS as f32;
-                    let dx = (px - cxf) / rx;
-                    let dy = (py - cyf) / ry;
-                    let d = (dx * dx + dy * dy).sqrt();
-                    if (d - 1.0).abs() <= hw {
+                    let dx = r - (px - cx) * direction_x;
+                    let dy = r - (py - cy) * direction_y;
+                    let distance = if dx < 0.0 {
+                        (py - cy).abs()
+                    } else if dy < 0.0 {
+                        (px - cx).abs()
+                    } else {
+                        ((dx * dx + dy * dy).sqrt() - r).abs()
+                    };
+                    if distance <= hw {
                         hits += 1;
                     }
                 }
@@ -1006,6 +1020,68 @@ mod tests {
             0,
             "outer corner of ╔ is fused"
         );
+    }
+
+    #[test]
+    fn tiny_rounded_corners_keep_the_square_junction() {
+        for w in 1..=3 {
+            for h in 1..=3 {
+                for (rounded, square) in [('╭', '┌'), ('╮', '┐'), ('╯', '┘'), ('╰', '└')]
+                {
+                    assert_eq!(
+                        coverage(rounded, w, h),
+                        coverage(square, w, h),
+                        "{rounded} keeps its arms in {w}x{h}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_corners_match_their_straight_neighbours() {
+        // Compare the complete seam, including clear pixels: checking only the
+        // brightest pixel would miss a displaced or wider antialiased stroke.
+        for w in 6..=32 {
+            for h in 6..=48 {
+                let horizontal = coverage('─', w, h);
+                let vertical = coverage('│', w, h);
+                for (ch, right, down) in [
+                    ('╭', true, true),
+                    ('╮', false, true),
+                    ('╯', false, false),
+                    ('╰', true, false),
+                ] {
+                    let corner = coverage(ch, w, h);
+                    let x = if right { w - 1 } else { 0 };
+                    let y = if down { h - 1 } else { 0 };
+                    for row in 0..h {
+                        assert_eq!(
+                            at(&corner, w, x, row),
+                            at(&horizontal, w, w - 1 - x, row),
+                            "{ch} horizontal join at row {row} in {w}x{h}"
+                        );
+                        assert_eq!(
+                            at(&corner, w, w - 1 - x, row),
+                            0,
+                            "{ch} closed horizontal edge at row {row} in {w}x{h}"
+                        );
+                    }
+                    for col in 0..w {
+                        assert_eq!(
+                            at(&corner, w, col, y),
+                            at(&vertical, w, col, h - 1 - y),
+                            "{ch} vertical join at column {col} in {w}x{h}"
+                        );
+                        assert_eq!(
+                            at(&corner, w, col, h - 1 - y),
+                            0,
+                            "{ch} closed vertical edge at column {col} in {w}x{h}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
