@@ -2,7 +2,9 @@
 
 The UCD data files the terminal generates its property tables from, pinned to one
 Unicode version and committed so a build (and a table regeneration) never touches the
-network. Everything here is verbatim from the Unicode Consortium's public files.
+network. Everything here is verbatim from the Unicode Consortium's public files,
+redistributed under the Unicode Terms of Use their headers cite. The repository's
+MIT license covers the rest of the tree.
 
 **Version: 18.0.0**
 

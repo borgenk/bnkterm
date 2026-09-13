@@ -4,6 +4,7 @@
   <name>BNK Term</name>
   <summary>Terminal emulator for Wayland</summary>
   <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
   <developer id="io.github.borgenk">
     <name>BNK Term contributors</name>
   </developer>

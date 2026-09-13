@@ -1,7 +1,6 @@
 {
   "io.github.borgenk.BnkTerm": [
     "appstream-external-screenshot-url",
-    "appstream-missing-project-license",
     "appstream-screenshots-not-mirrored-in-ostree",
     "finish-args-flatpak-spawn-access",
     "finish-args-only-wayland",
