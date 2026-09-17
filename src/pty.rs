@@ -321,13 +321,14 @@ impl Pty {
         std::fs::read_link(format!("/proc/{}/cwd", self.pid)).ok()
     }
 
-    /// The name (`comm`) of the program in the foreground of this PTY, e.g. `zsh` at
-    /// a prompt or `claude` while that runs. Resolved from `/proc/<pid>/stat`'s
-    /// `tpgid` field (the tty's foreground process group), then that leader's
+    /// The name (`comm`) of a foreground job. When the original shell owns the
+    /// foreground, returns `None` so the tab shows its directory.
+    /// Resolved from `/proc/<pid>/stat`'s `tpgid` field (the tty's foreground
+    /// process group), then that leader's
     /// `/proc/<tpgid>/comm`. `None` if `/proc` is unavailable or the fields cannot be
     /// read. Like [`cwd`](Self::cwd) it is read only when a tab settles, never on the
-    /// byte path, so plain file reads are fine. Lets the tab bar prefix a directory
-    /// only for configured programs without depending on any shell integration.
+    /// byte path, so plain file reads are fine. The tab uses this as a label fallback
+    /// and to select configured directory prefixes without shell integration.
     ///
     /// `/proc/<pid>/stat` layout: field 2 (`comm`) is parenthesized and may itself
     /// contain spaces or `)`, so the fixed fields are parsed from *after the last*
@@ -341,7 +342,7 @@ impl Pty {
         }
         let stat = std::fs::read_to_string(format!("/proc/{}/stat", self.pid)).ok()?;
         let tpgid = parse_tpgid(&stat)?;
-        if tpgid <= 0 {
+        if tpgid <= 0 || tpgid == self.pid {
             return None;
         }
         let comm = std::fs::read_to_string(format!("/proc/{tpgid}/comm")).ok()?;
@@ -945,8 +946,8 @@ mod tests {
         let nasty = "42 (weird ) name) R 1 42 42 0 -1 4194560 ...";
         assert_eq!(parse_tpgid(nasty), Some(-1));
 
-        // At a prompt with no distinct foreground the caller treats tpgid == pgrp
-        // as "the shell"; a parse of it still succeeds (the filtering is elsewhere).
+        // At a prompt, the foreground belongs to the shell's own process group.
+        // Parsing still succeeds; `foreground_program` excludes the shell's pid.
         let prompt = "9 (bash) S 1 9 9 34816 9 4194304";
         assert_eq!(parse_tpgid(prompt), Some(9));
 
@@ -1123,6 +1124,54 @@ mod tests {
         };
         assert_ne!(local, 0, "a local child owns its terminal");
         assert_eq!(host, 0, "the far side of flatpak-spawn is left to claim it");
+    }
+
+    #[test]
+    fn a_foreground_job_is_named_until_the_shell_takes_the_terminal_back() {
+        // A real shell hands the terminal to cat twice, with no history or title
+        // hooks. EOF ends each cat; the shell then owns the foreground again.
+        let script = "set -m; printf 'ready\\n'; while IFS= read -r line; do /bin/cat; printf 'ready\\n'; done";
+        let Ok(pty) = Pty::spawn_command(80, 24, &["/bin/sh", "-c", script]) else {
+            eprintln!("fork/exec unavailable; skipping");
+            return;
+        };
+        let wait_ready = || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut poll_set = PollSet::new();
+            poll_set.add(pty.fd());
+            while std::time::Instant::now() < deadline {
+                match pty.read(&mut buf).expect("read from the shell") {
+                    ReadOutcome::Data(n) => {
+                        got.extend_from_slice(&buf[..n]);
+                        if got.windows(5).any(|w| w == b"ready") {
+                            return;
+                        }
+                    }
+                    ReadOutcome::WouldBlock => {
+                        let _ = poll_set.wait(Some(Duration::from_millis(50)));
+                    }
+                    ReadOutcome::Eof => break,
+                }
+            }
+            panic!("the shell never became ready: {got:?}");
+        };
+        wait_ready();
+        assert_eq!(pty.foreground_program(), None, "the shell is not a job");
+        for _ in 0..2 {
+            assert_eq!(pty.write_some(b"\n").expect("start cat"), 1);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while pty.foreground_program().as_deref() != Some("cat")
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(pty.foreground_program().as_deref(), Some("cat"));
+            assert_eq!(pty.write_some(b"\x04").expect("EOF to cat"), 1);
+            wait_ready();
+            assert_eq!(pty.foreground_program(), None, "the job has ended");
+        }
     }
 
     #[test]

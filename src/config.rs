@@ -142,11 +142,10 @@ pub struct TabBarConfig {
     /// keeps the label at the terminal size.
     pub label_scale_pct: u16,
     /// Programs (matched by the foreground process group's `comm`) whose tab label
-    /// is prefixed with the working directory. A program that sets its own title
-    /// (e.g. `claude`, whose title is the session name) otherwise hides which
-    /// directory it runs in; the prefix keeps that visible. The path stays pinned
-    /// because labels truncate from the end (see `tab_bar::fit_end`), so the volatile
-    /// title is what clips, not the directory.
+    /// is prefixed with the working directory. An application title describing a
+    /// session can hide which directory it runs in; the prefix keeps that visible.
+    /// The path stays pinned because labels truncate from the end (see
+    /// `tab_bar::fit_end`), so the volatile title clips before the directory.
     pub path_prefix_programs: Vec<String>,
 }
 

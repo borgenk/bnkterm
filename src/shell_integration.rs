@@ -610,7 +610,7 @@ end
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::shell_integration::*;
 
     #[test]
     fn detects_each_shell_by_the_final_path_component() {
