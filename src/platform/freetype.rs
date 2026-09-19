@@ -554,12 +554,6 @@ impl Face {
         Ok(face)
     }
 
-    /// Build a face from a font file on disk (its first face; see
-    /// [`from_path_index`](Self::from_path_index) for a collection).
-    pub fn from_path(path: &str) -> Result<Self> {
-        Self::from_path_index(Path::new(path), 0)
-    }
-
     /// Open the path and face index selected by fontconfig.
     pub fn from_file(file: &FontFile) -> Result<Self> {
         Self::from_path_index(&file.path, file.index)
@@ -748,26 +742,11 @@ impl Face {
         unsafe { slot.as_ref().advance.x as f32 / 64.0 }
     }
 
-    /// Pen advance of one grapheme cluster, in pixels: the emoji face's glyph
-    /// advance when the cluster routes to color emoji, else the sum of the
-    /// per-character advances (identical to measuring the characters one by
-    /// one, so ASCII fast paths and this stay in exact agreement). This is the
-    /// measuring twin of [`Self::with_cluster_glyph`]; the two must route the
-    /// same way or the caret drifts from the pixels.
-    pub fn cluster_advance(&self, cluster: &str) -> f32 {
-        if let Some((emoji, px)) = self.emoji_cluster(cluster) {
-            if let Some(advance) = emoji.advance(cluster, px) {
-                return advance;
-            }
-        }
-        cluster.chars().map(|c| self.advance(c)).sum()
-    }
-
     /// Run `f` over the color glyph for an emoji cluster rasterized at `target`
     /// pixels, or return `None` when the cluster renders through the ordinary
     /// per-character path (not an emoji, no emoji font installed, or the emoji
     /// font cannot form it). `None` tells the caller to draw the cluster's
-    /// characters instead, matching what [`Self::cluster_advance`] measured.
+    /// characters instead.
     ///
     /// The caller passes `target` because the fit differs by path: a wide
     /// cluster (two grid cells) is drawn at the em (its natural ~square size
@@ -779,21 +758,11 @@ impl Face {
         target: u32,
         f: impl FnOnce(&ColorGlyph) -> R,
     ) -> Option<R> {
-        self.emoji_font(cluster)?.with_glyph(cluster, target, f)
-    }
-
-    /// The emoji font for `cluster`, or `None` when the cluster should take the
-    /// per-character path. The single routing decision the measure and draw
-    /// paths share, so they never disagree on what is an emoji.
-    fn emoji_font(&self, cluster: &str) -> Option<&Rc<EmojiFont>> {
         let emoji = self.emoji.as_ref()?;
-        wants_emoji(cluster, |c| self.has_scalar(c)).then_some(emoji)
-    }
-
-    /// The emoji font and its natural (em) target size for `cluster`. The
-    /// measure path uses this so a run's width matches an emoji drawn at the em.
-    fn emoji_cluster(&self, cluster: &str) -> Option<(&Rc<EmojiFont>, u32)> {
-        Some((self.emoji_font(cluster)?, self.pixel_size.get()))
+        if !wants_emoji(cluster, |c| self.has_scalar(c)) {
+            return None;
+        }
+        emoji.with_glyph(cluster, target, f)
     }
 
     /// Whether this face's character map has a real glyph for `ch` (a missing
@@ -1821,23 +1790,14 @@ mod tests {
     fn faces_route_emoji_clusters_and_keep_ascii_on_the_char_path() {
         let fonts = Fonts::new(&[32]).expect("a default font");
         let face = fonts.face(32, FontStyle::Regular);
-        let advance = face.cluster_advance("😀");
-        assert!(advance > 0.0);
-        // Drawn at the em (32px), the measure twin: `cluster_advance` measures at
-        // the em too, so the two agree for a wide cluster.
-        assert_eq!(
-            face.with_cluster_glyph("😀", 32, |g| g.advance),
-            Some(advance),
-            "draw and measure route identically"
+        assert!(
+            face.with_cluster_glyph("😀", 32, |g| g.advance)
+                .is_some_and(|advance| advance > 0.0),
+            "a smiley routes to the emoji path"
         );
         assert!(
             face.with_cluster_glyph("a", 32, |_| ()).is_none(),
             "ASCII never routes to the emoji path"
-        );
-        assert_eq!(
-            face.cluster_advance("a"),
-            face.advance('a'),
-            "a simple cluster measures exactly like its character"
         );
     }
 

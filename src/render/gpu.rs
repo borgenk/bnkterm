@@ -699,8 +699,7 @@ impl Batcher<'_> {
     }
 
     /// Emit a run's glyph quads: the ASCII fast path, then grapheme clusters
-    /// routed to the emoji glyph or per-character drawing. The routing mirrors
-    /// `shape::text_advance`, so the quads land where layout measured.
+    /// routed to the emoji glyph or per-character drawing.
     fn text(&mut self, face_key: FaceKey, x: i32, baseline: i32, text: &str, paint: Paint) {
         let mut pen = x as f32;
         if text.is_ascii() {

@@ -1,14 +1,12 @@
 //! The color emoji font: a bitmap-strike (CBDT) FreeType face plus a HarfBuzz
 //! shaper over it. It turns a grapheme cluster (a ZWJ family, a flag, a skin
 //! tone, a keycap) into a single ligature glyph, decodes that glyph's color
-//! strike, and scales it to the surrounding text size, caching the result per
-//! (cluster, size). Sits above the FFI layer in `freetype.rs` (whose faces and
+//! strike, and scales it to the surrounding text size. Sits above the FFI layer in `freetype.rs` (whose faces and
 //! glyph-slot mirror it reads) and the pure pixel math in `pixel.rs`.
 
 use core::ffi::{c_uint, c_void};
 use core::ptr::NonNull;
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::cell::Cell;
 
 use crate::platform::fontconfig::FontFile;
 use crate::platform::freetype::{
@@ -62,18 +60,11 @@ pub struct ColorGlyph {
     pub argb: Vec<u32>,
 }
 
-/// A cache of cluster results, keyed by target pixel size then by cluster bytes.
-/// Splitting on the size (a cheap `u32` key) lets the inner lookup borrow the
-/// cluster `&str` directly (`Box<str>: Borrow<str>`), so a cache *hit* allocates
-/// nothing; only a miss boxes the cluster to insert it. `None` records that the
-/// font cannot form the cluster, so the miss is not re-shaped every frame.
-type ClusterCache<T> = RefCell<HashMap<u32, HashMap<Box<str>, Option<T>>>>;
-
 /// The color emoji font: a bitmap-strike (CBDT) face plus a HarfBuzz shaper
 /// over it. The shaper is what turns a multi-scalar cluster (ZWJ family, flag,
 /// skin tone, keycap) into the single ligature glyph the font's GSUB table
 /// defines; FreeType then decodes that glyph's color strike, and the result is
-/// scaled to the text size and cached per (cluster, size).
+/// scaled to the text size.
 ///
 /// Everything degrades gracefully: no installed font, an outline-only emoji
 /// font, or a cluster the font cannot form all yield `None`, and the caller
@@ -88,10 +79,6 @@ pub struct EmojiFont {
     /// The strike's nominal pixel size; glyph bitmaps and shaped positions are
     /// scaled by `target / strike` to land on the text's em square.
     strike: f32,
-    /// The measure-only cache, filled by shaping alone (no strike decode), so
-    /// layout can measure off-screen emoji without rasterizing them. The GPU
-    /// atlas holds the rasterized clusters, so there is no color-glyph cache here.
-    advances: ClusterCache<f32>,
     /// Cluster-cache hit and miss tallies, reported by the GPU batcher (which
     /// owns the atlas-placement cache) through [`Face::record_cluster_hit`] and
     /// [`Face::record_cluster_miss`]. Pure instrumentation.
@@ -114,34 +101,15 @@ impl EmojiFont {
             face,
             shaper,
             strike,
-            advances: RefCell::new(HashMap::new()),
             hits: Cell::new(0),
             misses: Cell::new(0),
         })
     }
 
-    /// Pen advance of `cluster` scaled to `target` pixels, or `None` when the
-    /// font cannot form the cluster. Cached; filled by shaping only, no bitmap
-    /// is decoded.
-    pub(crate) fn advance(&self, cluster: &str, target: u32) -> Option<f32> {
-        let mut cache = self.advances.borrow_mut();
-        let by_cluster = cache.entry(target).or_default();
-        // Borrow the cluster to probe: a hit returns without boxing it.
-        if let Some(&hit) = by_cluster.get(cluster) {
-            return hit;
-        }
-        let advance = self
-            .shaped(cluster)
-            .map(|glyphs| glyphs.iter().map(|g| g.x_advance).sum::<f32>() * self.scale(target));
-        by_cluster.insert(cluster.into(), advance);
-        advance
-    }
-
     /// Run `f` over the color glyph for `cluster` at `target` pixels, rasterizing
     /// it (shape, decode strikes, composite, resample) on the spot. `None` means
-    /// the font cannot form this cluster, matching what [`Self::advance`]
-    /// reported, since both derive from the same shaping. The GPU batcher caches
-    /// the atlas placement, so it calls this only on the first sight of a cluster.
+    /// the font cannot form this cluster. The GPU batcher caches the atlas
+    /// placement, so it calls this only on the first sight of a cluster.
     pub(crate) fn with_glyph<R>(
         &self,
         cluster: &str,
@@ -173,9 +141,7 @@ impl EmojiFont {
     }
 
     /// Shape `cluster` and keep the result only when the font can really form
-    /// it: at least one glyph and no `.notdef`. The single success predicate
-    /// behind both [`Self::advance`] and [`Self::with_glyph`], which is what
-    /// keeps measuring and drawing in agreement.
+    /// it: at least one glyph and no `.notdef`.
     fn shaped(&self, cluster: &str) -> Option<Vec<crate::platform::shape::ShapedGlyph>> {
         let glyphs = self.shaper.shape(cluster);
         if glyphs.is_empty() || glyphs.iter().any(|g| g.id == 0) {
@@ -419,11 +385,9 @@ mod tests {
     }
 
     #[test]
-    fn emoji_font_measures_and_rasters_a_smiley() {
+    fn emoji_font_rasters_a_smiley() {
         let font = emoji();
-        let advance = font.advance("😀", 32).expect("the smiley should shape");
-        assert!(advance > 0.0);
-        let (width, rows, has_ink, glyph_advance) = font
+        let (width, rows, has_ink, advance) = font
             .with_glyph("😀", 32, |g| {
                 let ink = g.argb.iter().any(|&p| p >> 24 != 0);
                 (g.width, g.rows, ink, g.advance)
@@ -435,21 +399,20 @@ mod tests {
             rows <= 40,
             "scaled to the 32px em square, not the strike ({rows} rows)"
         );
-        assert_eq!(glyph_advance, advance, "measure and raster agree");
+        assert!(advance > 0.0);
     }
 
     #[test]
     fn zwj_and_flag_clusters_ligate_to_one_glyph() {
         let font = emoji();
-        let single = font.advance("👨", 32).expect("the man emoji shapes");
-        let family = font
-            .advance("👨\u{200d}👩\u{200d}👧", 32)
-            .expect("the family should ligate");
+        let advance = |cluster| font.with_glyph(cluster, 32, |g| g.advance);
+        let single = advance("👨").expect("the man emoji shapes");
+        let family = advance("👨\u{200d}👩\u{200d}👧").expect("the family should ligate");
         assert!(
             family < single * 2.0,
             "a family is one ligature, not three glyphs ({family} vs {single})"
         );
-        let flag = font.advance("🇳🇴", 32).expect("the flag should ligate");
+        let flag = advance("🇳🇴").expect("the flag should ligate");
         assert!(
             flag < single * 2.0,
             "a flag is one glyph, not two letter symbols"
@@ -475,7 +438,6 @@ mod tests {
         // A letter with a combining mark is no emoji ligature; the emoji font
         // has no glyphs for it and must say so rather than render garbage.
         // (Routing filters this out anyway; the font still answers safely.)
-        assert!(font.advance("e\u{301}", 32).is_none());
         assert!(font.with_glyph("e\u{301}", 32, |_| ()).is_none());
     }
 }
