@@ -362,7 +362,7 @@ impl State {
             .presentation
             .dmabuf
             .ok_or_else(|| Error::msg("gpu buffers without zwp_linux_dmabuf_v1"))?;
-        let (w, h) = (self.width, self.height);
+        let (w, h) = (self.layout.terminal.width, self.layout.terminal.height);
         let mut images = Vec::with_capacity(2);
         {
             let Some(gpu) = self.presentation.backend.as_ref() else {
@@ -409,7 +409,7 @@ impl State {
             self.presentation.buffers[i] = buffer;
         }
         self.presentation.images = images;
-        self.presentation.buffer_size = (self.width, self.height);
+        self.presentation.buffer_size = (self.layout.terminal.width, self.layout.terminal.height);
         self.presentation.busy = [false, false];
         // Fresh images never carried a release point, so a resize must forget the
         // old buffers' points; their next use starts with no wait.
@@ -607,7 +607,9 @@ impl State {
         // deferring from every configure to the first frame after them collapses
         // an interactive resize's dmabuf churn to one reallocation per painted
         // frame (frame-callback paced) instead of one per configure.
-        if self.presentation.buffer_size != (self.width, self.height) {
+        if self.presentation.buffer_size
+            != (self.layout.terminal.width, self.layout.terminal.height)
+        {
             self.destroy_buffers();
             self.create_buffers()?;
         }
@@ -615,7 +617,10 @@ impl State {
             return Ok(false);
         };
         let started = self.verbosity.frame_stats().then(Instant::now);
-        let (sw, sh) = (self.width as i32, self.height as i32);
+        let (sw, sh) = (
+            self.layout.terminal.width as i32,
+            self.layout.terminal.height as i32,
+        );
         // Rebuild the display list into the recycled back buffer (salvaging the
         // previous occupant's run strings into the pool first), so a steady frame
         // builds it without allocating. `front` still holds the on-screen frame.
@@ -628,7 +633,7 @@ impl State {
                 self.key_mode,
                 out,
                 strings,
-                self.metrics,
+                self.layout.terminal.metrics,
                 self.tabs.active().theme(),
                 sw,
                 sh,
@@ -639,7 +644,7 @@ impl State {
                 self.tabs.notice(),
                 out,
                 strings,
-                self.metrics,
+                self.layout.terminal.metrics,
                 self.tabs.active().theme(),
                 sw,
                 sh,

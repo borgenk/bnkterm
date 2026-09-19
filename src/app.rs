@@ -426,13 +426,11 @@ struct State {
     /// Reused `poll(2)` descriptor storage: Wayland first, followed by gatherer
     /// wake fds. Clearing it retains capacity, so idle waits do not allocate.
     poll_set: pty::PollSet,
-    /// The fixed cell box the whole grid is laid out on. Window-authoritative (it
-    /// owns the fonts and scale); the core holds a copy, shipped over on a resize.
-    metrics: CellMetrics,
-    /// The cell box for the (smaller) tab-bar label font, recomputed with `metrics`
-    /// on every scale/zoom change and handed to the tabs layer on a resize. Equal to
-    /// `metrics` when the label scale is 100%.
-    label_metrics: CellMetrics,
+    /// Where everything sits: the grid's device-pixel geometry (the core holds a copy,
+    /// shipped over on a resize) and the tab strip's. Window-authoritative, because the
+    /// window owns the fonts and the scale. [`Self::resize_to`] recomputes it whole, so
+    /// no two parts of a frame can come from different passes.
+    layout: WindowLayout,
     /// Key auto-repeat: Wayland delivers no repeat events, so the client synthesises
     /// them from the compositor's `repeat_info`. `repeat_key`/`repeat_at` track the
     /// held key and when it next fires; `repeat_interval` is `None` when repeat is
@@ -449,21 +447,6 @@ struct State {
     /// the centered overlay. See [`crate::keymode`].
     key_mode: KeyMode,
 
-    /// Current surface size in *device* pixels (the buffer resolution the grid is
-    /// laid out in). The logical size lives in `scale.logical`.
-    width: u32,
-    height: u32,
-    /// The grid size in cells the window last shipped to the core, mirrored here so
-    /// the window can clamp a pointer to the grid and skip a no-op resize without
-    /// reaching into the core's screen.
-    grid_dims: (usize, usize),
-    /// Device-pixel y coordinate of grid row zero. It moves down by the strip
-    /// height while a top-anchored tab bar is visible.
-    grid_origin_y: i32,
-    /// The tab strip's device-pixel top and height (both `0`-height when hidden),
-    /// mirrored here so pointer hit testing and the resize math share one source.
-    bar_y: i32,
-    bar_h: i32,
     /// Tab strip appearance and placement (top/bottom, height, widths, colors).
     tab_bar_config: TabBarConfig,
     /// Compositor scale factor and the objects that report it.
@@ -598,19 +581,17 @@ impl State {
         // The terminal core owns the grid/parser/PTY and its own geometry copy. At
         // unity scale the device padding is just `WINDOW_PADDING`; the first configure
         // ships the real geometry over on a `Resize`.
-        let mut core = TerminalCore::new(
-            demo,
-            TerminalGeometry {
-                cols,
-                rows,
-                width,
-                height,
-                metrics,
-                pad: WINDOW_PADDING,
-                origin_y: WINDOW_PADDING,
-                scale: Scale::ONE,
-            },
-        );
+        let geom = TerminalGeometry {
+            cols,
+            rows,
+            width,
+            height,
+            metrics,
+            pad: WINDOW_PADDING,
+            origin_y: WINDOW_PADDING,
+            scale: Scale::ONE,
+        };
+        let mut core = TerminalCore::new(demo, geom);
         let theme = Rc::new(config.theme);
         core.set_theme(Rc::clone(&theme));
 
@@ -628,8 +609,12 @@ impl State {
                 config.shell_startup,
             ),
             poll_set: pty::PollSet::new(),
-            metrics,
-            label_metrics,
+            layout: WindowLayout {
+                terminal: geom,
+                label_metrics,
+                bar_y: WINDOW_PADDING,
+                bar_h: 0,
+            },
             // Sensible defaults until the compositor sends repeat_info.
             repeat_delay: Duration::from_millis(400),
             repeat_interval: Some(Duration::from_millis(33)),
@@ -637,12 +622,6 @@ impl State {
             repeat_at: None,
             window_focused: false,
             key_mode: KeyMode::Normal,
-            width,
-            height,
-            grid_dims: (cols, rows),
-            grid_origin_y: WINDOW_PADDING,
-            bar_y: WINDOW_PADDING,
-            bar_h: 0,
             tab_bar_config,
             scale: Scaling::new((width, height)),
             registry: 0,
@@ -883,7 +862,7 @@ impl State {
             }
             // Opening/closing (including a child exiting during the pump) can
             // make the bar appear or disappear without a compositor configure.
-            self.resize_to(self.width, self.height);
+            self.resize_to(self.layout.terminal.width, self.layout.terminal.height);
             self.drain_outbox()?;
             // A program grabbing or releasing the mouse changes what a drag means, and
             // it arrives as output rather than as a pointer event: without this the
@@ -1040,31 +1019,6 @@ impl State {
         self.to_device(WINDOW_PADDING as u32) as i32
     }
 
-    /// The frame geometry every core lays out in, as one value from this layout pass.
-    fn terminal_geometry(&self) -> TerminalGeometry {
-        let (cols, rows) = self.grid_dims;
-        TerminalGeometry {
-            cols,
-            rows,
-            width: self.width,
-            height: self.height,
-            metrics: self.metrics,
-            pad: self.device_pad(),
-            origin_y: self.grid_origin_y,
-            scale: self.ui_scale(),
-        }
-    }
-
-    /// The same pass over the whole window: the grid's geometry plus the strip's.
-    fn window_layout(&self) -> WindowLayout {
-        WindowLayout {
-            terminal: self.terminal_geometry(),
-            label_metrics: self.label_metrics,
-            bar_y: self.bar_y,
-            bar_h: self.bar_h,
-        }
-    }
-
     /// The device pixels the strip and its gap take out of the window. Floored at one
     /// text row, so a label cannot clip on a small configured height or a large font.
     fn strip_reservation(&self) -> (i32, i32) {
@@ -1073,7 +1027,7 @@ impl State {
         }
         let cfg = &self.tab_bar_config;
         (
-            (self.to_device(cfg.height_px) as i32).max(self.metrics.h),
+            (self.to_device(cfg.height_px) as i32).max(self.layout.terminal.metrics.h),
             self.to_device(cfg.gap_px) as i32,
         )
     }
@@ -1084,8 +1038,8 @@ impl State {
     fn pin_surface_to_cells(&mut self, cols: usize, rows: usize) -> (u32, u32) {
         let pad = self.device_pad();
         let (bar_h, gap) = self.strip_reservation();
-        let w = cols as i32 * self.metrics.w + 2 * pad;
-        let h = rows as i32 * self.metrics.h + 2 * pad + bar_h + gap;
+        let w = cols as i32 * self.layout.terminal.metrics.w + 2 * pad;
+        let h = rows as i32 * self.layout.terminal.metrics.h + 2 * pad + bar_h + gap;
         let wanted = (w.max(1) as u32, h.max(1) as u32);
         let (device, logical) = capture_surface(wanted, self.scale.factor_120);
         if self.scale.logical != logical {
@@ -1098,8 +1052,8 @@ impl State {
     /// Record a new *device* surface size and the grid geometry that now fits inside the
     /// scaled padding, leaving [`Self::flush_layout`] to hand it to the tabs at the next
     /// paint. GPU buffers are reallocated lazily in `render_frame` for the same reason.
-    /// A no-op only when neither the device size nor the resulting grid changed (the
-    /// grid can change from a scale-driven metrics change at an unchanged size).
+    /// A no-op only when the whole layout lands identical, so a scale-driven metrics
+    /// change still reaches the cores at an unchanged window size.
     fn resize_to(&mut self, w: u32, h: u32) {
         #[cfg(test)]
         let (w, h) = match self.capture_cells {
@@ -1112,7 +1066,11 @@ impl State {
         let (bar_h, gap) = self.strip_reservation();
         let usable_w = (w as i32 - 2 * pad).max(0);
         let usable_h = (h as i32 - 2 * pad - bar_h - gap).max(0);
-        let (cols, rows) = self.metrics.columns_rows(usable_w, usable_h);
+        let (cols, rows) = self
+            .layout
+            .terminal
+            .metrics
+            .columns_rows(usable_w, usable_h);
         // The strip steals its height (and the gap) from the side it sits on: a top
         // bar tucks under the padding and pushes the grid down past the gap; a bottom
         // bar sits flush above the bottom padding, the gap reserved above it.
@@ -1121,19 +1079,25 @@ impl State {
             (_, TabBarPosition::Top) => (pad + bar_h + gap, pad),
             (_, TabBarPosition::Bottom) => (pad, h as i32 - pad - bar_h),
         };
-        if (w, h) == (self.width, self.height)
-            && (cols, rows) == self.grid_dims
-            && origin_y == self.grid_origin_y
-            && (bar_y, bar_h) == (self.bar_y, self.bar_h)
-        {
+        let layout = WindowLayout {
+            terminal: TerminalGeometry {
+                cols,
+                rows,
+                width: w,
+                height: h,
+                pad,
+                origin_y,
+                scale: self.ui_scale(),
+                ..self.layout.terminal
+            },
+            bar_y,
+            bar_h,
+            ..self.layout
+        };
+        if layout == self.layout {
             return;
         }
-        self.width = w;
-        self.height = h;
-        self.grid_dims = (cols, rows);
-        self.grid_origin_y = origin_y;
-        self.bar_y = bar_y;
-        self.bar_h = bar_h;
+        self.layout = layout;
         self.pending_layout = true;
     }
 
@@ -1153,7 +1117,7 @@ impl State {
             return;
         }
         self.pending_layout = false;
-        let _ = self.tabs.resize_all(self.window_layout());
+        let _ = self.tabs.resize_all(self.layout);
     }
 
     /// Adopt a new compositor scale (in 120ths): reopen the fonts at the size it
@@ -1184,7 +1148,7 @@ impl State {
     /// Reopen the fonts at device-pixel `size` and recompute the cell metrics. On a
     /// font-open failure the working fonts are kept (no panic, no blank window).
     fn apply_font_size(&mut self, size: u32) {
-        if size == self.metrics.size {
+        if size == self.layout.terminal.metrics.size {
             return;
         }
         // On a font-open failure, keep the working fonts (no panic, no blank
@@ -1192,8 +1156,8 @@ impl State {
         let label_size = label_font_px(size, self.tab_bar_config.label_scale_pct);
         let sizes = font_sizes(size, label_size);
         if let Ok(fonts) = Fonts::with_selection(&self.font_selection, &sizes, 1.0) {
-            self.metrics = CellMetrics::from_fonts(&fonts, size);
-            self.label_metrics = CellMetrics::from_ui(&fonts, label_size);
+            self.layout.terminal.metrics = CellMetrics::from_fonts(&fonts, size);
+            self.layout.label_metrics = CellMetrics::from_ui(&fonts, label_size);
             self.fonts = fonts;
         }
     }
@@ -1711,7 +1675,7 @@ impl State {
         if self.tabs.active().is_demo() {
             return;
         }
-        let geom = self.terminal_geometry();
+        let geom = self.layout.terminal;
         if let Err(error) = self.tabs.open(geom, self.window_focused) {
             eprintln!("bnkterm: could not open tab: {error}");
         }
@@ -1815,16 +1779,15 @@ impl State {
     /// multi-click identity use the cell alone; a character selection also reads
     /// the side to round each endpoint to the nearer cell edge.
     fn pointer_cell(&self) -> (usize, usize, Side) {
-        let (cols, rows) = self.grid_dims;
+        let grid = self.layout.terminal;
         // Pointer coordinates are logical (surface-local); the grid is device
         // pixels, so scale up first. The grid is then inset by the (device) padding;
         // a pointer in the margin maps to the nearest edge cell (floored at zero).
         let scale = self.scale.factor_120 as f32 / 120.0;
-        let pad = self.device_pad() as f32;
-        let px = (self.pointer_x * scale - pad).max(0.0);
-        let py = (self.pointer_y * scale - self.grid_origin_y as f32).max(0.0);
-        let (col, side) = column_under(px, self.metrics.w, cols);
-        let row = ((py / self.metrics.h as f32) as usize).min(rows.saturating_sub(1));
+        let px = (self.pointer_x * scale - grid.pad as f32).max(0.0);
+        let py = (self.pointer_y * scale - grid.origin_y as f32).max(0.0);
+        let (col, side) = column_under(px, grid.metrics.w, grid.cols);
+        let row = ((py / grid.metrics.h as f32) as usize).min(grid.rows.saturating_sub(1));
         (col, row, side)
     }
 
@@ -1837,7 +1800,7 @@ impl State {
         }
         let scale = self.scale.factor_120 as f32 / 120.0;
         let y = self.pointer_y * scale;
-        y >= self.bar_y as f32 && y < (self.bar_y + self.bar_h) as f32
+        y >= self.layout.bar_y as f32 && y < (self.layout.bar_y + self.layout.bar_h) as f32
     }
 
     /// Stable tab identity under the pointer while it is in the bar.
@@ -1847,11 +1810,11 @@ impl State {
         }
         let scale = self.scale.factor_120 as f32 / 120.0;
         let x = self.pointer_x * scale;
-        let pad = self.device_pad() as f32;
+        let pad = self.layout.terminal.pad as f32;
         if x < pad {
             return None;
         }
-        let col = ((x - pad) / self.metrics.w as f32) as usize;
+        let col = ((x - pad) / self.layout.terminal.metrics.w as f32) as usize;
         self.tabs.tab_at_bar_col(col)
     }
 
@@ -2206,13 +2169,13 @@ impl State {
         self.tabs
             .active_mut()
             .feed_test_bytes(format!("\x1b]2;{active}\x07").as_bytes());
-        let geom = self.terminal_geometry();
+        let geom = self.layout.terminal;
         for title in rest {
             self.tabs.push_demo_tab(geom, title);
         }
         // The strip appears at two tabs and takes its height from the grid; only a
         // resize re-derives that split.
-        let (w, h) = (self.width, self.height);
+        let (w, h) = (self.layout.terminal.width, self.layout.terminal.height);
         self.resize_to(w, h);
     }
 

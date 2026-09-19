@@ -8,7 +8,7 @@ use crate::platform::geom::Scale;
 use crate::term_render::CellMetrics;
 
 /// One grid's size and the device-pixel box it lays out in.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) struct TerminalGeometry {
     pub(super) cols: usize,
     pub(super) rows: usize,
@@ -30,7 +30,7 @@ pub(super) struct TerminalGeometry {
 /// One layout pass over the whole window: the grid's geometry and the strip above or
 /// below it. The window computes it; `Tabs` keeps the strip fields and hands the
 /// terminal half to every core.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) struct WindowLayout {
     pub(super) terminal: TerminalGeometry,
     /// The cell box tab labels are measured and drawn on.
