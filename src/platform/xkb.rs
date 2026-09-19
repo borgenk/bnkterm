@@ -31,26 +31,6 @@ use crate::platform::error::{Error, Result};
 /// Wayland passes raw evdev keycodes; XKB expects them offset by +8.
 const EVDEV_OFFSET: u32 = 8;
 
-/// Raw Linux evdev keycodes, as `wl_keyboard.key` reports them (before the
-/// libxkbcommon `+8` offset). From `linux/input-event-codes.h`, a kernel ABI, which
-/// is why they live down here: an app binds them, but it does not get to define them.
-pub mod keycode {
-    pub const ESC: u32 = 1;
-    pub const BACKSPACE: u32 = 14;
-    pub const TAB: u32 = 15;
-    pub const ENTER: u32 = 28;
-    pub const KP_ENTER: u32 = 96;
-    pub const HOME: u32 = 102;
-    pub const UP: u32 = 103;
-    pub const PAGEUP: u32 = 104;
-    pub const LEFT: u32 = 105;
-    pub const RIGHT: u32 = 106;
-    pub const END: u32 = 107;
-    pub const DOWN: u32 = 108;
-    pub const PAGEDOWN: u32 = 109;
-    pub const DELETE: u32 = 111;
-}
-
 const XKB_KEYMAP_FORMAT_TEXT_V1: u32 = 1;
 /// The *effective* modifier state: depressed (physically held), latched (sticky
 /// keys: tapped, released, and applied to the next key), and locked (Caps Lock)
