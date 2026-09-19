@@ -31,18 +31,6 @@ pub type DisplayList = Vec<DrawCmd>;
 /// cheaper than tracking and clipping each one.
 const MAX_DAMAGE_RECTS: usize = 16;
 
-/// Which corners a [`DrawCmd::RoundRect`] rounds. A fenced code block's panel is
-/// drawn as one rounded rectangle: the GPU shader rounds whichever corners this
-/// selects, so a single-line block rounds both ends and a multi-line block rounds
-/// only its first and last rows.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum RoundedCorners {
-    None,
-    Top,
-    Bottom,
-    Both,
-}
-
 /// The horizontal span over which a [`DrawCmd::Text`] run's ink ramps away to
 /// nothing, in screen pixels: full ink at [`from`](Self::from) and to the left of
 /// it, none at [`to`](Self::to) and beyond. The tab bar's only use of it is a
@@ -76,13 +64,9 @@ pub struct Fade {
 pub enum DrawCmd {
     /// A solid, opaque rectangle (background, selection, caret, quote bar, rule).
     Fill { rect: Rect, color: u32 },
-    /// A solid rectangle with anti-aliased rounded corners (a code panel).
-    RoundRect {
-        rect: Rect,
-        color: u32,
-        radius: i32,
-        corners: RoundedCorners,
-    },
+    /// A solid rectangle with anti-aliased rounded corners (the scrollbar thumb, an
+    /// overlay panel).
+    RoundRect { rect: Rect, color: u32, radius: i32 },
     /// A run of text drawn from `x` along `baseline`. `bounds` is the run's screen
     /// rectangle padded for glyph ink that overhangs the advance box, so the
     /// damage diff and the clip test never clip a glyph's edge.

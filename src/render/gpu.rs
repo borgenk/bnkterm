@@ -22,7 +22,6 @@ use crate::platform::grapheme;
 use crate::render::boxdraw;
 use crate::render::display::DrawCmd;
 use crate::render::display::Fade;
-use crate::render::display::RoundedCorners;
 
 /// Vertex modes, matching shaders/quad.frag. (Mode 3, the decoded-image path,
 /// is excised: a terminal draws no images.)
@@ -586,8 +585,7 @@ impl Batcher<'_> {
                 rect,
                 color,
                 radius,
-                corners,
-            } => self.round_rect(*rect, *color, *radius, *corners),
+            } => self.round_rect(*rect, *color, *radius),
             DrawCmd::Text {
                 x,
                 baseline,
@@ -678,23 +676,18 @@ impl Batcher<'_> {
         self.batches.push(Batch { start, count });
     }
 
-    fn round_rect(&mut self, rect: Rect, color: u32, radius: i32, corners: RoundedCorners) {
+    fn round_rect(&mut self, rect: Rect, color: u32, radius: i32) {
         // Clamp the radius to half the shorter side so opposite corners never
         // overlap; the shader's coverage function assumes this bound holds.
         let r = radius.clamp(0, (rect.w / 2).min(rect.h / 2).max(0));
-        let mask = match corners {
-            RoundedCorners::None => 0u32,
-            RoundedCorners::Top => 1,
-            RoundedCorners::Bottom => 2,
-            RoundedCorners::Both => 3,
-        };
-        if r == 0 || mask == 0 {
+        if r == 0 {
             self.quad(rect, MODE_SOLID, color, [0.0; 2], [0.0; 4]);
             return;
         }
         // uv carries the position within the rect (pixels); extra carries the
-        // geometry the shader's coverage function needs.
-        let extra = [rect.w as f32, rect.h as f32, r as f32, mask as f32];
+        // geometry the shader's coverage function needs. The shader's corner mask
+        // is top 1, bottom 2; every rounded rect rounds all four, so it is 3.
+        let extra = [rect.w as f32, rect.h as f32, r as f32, 3.0];
         self.quad(rect, MODE_ROUND, color, [0.0; 2], extra);
     }
 
@@ -1548,13 +1541,12 @@ mod tests {
             rect,
             color: 0x0011_2233,
             radius: 4,
-            corners: RoundedCorners::Top,
         }];
         let f = build_frame(&fonts, &list, &mut cache, GAMMA);
         assert_eq!(f.vertices.len(), 6);
         let v = &f.vertices[0];
         assert_eq!(v.mode, MODE_ROUND);
-        assert_eq!(v.extra, [20.0, 10.0, 4.0, 1.0], "w, h, r, corner mask");
+        assert_eq!(v.extra, [20.0, 10.0, 4.0, 3.0], "w, h, r, corner mask");
         assert_eq!(v.uv, [0.0, 0.0], "uv is rect-local pixels");
         assert_eq!(f.vertices[4].uv, [20.0, 10.0]);
     }
@@ -1572,7 +1564,6 @@ mod tests {
             },
             color: 0,
             radius: 0,
-            corners: RoundedCorners::Both,
         }];
         let f = build_frame(&fonts, &list, &mut cache, GAMMA);
         assert!(f.vertices.iter().all(|v| v.mode == MODE_SOLID));

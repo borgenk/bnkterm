@@ -66,7 +66,7 @@ use crate::platform::geom::{Rect, Scale};
 use crate::platform::grapheme;
 use crate::platform::pixel;
 use crate::platform::scroll::{self, Scrollbar};
-use crate::render::display::{DisplayList, DrawCmd, Fade, RoundedCorners};
+use crate::render::display::{DisplayList, DrawCmd, Fade};
 
 /// The glyph whose advance defines the monospace cell width. `M` is the classic
 /// full-width reference; on a genuine monospace face every glyph shares it.
@@ -1167,7 +1167,6 @@ impl Painter<'_> {
             rect,
             color: pixel::tint(behind, SCROLL_INK, cover * lit),
             radius: w / 2,
-            corners: RoundedCorners::Both,
         });
     }
 

@@ -32,7 +32,7 @@ use crate::input::{Key, Mods};
 use crate::platform::freetype::{FaceKey, FontStyle};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
-use crate::render::display::{DisplayList, DrawCmd, RoundedCorners};
+use crate::render::display::{DisplayList, DrawCmd};
 use crate::term_render::{self, CellMetrics};
 
 /// The modal key-table state. `Normal` is the transparent default in which every
@@ -221,7 +221,6 @@ pub(crate) fn paint_overlay(
         },
         color: panel_bg.to_u32(),
         radius,
-        corners: RoundedCorners::Both,
     });
 
     let face = FaceKey::Prose {

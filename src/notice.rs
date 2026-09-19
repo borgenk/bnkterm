@@ -34,7 +34,7 @@ use crate::config::ShellStartupConfig;
 use crate::platform::freetype::{FaceKey, FontStyle};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
-use crate::render::display::{DisplayList, DrawCmd, RoundedCorners};
+use crate::render::display::{DisplayList, DrawCmd};
 use crate::term_render::{self, CellMetrics};
 use std::time::{Duration, Instant};
 
@@ -181,7 +181,6 @@ pub(crate) fn paint(
         },
         color: faded_bg.to_u32(),
         radius,
-        corners: RoundedCorners::Both,
     });
     term_render::push_cell_text(
         out,
