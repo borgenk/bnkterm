@@ -434,7 +434,7 @@ impl Glyph {
 /// seat the baseline the same way.
 ///
 /// Leading a *caller* adds on top of the font's own line height (see
-/// [`Fonts::with_config`]) is a different thing: that one is split evenly, so text
+/// [`Fonts::with_selection`]) is a different thing: that one is split evenly, so text
 /// stays centered in the taller line box rather than sinking to its floor.
 #[derive(Clone, Copy, Debug)]
 pub struct Metrics {
@@ -490,7 +490,7 @@ pub struct Face {
     /// The emoji face scales its color glyphs to this so an emoji sits on the
     /// same em square as the surrounding text.
     pixel_size: Cell<u32>,
-    /// The shared color emoji font, if one is installed; [`Fonts::new`] attaches
+    /// The shared color emoji font, if one is installed; [`Fonts::with_selection`] attaches
     /// it to every face it opens. `None` on the emoji face itself and in
     /// face-only tests, in which case emoji clusters take the per-character
     /// path (tofu, exactly the pre-emoji behavior).
@@ -982,25 +982,19 @@ pub struct Fonts {
 
 impl Fonts {
     /// Open the default font selection at each of `sizes`, with the font's own
-    /// line height (a scale of 1.0, no extra leading). A convenience over
-    /// [`Self::with_config`] using [`FontConfig::default`]; tests and the perf
-    /// harness use it, while the editor threads its own config through
-    /// [`Self::with_config`].
+    /// line height (a scale of 1.0, no extra leading). For tests; the app resolves
+    /// its configured selection once and opens it through [`Self::with_selection`].
+    #[cfg(test)]
     pub fn new(sizes: &[u32]) -> Result<Self> {
-        Self::with_config(&FontConfig::default(), sizes, 1.0)
+        Self::with_selection(&FontSelection::resolve(&FontConfig::default())?, sizes, 1.0)
     }
 
-    /// Resolve `config` against the installed fonts and open it at each of `sizes` (zeros and
+    /// Open an already-resolved [`FontSelection`] at each of `sizes` (zeros and
     /// duplicates skipped), loading every available style per size. Each size's
     /// line box is grown to at least `line_height_scale` times the size (the CSS
     /// line-height model), never below the font's own line height, so lines can
     /// be spaced out without overlapping. At least one nonzero size is required;
     /// the first opened becomes the fallback.
-    pub fn with_config(config: &FontConfig, sizes: &[u32], line_height_scale: f32) -> Result<Self> {
-        Self::with_selection(&FontSelection::resolve(config)?, sizes, line_height_scale)
-    }
-
-    /// Open an already-resolved [`FontSelection`] at each requested size.
     pub fn with_selection(
         selection: &FontSelection,
         sizes: &[u32],
@@ -1076,7 +1070,7 @@ impl Fonts {
             });
         }
         if sized.is_empty() {
-            return Err(Error::msg("Fonts::new needs at least one nonzero size"));
+            return Err(Error::msg("fonts need at least one nonzero size"));
         }
         Ok(Self {
             sized,
@@ -1087,7 +1081,7 @@ impl Fonts {
 
     /// The entry for `size`, or the fallback (first opened) if `size` is unknown.
     fn entry(&self, size: u32) -> &SizedFaces {
-        // `sized` is never empty (Fonts::new errors otherwise), so the `[0]`
+        // `sized` is never empty (`with_selection` errors otherwise), so the `[0]`
         // fallback for an unknown size cannot panic.
         debug_assert!(!self.sized.is_empty());
         self.sized
@@ -1374,8 +1368,9 @@ mod tests {
         if fontconfig::font_for_family("monospace", FontStyle::Regular).is_none() {
             return;
         }
-        let fonts = Fonts::with_config(&config_of(&["NoSuchFamilyAtAll", "monospace"]), &[16], 1.0)
-            .expect("fonts open");
+        let selection = FontSelection::resolve(&config_of(&["NoSuchFamilyAtAll", "monospace"]))
+            .expect("the alias resolves");
+        let fonts = Fonts::with_selection(&selection, &[16], 1.0).expect("fonts open");
         let face = fonts.face_for(FaceKey::Prose {
             size: 16,
             style: FontStyle::Regular,
@@ -1622,7 +1617,8 @@ mod tests {
         let base = Fonts::new(&[14]).expect("a default font").metrics(14);
         // A scale well above any 14px font's own line height forces the box to
         // the scaled target; 3.0 gives 42px, past ascent + descent.
-        let big = Fonts::with_config(&FontConfig::default(), &[14], 3.0)
+        let selection = FontSelection::resolve(&FontConfig::default()).expect("a default font");
+        let big = Fonts::with_selection(&selection, &[14], 3.0)
             .expect("a default font")
             .metrics(14);
         assert_eq!(big.ascent, base.ascent, "ascent stays the glyph metric");
@@ -1639,7 +1635,8 @@ mod tests {
         // A scale too small to matter leaves the font's own line height, so
         // lines never overlap.
         let base = Fonts::new(&[14]).expect("a default font").metrics(14);
-        let tiny = Fonts::with_config(&FontConfig::default(), &[14], 0.1)
+        let selection = FontSelection::resolve(&FontConfig::default()).expect("a default font");
+        let tiny = Fonts::with_selection(&selection, &[14], 0.1)
             .expect("a default font")
             .metrics(14);
         assert_eq!(tiny.line_height, base.line_height);
