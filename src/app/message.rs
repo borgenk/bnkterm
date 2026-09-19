@@ -7,10 +7,9 @@
 //! into window actions. Everything except PTY reads stays on `app::State`'s main
 //! thread; gather threads publish only byte batches.
 
+use crate::app::geometry::TerminalGeometry;
 use crate::input::{Key, KeyEvent, Mods};
 use crate::mouse::MouseButton;
-use crate::platform::geom::Scale;
-use crate::term_render::CellMetrics;
 
 /// Which half of its cell the pointer sits in, against the cell's vertical midline.
 /// A character selection reads it to round each endpoint to the nearer cell edge —
@@ -74,25 +73,9 @@ pub enum ToTerminal {
     /// A pointer event mapped to a cell, plus the modifier chord (Shift forces local
     /// use even while a program is grabbing the mouse).
     Pointer { event: PointerEvent, mods: Mods },
-    /// A new grid size in cells, plus the frame geometry that produced it. The
-    /// window owns the fonts and scale, so it computes the cell `metrics`, the
-    /// device surface `width`/`height`, and the device `pad`; the terminal resizes
-    /// the grid, pushes the size to the child (`TIOCSWINSZ`), and keeps the geometry
-    /// copies it lays frames out with.
-    Resize {
-        cols: usize,
-        rows: usize,
-        width: u32,
-        height: u32,
-        metrics: CellMetrics,
-        pad: i32,
-        /// Device-pixel y coordinate of the grid's first row. This is `pad` with
-        /// one tab and `pad + metrics.h` while the tab bar is visible.
-        origin_y: i32,
-        /// The display scale, so the core can size the chrome it owns (the scrollbar)
-        /// in the same device pixels the rest of this geometry is in.
-        scale: Scale,
-    },
+    /// The window's fresh frame geometry. The terminal resizes the grid to it, pushes
+    /// the new size to the child (`TIOCSWINSZ`), and keeps it to lay frames out with.
+    Resize(TerminalGeometry),
     /// Keyboard focus gained or lost. The window observes it (Wayland); the terminal
     /// needs it because the cursor draws solid when focused, hollow when not.
     Focus(bool),

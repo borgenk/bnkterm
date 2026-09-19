@@ -26,6 +26,7 @@
 //! render question from the live pipeline.
 
 mod clipboard;
+mod geometry;
 mod message;
 mod present;
 mod tabs;
@@ -36,6 +37,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use self::clipboard::{PendingSend, SelectionState};
+use self::geometry::{TerminalGeometry, WindowLayout};
 use self::message::{PointerEvent, Side, ToTerminal, ToWindow};
 use self::present::GpuPresentation;
 use self::tabs::{Reorder, Tabs};
@@ -593,10 +595,22 @@ impl State {
         let (cols, rows) = (DEFAULT_COLS, DEFAULT_ROWS);
         let width = (cols as i32 * metrics.w + 2 * WINDOW_PADDING).max(1) as u32;
         let height = (rows as i32 * metrics.h + 2 * WINDOW_PADDING).max(1) as u32;
-        // The terminal core owns the grid/parser/PTY and its own geometry copies.
-        // At unity scale the device padding is just `WINDOW_PADDING`; the first
-        // configure ships the real geometry over on a `Resize`.
-        let mut core = TerminalCore::new(demo, cols, rows, metrics, width, height, WINDOW_PADDING);
+        // The terminal core owns the grid/parser/PTY and its own geometry copy. At
+        // unity scale the device padding is just `WINDOW_PADDING`; the first configure
+        // ships the real geometry over on a `Resize`.
+        let mut core = TerminalCore::new(
+            demo,
+            TerminalGeometry {
+                cols,
+                rows,
+                width,
+                height,
+                metrics,
+                pad: WINDOW_PADDING,
+                origin_y: WINDOW_PADDING,
+                scale: Scale::ONE,
+            },
+        );
         let theme = Rc::new(config.theme);
         core.set_theme(Rc::clone(&theme));
 
@@ -1026,6 +1040,31 @@ impl State {
         self.to_device(WINDOW_PADDING as u32) as i32
     }
 
+    /// The frame geometry every core lays out in, as one value from this layout pass.
+    fn terminal_geometry(&self) -> TerminalGeometry {
+        let (cols, rows) = self.grid_dims;
+        TerminalGeometry {
+            cols,
+            rows,
+            width: self.width,
+            height: self.height,
+            metrics: self.metrics,
+            pad: self.device_pad(),
+            origin_y: self.grid_origin_y,
+            scale: self.ui_scale(),
+        }
+    }
+
+    /// The same pass over the whole window: the grid's geometry plus the strip's.
+    fn window_layout(&self) -> WindowLayout {
+        WindowLayout {
+            terminal: self.terminal_geometry(),
+            label_metrics: self.label_metrics,
+            bar_y: self.bar_y,
+            bar_h: self.bar_h,
+        }
+    }
+
     /// The device pixels the strip and its gap take out of the window. Floored at one
     /// text row, so a label cannot clip on a small configured height or a large font.
     fn strip_reservation(&self) -> (i32, i32) {
@@ -1114,20 +1153,7 @@ impl State {
             return;
         }
         self.pending_layout = false;
-        let (cols, rows) = self.grid_dims;
-        let _ = self.tabs.resize_all(
-            cols,
-            rows,
-            self.width,
-            self.height,
-            self.metrics,
-            self.label_metrics,
-            self.device_pad(),
-            self.grid_origin_y,
-            self.bar_y,
-            self.bar_h,
-            self.ui_scale(),
-        );
+        let _ = self.tabs.resize_all(self.window_layout());
     }
 
     /// Adopt a new compositor scale (in 120ths): reopen the fonts at the size it
@@ -1685,17 +1711,8 @@ impl State {
         if self.tabs.active().is_demo() {
             return;
         }
-        let (cols, rows) = self.grid_dims;
-        let pad = self.device_pad();
-        if let Err(error) = self.tabs.open(
-            cols,
-            rows,
-            self.metrics,
-            self.width,
-            self.height,
-            pad,
-            self.window_focused,
-        ) {
+        let geom = self.terminal_geometry();
+        if let Err(error) = self.tabs.open(geom, self.window_focused) {
             eprintln!("bnkterm: could not open tab: {error}");
         }
     }
@@ -2189,9 +2206,9 @@ impl State {
         self.tabs
             .active_mut()
             .feed_test_bytes(format!("\x1b]2;{active}\x07").as_bytes());
+        let geom = self.terminal_geometry();
         for title in rest {
-            self.tabs
-                .push_demo_tab(self.metrics, self.width, self.height, WINDOW_PADDING, title);
+            self.tabs.push_demo_tab(geom, title);
         }
         // The strip appears at two tabs and takes its height from the grid; only a
         // resize re-derives that split.

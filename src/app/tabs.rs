@@ -23,17 +23,16 @@ use std::time::{Duration, Instant};
 
 use super::message::{ToTerminal, ToWindow};
 use super::terminal::{PumpOutcome, TerminalCore};
+use crate::app::geometry::{TerminalGeometry, WindowLayout};
 use crate::color::Theme;
 use crate::config::{ShellStartupConfig, TabBarConfig};
 use crate::error::Result;
 use crate::gather::GatherEnd;
 use crate::notice::Notice;
 use crate::platform::freetype::Fonts;
-use crate::platform::geom::Scale;
 use crate::pty::{Launch, ZombieChild};
 use crate::render::display::DisplayList;
 use crate::tab_bar::{self, BarGeom, Lift, Slot, TabLabel};
-use crate::term_render::CellMetrics;
 
 /// One global gather budget per event-loop turn. Foreground output is parsed
 /// first; background tabs rotate through whatever remains.
@@ -184,18 +183,8 @@ impl Tabs {
 
     /// Open a live shell at the current geometry. Existing tabs are not touched
     /// until PTY and gatherer startup both succeed.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn open(
-        &mut self,
-        cols: usize,
-        rows: usize,
-        metrics: CellMetrics,
-        width: u32,
-        height: u32,
-        pad: i32,
-        window_focused: bool,
-    ) -> Result<TabId> {
-        let mut core = TerminalCore::new(false, cols, rows, metrics, width, height, pad);
+    pub(super) fn open(&mut self, geom: TerminalGeometry, window_focused: bool) -> Result<TabId> {
+        let mut core = TerminalCore::new(false, geom);
         core.set_theme(Rc::clone(&self.theme));
         if let Err(error) = core.spawn_shell(&self.launch) {
             if let Some(child) = core.into_child() {
@@ -220,17 +209,8 @@ impl Tabs {
     /// Add a tab on a static demo grid under `title`. Not [`open`](Self::open),
     /// which spawns a shell and would put the environment into the picture.
     #[cfg(test)]
-    pub(super) fn push_demo_tab(
-        &mut self,
-        metrics: CellMetrics,
-        width: u32,
-        height: u32,
-        pad: i32,
-        title: &str,
-    ) {
-        // The grid size the tabs already agree on, so a new one lands the same shape.
-        let (cols, rows) = self.active().dimensions();
-        let mut core = TerminalCore::new(true, cols, rows, metrics, width, height, pad);
+    pub(super) fn push_demo_tab(&mut self, geom: TerminalGeometry, title: &str) {
+        let mut core = TerminalCore::new(true, geom);
         core.set_theme(Rc::clone(&self.theme));
         core.feed_test_bytes(format!("\x1b]2;{title}\x07").as_bytes());
         let id = self.allocate_id();
@@ -457,41 +437,19 @@ impl Tabs {
     /// Apply the window's current geometry eagerly to every tab so background
     /// output always wraps at the true width, and adopt the strip rectangle the
     /// window computed for this size and top/bottom placement.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn resize_all(
-        &mut self,
-        cols: usize,
-        rows: usize,
-        width: u32,
-        height: u32,
-        metrics: CellMetrics,
-        label: CellMetrics,
-        pad: i32,
-        origin_y: i32,
-        bar_y: i32,
-        bar_h: i32,
-        scale: Scale,
-    ) -> Result<()> {
+    pub(super) fn resize_all(&mut self, layout: WindowLayout) -> Result<()> {
+        let grid = layout.terminal;
         for entry in &mut self.entries {
-            entry.core.apply(ToTerminal::Resize {
-                cols,
-                rows,
-                width,
-                height,
-                metrics,
-                pad,
-                origin_y,
-                scale,
-            })?;
-            debug_assert_eq!(entry.core.dimensions(), (cols, rows));
+            entry.core.apply(ToTerminal::Resize(grid))?;
+            debug_assert_eq!(entry.core.dimensions(), (grid.cols, grid.rows));
         }
         self.bar_geom = Some(BarGeom {
-            metrics,
-            label,
-            surface_width: width as i32,
-            pad,
-            y: bar_y,
-            h: bar_h,
+            metrics: grid.metrics,
+            label: layout.label_metrics,
+            surface_width: grid.width as i32,
+            pad: grid.pad,
+            y: layout.bar_y,
+            h: layout.bar_h,
         });
         self.rebuild_bar();
         Ok(())
@@ -963,8 +921,10 @@ impl Tabs {
 mod tests {
     use super::*;
     use crate::input::{Key, Mods};
+    use crate::platform::geom::Scale;
     use crate::pty::{Launch, PollSet, Target};
     use crate::render::display::DrawCmd;
+    use crate::term_render::CellMetrics;
 
     const METRICS: CellMetrics = CellMetrics {
         size: 16,
@@ -976,16 +936,38 @@ mod tests {
         lock_glyph: true,
     };
 
-    fn core(demo: bool, cols: usize, rows: usize) -> TerminalCore {
-        TerminalCore::new(
-            demo,
+    /// A geometry on [`METRICS`] cells sized to fit them exactly, no padding, unity scale.
+    fn geom(cols: usize, rows: usize) -> TerminalGeometry {
+        TerminalGeometry {
             cols,
             rows,
-            METRICS,
-            (cols as i32 * METRICS.w) as u32,
-            (rows as i32 * METRICS.h) as u32,
-            0,
-        )
+            width: (cols as i32 * METRICS.w) as u32,
+            height: (rows as i32 * METRICS.h) as u32,
+            metrics: METRICS,
+            pad: 0,
+            origin_y: 0,
+            scale: Scale::ONE,
+        }
+    }
+
+    /// A layout with the strip along the top edge, so the grid starts one strip
+    /// height down. Labels are measured on the grid's own cell box.
+    fn layout(cols: usize, rows: usize, width: u32, height: u32) -> WindowLayout {
+        WindowLayout {
+            terminal: TerminalGeometry {
+                width,
+                height,
+                origin_y: METRICS.h,
+                ..geom(cols, rows)
+            },
+            label_metrics: METRICS,
+            bar_y: 0,
+            bar_h: METRICS.h,
+        }
+    }
+
+    fn core(demo: bool, cols: usize, rows: usize) -> TerminalCore {
+        TerminalCore::new(demo, geom(cols, rows))
     }
 
     fn demo_tabs(count: usize) -> Tabs {
@@ -1240,20 +1222,8 @@ mod tests {
     /// real device-pixel geometry to work against. `count` equal blocks fill `cols`.
     fn dragging_tabs(count: usize, cols: usize) -> Tabs {
         let mut tabs = demo_tabs(count);
-        tabs.resize_all(
-            cols,
-            10,
-            (cols as i32 * METRICS.w) as u32,
-            176,
-            METRICS,
-            METRICS,
-            0,
-            16,
-            0,
-            16,
-            Scale::ONE,
-        )
-        .expect("build the bar");
+        tabs.resize_all(layout(cols, 10, (cols as i32 * METRICS.w) as u32, 176))
+            .expect("build the bar");
         tabs
     }
 
@@ -1386,20 +1356,8 @@ mod tests {
     #[test]
     fn resize_updates_every_core() {
         let mut tabs = demo_tabs(3);
-        tabs.resize_all(
-            100,
-            30,
-            800,
-            480,
-            METRICS,
-            METRICS,
-            0,
-            16,
-            0,
-            16,
-            Scale::ONE,
-        )
-        .expect("resize every demo core");
+        tabs.resize_all(layout(100, 30, 800, 480))
+            .expect("resize every demo core");
         assert!(tabs
             .entries
             .iter()
@@ -1411,7 +1369,7 @@ mod tests {
     fn bar_hit_testing_maps_to_stable_ids() {
         let mut tabs = demo_tabs(2);
         let ids: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
-        tabs.resize_all(20, 10, 160, 176, METRICS, METRICS, 0, 16, 0, 16, Scale::ONE)
+        tabs.resize_all(layout(20, 10, 160, 176))
             .expect("build bar layout");
 
         // Two tabs in 20 cols land at the floor width of 10 each: 0..10, 10..20.
@@ -1437,20 +1395,8 @@ mod tests {
 
         // A top-anchored one-cell strip: grid origin drops one cell, strip at y 0.
         let mut two = demo_tabs(2);
-        two.resize_all(
-            80,
-            23,
-            640,
-            384,
-            METRICS,
-            METRICS,
-            0,
-            METRICS.h,
-            0,
-            METRICS.h,
-            Scale::ONE,
-        )
-        .expect("shift both grids below the bar");
+        two.resize_all(layout(80, 23, 640, 384))
+            .expect("shift both grids below the bar");
         let mut two_list = Vec::new();
         let mut two_strings = Vec::new();
         two.fill_frame_list(&mut two_list, &mut two_strings, &fonts);
@@ -1482,20 +1428,8 @@ mod tests {
         let fonts = Fonts::new(&[METRICS.size]).expect("fonts");
         let mut two = demo_tabs(2);
         let ids: Vec<_> = two.entries.iter().map(|entry| entry.id).collect();
-        two.resize_all(
-            80,
-            23,
-            640,
-            384,
-            METRICS,
-            METRICS,
-            0,
-            METRICS.h,
-            0,
-            METRICS.h,
-            Scale::ONE,
-        )
-        .expect("build the bar");
+        two.resize_all(layout(80, 23, 640, 384))
+            .expect("build the bar");
         // The runtime path makes the newly opened tab active and tab zero inactive.
         assert!(two.select(ids[1], false));
 
@@ -1535,7 +1469,7 @@ mod tests {
             Launch::new(vec!["/bin/cat".to_string()], Target::Local),
             ShellStartupConfig::default(),
         );
-        if tabs.open(40, 10, METRICS, 320, 160, 0, false).is_err() {
+        if tabs.open(geom(40, 10), false).is_err() {
             eprintln!("second PTY unavailable; skipping multi-tab PTY test");
             return;
         }
