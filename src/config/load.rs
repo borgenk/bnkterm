@@ -159,7 +159,6 @@ fn apply(
     let list = match field {
         "font" => Some(&mut config.fonts.families),
         "ui_font" => Some(&mut config.fonts.ui),
-        "code_font" => Some(&mut config.fonts.code),
         "fallback_font" => Some(&mut config.fonts.fallback),
         _ => None,
     };
@@ -167,7 +166,6 @@ fn apply(
         let key = match field {
             "font" => "font",
             "ui_font" => "ui_font",
-            "code_font" => "code_font",
             _ => "fallback_font",
         };
         if !replaced.contains(&key) {
@@ -313,11 +311,9 @@ mod tests {
 
     #[test]
     fn every_font_role_can_be_set() {
-        let config =
-            clean("font A\nui_font B\ncode_font C\nemoji_font D\nfallback_font E\nfont_size 18");
+        let config = clean("font A\nui_font B\nemoji_font D\nfallback_font E\nfont_size 18");
         assert_eq!(config.fonts.families, ["A"]);
         assert_eq!(config.fonts.ui, ["B"]);
-        assert_eq!(config.fonts.code, ["C"]);
         assert_eq!(config.fonts.emoji, "D");
         assert_eq!(config.fonts.fallback, ["E"]);
         assert_eq!(config.font_size, Some(18));

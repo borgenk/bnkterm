@@ -31,7 +31,6 @@ impl Default for FontConfig {
         Self {
             families: vec!["monospace".into()],
             ui: vec!["sans-serif".into()],
-            code: Vec::new(),
             emoji: "emoji".into(),
             // Prefer cell-fitted symbols before the wider cut.
             fallback: vec!["Symbols Nerd Font Mono".into(), "Symbols Nerd Font".into()],
@@ -195,6 +194,5 @@ mod tests {
                 "{role} ends in {last:?}, which is a font that may not be installed"
             );
         }
-        assert!(config.code.is_empty(), "the code arm is the user's to name");
     }
 }

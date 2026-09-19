@@ -86,7 +86,7 @@ fn style_file_in_family(
         .then_some(matched.file)
 }
 
-/// Font-family preferences for grid text, chrome, code, emoji, and explicit fallbacks.
+/// Font-family preferences for grid text, chrome, emoji, and explicit fallbacks.
 ///
 /// Fontconfig resolves names to files on the current machine. Candidate lists use the
 /// first installed family.
@@ -98,8 +98,6 @@ pub struct FontConfig {
     /// Proportional families for chrome, first installed wins.
     /// The prose family is used when none resolve.
     pub ui: Vec<String>,
-    /// Code-face candidates distinct from the selected prose face.
-    pub code: Vec<String>,
     /// The colour emoji family. [`EmojiFont::open`] verifies its bitmap strikes.
     pub emoji: String,
     /// Ordered overrides for characters absent from the selected face. Remaining
@@ -123,8 +121,6 @@ pub struct FontSelection {
     /// The medium cut of the interface family, for the tab label. `None` when the family
     /// has no such cut, which leaves the label at the UI regular weight.
     pub ui_medium: Option<FontFile>,
-    /// The code face, or `None` to share the prose face.
-    pub code: Option<FontFile>,
     /// The pinned fallback faces, in the order they are consulted.
     pub fallback: Vec<FontFile>,
     /// The colour emoji family, when one is installed.
@@ -153,12 +149,6 @@ impl FontSelection {
         });
         let ui = ui.map_or_else(|| prose.clone(), |(_, family)| family);
 
-        let code = config
-            .code
-            .iter()
-            .filter_map(|name| fontconfig::font_for_family(name, FontStyle::Regular))
-            .find(|file| *file != prose.regular);
-
         let fallback = config
             .fallback
             .iter()
@@ -171,7 +161,6 @@ impl FontSelection {
             prose,
             ui,
             ui_medium,
-            code,
             fallback,
             emoji,
         })
@@ -210,15 +199,12 @@ pub enum FontStyle {
 /// of [`Fonts`]. The display list stores this (rather than a `&Face`) so a built
 /// frame outlives the borrow and can be diffed across frames; [`Fonts::face_for`]
 /// resolves it back to a face at paint time. The two arms mirror the two families
-/// [`Fonts`] holds: the prose family at a style, and the distinct code family.
+/// [`Fonts`] holds: the prose (grid) family and the interface family, each at a style.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum FaceKey {
     Prose {
         size: u32,
         style: FontStyle,
-    },
-    Code {
-        size: u32,
     },
     /// The proportional interface family, for chrome (the tab bar). Only regular
     /// and bold are opened; italic keys resolve to their upright weight.
@@ -232,7 +218,7 @@ impl FaceKey {
     /// The pixel size this face is drawn at, carried by both arms.
     pub fn size(self) -> u32 {
         match self {
-            FaceKey::Prose { size, .. } | FaceKey::Code { size } | FaceKey::Ui { size, .. } => size,
+            FaceKey::Prose { size, .. } | FaceKey::Ui { size, .. } => size,
         }
     }
 }
@@ -882,9 +868,8 @@ impl Drop for Face {
 const MAX_DISCOVERED: usize = 4096;
 
 /// The faces for one pixel size: the regular face (always present) plus any
-/// bold/italic/bold-italic variants the family ships, the distinct code face (if
-/// a separate code family is installed), and the cached line metrics. Metrics
-/// come from the regular face only, so emphasis or code selects a different glyph
+/// bold/italic/bold-italic variants the family ships, and the cached line metrics.
+/// Metrics come from the regular face only, so emphasis selects a different glyph
 /// set without ever changing line height.
 struct SizedFaces {
     size: u32,
@@ -892,9 +877,6 @@ struct SizedFaces {
     bold: Option<Rc<Face>>,
     italic: Option<Rc<Face>>,
     bold_italic: Option<Rc<Face>>,
-    /// The code family's regular face at this size, or `None` when no distinct
-    /// code family is installed (code then falls back to `regular`).
-    code: Option<Rc<Face>>,
     /// The interface family's proportional faces at this size (for chrome text; see
     /// [`FaceKey::Ui`]). `ui_regular` is always present (it falls back to the prose
     /// family when no UI family is installed); `ui_medium` and `ui_bold` are `None`
@@ -931,14 +913,13 @@ struct SizedFaces {
 
 impl SizedFaces {
     /// Every face this size actually opened: the regular face plus whichever
-    /// variants, code face, and fallback faces exist. Used to roll up cache stats
+    /// variants, UI faces, and fallback faces exist. Used to roll up cache stats
     /// across faces.
     fn faces(&self) -> impl Iterator<Item = &Face> {
         std::iter::once(&self.regular)
             .chain(self.bold.as_ref())
             .chain(self.italic.as_ref())
             .chain(self.bold_italic.as_ref())
-            .chain(self.code.as_ref())
             .chain(std::iter::once(&self.ui_regular))
             .chain(self.ui_medium.as_ref())
             .chain(self.ui_bold.as_ref())
@@ -1081,10 +1062,6 @@ impl Fonts {
                 bold: open_variant(&family.bold, size, emoji.as_ref()),
                 italic: open_variant(&family.italic, size, emoji.as_ref()),
                 bold_italic: open_variant(&family.bold_italic, size, emoji.as_ref()),
-                code: selection
-                    .code
-                    .as_ref()
-                    .and_then(|file| open_variant(file, size, emoji.as_ref())),
                 ui_regular,
                 ui_medium: selection
                     .ui_medium
@@ -1133,15 +1110,6 @@ impl Fonts {
         }
     }
 
-    /// The code face for `size`: the distinct code family's regular face, or the
-    /// prose regular face when no code family is installed (or `size` was not
-    /// opened). Code never renders bold or italic, so there is only the one face.
-    /// Never fails, never panics.
-    pub fn code_face(&self, size: u32) -> &Face {
-        let entry = self.entry(size);
-        entry.code.as_ref().unwrap_or(&entry.regular)
-    }
-
     /// The interface face for `size` and weight: the proportional UI family's
     /// medium or bold when asked and available, else its regular (italic styles
     /// resolve to their upright weight, since UI text never slants). A missing
@@ -1165,12 +1133,11 @@ impl Fonts {
     }
 
     /// Resolve a [`FaceKey`] to its face, the inverse of the key a run records.
-    /// Routes to [`Self::face`] or [`Self::code_face`], so it inherits their
+    /// Routes to [`Self::face`] or [`Self::ui_face`], so it inherits their
     /// fallbacks and never panics.
     pub fn face_for(&self, key: FaceKey) -> &Face {
         match key {
             FaceKey::Prose { size, style } => self.face(size, style),
-            FaceKey::Code { size } => self.code_face(size),
             FaceKey::Ui { size, style } => self.ui_face(size, style),
         }
     }
@@ -1228,7 +1195,6 @@ impl Fonts {
                 FontStyle::Italic => entry.italic.as_ref().unwrap_or(&entry.regular),
                 FontStyle::BoldItalic => entry.bold_italic.as_ref().unwrap_or(&entry.regular),
             },
-            FaceKey::Code { .. } => entry.code.as_ref().unwrap_or(&entry.regular),
             FaceKey::Ui { style, .. } => match style {
                 FontStyle::Medium => entry.ui_medium.as_ref().unwrap_or(&entry.ui_regular),
                 FontStyle::Bold | FontStyle::BoldItalic => {
@@ -1417,23 +1383,6 @@ mod tests {
         assert!(
             face.metrics().line_height > 0,
             "a face opened from the alias has real metrics"
-        );
-    }
-
-    #[test]
-    fn the_code_face_never_repeats_the_prose_face() {
-        if fontconfig::font_for_family("monospace", FontStyle::Regular).is_none() {
-            return;
-        }
-        let config = FontConfig {
-            families: vec!["monospace".into()],
-            code: vec!["monospace".into()],
-            ..FontConfig::default()
-        };
-        let selection = FontSelection::resolve(&config).expect("resolves");
-        assert!(
-            selection.code.is_none(),
-            "a code face identical to the prose face is no code face"
         );
     }
 
@@ -1727,19 +1676,6 @@ mod tests {
     fn fonts_reject_an_empty_size_set() {
         assert!(Fonts::new(&[]).is_err());
         assert!(Fonts::new(&[0]).is_err());
-    }
-
-    #[test]
-    fn code_face_resolves_for_every_size_without_panicking() {
-        let fonts = Fonts::new(&[16, 32]).expect("a default font");
-        // The code face is usable at opened and unopened sizes: a distinct code
-        // family if installed, else the prose regular face. Never panics.
-        for &size in &[16, 32, 99] {
-            assert!(
-                fonts.code_face(size).advance('m') > 0.0,
-                "code face at {size}px advances"
-            );
-        }
     }
 
     #[test]

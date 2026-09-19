@@ -1209,7 +1209,10 @@ mod tests {
         // Past the cap the maps drop and re-fill rather than growing forever, so a
         // hostile stream of distinct glyphs or clusters cannot exhaust memory.
         let mut cache = GlyphCache::new();
-        let face = FaceKey::Code { size: 16 };
+        let face = FaceKey::Prose {
+            size: 16,
+            style: crate::platform::freetype::FontStyle::Regular,
+        };
         let none = PackedGlyph {
             slot: None,
             left: 0,
@@ -1263,7 +1266,10 @@ mod tests {
     #[test]
     fn an_atlas_wipe_invalidates_the_direct_mapped_ascii_rows() {
         let mut cache = GlyphCache::new();
-        let face = FaceKey::Code { size: 16 };
+        let face = FaceKey::Prose {
+            size: 16,
+            style: crate::platform::freetype::FontStyle::Regular,
+        };
         cache.cache_scalar((face, 'A'), placed());
         cache.cache_scalar((face, '\u{2500}'), placed());
         assert!(cache.ascii_get(face, 'A').is_some());
@@ -1297,7 +1303,10 @@ mod tests {
     #[test]
     fn ascii_is_direct_mapped_and_every_other_scalar_is_hashed() {
         let mut cache = GlyphCache::new();
-        let face = FaceKey::Code { size: 16 };
+        let face = FaceKey::Prose {
+            size: 16,
+            style: crate::platform::freetype::FontStyle::Regular,
+        };
         // The span and both its edges.
         for ch in [' ', 'A', '~'] {
             cache.cache_scalar((face, ch), placed());
@@ -1331,10 +1340,22 @@ mod tests {
     fn ascii_past_the_face_ceiling_falls_back_to_the_map() {
         let mut cache = GlyphCache::new();
         for i in 0..MAX_ASCII_FACES {
-            cache.cache_scalar((FaceKey::Code { size: i as u32 }, 'A'), placed());
+            cache.cache_scalar(
+                (
+                    FaceKey::Prose {
+                        size: i as u32,
+                        style: crate::platform::freetype::FontStyle::Regular,
+                    },
+                    'A',
+                ),
+                placed(),
+            );
         }
         assert_eq!(cache.ascii_slots.len(), MAX_ASCII_FACES);
-        let extra = FaceKey::Code { size: 9999 };
+        let extra = FaceKey::Prose {
+            size: 9999,
+            style: crate::platform::freetype::FontStyle::Regular,
+        };
         cache.cache_scalar((extra, 'A'), placed());
         assert!(
             cache.ascii_get(extra, 'A').is_none(),
@@ -1590,7 +1611,10 @@ mod tests {
             x: 5,
             baseline: 16,
             cell_w,
-            face: FaceKey::Code { size: 16 },
+            face: FaceKey::Prose {
+                size: 16,
+                style: crate::platform::freetype::FontStyle::Regular,
+            },
             color: 0x00ff_ffff,
             bg: 0,
             text: "MMMM".to_string(),
@@ -1629,7 +1653,10 @@ mod tests {
             x: 0,
             baseline: 16,
             cell_w,
-            face: FaceKey::Code { size: 16 },
+            face: FaceKey::Prose {
+                size: 16,
+                style: crate::platform::freetype::FontStyle::Regular,
+            },
             color: 0x00ff_ffff,
             bg: 0,
             text: "M M".to_string(),
@@ -1667,7 +1694,10 @@ mod tests {
                 x,
                 baseline,
                 cell_w,
-                face: FaceKey::Code { size: 16 },
+                face: FaceKey::Prose {
+                    size: 16,
+                    style: crate::platform::freetype::FontStyle::Regular,
+                },
                 color: 0x00ff_ffff,
                 bg: 0,
                 text: glyph.to_string(),

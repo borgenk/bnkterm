@@ -410,7 +410,10 @@ mod tests {
             x: 0,
             baseline: 16,
             cell_w: 10,
-            face: FaceKey::Code { size: 16 },
+            face: FaceKey::Prose {
+                size: 16,
+                style: crate::platform::freetype::FontStyle::Regular,
+            },
             color: 0x00ff_ffff,
             bg: 0,
             text: text.to_string(),
