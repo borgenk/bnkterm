@@ -284,10 +284,6 @@ impl KittyFlags {
         self.0 & other.0 == other.0
     }
 
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
     /// Build from an application's requested bits, dropping everything we do not
     /// implement.
     pub const fn from_request(bits: u16) -> KittyFlags {
@@ -704,14 +700,6 @@ fn push_utf8(c: char, out: &mut Vec<u8>) {
     out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
 }
 
-/// A convenience wrapper returning a fresh buffer, for call sites (and tests)
-/// that do not thread one through.
-pub fn encoded(key: Key, mods: Mods, modes: Modes) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode(key, mods, modes, &mut out);
-    out
-}
-
 /// A layout character with Ctrl and Alt applied. Ctrl folds the character to its
 /// C0 control byte when one exists; Alt prefixes an `ESC` before whatever the
 /// non-Alt encoding would be (`metaSendsEscape`).
@@ -958,6 +946,13 @@ mod keycode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Encode into a fresh buffer.
+    fn encoded(key: Key, mods: Mods, modes: Modes) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode(key, mods, modes, &mut out);
+        out
+    }
 
     /// Encode with default (all-off) modes, the common case.
     fn enc(key: Key, mods: Mods) -> Vec<u8> {

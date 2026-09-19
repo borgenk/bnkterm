@@ -141,20 +141,6 @@ pub fn encode(
     true
 }
 
-/// A convenience wrapper returning a fresh buffer (`None` when nothing is
-/// reported), for tests and simple call sites.
-pub fn encoded(
-    mode: MouseMode,
-    button: MouseButton,
-    kind: MouseKind,
-    col: usize,
-    row: usize,
-    mods: Mods,
-) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    encode(mode, button, kind, col, row, mods, &mut out).then_some(out)
-}
-
 /// The base button field of the report code: the three buttons, "no button", and
 /// the two wheel directions (which set the high bit, `64`).
 fn base_code(button: MouseButton) -> u32 {
@@ -202,6 +188,19 @@ fn push_num(out: &mut Vec<u8>, mut n: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Encode into a fresh buffer, or `None` when nothing is reported.
+    fn encoded(
+        mode: MouseMode,
+        button: MouseButton,
+        kind: MouseKind,
+        col: usize,
+        row: usize,
+        mods: Mods,
+    ) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        encode(mode, button, kind, col, row, mods, &mut out).then_some(out)
+    }
 
     const PRESS: MouseMode = MouseMode {
         protocol: MouseProtocol::Press,
