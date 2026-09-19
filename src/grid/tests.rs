@@ -207,7 +207,7 @@ fn attrs_insert_remove_set_roundtrip() {
     assert!(!a.contains(Attrs::BOLD | Attrs::UNDERLINE));
     a.remove(Attrs::BOLD);
     assert!(!a.contains(Attrs::BOLD));
-    a.set(Attrs::ITALIC, false);
+    a.remove(Attrs::ITALIC);
     assert!(a.is_empty());
 }
 
@@ -234,8 +234,9 @@ fn attrs_debug_lists_flags() {
 #[test]
 fn wide_halves_report_their_role() {
     let leader = Cell {
+        rune: '世',
         width: CellWidth::Leader,
-        ..Cell::new('世')
+        ..Cell::BLANK
     };
     assert!(leader.is_wide_leader());
     assert!(!leader.is_wide_spacer());
@@ -249,7 +250,7 @@ fn wide_halves_report_their_role() {
 
     // The role is layout, not rendition: both halves of a wide glyph share one style,
     // which is exactly why it had to leave `Attrs` before a style could be interned.
-    assert_eq!(leader.style(), Cell::new('世').style());
+    assert_eq!(leader.style(), spacer.style());
     assert!(!Cell::BLANK.is_wide_leader());
     assert!(!Cell::BLANK.is_wide_spacer());
 }

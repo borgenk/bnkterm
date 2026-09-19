@@ -246,16 +246,6 @@ impl Attrs {
         self.0 &= !other.0;
     }
 
-    /// Set or clear `other` by a boolean, the shape SGR wants (e.g. bold on 1,
-    /// off on 22).
-    pub fn set(&mut self, other: Attrs, on: bool) {
-        if on {
-            self.insert(other);
-        } else {
-            self.remove(other);
-        }
-    }
-
     /// The bits that decide how a *run* of cells is drawn: the two that pick a face
     /// (bold, italic) and the two rules laid over it (underline, with its shape, and
     /// strike).
@@ -838,16 +828,8 @@ impl Cell {
         link: LinkId::NONE,
     };
 
-    /// A cell carrying `rune` in the default colors, no attributes. Handy for
-    /// tests and for plain printable output before any SGR is seen.
-    pub fn new(rune: char) -> Self {
-        Cell {
-            rune,
-            ..Cell::BLANK
-        }
-    }
-
     /// The rendition half of this cell, which is what gets interned.
+    #[cfg(test)]
     pub fn style(self) -> Style {
         Style {
             fg: self.fg,

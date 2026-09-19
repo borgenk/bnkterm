@@ -650,6 +650,7 @@ impl Screen {
 
     /// The whole visible screen as text, one row per line, trailing blanks
     /// trimmed. A debugging and golden-diff convenience.
+    #[cfg(test)]
     pub fn dump(&self) -> String {
         let (_, rows) = self.dimensions();
         (0..rows)
