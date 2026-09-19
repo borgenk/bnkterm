@@ -556,6 +556,7 @@ pub fn build_frame_into(
 
 /// Build a fresh frame, allocating its vertex and batch vectors. The one-shot path
 /// for tests; the render loop calls [`build_frame_into`] with a reused [`FrameData`].
+#[cfg(test)]
 pub fn build_frame(
     fonts: &Fonts,
     list: &[DrawCmd],

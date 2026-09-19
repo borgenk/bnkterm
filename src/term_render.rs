@@ -2,8 +2,8 @@
 //! backend-agnostic [`DisplayList`], the value the damage differ and the GPU
 //! batcher both consume. This is the seam between the terminal core and the
 //! renderer: the core never touches Vulkan, it emits drawing
-//! primitives, and everything downstream (`display::damage`, `gpu::build_frame`)
-//! is a pure function of that list.
+//! primitives, and everything downstream (`display::damage_into`,
+//! `gpu::build_frame_into`) is a pure function of that list.
 //!
 //! ```text
 //!   grid::Screen ──build_display_list──▶ DisplayList ──┬─ gpu::build_frame ─▶ pixels
@@ -450,9 +450,9 @@ pub fn build_display_list_into(
 }
 
 /// Build a fresh display list, allocating its vector and run strings. The one-shot
-/// path for tests and callers that do not keep frame-to-frame state; the windowed
-/// render loop uses [`build_display_list_into`] with a [`DisplayListPool`] to stay
-/// allocation-free in steady state.
+/// path for tests; the windowed render loop uses [`build_display_list_into`] with a
+/// [`DisplayListPool`] to stay allocation-free in steady state.
+#[cfg(test)]
 pub fn build_display_list(inputs: &FrameInputs) -> DisplayList {
     let mut out = DisplayList::new();
     let mut strings = Vec::new();
@@ -575,7 +575,7 @@ struct Shown {
 }
 
 /// The per-frame builder: the shared inputs plus the list being appended to. One
-/// method per concern keeps [`build_display_list`] readable.
+/// method per concern keeps [`build_display_list_into`] readable.
 struct Painter<'a> {
     screen: &'a Screen,
     theme: &'a Theme,

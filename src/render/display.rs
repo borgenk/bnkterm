@@ -3,12 +3,12 @@
 //! list" (section 1a). Two things hang off it:
 //!
 //! - **Damage tracking** (section 1b): because a frame is now a value, two frames
-//!   can be compared. [`damage`] diffs the previous frame against the new one and
+//!   can be compared. [`damage_into`] diffs the previous frame against the new one and
 //!   returns just the screen rectangles that changed, so an idle caret blink
 //!   presents a caret-sized damaged region instead of the whole surface, and a
 //!   keystroke reports the edited line rather than the screen.
 //! - **A backend-agnostic frame** (section 5): the list is turned into pixels by
-//!   the GPU batcher ([`crate::render::gpu::build_frame`]), which consumes exactly these
+//!   the GPU batcher ([`crate::render::gpu::build_frame_into`]), which consumes exactly these
 //!   commands. Nothing here is Vulkan-specific.
 //!
 //! Commands are in *screen* space (already shifted by the scroll), so scrolling,
@@ -40,7 +40,7 @@ const MAX_DAMAGE_RECTS: usize = 16;
 /// the foreground toward the background instead would leave two bruises. It never
 /// reaches the background, so a dark label on a light tab keeps a visible stain
 /// where it was cut; and the glyph's anti-aliasing is weighted by its contrast
-/// with the background (see [`crate::render::gpu::build_frame`]), so a run whose
+/// with the background (see [`crate::render::gpu::build_frame_into`]), so a run whose
 /// colour has been mixed *toward* that background reports a contrast it does not
 /// have and drifts to a different stroke weight than the rest of its own label.
 /// Scaling coverage leaves both the colour and the weight alone and lands on
@@ -57,7 +57,7 @@ pub struct Fade {
 /// One drawing primitive in screen (post-scroll) pixels. The set is deliberately
 /// small and low level so a future GPU backend can execute the same list; the
 /// painter decomposes higher-level chrome (an image's selection border, a button)
-/// into these. Every variant is `Eq + Hash` so [`damage`] can diff two frames by
+/// into these. Every variant is `Eq + Hash` so [`damage_into`] can diff two frames by
 /// value, which is why text runs carry an owned [`String`] and a borrow-free
 /// [`FaceKey`] rather than a `&str`/`&Face` tied to the rope and fonts.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -230,8 +230,9 @@ pub fn damage_into<'a>(
 }
 
 /// One-shot [`damage_into`] with a throwaway scratch, returning an owned `Vec`. For
-/// tests and callers off the per-frame path; the presentation loop keeps a
-/// [`DamageScratch`] and calls [`damage_into`] to avoid the per-frame allocation.
+/// tests; the presentation loop keeps a [`DamageScratch`] and calls [`damage_into`]
+/// to avoid the per-frame allocation.
+#[cfg(test)]
 pub fn damage(old: &[DrawCmd], new: &[DrawCmd], width: i32, height: i32) -> Vec<Rect> {
     let mut scratch = DamageScratch::default();
     damage_into(old, new, width, height, &mut scratch);
