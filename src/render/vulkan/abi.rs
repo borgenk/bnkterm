@@ -1328,8 +1328,6 @@ pub(super) type PfnAllocateDescriptorSets = unsafe extern "C" fn(
     *const VkDescriptorSetAllocateInfo,
     *mut VkDescriptorSet,
 ) -> VkResult;
-pub(super) type PfnFreeDescriptorSets =
-    unsafe extern "C" fn(VkDevice, VkDescriptorPool, u32, *const VkDescriptorSet) -> VkResult;
 pub(super) type PfnUpdateDescriptorSets =
     unsafe extern "C" fn(VkDevice, u32, *const VkWriteDescriptorSet, u32, *const c_void);
 pub(super) type PfnCreateSampler = unsafe extern "C" fn(
@@ -1464,7 +1462,6 @@ pub(super) struct DeviceFns {
     pub(super) create_descriptor_pool: PfnCreateDescriptorPool,
     pub(super) destroy_descriptor_pool: PfnDestroyDescriptorPool,
     pub(super) allocate_descriptor_sets: PfnAllocateDescriptorSets,
-    pub(super) free_descriptor_sets: PfnFreeDescriptorSets,
     pub(super) update_descriptor_sets: PfnUpdateDescriptorSets,
     pub(super) create_sampler: PfnCreateSampler,
     pub(super) destroy_sampler: PfnDestroySampler,
@@ -1558,7 +1555,6 @@ impl DeviceFns {
                 create_descriptor_pool: load_device(gdpa, device, c"vkCreateDescriptorPool")?,
                 destroy_descriptor_pool: load_device(gdpa, device, c"vkDestroyDescriptorPool")?,
                 allocate_descriptor_sets: load_device(gdpa, device, c"vkAllocateDescriptorSets")?,
-                free_descriptor_sets: load_device(gdpa, device, c"vkFreeDescriptorSets")?,
                 update_descriptor_sets: load_device(gdpa, device, c"vkUpdateDescriptorSets")?,
                 create_sampler: load_device(gdpa, device, c"vkCreateSampler")?,
                 destroy_sampler: load_device(gdpa, device, c"vkDestroySampler")?,
