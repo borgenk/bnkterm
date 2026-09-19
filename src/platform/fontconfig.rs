@@ -22,7 +22,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::ptr;
 
-use core::ffi::{c_char, c_int, c_uchar, c_uint, c_void};
+use core::ffi::{c_char, c_int, c_uchar, c_uint};
 
 use crate::platform::freetype::FontStyle;
 
@@ -32,7 +32,7 @@ struct FcPattern {
     _opaque: [u8; 0],
 }
 
-/// An opaque set of characters, used here to hold exactly one: the one we need drawn.
+/// An opaque set of characters: a font's coverage, which `font_for_char` queries.
 #[repr(C)]
 struct FcCharSet {
     _opaque: [u8; 0],
@@ -74,11 +74,6 @@ extern "C" {
     fn FcInit() -> c_int;
     fn FcPatternCreate() -> *mut FcPattern;
     fn FcPatternDestroy(pattern: *mut FcPattern);
-    fn FcPatternAddCharSet(
-        pattern: *mut FcPattern,
-        object: *const c_char,
-        charset: *const FcCharSet,
-    ) -> c_int;
     fn FcPatternAddBool(pattern: *mut FcPattern, object: *const c_char, value: c_int) -> c_int;
     fn FcPatternAddString(
         pattern: *mut FcPattern,
@@ -98,9 +93,6 @@ extern "C" {
         index: c_int,
         value: *mut c_int,
     ) -> c_int;
-    fn FcCharSetCreate() -> *mut FcCharSet;
-    fn FcCharSetDestroy(charset: *mut FcCharSet);
-    fn FcCharSetAddChar(charset: *mut FcCharSet, ch: c_uint) -> c_int;
     fn FcConfigSubstitute(config: *mut FcConfig, pattern: *mut FcPattern, kind: c_int) -> c_int;
     fn FcDefaultSubstitute(pattern: *mut FcPattern);
     fn FcFontSort(
@@ -148,16 +140,6 @@ struct FcFontSet {
 pub struct FontFile {
     pub path: PathBuf,
     pub index: i32,
-}
-
-impl FontFile {
-    /// Face zero of `path`.
-    pub fn at(path: &str) -> Self {
-        Self {
-            path: PathBuf::from(path),
-            index: 0,
-        }
-    }
 }
 
 /// A matched file and the family names fontconfig assigns to it.
@@ -439,16 +421,6 @@ impl Drop for Fontconfig {
     }
 }
 
-/// A string property of a pattern, copied out. The pointer fontconfig hands back points
-/// *into* the pattern, so it lives and dies with it: copy before the pattern is freed.
-///
-/// Takes a raw pointer rather than an owned [`Pattern`] because it is used both ways: on a
-/// pattern we own (nothing does, now) and on one merely *borrowed* from the ranked set,
-/// which must not be freed by us.
-fn pattern_string(pattern: *const FcPattern, object: &[u8]) -> Option<String> {
-    pattern_string_at(pattern, object, 0)
-}
-
 /// Every string value of a pattern property, in fontconfig preference order.
 fn pattern_strings(pattern: *const FcPattern, object: &[u8]) -> Vec<String> {
     (0..)
@@ -457,7 +429,9 @@ fn pattern_strings(pattern: *const FcPattern, object: &[u8]) -> Vec<String> {
 }
 
 /// The `index`th value of a string property, for the properties that carry several (a
-/// font's family names, one per language it declares).
+/// font's family names, one per language it declares). The pointer fontconfig hands back
+/// points *into* the pattern, so it lives and dies with it: copy before the pattern is
+/// freed.
 fn pattern_string_at(pattern: *const FcPattern, object: &[u8], index: c_int) -> Option<String> {
     let mut value: *mut c_uchar = ptr::null_mut();
     // SAFETY: pattern is live, object is a NUL-terminated literal, and value is a live
@@ -490,7 +464,7 @@ fn pattern_path(pattern: *const FcPattern, object: &[u8]) -> Option<PathBuf> {
 /// An integer property of a pattern, or `None` when it does not carry one.
 fn pattern_integer(pattern: *const FcPattern, object: &[u8]) -> Option<i32> {
     let mut value: c_int = 0;
-    // SAFETY: as `pattern_string`; fontconfig writes the integer through the pointer.
+    // SAFETY: as `pattern_string_at`; fontconfig writes the integer through the pointer.
     let result = unsafe { FcPatternGetInteger(pattern, object.as_ptr().cast(), 0, &mut value) };
     (result == FC_RESULT_MATCH).then_some(value)
 }
@@ -516,30 +490,9 @@ impl Drop for Pattern {
     }
 }
 
-/// An owned `FcCharSet`, freed on drop.
-struct CharSet(*mut FcCharSet);
-
-impl CharSet {
-    fn new() -> Option<Self> {
-        // SAFETY: takes no arguments; returns null on allocation failure.
-        let charset = unsafe { FcCharSetCreate() };
-        (!charset.is_null()).then_some(CharSet(charset))
-    }
-}
-
-impl Drop for CharSet {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: self.0 was returned by FcCharSetCreate and is dropped once.
-            unsafe { FcCharSetDestroy(self.0) };
-        }
-    }
-}
-
 /// Silence the unused-type warning for the config handle, which only ever appears behind
 /// a null pointer in the calls above.
 const _: Option<&FcConfig> = None;
-const _: Option<&c_void> = None;
 
 #[cfg(test)]
 mod tests {
@@ -713,7 +666,7 @@ mod tests {
                 continue;
             }
             if pattern_path(font, FC_FILE).as_ref() == Some(&file.path) {
-                return pattern_string(font, FC_FAMILY);
+                return pattern_string_at(font, FC_FAMILY, 0);
             }
         }
         None
@@ -742,10 +695,9 @@ mod tests {
 
     #[test]
     fn every_call_is_independent() {
-        // The pattern and charset are owned and freed per call (see `Pattern`/`CharSet`),
-        // so a repeated query must keep answering rather than resolve once and then hand
-        // back a dangling or emptied pattern. Under a leak or a double free this is where
-        // it shows.
+        // A lookup only borrows the set's patterns and charsets, so a repeated query must
+        // keep answering rather than resolve once and then read a dangling or emptied
+        // pattern. Under a double free this is where it shows.
         let Some(fc) = Fontconfig::new() else {
             return;
         };

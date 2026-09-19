@@ -1454,7 +1454,10 @@ mod tests {
     #[test]
     fn a_style_substituted_from_another_family_is_refused() {
         let selected = vec!["Grid Face".to_string(), "Localized Grid Face".to_string()];
-        let expected = FontFile::at("/same-family.ttf");
+        let expected = FontFile {
+            path: "/same-family.ttf".into(),
+            index: 0,
+        };
         let same_family = fontconfig::FamilyMatch {
             file: expected.clone(),
             families: vec!["localized grid face".to_string()],
@@ -1462,7 +1465,10 @@ mod tests {
         assert_eq!(style_file_in_family(same_family, &selected), Some(expected));
 
         let foreign = fontconfig::FamilyMatch {
-            file: FontFile::at("/foreign-family.ttf"),
+            file: FontFile {
+                path: "/foreign-family.ttf".into(),
+                index: 0,
+            },
             families: vec!["Foreign Face".to_string()],
         };
         assert_eq!(style_file_in_family(foreign, &selected), None);
