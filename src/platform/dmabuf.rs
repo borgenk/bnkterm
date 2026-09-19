@@ -25,8 +25,6 @@ use crate::platform::error::{Error, Result};
 /// DRM fourcc for 32-bit xRGB, little-endian (`XR24`), the dmabuf twin of the
 /// `wl_shm` XRGB8888 the software path renders today.
 pub const DRM_FORMAT_XRGB8888: u32 = fourcc(b"XR24");
-/// The linear (no tiling) layout modifier, `DRM_FORMAT_MOD_LINEAR`.
-pub const MOD_LINEAR: u64 = 0;
 
 /// A DRM fourcc: four ASCII bytes packed little-endian.
 const fn fourcc(code: &[u8; 4]) -> u32 {
@@ -104,11 +102,6 @@ impl FeedbackState {
     /// Install the format table from the mmapped `format_table` fd's bytes.
     pub fn set_table(&mut self, bytes: &[u8]) {
         self.table = parse_format_table(bytes);
-    }
-
-    /// How many entries the current format table holds (for diagnostics).
-    pub fn table_len(&self) -> usize {
-        self.table.len()
     }
 
     /// The `main_device` event: a dev_t as a wire array.
@@ -202,6 +195,9 @@ pub fn dev_minor(dev: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The linear (no tiling) layout modifier, `DRM_FORMAT_MOD_LINEAR`.
+    const MOD_LINEAR: u64 = 0;
 
     /// Build one 16-byte format-table entry.
     fn entry(format: u32, modifier: u64) -> Vec<u8> {

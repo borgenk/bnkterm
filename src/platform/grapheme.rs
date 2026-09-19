@@ -1,9 +1,9 @@
 //! Grapheme cluster segmentation, following the Unicode UAX #29 rules.
 //!
-//! The editor moves the cursor and deletes by *user-perceived characters*, not
-//! by Unicode scalars: Backspace over a flag, a skin-toned wave, or a ZWJ family
-//! emoji removes the whole thing, and a base letter plus its combining accent
-//! travel together. That is exactly a grapheme cluster.
+//! The grid stores and the renderer draws *user-perceived characters*, not
+//! Unicode scalars: a flag, a skin-toned wave, or a ZWJ family emoji is one
+//! character, and a base letter plus its combining accent travel together. That
+//! is exactly a grapheme cluster.
 //!
 //! UAX #29 decides cluster boundaries from each scalar's Grapheme_Cluster_Break
 //! property (plus Extended_Pictographic for emoji and Indic_Conjunct_Break for
@@ -54,8 +54,6 @@ enum Incb {
     Linker,
 }
 
-/// Byte offsets of every grapheme cluster boundary in `s`, always including 0
-/// and `s.len()`. Consecutive entries bound one cluster.
 /// A lazy iterator over the grapheme clusters of a string, each yielded as its
 /// byte offset and substring. It runs the UAX #29 break state machine forward one
 /// scalar at a time, so no boundary list is ever materialised, the layout measure
@@ -250,33 +248,6 @@ fn should_break(
     true
 }
 
-/// The byte offset of the first cluster boundary strictly after `i`. `i` is
-/// assumed to be a boundary itself (the cursor always sits on one). Cluster starts
-/// plus the string end are the boundaries, so the first start past `i` is it, or
-/// the end when `i` sits in the last cluster.
-pub fn next_boundary(s: &str, i: usize) -> usize {
-    graphemes(s)
-        .map(|(off, _)| off)
-        .find(|&off| off > i)
-        .unwrap_or(s.len())
-}
-
-/// The byte offset of the last cluster boundary strictly before `i`.
-pub fn prev_boundary(s: &str, i: usize) -> usize {
-    graphemes(s)
-        .map(|(off, _)| off)
-        .take_while(|&off| off < i)
-        .last()
-        .unwrap_or(0)
-}
-
-/// Whether `c` counts as a word character for word motion (Ctrl+arrow, word
-/// delete) and whole-word find: an alphanumeric or `_`. The single definition the
-/// two share, so they can never drift apart.
-pub fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
 /// The grapheme clusters of `s`, lazily: each yielded as its byte offset and
 /// substring, with nothing allocated.
 pub fn graphemes(s: &str) -> Graphemes<'_> {
@@ -463,8 +434,6 @@ mod tests {
         let family = "👨\u{200D}👩\u{200D}👧";
         assert_eq!(family.len(), 18);
         assert_eq!(bounds(family), vec![0, 18]);
-        assert_eq!(next_boundary(family, 0), 18);
-        assert_eq!(prev_boundary(family, 18), 0);
     }
 
     #[test]
@@ -524,18 +493,6 @@ mod tests {
     fn graphemes_splits_into_substrings() {
         let g: Vec<_> = graphemes("a😀b").collect();
         assert_eq!(g, vec![(0, "a"), (1, "😀"), (5, "b")]);
-    }
-
-    #[test]
-    fn boundary_navigation_steps_whole_clusters() {
-        let s = "👋\u{1F3FD}x"; // wave+tone (8 bytes), then x
-        assert_eq!(next_boundary(s, 0), 8);
-        assert_eq!(next_boundary(s, 8), 9);
-        assert_eq!(prev_boundary(s, 9), 8);
-        assert_eq!(prev_boundary(s, 8), 0);
-        // At the ends, navigation clamps.
-        assert_eq!(prev_boundary(s, 0), 0);
-        assert_eq!(next_boundary(s, 9), 9);
     }
 
     /// The official UAX #29 conformance suite, vendored in `ucd/` at the pinned

@@ -120,16 +120,6 @@ impl<'a> Cursor<'a> {
         self.pos = end;
         Some(slice)
     }
-
-    /// How many bytes have been consumed so far.
-    pub fn pos(&self) -> usize {
-        self.pos
-    }
-
-    /// How many bytes remain unread.
-    pub fn remaining(&self) -> usize {
-        self.data.len() - self.pos
-    }
 }
 
 #[cfg(test)]
@@ -203,16 +193,11 @@ mod tests {
     #[test]
     fn cursor_takes_in_bounds_and_tracks_position() {
         let mut c = Cursor::new(&[1, 2, 3, 4, 5]);
-        assert_eq!(c.pos(), 0);
-        assert_eq!(c.remaining(), 5);
         assert_eq!(c.take(2), Some(&[1, 2][..]));
-        assert_eq!(c.pos(), 2);
-        assert_eq!(c.remaining(), 3);
         assert_eq!(c.take(3), Some(&[3, 4, 5][..]));
-        assert_eq!(c.remaining(), 0);
         // Zero-length reads are always fine and stay put.
         assert_eq!(c.take(0), Some(&[][..]));
-        assert_eq!(c.pos(), 5);
+        assert_eq!(c.take(1), None);
     }
 
     #[test]
@@ -221,10 +206,8 @@ mod tests {
         assert_eq!(c.take(2), Some(&[1, 2][..]));
         // One byte left, asking for two leaves the cursor unmoved.
         assert_eq!(c.take(2), None);
-        assert_eq!(c.pos(), 2);
-        assert_eq!(c.remaining(), 1);
         // A length that would overflow the offset is rejected too.
         assert_eq!(c.take(usize::MAX), None);
-        assert_eq!(c.pos(), 2);
+        assert_eq!(c.take(1), Some(&[3][..]));
     }
 }
