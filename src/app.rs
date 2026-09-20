@@ -40,7 +40,7 @@ use self::clipboard::{PendingSend, SelectionTransport, Transport};
 use self::layout::{TerminalGeometry, WindowLayout, WINDOW_PADDING};
 use self::message::{PointerEvent, Side, ToWindow};
 use self::present::GpuPresentation;
-use self::tabs::{Reorder, Tabs};
+use self::tabs::Tabs;
 use self::terminal::TerminalCore;
 use crate::config::{self, TabBarConfig, FONT_SIZE_RANGE};
 // The app orchestrates the platform/render layers (which carry their own error
@@ -49,7 +49,7 @@ use crate::config::{self, TabBarConfig, FONT_SIZE_RANGE};
 // through the `From` bridge in `crate::error`, so there is one error type here.
 use crate::error::{Error, Result};
 use crate::input;
-use crate::keymode::{self, Disposition, KeyMode, TabAction};
+use crate::keymode::{self, Dir, Disposition, KeyMode, TabAction};
 use crate::mouse::MouseButton;
 use crate::platform::conn::{Connection, Fill};
 use crate::platform::ffi;
@@ -1378,9 +1378,9 @@ impl State {
                 self.stop_repeat();
                 if !self.tabs.active().is_demo() {
                     if mods.contains(input::Mods::SHIFT) {
-                        self.tabs.prev(self.window_focused);
+                        self.tabs.cycle(Dir::Prev, self.window_focused);
                     } else {
-                        self.tabs.next(self.window_focused);
+                        self.tabs.cycle(Dir::Next, self.window_focused);
                     }
                 }
                 return Ok(());
@@ -1423,14 +1423,14 @@ impl State {
                 Some(input::Key::PageUp) => {
                     self.stop_repeat();
                     if !self.tabs.active().is_demo() {
-                        self.tabs.prev(self.window_focused);
+                        self.tabs.cycle(Dir::Prev, self.window_focused);
                     }
                     return Ok(());
                 }
                 Some(input::Key::PageDown) => {
                     self.stop_repeat();
                     if !self.tabs.active().is_demo() {
-                        self.tabs.next(self.window_focused);
+                        self.tabs.cycle(Dir::Next, self.window_focused);
                     }
                     return Ok(());
                 }
@@ -1478,17 +1478,11 @@ impl State {
         match action {
             TabAction::New => self.open_tab(),
             TabAction::Close => self.close_active_tab(),
-            TabAction::Prev => {
-                self.tabs.prev(self.window_focused);
+            TabAction::Select(dir) => {
+                self.tabs.cycle(dir, self.window_focused);
             }
-            TabAction::Next => {
-                self.tabs.next(self.window_focused);
-            }
-            TabAction::MovePrev => {
-                self.tabs.move_active(Reorder::Prev);
-            }
-            TabAction::MoveNext => {
-                self.tabs.move_active(Reorder::Next);
+            TabAction::Move(dir) => {
+                self.tabs.move_active(dir);
             }
         }
         Ok(())

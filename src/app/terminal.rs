@@ -135,8 +135,19 @@ impl Edge {
 #[derive(Clone, Copy)]
 enum DragMode {
     Char(Edge),
-    Word(((AbsRow, usize), (AbsRow, usize))),
-    Line(((AbsRow, usize), (AbsRow, usize))),
+    /// A word or line drag: the anchored unit's inclusive cell range, and which kind
+    /// of unit to snap the far end to.
+    Unit {
+        range: ((AbsRow, usize), (AbsRow, usize)),
+        by: Granularity,
+    },
+}
+
+/// The unit a word or line drag snaps to under the pointer.
+#[derive(Clone, Copy)]
+enum Granularity {
+    Word,
+    Line,
 }
 
 impl DragMode {
@@ -146,7 +157,7 @@ impl DragMode {
     fn last_row(self) -> AbsRow {
         match self {
             DragMode::Char(edge) => edge.row,
-            DragMode::Word(unit) | DragMode::Line(unit) => unit.1 .0,
+            DragMode::Unit { range, .. } => range.1 .0,
         }
     }
 }
@@ -1033,10 +1044,20 @@ impl TerminalCore {
     /// Hands over what was under the highlight when the user drew it, not what is under
     /// it now — see [`Self::selection_text`].
     pub(super) fn copy_selection(&mut self) {
+        self.offer_selection(false);
+    }
+
+    /// Queue the captured selection text for the window to own on the clipboard, and on
+    /// the primary selection too when `primary` (copy-on-select offers both). A no-op
+    /// with no selection or empty text.
+    fn offer_selection(&mut self, primary: bool) {
         if self.selection_text.is_empty() {
             return;
         }
         let bytes = self.selection_text.as_bytes().to_vec();
+        if primary {
+            self.outbox.push(ToWindow::OfferPrimary(bytes.clone()));
+        }
         self.outbox.push(ToWindow::OfferSelection(bytes));
     }
 
@@ -1066,12 +1087,24 @@ impl TerminalCore {
         let abs = self.screen.abs_row(row);
         let (mode, unit) = match count {
             2 => {
-                let unit = self.screen.word_at(abs, col);
-                (DragMode::Word(unit), Some(unit))
+                let range = self.screen.word_at(abs, col);
+                (
+                    DragMode::Unit {
+                        range,
+                        by: Granularity::Word,
+                    },
+                    Some(range),
+                )
             }
             n if n >= 3 => {
-                let unit = self.screen.line_at(abs);
-                (DragMode::Line(unit), Some(unit))
+                let range = self.screen.line_at(abs);
+                (
+                    DragMode::Unit {
+                        range,
+                        by: Granularity::Line,
+                    },
+                    Some(range),
+                )
             }
             _ => (DragMode::Char(Edge::nearest(abs, col, side)), None),
         };
@@ -1100,12 +1133,11 @@ impl TerminalCore {
                 let cols = self.screen.dimensions().0;
                 char_range(anchor, Edge::nearest(abs, col, side), cols)
             }
-            DragMode::Word(anchor) => {
-                let unit = self.screen.word_at(abs, col);
-                Some((anchor.0.min(unit.0), anchor.1.max(unit.1)))
-            }
-            DragMode::Line(anchor) => {
-                let unit = self.screen.line_at(abs);
+            DragMode::Unit { range: anchor, by } => {
+                let unit = match by {
+                    Granularity::Word => self.screen.word_at(abs, col),
+                    Granularity::Line => self.screen.line_at(abs),
+                };
                 Some((anchor.0.min(unit.0), anchor.1.max(unit.1)))
             }
         };
@@ -1134,12 +1166,7 @@ impl TerminalCore {
         // it then, not what was under it when the pointer last moved.
         let sel = self.selection;
         self.set_selection(sel);
-        if self.selection_text.is_empty() {
-            return;
-        }
-        let bytes = self.selection_text.as_bytes().to_vec();
-        self.outbox.push(ToWindow::OfferPrimary(bytes.clone()));
-        self.outbox.push(ToWindow::OfferSelection(bytes));
+        self.offer_selection(true);
     }
 
     /// Drain published child output through the parser until `max_bytes` or

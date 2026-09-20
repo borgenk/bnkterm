@@ -56,12 +56,18 @@ pub(crate) enum KeyMode {
 pub(crate) enum TabAction {
     New,
     Close,
+    /// Make the tab one slot along the active one. Selection wraps at both edges.
+    Select(Dir),
+    /// Reorder the active tab one slot along, keeping it active. Reordering does not
+    /// wrap: flinging a tab past the edge to the far side would be surprising.
+    Move(Dir),
+}
+
+/// Which way along the strip an action travels: toward index 0, or toward the end.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Dir {
     Prev,
     Next,
-    /// Reorder the active tab one slot toward index 0.
-    MovePrev,
-    /// Reorder the active tab one slot toward the end.
-    MoveNext,
 }
 
 /// What the app does with a key after the mode machine has seen it.
@@ -144,19 +150,16 @@ pub(crate) fn advance(mode: KeyMode, key: Key, mods: Mods) -> (KeyMode, Disposit
             }
             let shift = mods.contains(Mods::SHIFT);
             match key {
-                Key::Up | Key::Left => {
-                    let action = if shift {
-                        TabAction::MovePrev
-                    } else {
-                        TabAction::Prev
+                Key::Up | Key::Left | Key::Down | Key::Right => {
+                    let dir = match key {
+                        Key::Up | Key::Left => Dir::Prev,
+                        _ => Dir::Next,
                     };
-                    (KeyMode::Tabs, Disposition::Consumed(Some(action)))
-                }
-                Key::Down | Key::Right => {
+                    // Shift reorders the tab instead of selecting one.
                     let action = if shift {
-                        TabAction::MoveNext
+                        TabAction::Move(dir)
                     } else {
-                        TabAction::Next
+                        TabAction::Select(dir)
                     };
                     (KeyMode::Tabs, Disposition::Consumed(Some(action)))
                 }
@@ -387,10 +390,26 @@ mod tests {
     #[test]
     fn tabs_arrows_switch_and_reorder_and_stay() {
         for (key, plain, moved) in [
-            (Key::Up, TabAction::Prev, TabAction::MovePrev),
-            (Key::Left, TabAction::Prev, TabAction::MovePrev),
-            (Key::Down, TabAction::Next, TabAction::MoveNext),
-            (Key::Right, TabAction::Next, TabAction::MoveNext),
+            (
+                Key::Up,
+                TabAction::Select(Dir::Prev),
+                TabAction::Move(Dir::Prev),
+            ),
+            (
+                Key::Left,
+                TabAction::Select(Dir::Prev),
+                TabAction::Move(Dir::Prev),
+            ),
+            (
+                Key::Down,
+                TabAction::Select(Dir::Next),
+                TabAction::Move(Dir::Next),
+            ),
+            (
+                Key::Right,
+                TabAction::Select(Dir::Next),
+                TabAction::Move(Dir::Next),
+            ),
         ] {
             assert_eq!(
                 advance(KeyMode::Tabs, key, Mods::NONE),

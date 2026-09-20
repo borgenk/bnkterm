@@ -28,6 +28,7 @@ use crate::color::Theme;
 use crate::config::{ShellStartupConfig, TabBarConfig};
 use crate::error::Result;
 use crate::gather::GatherEnd;
+use crate::keymode::Dir;
 use crate::notice::Notice;
 use crate::platform::freetype::Fonts;
 use crate::pty::{Launch, ZombieChild};
@@ -43,13 +44,6 @@ const GATHER_BYTE_BUDGET: usize = 1024 * 1024;
 /// identities do not.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct TabId(u64);
-
-/// The direction the active tab reorders in: toward index 0 or toward the end.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Reorder {
-    Prev,
-    Next,
-}
 
 /// One managed terminal and its stable identity.
 struct TabEntry {
@@ -279,22 +273,16 @@ impl Tabs {
         true
     }
 
-    /// Select the previous tab, wrapping at the left edge.
-    pub(super) fn prev(&mut self, window_focused: bool) -> bool {
+    /// Select the tab one slot along, wrapping at both edges.
+    pub(super) fn cycle(&mut self, dir: Dir, window_focused: bool) -> bool {
         if self.len() < 2 {
             return false;
         }
-        let index = (self.active + self.entries.len() - 1) % self.entries.len();
-        let id = self.entries[index].id;
-        self.select(id, window_focused)
-    }
-
-    /// Select the next tab, wrapping at the right edge.
-    pub(super) fn next(&mut self, window_focused: bool) -> bool {
-        if self.len() < 2 {
-            return false;
-        }
-        let index = (self.active + 1) % self.entries.len();
+        let step = match dir {
+            Dir::Prev => self.entries.len() - 1,
+            Dir::Next => 1,
+        };
+        let index = (self.active + step) % self.entries.len();
         let id = self.entries[index].id;
         self.select(id, window_focused)
     }
@@ -324,18 +312,16 @@ impl Tabs {
         true
     }
 
-    /// Reorder the active tab one slot toward index 0 (`Prev`) or the end (`Next`),
-    /// keeping it the active tab. Reordering does not wrap: unlike selection (which
-    /// cycles), flinging a tab past the edge to the far side would be surprising, so
-    /// an edge move is a no-op. Returns whether the order changed. The active tab's
-    /// content is untouched; only the bar reflows.
-    pub(super) fn move_active(&mut self, dir: Reorder) -> bool {
+    /// Reorder the active tab one slot along, keeping it the active tab. Unlike
+    /// selection (which cycles), an edge move is a no-op. Returns whether the order
+    /// changed. The tab's content is untouched; only the bar reflows.
+    pub(super) fn move_active(&mut self, dir: Dir) -> bool {
         if self.len() < 2 {
             return false;
         }
         let target = match dir {
-            Reorder::Prev if self.active > 0 => self.active - 1,
-            Reorder::Next if self.active + 1 < self.entries.len() => self.active + 1,
+            Dir::Prev if self.active > 0 => self.active - 1,
+            Dir::Next if self.active + 1 < self.entries.len() => self.active + 1,
             _ => return false,
         };
         self.move_active_to(target)
@@ -1108,9 +1094,9 @@ mod tests {
         let mut tabs = demo_tabs(3);
         let ids: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
 
-        assert!(tabs.prev(false));
+        assert!(tabs.cycle(Dir::Prev, false));
         assert_eq!(tabs.active_id(), Some(ids[2]));
-        assert!(tabs.next(false));
+        assert!(tabs.cycle(Dir::Next, false));
         assert_eq!(tabs.active_id(), Some(ids[0]));
     }
 
@@ -1123,24 +1109,24 @@ mod tests {
         // Active is the last tab (open makes the newest active; demo pushes tab 0
         // as active, so start by selecting the middle to reorder from the interior).
         assert!(tabs.select(ids[1], false));
-        assert!(tabs.move_active(Reorder::Next));
+        assert!(tabs.move_active(Dir::Next));
         assert_eq!(order(&tabs), vec![ids[0], ids[2], ids[1]]);
         assert_eq!(tabs.active_id(), Some(ids[1]), "identity follows the move");
 
-        assert!(tabs.move_active(Reorder::Prev));
+        assert!(tabs.move_active(Dir::Prev));
         assert_eq!(order(&tabs), vec![ids[0], ids[1], ids[2]]);
 
         // At an edge the move is a no-op (no wrap), unlike selection.
         assert!(tabs.select(ids[0], false));
-        assert!(!tabs.move_active(Reorder::Prev));
+        assert!(!tabs.move_active(Dir::Prev));
         assert_eq!(order(&tabs), vec![ids[0], ids[1], ids[2]]);
         assert!(tabs.select(ids[2], false));
-        assert!(!tabs.move_active(Reorder::Next));
+        assert!(!tabs.move_active(Dir::Next));
         assert_eq!(order(&tabs), vec![ids[0], ids[1], ids[2]]);
 
         // A single tab cannot reorder.
         let mut one = demo_tabs(1);
-        assert!(!one.move_active(Reorder::Next));
+        assert!(!one.move_active(Dir::Next));
     }
 
     #[test]
