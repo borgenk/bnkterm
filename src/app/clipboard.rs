@@ -249,12 +249,7 @@ impl State {
             let Some(manager) = manager else {
                 continue;
             };
-            let device = self.alloc_id();
-            self.conn.request(
-                manager,
-                get_device,
-                &[Arg::NewId(device), Arg::Object(seat)],
-            );
+            let device = self.create_for(manager, get_device, seat);
             self.sel_mut(t).device = device;
         }
     }
@@ -353,9 +348,7 @@ impl State {
         if old_source != 0 {
             self.conn.request(old_source, ops.source_destroy, &[]);
         }
-        let source = self.alloc_id();
-        self.conn
-            .request(manager, ops.create_source, &[Arg::NewId(source)]);
+        let source = self.create(manager, ops.create_source);
         for mime in CLIPBOARD_MIMES {
             self.conn
                 .request(source, ops.source_offer, &[Arg::Str(mime)]);

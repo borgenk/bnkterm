@@ -312,11 +312,10 @@ impl State {
         let scratch = ffi::drm_syncobj_create(fd, false)?;
         let acquire_timeline = self.import_timeline(manager, fd, acquire_syncobj)?;
         let release_timeline = self.import_timeline(manager, fd, release_syncobj)?;
-        let surface = self.alloc_id();
-        self.conn.request(
+        let surface = self.create_for(
             manager,
             wp_linux_drm_syncobj_manager_v1::GET_SURFACE,
-            &[Arg::NewId(surface), Arg::Object(self.surface)],
+            self.surface,
         );
         Ok(ExplicitSync {
             drm,
@@ -373,12 +372,7 @@ impl State {
             }
         }
         for (i, img) in images.iter().enumerate() {
-            let params = self.alloc_id();
-            self.conn.request(
-                dmabuf_global,
-                zwp_linux_dmabuf_v1::CREATE_PARAMS,
-                &[Arg::NewId(params)],
-            );
+            let params = self.create(dmabuf_global, zwp_linux_dmabuf_v1::CREATE_PARAMS);
             let modifier = img.modifier();
             self.conn.request_with_fd(
                 params,
@@ -755,9 +749,7 @@ impl State {
                 &[Arg::Int(r.x), Arg::Int(r.y), Arg::Int(r.w), Arg::Int(r.h)],
             );
         }
-        let callback = self.alloc_id();
-        self.conn
-            .request(self.surface, wl_surface::FRAME, &[Arg::NewId(callback)]);
+        let callback = self.create(self.surface, wl_surface::FRAME);
         self.frame_callback = callback;
         self.conn.request(self.surface, wl_surface::COMMIT, &[]);
         self.presentation.busy[idx] = true;
@@ -833,13 +825,8 @@ impl State {
         let Some(dmabuf) = self.presentation.dmabuf else {
             return;
         };
-        let id = self.alloc_id();
-        self.conn.request(
-            dmabuf,
-            zwp_linux_dmabuf_v1::GET_DEFAULT_FEEDBACK,
-            &[Arg::NewId(id)],
-        );
-        self.presentation.feedback_id = id;
+        self.presentation.feedback_id =
+            self.create(dmabuf, zwp_linux_dmabuf_v1::GET_DEFAULT_FEEDBACK);
     }
 
     /// One event of a feedback burst; the feedback state accumulates and commits.
@@ -882,12 +869,7 @@ impl State {
     /// print what the GPU presentation path has to work with, without opening a
     /// window. A successful probe means the terminal's GPU prerequisites hold.
     pub(super) fn probe_dmabuf(&mut self) -> Result<()> {
-        self.registry = self.alloc_id();
-        self.conn.request(
-            protocol::WL_DISPLAY,
-            wl_display::GET_REGISTRY,
-            &[Arg::NewId(self.registry)],
-        );
+        self.registry = self.create(protocol::WL_DISPLAY, wl_display::GET_REGISTRY);
         self.roundtrip()?;
         if self.presentation.dmabuf.is_none() {
             println!(

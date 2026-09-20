@@ -652,6 +652,23 @@ impl State {
         })
     }
 
+    /// Allocate an object id and ask `parent` to create it: the "`NewId` alone" shape
+    /// every plain object-creating request takes. The caller keeps the id.
+    fn create(&mut self, parent: u32, opcode: u16) -> u32 {
+        let id = self.alloc_id();
+        self.conn.request(parent, opcode, &[Arg::NewId(id)]);
+        id
+    }
+
+    /// The same, for the requests that also name the object the new one attaches to
+    /// (a surface, a seat, a pointer).
+    fn create_for(&mut self, parent: u32, opcode: u16, object: u32) -> u32 {
+        let id = self.alloc_id();
+        self.conn
+            .request(parent, opcode, &[Arg::NewId(id), Arg::Object(object)]);
+        id
+    }
+
     fn alloc_id(&mut self) -> u32 {
         self.free_ids.pop().unwrap_or_else(|| {
             let id = self.next_id;
@@ -672,12 +689,7 @@ impl State {
     /// screenshot harness runs it until the capture is written).
     fn bring_up_surface(&mut self) -> Result<()> {
         // Discover and bind globals.
-        self.registry = self.alloc_id();
-        self.conn.request(
-            protocol::WL_DISPLAY,
-            wl_display::GET_REGISTRY,
-            &[Arg::NewId(self.registry)],
-        );
+        self.registry = self.create(protocol::WL_DISPLAY, wl_display::GET_REGISTRY);
         self.roundtrip()?;
 
         let compositor = self.compositor.ok_or_else(|| {
@@ -699,24 +711,9 @@ impl State {
             .map_err(|e| Error::msg(format!("requires a Vulkan device; none available: {e}")))?;
 
         // Surface stack: wl_surface -> xdg_surface -> xdg_toplevel.
-        self.surface = self.alloc_id();
-        self.conn.request(
-            compositor,
-            wl_compositor::CREATE_SURFACE,
-            &[Arg::NewId(self.surface)],
-        );
-        self.xdg_surface = self.alloc_id();
-        self.conn.request(
-            wm_base,
-            xdg_wm_base::GET_XDG_SURFACE,
-            &[Arg::NewId(self.xdg_surface), Arg::Object(self.surface)],
-        );
-        self.toplevel = self.alloc_id();
-        self.conn.request(
-            self.xdg_surface,
-            xdg_surface::GET_TOPLEVEL,
-            &[Arg::NewId(self.toplevel)],
-        );
+        self.surface = self.create(compositor, wl_compositor::CREATE_SURFACE);
+        self.xdg_surface = self.create_for(wm_base, xdg_wm_base::GET_XDG_SURFACE, self.surface);
+        self.toplevel = self.create(self.xdg_surface, xdg_surface::GET_TOPLEVEL);
         self.conn.request(
             self.toplevel,
             xdg_toplevel::SET_APP_ID,
@@ -731,20 +728,12 @@ impl State {
         // logical window size. They come as a pair; without both, the integer
         // fallback (wl_output scale + set_buffer_scale) is used instead.
         if let (Some(fmgr), Some(vp)) = (self.scale.fractional_manager, self.scale.viewporter) {
-            let fractional = self.alloc_id();
-            self.conn.request(
+            self.scale.fractional_scale = self.create_for(
                 fmgr,
                 wp_fractional_scale_manager_v1::GET_FRACTIONAL_SCALE,
-                &[Arg::NewId(fractional), Arg::Object(self.surface)],
+                self.surface,
             );
-            self.scale.fractional_scale = fractional;
-            let viewport = self.alloc_id();
-            self.conn.request(
-                vp,
-                wp_viewporter::GET_VIEWPORT,
-                &[Arg::NewId(viewport), Arg::Object(self.surface)],
-            );
-            self.scale.viewport = viewport;
+            self.scale.viewport = self.create_for(vp, wp_viewporter::GET_VIEWPORT, self.surface);
         }
 
         // The devices drive copy and paste; each is skipped when the compositor has no
@@ -784,12 +773,7 @@ impl State {
     }
 
     fn roundtrip(&mut self) -> Result<()> {
-        let callback = self.alloc_id();
-        self.conn.request(
-            protocol::WL_DISPLAY,
-            wl_display::SYNC,
-            &[Arg::NewId(callback)],
-        );
+        let callback = self.create(protocol::WL_DISPLAY, wl_display::SYNC);
         self.pending_sync = Some(callback);
         self.run_until(|s| s.pending_sync.is_none())
     }
@@ -1224,28 +1208,18 @@ impl State {
         if Some(msg.object) == self.seat && msg.opcode == wl_seat::EV_CAPABILITIES {
             let caps = r.u32()?;
             if caps & wl_seat::CAP_KEYBOARD != 0 && self.keyboard == 0 {
-                let keyboard = self.alloc_id();
-                self.conn
-                    .request(msg.object, wl_seat::GET_KEYBOARD, &[Arg::NewId(keyboard)]);
-                self.keyboard = keyboard;
+                self.keyboard = self.create(msg.object, wl_seat::GET_KEYBOARD);
             }
             if caps & wl_seat::CAP_POINTER != 0 && self.pointer == 0 {
-                let pointer = self.alloc_id();
-                self.conn
-                    .request(msg.object, wl_seat::GET_POINTER, &[Arg::NewId(pointer)]);
+                let pointer = self.create(msg.object, wl_seat::GET_POINTER);
                 self.pointer = pointer;
                 // Pair the pointer with a cursor-shape device so we can ask for the
                 // I-beam over the grid. The manager is bound in the same global burst
                 // as the seat, so it is known by the time capabilities arrive; without
                 // it the pointer keeps the compositor default shape.
                 if let Some(manager) = self.cursor_shape_manager {
-                    let device = self.alloc_id();
-                    self.conn.request(
-                        manager,
-                        wp_cursor_shape_manager_v1::GET_POINTER,
-                        &[Arg::NewId(device), Arg::Object(pointer)],
-                    );
-                    self.cursor_shape_device = device;
+                    self.cursor_shape_device =
+                        self.create_for(manager, wp_cursor_shape_manager_v1::GET_POINTER, pointer);
                 }
             }
             return Ok(());
