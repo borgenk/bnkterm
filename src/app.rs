@@ -36,7 +36,7 @@ use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use self::clipboard::{PendingSend, SelectionState};
+use self::clipboard::{PendingSend, SelectionTransport, Transport};
 use self::layout::{TerminalGeometry, WindowLayout, WINDOW_PADDING};
 use self::message::{PointerEvent, Side, ToWindow};
 use self::present::GpuPresentation;
@@ -56,11 +56,10 @@ use crate::platform::ffi;
 use crate::platform::freetype::{FontConfig, FontSelection, Fonts};
 use crate::platform::geom::{logical_to_device, Scale};
 use crate::platform::protocol::{
-    self, wl_buffer, wl_callback, wl_compositor, wl_data_device_manager, wl_data_offer, wl_display,
-    wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_surface,
-    wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1, wp_fractional_scale_manager_v1,
-    wp_fractional_scale_v1, wp_viewporter, xdg_surface, xdg_toplevel, xdg_wm_base,
-    zwp_primary_selection_device_manager_v1, zwp_primary_selection_offer_v1,
+    self, wl_buffer, wl_callback, wl_compositor, wl_display, wl_keyboard, wl_output, wl_pointer,
+    wl_registry, wl_seat, wl_surface, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
+    wp_fractional_scale_manager_v1, wp_fractional_scale_v1, wp_viewporter, xdg_surface,
+    xdg_toplevel, xdg_wm_base,
 };
 use crate::platform::wire::{Arg, Message, Reader};
 use crate::platform::xkb::Xkb;
@@ -490,17 +489,10 @@ struct State {
     surface: u32,
     xdg_surface: u32,
     toplevel: u32,
-    /// The clipboard data device and manager (absent if the compositor has no
-    /// `wl_data_device_manager`; copy/paste is then a no-op), plus our state.
-    data_device_manager: Option<u32>,
-    data_device: u32,
-    clipboard: SelectionState,
-    /// The primary-selection device and manager (absent if the compositor has no
-    /// `zwp_primary_selection_device_manager_v1`; select-to-copy and middle-click
-    /// paste are then a no-op), plus our state. Same machinery as the clipboard.
-    primary_manager: Option<u32>,
-    primary_device: u32,
-    primary: SelectionState,
+    /// The clipboard (Ctrl+Shift+C/V) and the primary selection (select-to-copy,
+    /// middle-click paste), indexed by [`Transport`]. One state machine over two object
+    /// families; a transport whose manager the compositor never advertised is a no-op.
+    selections: [SelectionTransport; 2],
     /// Selection transfers still owed bytes to whoever asked for them, shared by both
     /// transports. Serving is asynchronous because the receiver decides when to read and
     /// a pipe holds only 64 KiB (see `State::begin_selection_send`).
@@ -639,12 +631,7 @@ impl State {
             surface: 0,
             xdg_surface: 0,
             toplevel: 0,
-            data_device_manager: None,
-            data_device: 0,
-            clipboard: SelectionState::new(),
-            primary_manager: None,
-            primary_device: 0,
-            primary: SelectionState::new(),
+            selections: SelectionTransport::pair(),
             pending_sends: Vec::new(),
             last_serial: 0,
             presentation: GpuPresentation::new(),
@@ -760,28 +747,10 @@ impl State {
             self.scale.viewport = viewport;
         }
 
-        // The data device drives the clipboard; skip it when the compositor has no
-        // manager (copy/paste is then simply unavailable).
-        if let (Some(manager), Some(seat)) = (self.data_device_manager, self.seat) {
-            let device = self.alloc_id();
-            self.conn.request(
-                manager,
-                wl_data_device_manager::GET_DATA_DEVICE,
-                &[Arg::NewId(device), Arg::Object(seat)],
-            );
-            self.data_device = device;
-        }
-
-        // The primary-selection device drives select-to-copy / middle-click paste,
-        // the same way; skip it when the compositor has no manager.
-        if let (Some(manager), Some(seat)) = (self.primary_manager, self.seat) {
-            let device = self.alloc_id();
-            self.conn.request(
-                manager,
-                zwp_primary_selection_device_manager_v1::GET_DEVICE,
-                &[Arg::NewId(device), Arg::Object(seat)],
-            );
-            self.primary_device = device;
+        // The devices drive copy and paste; each is skipped when the compositor has no
+        // manager for it, leaving that transport unavailable rather than broken.
+        if let Some(seat) = self.seat {
+            self.create_selection_devices(seat);
         }
 
         self.create_buffers()?;
@@ -1290,34 +1259,8 @@ impl State {
             return self.on_pointer(msg.opcode, &mut r);
         }
 
-        if self.data_device != 0 && msg.object == self.data_device {
-            return self.on_data_device(msg.opcode, &mut r);
-        }
-
-        if self.clipboard.source != 0 && msg.object == self.clipboard.source {
-            return self.on_data_source(msg.opcode, &mut r);
-        }
-
-        if self.clipboard.incoming_offer != 0
-            && msg.object == self.clipboard.incoming_offer
-            && msg.opcode == wl_data_offer::EV_OFFER
-        {
-            return self.on_offer_mime(&mut r);
-        }
-
-        if self.primary_device != 0 && msg.object == self.primary_device {
-            return self.on_primary_device(msg.opcode, &mut r);
-        }
-
-        if self.primary.source != 0 && msg.object == self.primary.source {
-            return self.on_primary_source(msg.opcode, &mut r);
-        }
-
-        if self.primary.incoming_offer != 0
-            && msg.object == self.primary.incoming_offer
-            && msg.opcode == zwp_primary_selection_offer_v1::EV_OFFER
-        {
-            return self.on_primary_offer_mime(&mut r);
+        if let Some(result) = self.on_selection_message(msg, &mut r) {
+            return result;
         }
 
         if self.presentation.feedback_id != 0 && msg.object == self.presentation.feedback_id {
@@ -1525,7 +1468,7 @@ impl State {
                         return Ok(());
                     }
                     'v' => {
-                        self.paste()?;
+                        self.paste_from(Transport::Clipboard)?;
                         return Ok(());
                     }
                     _ => {}
@@ -2051,7 +1994,7 @@ impl State {
                     version,
                     protocol::VERSION_DATA_DEVICE_MANAGER,
                 );
-                self.data_device_manager = Some(id);
+                self.selections[Transport::Clipboard as usize].manager = Some(id);
             }
             protocol::IFACE_PRIMARY_SELECTION => {
                 let id = self.bind_capped(
@@ -2060,7 +2003,7 @@ impl State {
                     version,
                     protocol::VERSION_PRIMARY_SELECTION,
                 );
-                self.primary_manager = Some(id);
+                self.selections[Transport::Primary as usize].manager = Some(id);
             }
             protocol::IFACE_DMABUF if version >= protocol::VERSION_DMABUF => {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_DMABUF);
@@ -2145,9 +2088,9 @@ impl State {
         for msg in outbox.drain(..) {
             match msg {
                 ToWindow::Title(title) => self.set_toplevel_title(&title),
-                ToWindow::OfferSelection(bytes) => self.set_clipboard(bytes),
-                ToWindow::OfferPrimary(bytes) => self.set_primary(bytes),
-                ToWindow::PastePrimary => self.paste_primary()?,
+                ToWindow::OfferSelection(bytes) => self.set_selection(Transport::Clipboard, bytes),
+                ToWindow::OfferPrimary(bytes) => self.set_selection(Transport::Primary, bytes),
+                ToWindow::PastePrimary => self.paste_from(Transport::Primary)?,
                 ToWindow::OpenUrl(url) => open_url(&url),
                 ToWindow::Closed => self.closed = true,
             }

@@ -22,7 +22,7 @@ use crate::platform::protocol::{
     zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
     zwp_primary_selection_offer_v1, zwp_primary_selection_source_v1,
 };
-use crate::platform::wire::{Arg, Reader};
+use crate::platform::wire::{Arg, Message, Reader};
 
 /// The MIME types we advertise on copy and accept on paste, preferred first.
 pub(super) const CLIPBOARD_MIMES: &[&str] = &["text/plain;charset=utf-8", "text/plain"];
@@ -63,15 +63,16 @@ impl PendingSend {
 /// one state machine over two object families, so the code is written once and the
 /// caller picks the transport.
 #[derive(Clone, Copy)]
-enum Transport {
+pub(super) enum Transport {
     Clipboard,
     Primary,
 }
 
 /// The wire opcodes that differ between the clipboard and the primary selection;
-/// the message flow over them is identical. One table per transport, selected by
-/// [`State::ops`].
+/// the message flow over them is identical. One table per transport, held by the
+/// transport it belongs to.
 struct SelectionOps {
+    get_device: u16,
     create_source: u16,
     source_offer: u16,
     source_destroy: u16,
@@ -82,9 +83,12 @@ struct SelectionOps {
     ev_selection: u16,
     offer_receive: u16,
     offer_destroy: u16,
+    /// One MIME type of an incoming offer.
+    ev_offer: u16,
 }
 
 const CLIPBOARD_OPS: SelectionOps = SelectionOps {
+    get_device: wl_data_device_manager::GET_DATA_DEVICE,
     create_source: wl_data_device_manager::CREATE_DATA_SOURCE,
     source_offer: wl_data_source::OFFER,
     source_destroy: wl_data_source::DESTROY,
@@ -95,9 +99,11 @@ const CLIPBOARD_OPS: SelectionOps = SelectionOps {
     ev_selection: wl_data_device::EV_SELECTION,
     offer_receive: wl_data_offer::RECEIVE,
     offer_destroy: wl_data_offer::DESTROY,
+    ev_offer: wl_data_offer::EV_OFFER,
 };
 
 const PRIMARY_OPS: SelectionOps = SelectionOps {
+    get_device: zwp_primary_selection_device_manager_v1::GET_DEVICE,
     create_source: zwp_primary_selection_device_manager_v1::CREATE_SOURCE,
     source_offer: zwp_primary_selection_source_v1::OFFER,
     source_destroy: zwp_primary_selection_source_v1::DESTROY,
@@ -108,7 +114,40 @@ const PRIMARY_OPS: SelectionOps = SelectionOps {
     ev_selection: zwp_primary_selection_device_v1::EV_SELECTION,
     offer_receive: zwp_primary_selection_offer_v1::RECEIVE,
     offer_destroy: zwp_primary_selection_offer_v1::DESTROY,
+    ev_offer: zwp_primary_selection_offer_v1::EV_OFFER,
 };
+
+/// One selection transport: the manager global and device object it runs over, the
+/// opcodes that differ from the other transport's, and its bookkeeping. `State` holds
+/// both, indexed by [`Transport`], so nothing has to match a transport to a field.
+pub(super) struct SelectionTransport {
+    /// The manager global, or `None` when the compositor did not advertise it, which
+    /// makes this transport's copy and paste a no-op rather than an error.
+    pub(super) manager: Option<u32>,
+    /// The device object, `0` until bring-up creates it (and forever without a manager).
+    device: u32,
+    ops: &'static SelectionOps,
+    state: SelectionState,
+}
+
+impl SelectionTransport {
+    /// The clipboard and the primary selection, in [`Transport`] order.
+    pub(super) fn pair() -> [SelectionTransport; 2] {
+        [
+            SelectionTransport::new(&CLIPBOARD_OPS),
+            SelectionTransport::new(&PRIMARY_OPS),
+        ]
+    }
+
+    fn new(ops: &'static SelectionOps) -> Self {
+        Self {
+            manager: None,
+            device: 0,
+            ops,
+            state: SelectionState::new(),
+        }
+    }
+}
 
 /// One selection transport's bookkeeping. When we own the selection, `source` is
 /// our live source object and `data` the bytes it serves. Incoming offers are
@@ -195,110 +234,68 @@ impl SelectionState {
 }
 
 impl State {
-    // Clipboard entry points (Ctrl+Shift+C/V), thin wrappers over the shared path.
-
-    /// A `wl_data_device` event on the clipboard device.
-    pub(super) fn on_data_device(&mut self, opcode: u16, r: &mut Reader) -> Result<()> {
-        self.on_selection_device(Transport::Clipboard, opcode, r)
+    fn sel(&self, t: Transport) -> &SelectionTransport {
+        &self.selections[t as usize]
     }
 
-    /// A `wl_data_source` event on the clipboard source we own.
-    pub(super) fn on_data_source(&mut self, opcode: u16, r: &mut Reader) -> Result<()> {
-        self.on_selection_source(Transport::Clipboard, opcode, r)
+    fn sel_mut(&mut self, t: Transport) -> &mut SelectionTransport {
+        &mut self.selections[t as usize]
     }
 
-    /// One MIME type of the incoming clipboard offer.
-    pub(super) fn on_offer_mime(&mut self, r: &mut Reader) -> Result<()> {
-        self.on_selection_offer_mime(Transport::Clipboard, r)
-    }
-
-    /// Become the clipboard owner serving `data` as text.
-    pub(super) fn set_clipboard(&mut self, data: Vec<u8>) {
-        self.set_selection(Transport::Clipboard, data);
-    }
-
-    /// Paste the clipboard's text to the child (Ctrl+Shift+V).
-    pub(super) fn paste(&mut self) -> Result<()> {
-        self.paste_from(Transport::Clipboard)
-    }
-
-    // Primary selection entry points (select-to-copy, middle-click paste).
-
-    /// A `zwp_primary_selection_device_v1` event on the primary device.
-    pub(super) fn on_primary_device(&mut self, opcode: u16, r: &mut Reader) -> Result<()> {
-        self.on_selection_device(Transport::Primary, opcode, r)
-    }
-
-    /// A `zwp_primary_selection_source_v1` event on the primary source we own.
-    pub(super) fn on_primary_source(&mut self, opcode: u16, r: &mut Reader) -> Result<()> {
-        self.on_selection_source(Transport::Primary, opcode, r)
-    }
-
-    /// One MIME type of the incoming primary offer.
-    pub(super) fn on_primary_offer_mime(&mut self, r: &mut Reader) -> Result<()> {
-        self.on_selection_offer_mime(Transport::Primary, r)
-    }
-
-    /// Become the primary-selection owner serving `data` as text (copy-on-select).
-    pub(super) fn set_primary(&mut self, data: Vec<u8>) {
-        self.set_selection(Transport::Primary, data);
-    }
-
-    /// Paste the primary selection's text to the child (middle-click).
-    pub(super) fn paste_primary(&mut self) -> Result<()> {
-        self.paste_from(Transport::Primary)
-    }
-
-    // The shared implementation, keyed by transport.
-
-    fn ops(t: Transport) -> SelectionOps {
-        match t {
-            Transport::Clipboard => CLIPBOARD_OPS,
-            Transport::Primary => PRIMARY_OPS,
+    /// Create the device object each advertised transport runs over, on `seat`.
+    pub(super) fn create_selection_devices(&mut self, seat: u32) {
+        for t in [Transport::Clipboard, Transport::Primary] {
+            let (manager, get_device) = (self.sel(t).manager, self.sel(t).ops.get_device);
+            let Some(manager) = manager else {
+                continue;
+            };
+            let device = self.alloc_id();
+            self.conn.request(
+                manager,
+                get_device,
+                &[Arg::NewId(device), Arg::Object(seat)],
+            );
+            self.sel_mut(t).device = device;
         }
     }
 
-    fn selection(&self, t: Transport) -> &SelectionState {
-        match t {
-            Transport::Clipboard => &self.clipboard,
-            Transport::Primary => &self.primary,
+    /// Route a Wayland message to whichever selection transport owns its object, or
+    /// `None` when neither does. Three object families per transport: the device, the
+    /// source we own while we hold the selection, and the offer being described to us.
+    pub(super) fn on_selection_message(
+        &mut self,
+        msg: &Message,
+        r: &mut Reader,
+    ) -> Option<Result<()>> {
+        for t in [Transport::Clipboard, Transport::Primary] {
+            let sel = self.sel(t);
+            if sel.device != 0 && msg.object == sel.device {
+                return Some(self.on_selection_device(t, msg.opcode, r));
+            }
+            if sel.state.source != 0 && msg.object == sel.state.source {
+                return Some(self.on_selection_source(t, msg.opcode, r));
+            }
+            if sel.state.incoming_offer != 0
+                && msg.object == sel.state.incoming_offer
+                && msg.opcode == sel.ops.ev_offer
+            {
+                return Some(self.on_selection_offer_mime(t, r));
+            }
         }
-    }
-
-    fn selection_mut(&mut self, t: Transport) -> &mut SelectionState {
-        match t {
-            Transport::Clipboard => &mut self.clipboard,
-            Transport::Primary => &mut self.primary,
-        }
-    }
-
-    /// The device object (`0` when the compositor lacks the manager).
-    fn selection_device(&self, t: Transport) -> u32 {
-        match t {
-            Transport::Clipboard => self.data_device,
-            Transport::Primary => self.primary_device,
-        }
-    }
-
-    /// The manager global, or `None` when the compositor did not advertise it.
-    fn selection_manager(&self, t: Transport) -> Option<u32> {
-        match t {
-            Transport::Clipboard => self.data_device_manager,
-            Transport::Primary => self.primary_manager,
-        }
+        None
     }
 
     /// A device event: a new offer being introduced, or the selection changing to
     /// one (or to null).
     fn on_selection_device(&mut self, t: Transport, opcode: u16, r: &mut Reader) -> Result<()> {
-        let ops = Self::ops(t);
+        let ops = self.sel(t).ops;
         // Wire decoding here, the offer lifecycle in [`SelectionState`], which is what
         // makes "who owns this offer now, and who destroys it" testable without a
         // compositor.
         let doomed = if opcode == ops.ev_data_offer {
-            self.selection_mut(t).introduce(r.u32()?)
+            self.sel_mut(t).state.introduce(r.u32()?)
         } else if opcode == ops.ev_selection {
-            self.selection_mut(t).take_selection(r.u32()?)
+            self.sel_mut(t).state.take_selection(r.u32()?)
         } else {
             None
         };
@@ -311,7 +308,7 @@ impl State {
     /// A source event on the source we own: serve our bytes to a paster, or tear the
     /// source down when another selection replaces ours.
     fn on_selection_source(&mut self, t: Transport, opcode: u16, r: &mut Reader) -> Result<()> {
-        let ops = Self::ops(t);
+        let ops = self.sel(t).ops;
         if opcode == ops.ev_send {
             // Every MIME we advertise serves the same bytes.
             let _mime = r.string()?;
@@ -321,11 +318,11 @@ impl State {
                 .ok_or_else(|| Error::msg("selection source.send arrived without its fd"))?;
             self.begin_selection_send(t, fd);
         } else if opcode == ops.ev_cancelled {
-            let source = self.selection(t).source;
+            let source = self.sel(t).state.source;
             if source != 0 {
                 self.conn.request(source, ops.source_destroy, &[]);
             }
-            let st = self.selection_mut(t);
+            let st = &mut self.sel_mut(t).state;
             st.source = 0;
             st.data.clear();
         }
@@ -336,23 +333,23 @@ impl State {
     /// what to request. See [`SelectionState::offer_mime`].
     fn on_selection_offer_mime(&mut self, t: Transport, r: &mut Reader) -> Result<()> {
         let mime = r.string()?;
-        self.selection_mut(t).offer_mime(mime);
+        self.sel_mut(t).state.offer_mime(mime);
         Ok(())
     }
 
     /// Become the transport's owner serving `data` as text, replacing any source we
     /// held. Needs the manager and device (skips silently without them). Called from
     /// the outbox drain when the core reports a fresh selection to own.
-    fn set_selection(&mut self, t: Transport, data: Vec<u8>) {
-        let Some(manager) = self.selection_manager(t) else {
+    pub(super) fn set_selection(&mut self, t: Transport, data: Vec<u8>) {
+        let Some(manager) = self.sel(t).manager else {
             return;
         };
-        let device = self.selection_device(t);
+        let device = self.sel(t).device;
         if device == 0 {
             return;
         }
-        let ops = Self::ops(t);
-        let old_source = self.selection(t).source;
+        let ops = self.sel(t).ops;
+        let old_source = self.sel(t).state.source;
         if old_source != 0 {
             self.conn.request(old_source, ops.source_destroy, &[]);
         }
@@ -368,7 +365,7 @@ impl State {
             ops.set_selection,
             &[Arg::Object(source), Arg::Uint(self.last_serial)],
         );
-        let st = self.selection_mut(t);
+        let st = &mut self.sel_mut(t).state;
         st.source = source;
         st.data = data;
     }
@@ -398,7 +395,7 @@ impl State {
         }
         self.pending_sends.push(PendingSend {
             fd,
-            data: self.selection(t).data.clone(),
+            data: self.sel(t).state.data.clone(),
             head: 0,
         });
         self.pump_selection_sends();
@@ -428,7 +425,7 @@ impl State {
 
     /// Paste a transport's text to the child: the core normalizes, brackets, and
     /// writes it (see `TerminalCore::paste`). A no-op when the transport is empty.
-    fn paste_from(&mut self, t: Transport) -> Result<()> {
+    pub(super) fn paste_from(&mut self, t: Transport) -> Result<()> {
         if let Some(text) = self.selection_text(t)? {
             self.tabs.active_mut().paste(text.into_bytes())?;
         }
@@ -440,19 +437,19 @@ impl State {
     /// reading the pipe while also owing our source a `send`). Otherwise the bytes
     /// come over a pipe (give the compositor the write end, read to EOF).
     fn selection_text(&mut self, t: Transport) -> Result<Option<String>> {
-        if self.selection(t).source != 0 {
+        if self.sel(t).state.source != 0 {
             return Ok(Some(
-                String::from_utf8_lossy(&self.selection(t).data).into_owned(),
+                String::from_utf8_lossy(&self.sel(t).state.data).into_owned(),
             ));
         }
-        let st = self.selection(t);
+        let st = &self.sel(t).state;
         let (Some(mime), offer) = (st.selection_text_mime.clone(), st.selection_offer) else {
             return Ok(None);
         };
         if offer == 0 {
             return Ok(None);
         }
-        let ops = Self::ops(t);
+        let ops = self.sel(t).ops;
         let (read_end, write_end) = ffi::pipe()?;
         self.conn.request_with_fd(
             offer,
