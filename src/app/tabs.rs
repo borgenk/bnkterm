@@ -340,7 +340,7 @@ impl Tabs {
         let Some(bar) = self.bar_geom else {
             return;
         };
-        let Some((left, _)) = tab_bar::block_px(&self.bar_slots, &bar, index) else {
+        let Some(left) = self.bar_slots.get(index).map(|slot| bar.block_left(slot)) else {
             return;
         };
         self.drag = Some(TabDrag {
@@ -376,12 +376,7 @@ impl Tabs {
             }
             drag.lifted = true;
         }
-        // Slot zero is never clipped, so its width is the true pitch.
-        let pitch = self
-            .bar_slots
-            .first()
-            .map_or(1, |slot| slot.cells.len() as i32 * bar.metrics.w)
-            .max(1);
+        let pitch = bar.pitch(&self.bar_slots).max(1);
         // A resize since the press can have shrunk the pitch below the grab offset;
         // keep the grip inside the block so the float cannot invert.
         let grab = drag.grab_dx.clamp(0, pitch - 1);
@@ -783,12 +778,7 @@ impl Tabs {
                 active: index == self.active,
             })
             .collect();
-        // Blocks are sized in terminal cells. Before the first resize there is no
-        // geometry; the resulting slots are not painted until that resize rebuilds
-        // them, so a placeholder cell width is harmless (the labels, fitted at paint
-        // time, never see it).
-        let cell_w = self.bar_geom.as_ref().map_or(1, |geom| geom.metrics.w);
-        self.bar_slots = tab_bar::layout(cols, &labels, &self.cfg, cell_w);
+        self.bar_slots = tab_bar::layout(cols, &labels, &self.cfg);
     }
 
     /// Translate each core's outbox according to foreground/background routing.

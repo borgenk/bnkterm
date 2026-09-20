@@ -197,9 +197,8 @@ impl GpuPresentation {
 }
 
 /// The sync mode reported on a `[stats]` line, written straight into the log via
-/// [`Display`](std::fmt::Display) rather than a heap `String`. `BNKTERM_STATS`
-/// exists to profile live allocation, and the counting allocator watches this exact
-/// path, so a `format!` here would tax the very measurement it prints beside.
+/// [`Display`](std::fmt::Display) rather than a heap `String`: `--stats` exists to
+/// profile a live session, so its own reporting must not allocate per frame.
 enum SyncStatus {
     Explicit {
         fence_frames: u64,
@@ -482,7 +481,7 @@ impl State {
     /// slots): the compositor is definitively done with it, so free its image now. Returns
     /// whether a retired entry matched. This is the only release signal on the implicit path,
     /// and a belt-and-suspenders one under explicit sync.
-    pub(super) fn release_retired(&mut self, buffer: u32) -> bool {
+    pub(super) fn release_retired(&mut self, buffer: u32) {
         if let Some(pos) = self
             .presentation
             .retired
@@ -491,9 +490,6 @@ impl State {
         {
             let r = self.presentation.retired.swap_remove(pos);
             self.free_retired(r);
-            true
-        } else {
-            false
         }
     }
 
@@ -661,7 +657,7 @@ impl State {
             self.declare_surface_scale();
         }
 
-        let background = color_f32(self.tabs.active().clear_color());
+        let background = clear_color_linear(self.tabs.active().clear_color());
         // Batch the freshly built list into the reused frame data (vertices/batches
         // refilled in place, no allocation in steady state).
         gpu::build_frame_into(
@@ -931,7 +927,7 @@ impl State {
 /// authored bytes are sRGB-encoded; the color attachment is an sRGB view, so the
 /// clear value is taken as linear and re-encoded on store. Converting here makes
 /// the cleared background land on the same bytes as the authored color.
-fn color_f32(color: u32) -> [f32; 4] {
+fn clear_color_linear(color: u32) -> [f32; 4] {
     let srgb_to_linear = |c: u32| {
         let c = c as f32 / 255.0;
         if c > 0.04045 {
@@ -964,8 +960,8 @@ mod tests {
         assert_eq!(SyncStatus::Implicit.to_string(), "implicit-sync bridge");
     }
 
-    /// The store-side sRGB encode the attachment applies, inverse of the decode
-    /// in color_f32.
+    /// The store-side sRGB encode the attachment applies, inverse of the decode in
+    /// `clear_color_linear`.
     fn linear_to_srgb(c: f32) -> f32 {
         if c > 0.003_130_8 {
             1.055 * c.powf(1.0 / 2.4) - 0.055
@@ -983,7 +979,7 @@ mod tests {
             0x0012_3456,
             0x001c_2127,
         ] {
-            let lin = color_f32(color);
+            let lin = clear_color_linear(color);
             let enc = |c: f32| (linear_to_srgb(c) * 255.0).round() as u32;
             let got = (enc(lin[0]) << 16) | (enc(lin[1]) << 8) | enc(lin[2]);
             assert_eq!(

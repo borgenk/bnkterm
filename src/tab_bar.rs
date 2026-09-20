@@ -80,6 +80,32 @@ pub(crate) struct BarGeom {
     pub h: i32,
 }
 
+impl BarGeom {
+    /// The device-pixel left edge of `slot`'s block, from the surface origin (the pad
+    /// included, the space the pointer scales into).
+    pub fn block_left(&self, slot: &Slot) -> i32 {
+        self.pad + slot.cells.start as i32 * self.metrics.w
+    }
+
+    /// The block's content area as a left edge and a width in device pixels: the label
+    /// centers in it, and is truncated with a trailing fade when it overflows. A block
+    /// too narrow for the side padding gives all of itself to the label.
+    pub fn content_span(&self, slot: &Slot) -> (i32, i32) {
+        let cells = slot.cells.len();
+        let pad = if cells >= PAD_MIN_WIDTH { SIDE_PAD } else { 0 };
+        let left = self.pad + (slot.cells.start + pad) as i32 * self.metrics.w;
+        (left, cells.saturating_sub(2 * pad) as i32 * self.metrics.w)
+    }
+
+    /// The nominal block pitch, from slot zero: it is never clipped, so its width is
+    /// the true pitch even when a narrow window cuts the last block. `0` with no tabs.
+    pub fn pitch(&self, slots: &[Slot]) -> i32 {
+        slots
+            .first()
+            .map_or(0, |slot| slot.cells.len() as i32 * self.metrics.w)
+    }
+}
+
 /// One resolved title supplied by the tabs manager.
 pub(crate) struct TabLabel<'a> {
     pub title: &'a str,
@@ -98,12 +124,6 @@ pub(crate) struct Slot {
     /// The child-safe label (controls and zero-width clusters already replaced),
     /// with the empty title mapped to `shell`. Fitted to the block at paint time.
     pub title: String,
-    /// Left edge of the block's content area in device pixels from the strip's
-    /// content origin (add [`BarGeom::pad`]); the label centers within it.
-    pub content_left: i32,
-    /// Width of the block's content area in device pixels: the label fits into this
-    /// span and is truncated (with a trailing fade) when it overflows.
-    pub content_px: i32,
     pub active: bool,
 }
 
@@ -112,18 +132,13 @@ pub(crate) struct Slot {
 /// Each title is sanitized (child-controlled bytes), stripped of its old numeric
 /// prefix, and either centered whole or cut from the end to fit.
 ///
-/// Blocks are sized in terminal cells (`cell_w`), so they align to the grid and hit
-/// test against the same pitch the window maps clicks with. Each slot records its
-/// content span in device pixels and the sanitized title; the proportional label is
-/// fitted, centered, and (when it overflows) truncated with a trailing fade at paint
-/// time by [`fill_bar`], which has the interface font to measure advances. `cell_w`
-/// is the one-past-config terminal cell width (`>= 1`).
-pub(crate) fn layout(
-    cols: usize,
-    labels: &[TabLabel<'_>],
-    cfg: &TabBarConfig,
-    cell_w: i32,
-) -> Vec<Slot> {
+/// Blocks are sized in terminal cells, so they align to the grid and hit test against
+/// the same pitch the window maps clicks with; the device-pixel spans come from
+/// [`BarGeom`] at paint and hit-test time. Each slot records its cell range and the
+/// sanitized title; the proportional label is fitted, centered, and (when it overflows)
+/// truncated with a trailing fade at paint time by [`fill_bar`], which has the interface
+/// font to measure advances.
+pub(crate) fn layout(cols: usize, labels: &[TabLabel<'_>], cfg: &TabBarConfig) -> Vec<Slot> {
     if labels.is_empty() {
         return Vec::new();
     }
@@ -148,7 +163,6 @@ pub(crate) fn layout(
         width = base;
     }
     let width = width.max(1);
-    let cell_w = cell_w.max(1);
 
     labels
         .iter()
@@ -159,14 +173,6 @@ pub(crate) fn layout(
             // narrow window; an empty range is simply not painted or hit.
             let end = (start + width).min(cols);
             let cells = start..end;
-            let avail = end.saturating_sub(start);
-            let pad = if avail >= PAD_MIN_WIDTH { SIDE_PAD } else { 0 };
-            let content_cells = avail.saturating_sub(2 * pad);
-            // The content area in device pixels, and its left edge from the strip's
-            // content origin. Blocks ride the terminal grid, so both use `cell_w`.
-            let content_px = content_cells as i32 * cell_w;
-            let content_left = (start + pad) as i32 * cell_w;
-
             let clean = sanitize_title(label.title);
             let title = if clean.is_empty() {
                 "shell".to_string()
@@ -176,8 +182,6 @@ pub(crate) fn layout(
             Slot {
                 cells,
                 title,
-                content_left,
-                content_px,
                 active: label.active,
             }
         })
@@ -258,13 +262,14 @@ pub(crate) fn fill_bar(
                 color: colors.bg.to_u32(),
             });
         }
+        let (content_left, content_px) = bar.content_span(slot);
         paint_label(
             out,
             strings,
             fonts,
             &slot.title,
-            bar.pad + slot.content_left,
-            slot.content_px,
+            content_left,
+            content_px,
             baseline,
             face,
             colors,
@@ -298,7 +303,7 @@ pub(crate) fn fill_bar(
     // home slot was clipped, and its label rides along by the same shift.
     if let Some(lift) = lift {
         if let Some(slot) = slots.get(lift.slot).filter(|slot| !slot.cells.is_empty()) {
-            let pitch = slots.first().map_or(0, |s| s.cells.len() as i32 * m.w);
+            let pitch = bar.pitch(slots);
             out.push(DrawCmd::Fill {
                 rect: Rect {
                     x: lift.left,
@@ -308,14 +313,15 @@ pub(crate) fn fill_bar(
                 },
                 color: cfg.active.bg.to_u32(),
             });
-            let dx = lift.left - (bar.pad + slot.cells.start as i32 * m.w);
+            let dx = lift.left - bar.block_left(slot);
+            let (content_left, content_px) = bar.content_span(slot);
             paint_label(
                 out,
                 strings,
                 fonts,
                 &slot.title,
-                bar.pad + slot.content_left + dx,
-                slot.content_px,
+                content_left + dx,
+                content_px,
                 baseline,
                 face,
                 cfg.active,
@@ -341,19 +347,6 @@ pub(crate) struct Lift {
     pub left: i32,
 }
 
-/// The device-pixel left edge and width of slot `i`'s block, measured from the
-/// surface origin ([`BarGeom::pad`] included, the same space the pointer scales
-/// into). The press reads slot `i`'s left edge to measure the grab offset; the drag
-/// reads slot zero's width for the pitch (slot zero is never clipped, so its block
-/// is the true pitch even when a narrow window cuts the last one). `None` when `i`
-/// is out of range.
-pub(crate) fn block_px(slots: &[Slot], bar: &BarGeom, i: usize) -> Option<(i32, i32)> {
-    let slot = slots.get(i)?;
-    let left = bar.pad + slot.cells.start as i32 * bar.metrics.w;
-    let width = (slot.cells.end - slot.cells.start) as i32 * bar.metrics.w;
-    Some((left, width))
-}
-
 /// Which slot a block whose left edge sits at device-x `left` wants to land in: the
 /// slot its own midpoint falls in, clamped to the run. Blocks are one equal width,
 /// so this is a divide against the pitch, not a scan; and because the pointer is not
@@ -361,7 +354,8 @@ pub(crate) fn block_px(slots: &[Slot], bar: &BarGeom, i: usize) -> Option<(i32, 
 /// pitch comes from slot zero (never clipped), so a narrow window cutting the last
 /// block does not skew the divide. `None` only when there are no tabs.
 pub(crate) fn drop_index(slots: &[Slot], bar: &BarGeom, left: i32) -> Option<usize> {
-    let pitch = (slots.first()?.cells.len() as i32 * bar.metrics.w).max(1);
+    slots.first()?;
+    let pitch = bar.pitch(slots).max(1);
     let mid = (left + pitch / 2 - bar.pad).max(0);
     Some(((mid / pitch) as usize).min(slots.len() - 1))
 }
@@ -493,10 +487,10 @@ mod tests {
         TabLabel { title, active }
     }
 
-    /// Lay out at the test cell width. Blocks are font-free, so this needs no fonts;
-    /// only painting (which fits the proportional label) does.
+    /// Blocks are font-free, so laying out needs no fonts; only painting (which fits
+    /// the proportional label) does.
     fn lay(cols: usize, labels: &[TabLabel<'_>], cfg: &TabBarConfig) -> Vec<Slot> {
-        layout(cols, labels, cfg, METRICS.w)
+        layout(cols, labels, cfg)
     }
 
     /// The real interface fonts at the test size. Painting the bar measures glyph
@@ -687,12 +681,10 @@ mod tests {
                 _ => None,
             })
             .expect("a run");
+        let (content_left, content_px) = geom(&fonts, 80, 0).content_span(&slots[0]);
+        assert!(x > content_left, "left of a centered run clears the gutter");
         assert!(
-            x > slots[0].content_left,
-            "left of a centered run clears the gutter"
-        );
-        assert!(
-            x + run_w < slots[0].content_left + slots[0].content_px + METRICS.w,
+            x + run_w < content_left + content_px + METRICS.w,
             "and it stays within the block"
         );
         assert_eq!(runs[0].1, cfg.active.fg.to_u32());

@@ -132,9 +132,8 @@ pub enum Verbosity {
 }
 
 impl Verbosity {
-    /// Read the verbosity out of the command line. `BNKTERM_STATS` in the
-    /// environment is the same knob as `--stats`, kept because the perf lab and
-    /// desktop launchers already set it that way.
+    /// Read the verbosity out of the command line. `BNKTERM_STATS` in the environment
+    /// is the same knob as `--stats`, for a launcher that cannot pass arguments.
     pub fn from_args(args: &[String]) -> Self {
         Self::parse(args, std::env::var_os("BNKTERM_STATS").is_some())
     }
