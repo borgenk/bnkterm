@@ -51,6 +51,13 @@ impl Scale {
         Scale(factor_120.max(1))
     }
 
+    /// A logical length in device pixels, unrounded. The pointer arrives as a float and
+    /// is hit-tested against cell and lane edges, where rounding to whole device pixels
+    /// would move the boundary it is being compared to.
+    pub fn pxf(self, logical: f32) -> f32 {
+        logical * self.0 as f32 / 120.0
+    }
+
     /// A logical length in device pixels. A negative length has no meaning in chrome
     /// geometry, so it scales to zero rather than wrapping.
     pub fn px(self, logical: i32) -> i32 {
@@ -72,6 +79,16 @@ mod tests {
         assert_eq!(logical_to_device(101, 150), 126); // 126.25 -> 126 (nearest)
                                                       // No overflow at the extremes (u64 math, then narrowed).
         assert_eq!(logical_to_device(16384, 240), 32768);
+    }
+
+    #[test]
+    fn pxf_keeps_the_fraction_px_rounds_away() {
+        // The hit-test path measures in fractions of a device pixel; the layout path
+        // rounds. Same scale, same direction, different precision.
+        assert_eq!(Scale::ONE.pxf(10.5), 10.5);
+        assert_eq!(Scale::from_120(240).pxf(10.5), 21.0);
+        assert_eq!(Scale::from_120(150).pxf(1.0), 1.25);
+        assert_eq!(Scale::from_120(150).px(1), 1);
     }
 
     #[test]

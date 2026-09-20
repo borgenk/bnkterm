@@ -54,7 +54,7 @@ use crate::mouse::MouseButton;
 use crate::platform::conn::{Connection, Fill};
 use crate::platform::ffi;
 use crate::platform::freetype::{FontConfig, FontSelection, Fonts};
-use crate::platform::geom::{logical_to_device, Scale};
+use crate::platform::geom::Scale;
 use crate::platform::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_display, wl_keyboard, wl_output, wl_pointer,
     wl_registry, wl_seat, wl_surface, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
@@ -372,6 +372,12 @@ struct Scaling {
 }
 
 impl Scaling {
+    /// The current scale, as every conversion takes it: one type, one rounding rule,
+    /// so the path that measures a lane and the path that draws it cannot disagree.
+    fn factor(&self) -> Scale {
+        Scale::from_120(self.factor_120)
+    }
+
     fn new(logical: (u32, u32)) -> Self {
         Scaling {
             factor_120: SCALE_120_UNITY,
@@ -917,36 +923,20 @@ impl State {
 
     /// A logical (surface-local) length in device pixels at the current scale,
     /// rounded to nearest. Device pixels are what the buffer and grid are sized in.
-    fn to_device(&self, logical: u32) -> u32 {
-        logical_to_device(logical, self.scale.factor_120)
-    }
-
-    /// The current display scale, as the painter and the chrome hit-tests take it.
-    fn ui_scale(&self) -> Scale {
-        Scale::from_120(self.scale.factor_120)
-    }
-
     /// The pointer in device pixels. Wayland delivers it in logical (surface-local)
     /// ones, but the grid and the chrome hanging off it are laid out in device pixels,
     /// so every hit-test against them has to scale up first.
     fn pointer_device(&self) -> (f32, f32) {
-        let scale = self.scale.factor_120 as f32 / 120.0;
-        (self.pointer_x * scale, self.pointer_y * scale)
-    }
-
-    /// The pointer's x in device pixels, the coordinate space the bar lays out in and
-    /// the one a tab drag tracks. `Tabs` needs only this scalar from the window.
-    fn pointer_device_x(&self) -> i32 {
-        self.pointer_device().0 as i32
+        let scale = self.scale.factor();
+        (scale.pxf(self.pointer_x), scale.pxf(self.pointer_y))
     }
 
     /// The logical window size scaled to the device buffer size, clamped so a bogus
     /// configure cannot blow up the buffer arithmetic.
     fn device_size(&self, logical_w: u32, logical_h: u32) -> (u32, u32) {
-        (
-            self.to_device(logical_w).clamp(1, MAX_DIMENSION),
-            self.to_device(logical_h).clamp(1, MAX_DIMENSION),
-        )
+        let scale = self.scale.factor();
+        let device = |logical: u32| (scale.px(logical as i32) as u32).clamp(1, MAX_DIMENSION);
+        (device(logical_w), device(logical_h))
     }
 
     /// Hold the surface at a `cols` x `rows` grid, padding and strip included, and
@@ -956,7 +946,7 @@ impl State {
         let wanted = layout::surface_for_cells(
             cols,
             rows,
-            self.ui_scale(),
+            self.scale.factor(),
             self.layout.terminal.metrics,
             self.strip_config(),
         );
@@ -981,7 +971,7 @@ impl State {
         };
         let layout = layout::window(
             (w, h),
-            self.ui_scale(),
+            self.scale.factor(),
             self.layout.terminal.metrics,
             self.layout.label_metrics,
             self.strip_config(),
@@ -1640,9 +1630,9 @@ impl State {
         // Pointer coordinates are logical (surface-local); the grid is device
         // pixels, so scale up first. The grid is then inset by the (device) padding;
         // a pointer in the margin maps to the nearest edge cell (floored at zero).
-        let scale = self.scale.factor_120 as f32 / 120.0;
-        let px = (self.pointer_x * scale - grid.pad as f32).max(0.0);
-        let py = (self.pointer_y * scale - grid.origin_y as f32).max(0.0);
+        let (px, py) = self.pointer_device();
+        let px = (px - grid.pad as f32).max(0.0);
+        let py = (py - grid.origin_y as f32).max(0.0);
         let (col, side) = column_under(px, grid.metrics.w, grid.cols);
         let row = ((py / grid.metrics.h as f32) as usize).min(grid.rows.saturating_sub(1));
         (col, row, side)
@@ -1655,8 +1645,7 @@ impl State {
         if !self.tabs.shows_bar() {
             return false;
         }
-        let scale = self.scale.factor_120 as f32 / 120.0;
-        let y = self.pointer_y * scale;
+        let y = self.pointer_device().1;
         y >= self.layout.bar_y as f32 && y < (self.layout.bar_y + self.layout.bar_h) as f32
     }
 
@@ -1665,13 +1654,14 @@ impl State {
         if !self.pointer_in_tab_bar() {
             return None;
         }
-        let scale = self.scale.factor_120 as f32 / 120.0;
-        let x = self.pointer_x * scale;
-        let pad = self.layout.terminal.pad as f32;
-        if x < pad {
+        let grid = self.layout.terminal;
+        let x = self.pointer_device().0;
+        if x < grid.pad as f32 {
             return None;
         }
-        let col = ((x - pad) / self.layout.terminal.metrics.w as f32) as usize;
+        // Not `column_under`: that clamps to the last column, which would make the
+        // padding past the final tab click it rather than nothing.
+        let col = ((x - grid.pad as f32) / grid.metrics.w as f32) as usize;
         self.tabs.tab_at_bar_col(col)
     }
 
@@ -1787,7 +1777,7 @@ impl State {
                     // dragging below the strip keeps reordering rather than dropping the
                     // tab (what every tabbed app does). The grid must not see this, or it
                     // would start a text selection or emit a mouse report mid-drag.
-                    self.tabs.drag_to(self.pointer_device_x());
+                    self.tabs.drag_to(self.pointer_device().0 as i32);
                 } else if self.pointer_in_tab_bar() {
                     self.pointer_left_grid()?;
                 } else {
@@ -1840,7 +1830,7 @@ impl State {
                                 // drag; the tab does not lift until the pointer travels
                                 // past the threshold, so a plain click stays a click.
                                 self.tabs.select(id, self.window_focused);
-                                self.tabs.begin_drag(id, self.pointer_device_x());
+                                self.tabs.begin_drag(id, self.pointer_device().0 as i32);
                             }
                             MouseButton::Middle => {
                                 self.closed = self.tabs.close(id, self.window_focused);
