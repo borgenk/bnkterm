@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use self::clipboard::{PendingSend, SelectionState};
 use self::layout::{TerminalGeometry, WindowLayout, WINDOW_PADDING};
-use self::message::{PointerEvent, Side, ToTerminal, ToWindow};
+use self::message::{PointerEvent, Side, ToWindow};
 use self::present::GpuPresentation;
 use self::tabs::{Reorder, Tabs};
 use self::terminal::TerminalCore;
@@ -1062,7 +1062,7 @@ impl State {
             return;
         }
         self.pending_layout = false;
-        let _ = self.tabs.resize_all(self.layout);
+        self.tabs.resize_all(self.layout);
     }
 
     /// Adopt a new compositor scale (in 120ths): reopen the fonts at the size it
@@ -1363,12 +1363,12 @@ impl State {
             wl_keyboard::EV_ENTER => {
                 let _serial = r.u32()?;
                 self.window_focused = true;
-                self.tabs.active_mut().apply(ToTerminal::Focus(true))?;
+                self.tabs.active_mut().focus(true)?;
             }
             wl_keyboard::EV_LEAVE => {
                 let _serial = r.u32()?;
                 self.window_focused = false;
-                self.tabs.active_mut().apply(ToTerminal::Focus(false))?;
+                self.tabs.active_mut().focus(false)?;
                 self.stop_repeat(); // drop any held-key repeat (window-side timer)
                                     // Losing focus resets the modifier state (see `Xkb::clear_modifiers`);
                                     // if Ctrl was down, the hand cursor it earned goes with it.
@@ -1441,11 +1441,9 @@ impl State {
         // every dead key one keystroke out of step — press `´`, release it, and the
         // release would already have consumed the `a` the user had not typed yet.
         if let Some(key) = self.resolve_key(keycode, Compose::Hold) {
-            self.tabs.active_mut().apply(ToTerminal::Key {
-                key,
-                mods,
-                event: input::KeyEvent::Release,
-            })?;
+            self.tabs
+                .active_mut()
+                .key(key, mods, input::KeyEvent::Release)?;
         }
         Ok(())
     }
@@ -1479,11 +1477,9 @@ impl State {
                 Disposition::SendLiteral(literal, literal_mods) => {
                     // The Ctrl+A Ctrl+A escape hatch: type a real Ctrl+A.
                     self.stop_repeat();
-                    self.tabs.active_mut().apply(ToTerminal::Key {
-                        key: literal,
-                        mods: literal_mods,
-                        event: input::KeyEvent::Press,
-                    })?;
+                    self.tabs
+                        .active_mut()
+                        .key(literal, literal_mods, input::KeyEvent::Press)?;
                     return Ok(());
                 }
                 Disposition::Passthrough => {}
@@ -1569,11 +1565,11 @@ impl State {
         // Send the key, and if it produced bytes and the keymap marks it
         // repeatable, arm auto-repeat on it.
         if let Some(key) = resolved {
-            if self.tabs.active_mut().apply(ToTerminal::Key {
-                key,
-                mods,
-                event: input::KeyEvent::Press,
-            })? {
+            if self
+                .tabs
+                .active_mut()
+                .key(key, mods, input::KeyEvent::Press)?
+            {
                 self.arm_repeat(keycode);
             }
         }
@@ -1641,7 +1637,7 @@ impl State {
     /// the keymap (a named key by its keycode, a keypad key by its keysym, else its
     /// layout character), or `None` for a bare modifier / unresolved key. xkb belongs
     /// with the Wayland keyboard, so this stays window-side; the terminal half is
-    /// [`TerminalCore::apply`](terminal::TerminalCore::apply).
+    /// [`TerminalCore::key`](terminal::TerminalCore::key).
     fn resolve_key(&self, keycode: u32, compose: Compose) -> Option<input::Key> {
         if let Some(named) = input::key_from_keycode(keycode) {
             return Some(named);
@@ -1693,11 +1689,10 @@ impl State {
             // The keyboard is repeating a held key. A program that asked to hear about
             // repeats is told it is one; to everyone else it is another press, which is
             // exactly what a repeat has always looked like to a terminal.
-            Some(key) => self.tabs.active_mut().apply(ToTerminal::Key {
-                key,
-                mods,
-                event: input::KeyEvent::Repeat,
-            })?,
+            Some(key) => self
+                .tabs
+                .active_mut()
+                .key(key, mods, input::KeyEvent::Repeat)?,
             None => false,
         };
         if sent {
@@ -1819,10 +1814,7 @@ impl State {
         // longer there would never shrink back.
         self.tabs.active_mut().track_scrollbar(None);
         let mods = self.current_mods();
-        self.tabs.active_mut().apply(ToTerminal::Pointer {
-            event: PointerEvent::Left,
-            mods,
-        })?;
+        self.tabs.active_mut().pointer(PointerEvent::Left, mods)?;
         Ok(())
     }
 
@@ -1887,10 +1879,9 @@ impl State {
                     self.tabs.active_mut().track_scrollbar(Some((px, py)));
                     let (col, row, side) = self.pointer_cell();
                     let mods = self.current_mods();
-                    self.tabs.active_mut().apply(ToTerminal::Pointer {
-                        event: PointerEvent::Motion { col, row, side },
-                        mods,
-                    })?;
+                    self.tabs
+                        .active_mut()
+                        .pointer(PointerEvent::Motion { col, row, side }, mods)?;
                 }
                 // After the terminal has seen the move, so the shape reflects the link
                 // now under the pointer: the arrow over the strip, the hand over a
@@ -1966,8 +1957,8 @@ impl State {
                         1
                     };
                     let mods = self.current_mods();
-                    self.tabs.active_mut().apply(ToTerminal::Pointer {
-                        event: PointerEvent::Button {
+                    self.tabs.active_mut().pointer(
+                        PointerEvent::Button {
                             button,
                             pressed,
                             col,
@@ -1976,7 +1967,7 @@ impl State {
                             side,
                         },
                         mods,
-                    })?;
+                    )?;
                 }
             }
             wl_pointer::EV_AXIS => {
@@ -2006,15 +1997,15 @@ impl State {
         }
         let (col, row, _) = self.pointer_cell();
         let mods = self.current_mods();
-        self.tabs.active_mut().apply(ToTerminal::Pointer {
-            event: PointerEvent::Wheel {
+        self.tabs.active_mut().pointer(
+            PointerEvent::Wheel {
                 down: notches > 0,
                 notches: notches.unsigned_abs(),
                 col,
                 row,
             },
             mods,
-        })?;
+        )?;
         Ok(())
     }
 

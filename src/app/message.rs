@@ -1,14 +1,15 @@
-//! The typed messages crossing the terminal/window seam.
+//! The values crossing the terminal/window seam: the pointer events the window maps
+//! for a core, and the facts a core sends back.
 //!
 //! The window side owns Wayland, xkb, and the GPU; each terminal core owns one PTY,
 //! parser, and grid. [`crate::app::tabs::Tabs`] sits between them: active-only input,
 //! focus, title, blink, and frames route to one core; resize and pumping fan out to
-//! all cores. `Title` and `Closed` are per-tab facts until `Tabs` translates them
-//! into window actions. Everything except PTY reads stays on `app::State`'s main
+//! all cores. Inbound calls go straight to the core's methods; outbound facts are
+//! values because they cross an ownership boundary — `Title` and `Closed` are per-tab
+//! until `Tabs` translates them into window actions, and a clipboard offer belongs to
+//! the window's data device. Everything except PTY reads stays on `app::State`'s main
 //! thread; gather threads publish only byte batches.
 
-use crate::app::layout::TerminalGeometry;
-use crate::input::{Key, KeyEvent, Mods};
 use crate::mouse::MouseButton;
 
 /// Which half of its cell the pointer sits in, against the cell's vertical midline.
@@ -55,36 +56,6 @@ pub enum PointerEvent {
     Left,
 }
 
-/// Window → terminal: input and geometry the terminal turns into PTY bytes, grid
-/// mutations, and frames.
-pub enum ToTerminal {
-    /// A resolved key press. The window did the keycode → keysym mapping (xkb lives
-    /// with the Wayland keyboard); the terminal encodes it under the current terminal
-    /// modes (which it owns) and writes the bytes to the child.
-    /// A key event: what key, what modifiers, and *what happened to it*. The event is
-    /// almost always a press; a release is sent only because a program can ask to hear
-    /// about them (kitty's `REPORT_EVENT_TYPES`), and the encoder drops it on the floor
-    /// when nobody has.
-    Key {
-        key: Key,
-        mods: Mods,
-        event: KeyEvent,
-    },
-    /// A pointer event mapped to a cell, plus the modifier chord (Shift forces local
-    /// use even while a program is grabbing the mouse).
-    Pointer { event: PointerEvent, mods: Mods },
-    /// The window's fresh frame geometry. The terminal resizes the grid to it, pushes
-    /// the new size to the child (`TIOCSWINSZ`), and keeps it to lay frames out with.
-    Resize(TerminalGeometry),
-    /// Keyboard focus gained or lost. The window observes it (Wayland); the terminal
-    /// needs it because the cursor draws solid when focused, hollow when not.
-    Focus(bool),
-    /// Clipboard text to paste. The window fetched it (data device); the terminal
-    /// normalizes newlines, wraps it in bracketed-paste markers if the program asked
-    /// (`?2004`), and writes it to the child.
-    Paste(Vec<u8>),
-}
-
 /// Terminal → tabs/window: per-core facts produced while parsing output or making
 /// a copy. `Tabs` translates title/close facts according to active-tab state, and
 /// the window turns the routed actions into Wayland requests. Frames remain pulled
@@ -102,7 +73,8 @@ pub enum ToWindow {
     /// pastes it, the Linux convention.
     OfferPrimary(Vec<u8>),
     /// A middle-click asked to paste the primary selection. The window owns the data
-    /// device, so it does the receive and feeds the bytes back as a [`ToTerminal::Paste`].
+    /// device, so it does the receive and feeds the bytes back to
+    /// [`TerminalCore::paste`](crate::app::terminal::TerminalCore::paste).
     PastePrimary,
     /// A Ctrl+click landed on a hyperlink: hand it to the user's default handler. The
     /// core found it in the grid and vetted its scheme (see

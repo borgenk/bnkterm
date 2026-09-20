@@ -14,7 +14,6 @@
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
-use super::message::ToTerminal;
 use super::State;
 use crate::error::{Error, Result};
 use crate::platform::ffi;
@@ -428,12 +427,10 @@ impl State {
     }
 
     /// Paste a transport's text to the child: the core normalizes, brackets, and
-    /// writes it (see `TerminalCore::apply`). A no-op when the transport is empty.
+    /// writes it (see `TerminalCore::paste`). A no-op when the transport is empty.
     fn paste_from(&mut self, t: Transport) -> Result<()> {
         if let Some(text) = self.selection_text(t)? {
-            self.tabs
-                .active_mut()
-                .apply(ToTerminal::Paste(text.into_bytes()))?;
+            self.tabs.active_mut().paste(text.into_bytes())?;
         }
         Ok(())
     }

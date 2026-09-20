@@ -21,7 +21,7 @@ use std::os::fd::RawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use super::message::{ToTerminal, ToWindow};
+use super::message::ToWindow;
 use super::terminal::{PumpOutcome, TerminalCore};
 use crate::app::layout::{TerminalGeometry, WindowLayout};
 use crate::color::Theme;
@@ -192,10 +192,10 @@ impl Tabs {
             }
             return Err(error);
         }
-        core.apply(ToTerminal::Focus(window_focused))?;
+        core.focus(window_focused)?;
 
         if !self.is_empty() {
-            self.active_mut().apply(ToTerminal::Focus(false))?;
+            self.active_mut().focus(false)?;
         }
         let id = self.allocate_id();
         self.entries.push(TabEntry { id, core });
@@ -252,7 +252,7 @@ impl Tabs {
             // The old right neighbor shifted into `index`; if there was none, use
             // the new last entry.
             self.active = index.min(self.entries.len() - 1);
-            let _ = self.active_mut().apply(ToTerminal::Focus(window_focused));
+            let _ = self.active_mut().focus(window_focused);
             self.active_mut().dirty = true;
             self.queue_active_title();
         }
@@ -269,9 +269,9 @@ impl Tabs {
         if index == self.active {
             return false;
         }
-        let _ = self.active_mut().apply(ToTerminal::Focus(false));
+        let _ = self.active_mut().focus(false);
         self.active = index;
-        let _ = self.active_mut().apply(ToTerminal::Focus(window_focused));
+        let _ = self.active_mut().focus(window_focused);
         self.active_mut().dirty = true;
         self.bar_dirty = true;
         self.rebuild_bar();
@@ -437,10 +437,10 @@ impl Tabs {
     /// Apply the window's current geometry eagerly to every tab so background
     /// output always wraps at the true width, and adopt the strip rectangle the
     /// window computed for this size and top/bottom placement.
-    pub(super) fn resize_all(&mut self, layout: WindowLayout) -> Result<()> {
+    pub(super) fn resize_all(&mut self, layout: WindowLayout) {
         let grid = layout.terminal;
         for entry in &mut self.entries {
-            entry.core.apply(ToTerminal::Resize(grid))?;
+            entry.core.resize(grid);
             debug_assert_eq!(entry.core.dimensions(), (grid.cols, grid.rows));
         }
         self.bar_geom = Some(BarGeom {
@@ -452,7 +452,6 @@ impl Tabs {
             h: layout.bar_h,
         });
         self.rebuild_bar();
-        Ok(())
     }
 
     /// Every gatherer wake fd, in entry order, for the app's reusable poll set.
@@ -912,8 +911,7 @@ mod tests {
         let now = Instant::now();
         assert_eq!(tabs.next_deadline(now, false), None, "idle: nothing armed");
 
-        tabs.resize_all(layout(80, 23, 640, 384))
-            .expect("resize every core");
+        tabs.resize_all(layout(80, 23, 640, 384));
         let due = tabs
             .next_deadline(now, false)
             .expect("the settled winsize is owed to the child");
@@ -1179,8 +1177,7 @@ mod tests {
     /// real device-pixel geometry to work against. `count` equal blocks fill `cols`.
     fn dragging_tabs(count: usize, cols: usize) -> Tabs {
         let mut tabs = demo_tabs(count);
-        tabs.resize_all(layout(cols, 10, (cols as i32 * METRICS.w) as u32, 176))
-            .expect("build the bar");
+        tabs.resize_all(layout(cols, 10, (cols as i32 * METRICS.w) as u32, 176));
         tabs
     }
 
@@ -1313,8 +1310,7 @@ mod tests {
     #[test]
     fn resize_updates_every_core() {
         let mut tabs = demo_tabs(3);
-        tabs.resize_all(layout(100, 30, 800, 480))
-            .expect("resize every demo core");
+        tabs.resize_all(layout(100, 30, 800, 480));
         assert!(tabs
             .entries
             .iter()
@@ -1326,8 +1322,7 @@ mod tests {
     fn bar_hit_testing_maps_to_stable_ids() {
         let mut tabs = demo_tabs(2);
         let ids: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
-        tabs.resize_all(layout(20, 10, 160, 176))
-            .expect("build bar layout");
+        tabs.resize_all(layout(20, 10, 160, 176));
 
         // Two tabs in 20 cols land at the floor width of 10 each: 0..10, 10..20.
         assert_eq!(tabs.tab_at_bar_col(2), Some(ids[0]));
@@ -1352,8 +1347,7 @@ mod tests {
 
         // A top-anchored one-cell strip: grid origin drops one cell, strip at y 0.
         let mut two = demo_tabs(2);
-        two.resize_all(layout(80, 23, 640, 384))
-            .expect("shift both grids below the bar");
+        two.resize_all(layout(80, 23, 640, 384));
         let mut two_list = Vec::new();
         let mut two_strings = Vec::new();
         two.fill_frame_list(&mut two_list, &mut two_strings, &fonts);
@@ -1385,8 +1379,7 @@ mod tests {
         let fonts = Fonts::new(&[METRICS.size]).expect("fonts");
         let mut two = demo_tabs(2);
         let ids: Vec<_> = two.entries.iter().map(|entry| entry.id).collect();
-        two.resize_all(layout(80, 23, 640, 384))
-            .expect("build the bar");
+        two.resize_all(layout(80, 23, 640, 384));
         // The runtime path makes the newly opened tab active and tab zero inactive.
         assert!(two.select(ids[1], false));
 
@@ -1433,19 +1426,11 @@ mod tests {
 
         tabs.entries[0]
             .core
-            .apply(ToTerminal::Key {
-                key: Key::plain('a'),
-                mods: Mods::NONE,
-                event: crate::input::KeyEvent::Press,
-            })
+            .key(Key::plain('a'), Mods::NONE, crate::input::KeyEvent::Press)
             .expect("write tab A");
         tabs.entries[1]
             .core
-            .apply(ToTerminal::Key {
-                key: Key::plain('b'),
-                mods: Mods::NONE,
-                event: crate::input::KeyEvent::Press,
-            })
+            .key(Key::plain('b'), Mods::NONE, crate::input::KeyEvent::Press)
             .expect("write tab B");
 
         let mut poll_set = PollSet::new();

