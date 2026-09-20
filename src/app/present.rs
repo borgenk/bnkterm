@@ -146,6 +146,7 @@ impl ExplicitSync {
 /// GPU/dmabuf presentation resources owned by the app: protocol globals and
 /// feedback, the Vulkan backend, the two exported swap buffers, explicit-sync
 /// state, and the small counters the stats line reports.
+#[derive(Default)]
 pub(super) struct GpuPresentation {
     pub(super) dmabuf: Option<u32>,
     pub(super) dmabuf_version: u32,
@@ -185,31 +186,12 @@ pub(super) struct GpuPresentation {
 }
 
 impl GpuPresentation {
-    pub(super) fn new() -> Self {
+    /// Everything at rest, but for the text gamma the window resolved from the
+    /// environment at startup (see `app::config_text_gamma`).
+    pub(super) fn with_gamma(text_gamma: gpu::TextGamma) -> Self {
         Self {
-            dmabuf: None,
-            dmabuf_version: 0,
-            feedback_id: 0,
-            feedback: dmabuf::FeedbackState::default(),
-            backend: None,
-            images: Vec::new(),
-            modifiers: Vec::new(),
-            glyphs: gpu::GlyphCache::new(),
-            text_gamma: crate::app::config_text_gamma(),
-            syncobj_manager: None,
-            explicit_sync: None,
-            buffers: [0, 0],
-            busy: [false, false],
-            retired: Vec::new(),
-            buffer_size: (0, 0),
-            lists: term_render::DisplayListPool::default(),
-            frame_scratch: gpu::FrameData::default(),
-            damage_scratch: display::DamageScratch::default(),
-            capture: false,
-            frame_count: 0,
-            last_present: None,
-            explicit_fence_frames: 0,
-            explicit_cpu_wait_frames: 0,
+            text_gamma,
+            ..Self::default()
         }
     }
 }

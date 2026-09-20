@@ -31,9 +31,11 @@ pub const MODE_EMOJI: u32 = 2;
 pub const MODE_ROUND: u32 = 4;
 
 /// How hard to correct the two opposite ways linear-light compositing misweights
-/// anti-aliased text. Two dials, not one, because they pull in opposite directions:
-/// see [`coverage_exponent`], which turns them into a run's exponent, and
-/// [`crate::app::TEXT_GAMMA`], which holds the shipping values.
+/// anti-aliased text. Two dials, not one, because they pull in opposite directions,
+/// and nothing says the two corrections need the same magnitude; folding them into one
+/// number makes "lighter correction" mean *bolder* in one direction and *thinner* in
+/// the other. Both reach `1.0` for no correction at all. See [`coverage_exponent`],
+/// which turns them into a run's exponent.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TextGamma {
     /// Thins light-on-dark text. `> 1` thins, `1.0` is no correction.
@@ -41,6 +43,18 @@ pub struct TextGamma {
     /// Thickens dark-on-light text, in proportion to the run's contrast. `> 1`
     /// thickens (it is raised to a negative power), `1.0` is no correction.
     pub dark_on_light: f32,
+}
+
+impl Default for TextGamma {
+    /// The shipping values, before any environment override (see
+    /// `app::config_text_gamma`), so a build's text weight never depends on the
+    /// environment it started in.
+    fn default() -> Self {
+        Self {
+            light_on_dark: 1.5,
+            dark_on_light: 2.0,
+        }
+    }
 }
 
 /// A glyph run's paint, threaded through the glyph emitters as one value: the
@@ -430,8 +444,10 @@ pub struct GlyphCache {
     cluster_slots: HashMap<FaceKey, HashMap<String, Option<PackedGlyph>>>,
 }
 
-impl GlyphCache {
-    pub fn new() -> Self {
+impl Default for GlyphCache {
+    /// Two empty atlases: one byte per pixel for the mono glyphs, four for the colour
+    /// emoji. Both grow on demand.
+    fn default() -> Self {
         Self {
             glyphs: Atlas::new(1),
             emoji: Atlas::new(4),
@@ -441,7 +457,9 @@ impl GlyphCache {
             cluster_slots: HashMap::new(),
         }
     }
+}
 
+impl GlyphCache {
     /// The direct-mapped index for a printable-ASCII scalar, or `None` for anything
     /// else (which belongs in [`Self::scalar_slots`]). The partition is total: a
     /// character is direct-mapped or hashed, never both, so the two can never
@@ -1095,7 +1113,7 @@ fn color_f32(color: u32) -> [f32; 4] {
 /// Linear-light compositing (the colour attachment is an sRGB view, so blending is
 /// gamma-correct) misweights anti-aliased text in *opposite* directions depending on
 /// which side is lighter, so the two cases get their own dial (see
-/// [`crate::app::TEXT_GAMMA`]):
+/// [`TextGamma::default`]):
 ///
 /// - **Light on dark**, the usual terminal text: rendered heavier than the
 ///   gamma-space stacks most terminals use, so thin it by
@@ -1208,7 +1226,7 @@ mod tests {
     fn glyph_caches_stay_bounded_under_distinct_input() {
         // Past the cap the maps drop and re-fill rather than growing forever, so a
         // hostile stream of distinct glyphs or clusters cannot exhaust memory.
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         let face = FaceKey::Prose {
             size: 16,
             style: crate::platform::freetype::FontStyle::Regular,
@@ -1265,7 +1283,7 @@ mod tests {
     /// rendering test would notice until it was on screen.
     #[test]
     fn an_atlas_wipe_invalidates_the_direct_mapped_ascii_rows() {
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         let face = FaceKey::Prose {
             size: 16,
             style: crate::platform::freetype::FontStyle::Regular,
@@ -1302,7 +1320,7 @@ mod tests {
     /// hashed, never both, or the two could disagree about one glyph's placement.
     #[test]
     fn ascii_is_direct_mapped_and_every_other_scalar_is_hashed() {
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         let face = FaceKey::Prose {
             size: 16,
             style: crate::platform::freetype::FontStyle::Regular,
@@ -1338,7 +1356,7 @@ mod tests {
     /// "no such glyph".
     #[test]
     fn ascii_past_the_face_ceiling_falls_back_to_the_map() {
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         for i in 0..MAX_ASCII_FACES {
             cache.cache_scalar(
                 (
@@ -1382,7 +1400,7 @@ mod tests {
         };
         let paint = Paint::new(0x00ff_ffff, 0x0000_0000, None, GAMMA);
         let quads = |text: &str, segmented: bool| -> Vec<Vertex> {
-            let mut cache = GlyphCache::new();
+            let mut cache = GlyphCache::default();
             let (mut vertices, mut batches) = (Vec::new(), Vec::new());
             let mut b = Batcher {
                 fonts: &fonts,
@@ -1452,7 +1470,7 @@ mod tests {
     #[test]
     fn fill_becomes_one_solid_quad_batch() {
         let fonts = Fonts::new(&[16]).expect("default font");
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         let list = vec![DrawCmd::Fill {
             rect: Rect {
                 x: 1,
@@ -1475,7 +1493,7 @@ mod tests {
     #[test]
     fn text_reuses_atlas_slots_across_frames() {
         let fonts = Fonts::new(&[16]).expect("default font");
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         let list = vec![DrawCmd::Text {
             bounds: Rect {
                 x: 0,
@@ -1509,7 +1527,7 @@ mod tests {
     #[test]
     fn glyph_quads_share_one_batch_with_fills() {
         let fonts = Fonts::new(&[16]).expect("default font");
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         let list = vec![
             DrawCmd::Fill {
                 rect: Rect {
@@ -1552,7 +1570,7 @@ mod tests {
     #[test]
     fn round_rect_emits_sdf_quad_with_geometry_in_extra() {
         let fonts = Fonts::new(&[16]).expect("default font");
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         let rect = Rect {
             x: 4,
             y: 6,
@@ -1576,7 +1594,7 @@ mod tests {
     #[test]
     fn zero_radius_round_rect_degrades_to_solid() {
         let fonts = Fonts::new(&[16]).expect("default font");
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         let list = vec![DrawCmd::RoundRect {
             rect: Rect {
                 x: 0,
@@ -1599,7 +1617,7 @@ mod tests {
         // one glyph keeps the left bearing constant, so equal spacing between the
         // quads' top-left corners is exactly the cell pitch.
         let fonts = Fonts::new(&[16]).expect("default font");
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         let cell_w = 20; // wider than a 16px glyph's natural advance
         let list = vec![DrawCmd::Cells {
             bounds: Rect {
@@ -1641,7 +1659,7 @@ mod tests {
         // must still land two pitches along, because placement is by column index,
         // not by walking a pen through the run.
         let fonts = Fonts::new(&[16]).expect("default font");
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         let cell_w = 12;
         let list = vec![DrawCmd::Cells {
             bounds: Rect {
@@ -1683,7 +1701,7 @@ mod tests {
         let cell_w = 11;
         let (x, baseline) = (7, 16);
         for glyph in ["▛", "⠂"] {
-            let mut cache = GlyphCache::new();
+            let mut cache = GlyphCache::default();
             let list = vec![DrawCmd::Cells {
                 bounds: Rect {
                     x: 0,
@@ -1734,7 +1752,7 @@ mod tests {
         // everywhere for the rest of the process's life: tofu, or hairline seams where the
         // drawing should tile. Any `DrawCmd::Text` under a grid face can carry one.
         let fonts = Fonts::new(&[16]).expect("default font");
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         let face = FaceKey::Prose {
             size: 16,
             style: crate::platform::freetype::FontStyle::Regular,
@@ -1813,7 +1831,7 @@ mod tests {
     #[test]
     fn emoji_lands_in_the_color_atlas() {
         let fonts = Fonts::new(&[16]).expect("default font");
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         let list = vec![DrawCmd::Text {
             bounds: Rect {
                 x: 0,
@@ -1854,7 +1872,7 @@ mod tests {
         let warn = "\u{26A0}".to_string();
         let cell_w = 10;
 
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         let cells = build_frame(
             &fonts,
             &[DrawCmd::Cells {
@@ -1875,7 +1893,7 @@ mod tests {
             &mut cache,
             GAMMA,
         );
-        let mut cache2 = GlyphCache::new();
+        let mut cache2 = GlyphCache::default();
         let text = build_frame(
             &fonts,
             &[DrawCmd::Text {
@@ -1930,7 +1948,7 @@ mod tests {
             style: crate::platform::freetype::FontStyle::Regular,
         };
         let (baseline, cell_w) = (16, 10);
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         let f = build_frame(
             &fonts,
             &[DrawCmd::Cells {
@@ -1994,7 +2012,7 @@ mod tests {
             fade,
             text: text.to_string(),
         }];
-        let mut cache = GlyphCache::new();
+        let mut cache = GlyphCache::default();
         build_frame(fonts, &list, &mut cache, GAMMA)
             .vertices
             .iter()

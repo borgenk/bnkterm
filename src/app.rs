@@ -78,29 +78,6 @@ const FONT_POINTS: f32 = 10.0;
 /// scale is unknown until the compositor reports it, so the window opens at unity.
 const SCALE_120_UNITY: u32 = 120;
 
-/// The default glyph coverage gammas: how hard to correct the two *opposite*
-/// artifacts linear-light compositing inflicts on anti-aliased text. They are
-/// separate dials because they correct opposite errors, and nothing says the two
-/// need the same magnitude; folding them into one number is a trap, because it
-/// makes "lighter correction" mean *bolder* in one direction and *thinner* in the
-/// other. Both reach `1.0` for "no correction at all".
-///
-/// - `light_on_dark` thins **light-on-dark** text (the usual terminal case), which
-///   linear-light compositing renders heavier than the gamma-space stacks most
-///   terminals use. `> 1` thins; `BNKTERM_TEXT_GAMMA` tunes it.
-/// - `dark_on_light` thickens **dark-on-light** text (a reverse-video highlight, a
-///   light theme, the active tab's dark label on its light block), which the same
-///   compositing washes out instead. Its strength scales with the run's contrast, so
-///   it is a `> 1` base raised to a negative power;
-///   `BNKTERM_TEXT_GAMMA_DARK_ON_LIGHT` tunes it.
-///
-/// These are the shipping values, before any environment override; the perf gate
-/// uses them directly so its numbers never depend on the environment.
-pub(crate) const TEXT_GAMMA: TextGamma = TextGamma {
-    light_on_dark: 1.5,
-    dark_on_light: 2.0,
-};
-
 /// The grid the window opens at, before the compositor sends a size. Classic
 /// 80x24; the surface then resizes to whatever the compositor grants.
 const DEFAULT_COLS: usize = 80;
@@ -640,7 +617,7 @@ impl State {
             selections: SelectionTransport::pair(),
             pending_sends: Vec::new(),
             last_serial: 0,
-            presentation: GpuPresentation::new(),
+            presentation: GpuPresentation::with_gamma(config_text_gamma()),
             next_id: 2, // 1 is wl_display
             free_ids: Vec::new(),
             pending_sync: None,
@@ -2199,7 +2176,7 @@ fn font_sizes(body: u32, label: u32) -> Vec<u32> {
     }
 }
 
-/// The glyph coverage gammas (see [`TEXT_GAMMA`]), each overridable by its own
+/// The glyph coverage gammas (see [`TextGamma`]), each overridable by its own
 /// environment variable and clamped to a sane range so a bad value cannot make text
 /// vanish.
 fn config_text_gamma() -> TextGamma {
@@ -2211,9 +2188,10 @@ fn config_text_gamma() -> TextGamma {
             .unwrap_or(default)
             .clamp(0.5, 4.0)
     }
+    let shipping = TextGamma::default();
     TextGamma {
-        light_on_dark: dial("BNKTERM_TEXT_GAMMA", TEXT_GAMMA.light_on_dark),
-        dark_on_light: dial("BNKTERM_TEXT_GAMMA_DARK_ON_LIGHT", TEXT_GAMMA.dark_on_light),
+        light_on_dark: dial("BNKTERM_TEXT_GAMMA", shipping.light_on_dark),
+        dark_on_light: dial("BNKTERM_TEXT_GAMMA_DARK_ON_LIGHT", shipping.dark_on_light),
     }
 }
 
