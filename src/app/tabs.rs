@@ -566,7 +566,7 @@ impl Tabs {
                 self.notice = Some(notice);
                 // Chrome draws over the active tab's frame, so that is the core whose
                 // repaint puts it on screen — whichever tab's shell was the slow one.
-                self.mark_active_dirty();
+                self.mark_dirty();
             }
         }
     }
@@ -576,8 +576,7 @@ impl Tabs {
     /// A standing notice needs nothing — its colours are the same as last frame's — so
     /// only the fade and its end mark the frame dirty. Without that, the hold would
     /// repaint every loop turn for no visible difference.
-    pub(super) fn tick_notice_if_due(&mut self) {
-        let now = Instant::now();
+    fn tick_notice_if_due(&mut self, now: Instant) {
         let Some(notice) = self.notice.as_ref() else {
             return;
         };
@@ -588,20 +587,7 @@ impl Tabs {
         if expired {
             self.notice = None;
         }
-        self.mark_active_dirty();
-    }
-
-    /// Mark the visible core's frame for a rebuild, the lever window chrome has for
-    /// getting itself painted.
-    fn mark_active_dirty(&mut self) {
-        if let Some(entry) = self.entries.get_mut(self.active) {
-            entry.core.dirty = true;
-        }
-    }
-
-    /// When the notice next needs a repaint (the end of its hold, then each fade frame).
-    pub(super) fn notice_retry_at(&self) -> Option<Instant> {
-        self.notice.as_ref()?.retry_at(Instant::now())
+        self.mark_dirty();
     }
 
     /// The notice the window should paint, if one stands.
@@ -628,60 +614,6 @@ impl Tabs {
         }
     }
 
-    /// Tick only the visible cursor's blink timer.
-    pub(super) fn tick_blink_if_due(&mut self) {
-        if let Some(entry) = self.entries.get_mut(self.active) {
-            entry.core.tick_blink_if_due();
-        }
-    }
-
-    /// The visible cursor's next blink deadline.
-    pub(super) fn blink_deadline(&self) -> Option<Instant> {
-        self.entries
-            .get(self.active)
-            .and_then(|entry| entry.core.blink_deadline())
-    }
-
-    /// Carry the visible tab's scrollbar forward a frame. A hidden tab's bar is frozen
-    /// wherever it was: nothing is showing it, and it will be ticked (or hidden, if its
-    /// history has gone) on the frame that brings it back.
-    pub(super) fn tick_scrollbar(&mut self) {
-        if let Some(entry) = self.entries.get_mut(self.active) {
-            entry.core.tick_scrollbar();
-        }
-    }
-
-    /// The visible scrollbar's next fade deadline.
-    pub(super) fn scrollbar_retry_at(&self) -> Option<Instant> {
-        self.entries
-            .get(self.active)
-            .and_then(|entry| entry.core.scrollbar_retry_at())
-    }
-
-    /// Whether the visible scrollbar is mid-fade, so the next compositor frame should
-    /// carry it on.
-    pub(super) fn scrollbar_animating(&self) -> bool {
-        self.entries
-            .get(self.active)
-            .is_some_and(|entry| entry.core.scrollbar_animating())
-    }
-
-    /// Whether the visible terminal has a hyperlink under the pointer, so the window
-    /// can offer the hand cursor.
-    pub(super) fn hovering_link(&self) -> bool {
-        self.entries
-            .get(self.active)
-            .is_some_and(|entry| entry.core.hovering_link())
-    }
-
-    /// Whether the visible terminal's program has grabbed the mouse, so the window can
-    /// drop the I-beam over a grid whose drags are not selections.
-    pub(super) fn mouse_reporting(&self) -> bool {
-        self.entries
-            .get(self.active)
-            .is_some_and(|entry| entry.core.mouse_reporting())
-    }
-
     /// Whether the active grid or future tab bar needs a frame.
     pub(super) fn needs_frame(&self) -> bool {
         if self.is_empty() {
@@ -706,56 +638,46 @@ impl Tabs {
             .is_some_and(|entry| entry.core.holds_frame())
     }
 
-    /// The visible child's synchronized-output deadline, for the event-loop wait: with
-    /// no output to wake us, nothing else would.
-    pub(super) fn sync_deadline(&self) -> Option<Instant> {
-        self.entries
-            .get(self.active)
-            .and_then(|entry| entry.core.sync_deadline())
-    }
-
-    /// Release the visible child's synchronized-output hold once its deadline has passed.
-    /// Only the visible tab, because only the visible tab's deadline reaches the
-    /// event-loop wait; a hidden tab's stale hold is cleared on the turn after it is
-    /// shown, before that wait is computed.
-    pub(super) fn tick_sync_if_due(&mut self) {
+    /// Carry every timer to `now`: the visible tab's visual ones (blink, synchronized
+    /// hold, bell, scrollbar) and the notice, then each tab's settled resize. Hidden tabs
+    /// get only the resize: their bars are frozen where they were and their holds are
+    /// cleared on the turn that brings them back, before the next wait is computed.
+    ///
+    /// Pairs with [`Self::next_deadline`]. Keeping the two adjacent is the point: a
+    /// deadline with no matching service clamps the event loop to 1 ms wakes.
+    pub(super) fn service_due(&mut self, now: Instant) -> Result<()> {
         if let Some(entry) = self.entries.get_mut(self.active) {
-            entry.core.tick_sync_if_due();
+            entry.core.service_due(now);
         }
-    }
-
-    /// The visible child's visual-bell deadline, likewise: the flash has to be taken back
-    /// off, and no output is coming to prompt it.
-    pub(super) fn bell_deadline(&self) -> Option<Instant> {
-        self.entries
-            .get(self.active)
-            .and_then(|entry| entry.core.bell_deadline())
-    }
-
-    /// End the visible child's bell flash if its moment has passed.
-    pub(super) fn tick_bell_if_due(&mut self) {
-        if let Some(entry) = self.entries.get_mut(self.active) {
-            entry.core.tick_bell_if_due();
-        }
-    }
-
-    /// Push each child its settled resize (`TIOCSWINSZ`). Every tab, not just the visible
-    /// one: a window resize reflowed all their grids, so all of them owe their shell the
-    /// debounced winsize.
-    pub(super) fn flush_winsize_if_due(&mut self) -> crate::error::Result<()> {
+        self.tick_notice_if_due(now);
+        // Every tab, not just the visible one: a window resize reflowed all their grids,
+        // so all of them owe their shell the debounced winsize (`TIOCSWINSZ`).
         for entry in &mut self.entries {
-            entry.core.flush_winsize_if_due()?;
+            entry.core.flush_winsize_if_due(now)?;
         }
         Ok(())
     }
 
-    /// The soonest pending debounced-resize deadline across all tabs, for the event-loop
-    /// wait: with no output coming, nothing else would wake us to deliver it.
-    pub(super) fn winsize_deadline(&self) -> Option<Instant> {
-        self.entries
-            .iter()
-            .filter_map(|entry| entry.core.winsize_deadline())
-            .min()
+    /// The soonest moment the event loop must wake for, or `None` when nothing is armed
+    /// and it can block indefinitely. `frame_pending` says a compositor frame callback is
+    /// outstanding, which carries an in-progress scrollbar fade on its own.
+    pub(super) fn next_deadline(&self, now: Instant, frame_pending: bool) -> Option<Instant> {
+        let active = self.entries.get(self.active);
+        let scrollbar = (!frame_pending)
+            .then(|| active.and_then(|entry| entry.core.scrollbar_retry_at()))
+            .flatten();
+        [
+            active.and_then(|entry| entry.core.next_deadline()),
+            scrollbar,
+            self.notice.as_ref().and_then(|notice| notice.retry_at(now)),
+            self.entries
+                .iter()
+                .filter_map(|entry| entry.core.winsize_deadline())
+                .min(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Mark the visible terminal for repaint.
@@ -968,6 +890,41 @@ mod tests {
 
     fn core(demo: bool, cols: usize, rows: usize) -> TerminalCore {
         TerminalCore::new(demo, geom(cols, rows))
+    }
+
+    /// A manager holding one live (non-demo) core, so a resize arms the debounced
+    /// winsize the way a real tab's does.
+    fn live_tabs() -> Tabs {
+        Tabs::new(
+            core(false, 80, 24),
+            TabBarConfig::default(),
+            Rc::new(Theme::default()),
+            Launch::new(Vec::new(), Target::Local),
+            ShellStartupConfig::default(),
+        )
+    }
+
+    #[test]
+    fn a_deadline_that_fires_is_disarmed() {
+        // The pairing `service_due`/`next_deadline` exists for this: a deadline that can
+        // be waited on but never cleared pins the event loop to 1 ms wakes forever.
+        let mut tabs = live_tabs();
+        let now = Instant::now();
+        assert_eq!(tabs.next_deadline(now, false), None, "idle: nothing armed");
+
+        tabs.resize_all(layout(80, 23, 640, 384))
+            .expect("resize every core");
+        let due = tabs
+            .next_deadline(now, false)
+            .expect("the settled winsize is owed to the child");
+        assert!(due > now, "and it is ahead of us, not behind");
+
+        tabs.service_due(due).expect("deliver it");
+        assert_eq!(
+            tabs.next_deadline(due, false),
+            None,
+            "delivering it takes the deadline back out of the wait"
+        );
     }
 
     fn demo_tabs(count: usize) -> Tabs {

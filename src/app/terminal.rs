@@ -1351,16 +1351,11 @@ impl TerminalCore {
 
     /// End the flash when its moment has passed, and repaint to take it back off.
     /// Without this the lifted background would simply stay lifted.
-    pub(super) fn tick_bell_if_due(&mut self) {
-        if self.bell_until.is_some_and(|until| until <= Instant::now()) {
+    fn tick_bell_if_due(&mut self, now: Instant) {
+        if self.bell_until.is_some_and(|until| until <= now) {
             self.bell_until = None;
             self.dirty = true;
         }
-    }
-
-    /// When the flash ends, for the event-loop wait.
-    pub(super) fn bell_deadline(&self) -> Option<Instant> {
-        self.bell_until
     }
 
     /// Push the debounced resize to the child once it has settled: `TIOCSWINSZ`
@@ -1368,8 +1363,8 @@ impl TerminalCore {
     /// child that asked. Best-effort — a resize on a dead child just surfaces as EOF on the
     /// next read. The grid was already reflowed when the resize arrived; this is only the
     /// child notification, held back so a drag does not flood it. See [`resize_settle`].
-    pub(super) fn flush_winsize_if_due(&mut self) -> crate::error::Result<()> {
-        if self.winsize_at.is_some_and(|at| at <= Instant::now()) {
+    pub(super) fn flush_winsize_if_due(&mut self, now: Instant) -> crate::error::Result<()> {
+        if self.winsize_at.is_some_and(|at| at <= now) {
             self.winsize_at = None;
             let (cols, rows) = self.screen.dimensions();
             if let Some(pty) = &self.pty {
@@ -1440,17 +1435,12 @@ impl TerminalCore {
     /// at 1 kHz with nothing to draw until the child speaks again. Clearing it here makes
     /// the deadline behave like every other timer in `service_timers` — armed once, fired
     /// once, gone.
-    pub(super) fn tick_sync_if_due(&mut self) {
-        if self.sync_until.is_some_and(|until| until <= Instant::now()) {
+    fn tick_sync_if_due(&mut self, now: Instant) {
+        if self.sync_until.is_some_and(|until| until <= now) {
             self.sync_until = None;
             // The frame that was being held is now the frame to show.
             self.dirty = true;
         }
-    }
-
-    /// When to wake and present anyway, for the event loop's wait.
-    pub(super) fn sync_deadline(&self) -> Option<Instant> {
-        self.sync_until
     }
 
     /// Carry the text selection across a resize per the grid's [`ResizeEffect`]. The ids
@@ -1682,9 +1672,9 @@ impl TerminalCore {
     /// Carry the bar forward a frame. A tab with nothing to scroll has nothing to point
     /// at, so its bar drops out of sight at once rather than fading from a history it no
     /// longer describes (switching to the alt screen is exactly this).
-    pub(super) fn tick_scrollbar(&mut self) {
+    fn tick_scrollbar(&mut self, now: Instant) {
         if self.scrollable() {
-            if self.scrollbar.tick(Instant::now()) {
+            if self.scrollbar.tick(now) {
                 self.dirty = true;
             }
         } else {
@@ -1720,16 +1710,37 @@ impl TerminalCore {
     }
 
     /// Flip the blink phase if its deadline has passed (called each loop turn).
-    pub(super) fn tick_blink_if_due(&mut self) {
-        if self.cursor_blinking() && self.blink_at.is_some_and(|at| at <= Instant::now()) {
-            self.tick_blink();
+    fn tick_blink_if_due(&mut self, now: Instant) {
+        if self.cursor_blinking() && self.blink_at.is_some_and(|at| at <= now) {
+            self.tick_blink(now);
         }
     }
 
-    /// The next cursor-blink deadline, or `None` when the cursor is not blinking;
-    /// the window folds it into the event-loop wait.
-    pub(super) fn blink_deadline(&self) -> Option<Instant> {
-        self.cursor_blinking().then_some(self.blink_at).flatten()
+    /// Carry the visual timers to `now`: the cursor blink, the synchronized-output hold,
+    /// the visual bell, and the scrollbar's fade. Each marks the frame dirty only when it
+    /// changes what is on screen, so an idle turn stays idle. The debounced winsize is
+    /// deliberately not here: it can fail, and it is owed to hidden tabs too (see
+    /// [`Self::flush_winsize_if_due`]).
+    pub(super) fn service_due(&mut self, now: Instant) {
+        self.tick_blink_if_due(now);
+        self.tick_sync_if_due(now);
+        self.tick_bell_if_due(now);
+        self.tick_scrollbar(now);
+    }
+
+    /// The soonest visual-timer deadline: the cursor's next blink (only while it is
+    /// blinking), the end of a synchronized-output hold, and the end of a bell flash.
+    /// The scrollbar's fade is not here: a pending compositor frame callback carries it
+    /// instead of a wake (see [`Self::scrollbar_retry_at`]).
+    pub(super) fn next_deadline(&self) -> Option<Instant> {
+        [
+            self.cursor_blinking().then_some(self.blink_at).flatten(),
+            self.sync_until,
+            self.bell_until,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// Whether the cursor should be blinking right now: focused, visible, and the
@@ -1739,9 +1750,9 @@ impl TerminalCore {
     }
 
     /// Flip the blink phase and schedule the next toggle.
-    fn tick_blink(&mut self) {
+    fn tick_blink(&mut self, now: Instant) {
         self.blink_on = !self.blink_on;
-        self.blink_at = Some(Instant::now() + BLINK_INTERVAL);
+        self.blink_at = Some(now + BLINK_INTERVAL);
         self.dirty = true;
     }
 
@@ -2422,13 +2433,13 @@ mod tests {
             calm,
             "and the clear lifted with the fill"
         );
-        assert!(core.bell_deadline().is_some(), "with a deadline to end it");
+        assert!(core.bell_until.is_some(), "with a deadline to end it");
 
         // The flash is not a state to be stuck in: when its moment passes it comes off,
         // and the frame that takes it off has to be asked for.
         core.bell_until = Some(Instant::now() - Duration::from_millis(1));
         core.dirty = false;
-        core.tick_bell_if_due();
+        core.tick_bell_if_due(Instant::now());
         assert!(!core.bell_flashing());
         assert!(core.dirty, "and it repaints to take the flash back off");
         assert_eq!(core.clear_color(), calm);
@@ -2447,7 +2458,7 @@ mod tests {
         core.feed_test_bytes(b"\x07");
         assert!(!core.bell_flashing(), "focused: the bell is swallowed");
         assert_eq!(core.clear_color(), calm, "so the surface never lifts");
-        assert!(core.bell_deadline().is_none(), "and no deadline is armed");
+        assert!(core.bell_until.is_none(), "and no deadline is armed");
 
         // The swallow consumed the flag rather than parking it, so simply losing focus
         // does not fire the bell that already rang; only a fresh BEL does.
@@ -2480,7 +2491,7 @@ mod tests {
         core.sync_until = Some(Instant::now() - Duration::from_millis(1));
         assert!(!core.holds_frame(), "the frame goes up anyway");
         assert!(
-            core.sync_deadline().is_some(),
+            core.sync_until.is_some(),
             "and the loop had a deadline to wake on, or nothing would have brought it back"
         );
 
@@ -2488,11 +2499,10 @@ mod tests {
         // out of the loop's wait. Leaving it set is the whole defect: a deadline in the
         // past is not a deadline, it is a 1 ms wait forever.
         core.dirty = false;
-        core.tick_sync_if_due();
+        core.tick_sync_if_due(Instant::now());
         assert!(core.dirty, "the held frame is presented");
         assert_eq!(
-            core.sync_deadline(),
-            None,
+            core.sync_until, None,
             "and the deadline is disarmed, or a past deadline clamps the wait to 1ms and \
              spins the loop at 1kHz forever"
         );
@@ -2503,9 +2513,7 @@ mod tests {
         // `?2026` forever costs one wake per timeout, not one per millisecond.
         assert!(core.screen.synchronized(), "the child never released it");
         core.feed_test_bytes(b"x");
-        let rearmed = core
-            .sync_deadline()
-            .expect("a fresh frame, a fresh deadline");
+        let rearmed = core.sync_until.expect("a fresh frame, a fresh deadline");
         assert!(
             rearmed > Instant::now(),
             "and it is ahead of us, not behind"
@@ -2523,20 +2531,16 @@ mod tests {
         // the frames it exists to keep whole.
         let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
         core.feed_test_bytes(b"\x1b[?2026h");
-        let armed = core.sync_deadline();
+        let armed = core.sync_until;
         assert!(armed.is_some(), "entering arms the deadline");
 
-        core.tick_sync_if_due();
-        assert_eq!(
-            core.sync_deadline(),
-            armed,
-            "still in the future, so untouched"
-        );
+        core.tick_sync_if_due(Instant::now());
+        assert_eq!(core.sync_until, armed, "still in the future, so untouched");
         assert!(core.holds_frame(), "and the frame is still held");
 
         // Leaving is what normally clears it, and still does.
         core.feed_test_bytes(b"\x1b[?2026l");
-        assert_eq!(core.sync_deadline(), None);
+        assert_eq!(core.sync_until, None);
         assert!(!core.holds_frame());
     }
 
@@ -3778,7 +3782,7 @@ mod tests {
 
         let mut parser = Parser::new();
         parser.advance_bytes(&mut core.screen, b"\x1b[?1049h");
-        core.tick_scrollbar();
+        core.tick_scrollbar(Instant::now());
         assert_eq!(
             core.scrollbar_retry_at(),
             None,

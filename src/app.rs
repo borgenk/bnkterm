@@ -864,8 +864,10 @@ impl State {
             // which is exactly when starting a TUI would leave the I-beam behind. The
             // early-out on an unchanged shape makes the steady-state cost a compare.
             self.update_pointer_shape();
-            // Fire any blink toggle or key repeat that has come due.
-            self.service_timers()?;
+            // Fire any blink toggle or key repeat that has come due, all against one
+            // clock read: a timer that fires must disarm against the same instant its
+            // neighbours were judged by.
+            self.service_timers(Instant::now())?;
             // Pace to the compositor: only draw when no frame callback is
             // outstanding, so a burst collapses into a single repaint. A resize the
             // configures have piled up rides the same pacing, and lands before the
@@ -886,7 +888,10 @@ impl State {
             let wait = if more_pty {
                 Some(Duration::ZERO)
             } else {
-                self.next_wake()
+                // Read the clock again rather than reusing the turn's `now`: painting
+                // the frame above can take milliseconds, and a wait measured from before
+                // it would overshoot every deadline by however long it took.
+                self.next_wake(Instant::now())
             };
             self.poll_set.clear();
             let wayland_slot = self.poll_set.add(self.conn.fd());
@@ -919,25 +924,18 @@ impl State {
         }
     }
 
-    /// Fire every deadline that has come due. Each one here has a counterpart in
-    /// [`Self::next_wake`], and the pairing is load-bearing: a deadline that can be
-    /// waited on but never disarmed clamps the wait to 1 ms and spins the loop forever,
-    /// so anything added to that list needs a tick here that clears or re-arms it.
+    /// Fire every deadline that has come due, against the turn's `now`. Each one here
+    /// has a counterpart in [`Self::next_wake`], and the pairing is load-bearing: a
+    /// deadline that can be waited on but never disarmed clamps the wait to 1 ms and
+    /// spins the loop forever.
     ///
     /// Ownership splits the obvious way. The blink, the fade, the bell, the
-    /// synchronized-output hold and the debounced resize are the core's (it builds the
-    /// frame and owns the child); key repeat is the window's, which holds the
+    /// synchronized-output hold and the debounced resize are the tabs' (they build the
+    /// frame and own the children); key repeat is the window's, which holds the
     /// compositor's `repeat_info` and the key being held down.
-    fn service_timers(&mut self) -> Result<()> {
-        self.tabs.tick_blink_if_due();
-        self.tabs.tick_bell_if_due();
-        self.tabs.tick_sync_if_due();
-        self.tabs.tick_scrollbar();
-        // Carry the corner notice through its fade, and take it off when it is spent.
-        self.tabs.tick_notice_if_due();
-        // Deliver any resize that has now settled to the children (debounced SIGWINCH).
-        self.tabs.flush_winsize_if_due()?;
-        if self.repeat_at.is_some_and(|at| at <= Instant::now()) {
+    fn service_timers(&mut self, now: Instant) -> Result<()> {
+        self.tabs.service_due(now)?;
+        if self.repeat_at.is_some_and(|at| at <= now) {
             self.fire_repeat()?;
         }
         Ok(())
@@ -947,25 +945,16 @@ impl State {
     /// fade, corner-notice, and key-repeat deadlines, or `None` (block indefinitely) when
     /// none is armed. The blink and fade deadlines are the core's; the key-repeat
     /// deadline is the window's.
-    fn next_wake(&self) -> Option<Duration> {
-        let now = Instant::now();
+    fn next_wake(&self, now: Instant) -> Option<Duration> {
         let due = |at: Instant| {
             at.saturating_duration_since(now)
                 .max(Duration::from_millis(1))
         };
         // While a frame callback is outstanding the compositor is driving the fade, so
         // the loop does not also need to wake for it (see the callback handler).
-        let scrollbar = (self.frame_callback == 0)
-            .then(|| self.tabs.scrollbar_retry_at())
-            .flatten();
         [
-            self.tabs.blink_deadline(),
+            self.tabs.next_deadline(now, self.frame_callback != 0),
             self.repeat_at,
-            scrollbar,
-            self.tabs.sync_deadline(),
-            self.tabs.bell_deadline(),
-            self.tabs.winsize_deadline(),
-            self.tabs.notice_retry_at(),
         ]
         .into_iter()
         .flatten()
@@ -1177,7 +1166,7 @@ impl State {
             // compositor has just offered. A step whose quantised colours did not move
             // presents nothing and arms no new callback, which is what `retry_at` and the
             // wake deadline are for; this is the fast path while it is visibly changing.
-            if self.tabs.scrollbar_animating() {
+            if self.tabs.active().scrollbar_animating() {
                 self.tabs.mark_dirty();
             }
             return Ok(());
@@ -1805,8 +1794,8 @@ impl State {
             on_chrome: self.pointer_in_tab_bar()
                 || self.drag_scroll
                 || self.tabs.active().on_scrollbar(px, py),
-            ctrl_link: self.xkb.ctrl_active() && self.tabs.hovering_link(),
-            reporting: self.tabs.mouse_reporting(),
+            ctrl_link: self.xkb.ctrl_active() && self.tabs.active().hovering_link(),
+            reporting: self.tabs.active().mouse_reporting(),
             shift: self.xkb.shift_active(),
         });
         if shape == self.pointer_shape {
