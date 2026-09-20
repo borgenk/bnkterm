@@ -7,7 +7,7 @@
 //! into window actions. Everything except PTY reads stays on `app::State`'s main
 //! thread; gather threads publish only byte batches.
 
-use crate::app::geometry::TerminalGeometry;
+use crate::app::layout::TerminalGeometry;
 use crate::input::{Key, KeyEvent, Mods};
 use crate::mouse::MouseButton;
 

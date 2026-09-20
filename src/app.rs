@@ -26,7 +26,7 @@
 //! render question from the live pipeline.
 
 mod clipboard;
-mod geometry;
+mod layout;
 mod message;
 mod present;
 mod tabs;
@@ -37,12 +37,12 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use self::clipboard::{PendingSend, SelectionState};
-use self::geometry::{TerminalGeometry, WindowLayout};
+use self::layout::{TerminalGeometry, WindowLayout, WINDOW_PADDING};
 use self::message::{PointerEvent, Side, ToTerminal, ToWindow};
 use self::present::GpuPresentation;
 use self::tabs::{Reorder, Tabs};
 use self::terminal::TerminalCore;
-use crate::config::{self, TabBarConfig, TabBarPosition, FONT_SIZE_RANGE};
+use crate::config::{self, TabBarConfig, FONT_SIZE_RANGE};
 // The app orchestrates the platform/render layers (which carry their own error
 // type) and the terminal core (which uses the crate-level one). It speaks the
 // crate-level `Error`/`Result` throughout; a `?` on a platform call converts
@@ -106,12 +106,6 @@ pub(crate) const TEXT_GAMMA: TextGamma = TextGamma {
 /// 80x24; the surface then resizes to whatever the compositor grants.
 const DEFAULT_COLS: usize = 80;
 const DEFAULT_ROWS: usize = 24;
-
-/// Blank margin, in pixels, between the window edge and the grid on every side
-/// (a common terminal default of `padding = 5`). The grid is
-/// inset by this and drawn from `(WINDOW_PADDING, WINDOW_PADDING)`; the surface
-/// background fills behind it, so the inset reads as a border of background.
-const WINDOW_PADDING: i32 = 5;
 
 /// Right mouse button (`BTN_RIGHT`) and middle (`BTN_MIDDLE`) from
 /// `linux/input-event-codes.h`; `BTN_LEFT` is in `protocol`.
@@ -1013,34 +1007,17 @@ impl State {
         )
     }
 
-    /// The window padding in device pixels: the logical [`WINDOW_PADDING`] scaled,
-    /// so the margin looks the same physical size at any DPI.
-    fn device_pad(&self) -> i32 {
-        self.to_device(WINDOW_PADDING as u32) as i32
-    }
-
-    /// The device pixels the strip and its gap take out of the window. Floored at one
-    /// text row, so a label cannot clip on a small configured height or a large font.
-    fn strip_reservation(&self) -> (i32, i32) {
-        if !self.tabs.shows_bar() {
-            return (0, 0);
-        }
-        let cfg = &self.tab_bar_config;
-        (
-            (self.to_device(cfg.height_px) as i32).max(self.layout.terminal.metrics.h),
-            self.to_device(cfg.gap_px) as i32,
-        )
-    }
-
     /// Hold the surface at a `cols` x `rows` grid, padding and strip included, and
     /// declare the matching logical geometry with it.
     #[cfg(test)]
     fn pin_surface_to_cells(&mut self, cols: usize, rows: usize) -> (u32, u32) {
-        let pad = self.device_pad();
-        let (bar_h, gap) = self.strip_reservation();
-        let w = cols as i32 * self.layout.terminal.metrics.w + 2 * pad;
-        let h = rows as i32 * self.layout.terminal.metrics.h + 2 * pad + bar_h + gap;
-        let wanted = (w.max(1) as u32, h.max(1) as u32);
+        let wanted = layout::surface_for_cells(
+            cols,
+            rows,
+            self.ui_scale(),
+            self.layout.terminal.metrics,
+            self.strip_config(),
+        );
         let (device, logical) = capture_surface(wanted, self.scale.factor_120);
         if self.scale.logical != logical {
             self.scale.logical = logical;
@@ -1060,45 +1037,24 @@ impl State {
             Some((cols, rows)) => self.pin_surface_to_cells(cols, rows),
             None => (w, h),
         };
-        // Reserve the padding on all sides, so the grid fits inside the margins.
-        let pad = self.device_pad();
-        let cfg = &self.tab_bar_config;
-        let (bar_h, gap) = self.strip_reservation();
-        let usable_w = (w as i32 - 2 * pad).max(0);
-        let usable_h = (h as i32 - 2 * pad - bar_h - gap).max(0);
-        let (cols, rows) = self
-            .layout
-            .terminal
-            .metrics
-            .columns_rows(usable_w, usable_h);
-        // The strip steals its height (and the gap) from the side it sits on: a top
-        // bar tucks under the padding and pushes the grid down past the gap; a bottom
-        // bar sits flush above the bottom padding, the gap reserved above it.
-        let (origin_y, bar_y) = match (bar_h, cfg.position) {
-            (0, _) => (pad, pad),
-            (_, TabBarPosition::Top) => (pad + bar_h + gap, pad),
-            (_, TabBarPosition::Bottom) => (pad, h as i32 - pad - bar_h),
-        };
-        let layout = WindowLayout {
-            terminal: TerminalGeometry {
-                cols,
-                rows,
-                width: w,
-                height: h,
-                pad,
-                origin_y,
-                scale: self.ui_scale(),
-                ..self.layout.terminal
-            },
-            bar_y,
-            bar_h,
-            ..self.layout
-        };
+        let layout = layout::window(
+            (w, h),
+            self.ui_scale(),
+            self.layout.terminal.metrics,
+            self.layout.label_metrics,
+            self.strip_config(),
+        );
         if layout == self.layout {
             return;
         }
         self.layout = layout;
         self.pending_layout = true;
+    }
+
+    /// The strip's configuration while it is showing, and `None` while it is hidden,
+    /// which is how the layout is told to give the grid the whole window.
+    fn strip_config(&self) -> Option<&TabBarConfig> {
+        self.tabs.shows_bar().then_some(&self.tab_bar_config)
     }
 
     /// Hand the geometry [`Self::resize_to`] worked out to the tabs: each one resizes its

@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use super::message::{ToTerminal, ToWindow};
 use super::terminal::{PumpOutcome, TerminalCore};
-use crate::app::geometry::{TerminalGeometry, WindowLayout};
+use crate::app::layout::{TerminalGeometry, WindowLayout};
 use crate::color::Theme;
 use crate::config::{ShellStartupConfig, TabBarConfig};
 use crate::error::Result;

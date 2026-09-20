@@ -22,7 +22,7 @@ use std::os::fd::RawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use crate::app::geometry::TerminalGeometry;
+use crate::app::layout::TerminalGeometry;
 use crate::app::message::{PointerEvent, Side, ToTerminal, ToWindow};
 use crate::color::Theme;
 use crate::config::TabBarConfig;
