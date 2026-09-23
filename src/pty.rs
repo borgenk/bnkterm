@@ -8,15 +8,6 @@
 //!                                        └─ parent: master fd (non-blocking) ── read/write
 //! ```
 //!
-//! # FFI kept out of the platform layer
-//!
-//! The PTY needs a cluster of libc calls (`posix_openpt`, `fork`, `execv`, the
-//! tty ioctls) that the portable `platform` layer deliberately does not carry:
-//! not every app built on that layer has a PTY, so putting this in the vendored
-//! leaf would muddy it. The raw ABI for the PTY stays isolated in this one module. The
-//! `unsafe` is confined to the FFI section at the bottom and wrapped so [`Pty`]'s
-//! callers only ever deal in safe types and `Result`.
-//!
 //! # The fork/exec dance
 //!
 //! By the time we spawn, the Vulkan driver may have started threads, so between
@@ -38,9 +29,10 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
-use core::ffi::{c_char, c_int, c_short, c_ulong, c_void};
+use core::ffi::{c_char, c_int, c_short, c_ulong};
 
 use crate::error::{Error, Result};
+use crate::platform::ffi;
 
 /// One variable of the environment a shell starts with: set to `value`, or removed when
 /// `value` is `None`.
@@ -191,7 +183,7 @@ impl Pty {
 
         let slave_path = ptsname(master.as_raw_fd())?;
         set_winsize(master.as_raw_fd(), cols, rows)?;
-        set_nonblocking(master.as_raw_fd())?;
+        ffi::set_nonblocking(master.as_raw_fd())?;
         // Mark tty input as UTF-8 (the child inherits it before the fork). The
         // output flags are left at the cooked default, so the pty still works if
         // this fails; it is not fatal.
@@ -244,35 +236,17 @@ impl Pty {
     /// Read whatever the child has produced into `buf`, non-blocking. `Eof` means
     /// the child exited; `WouldBlock` means nothing is ready yet.
     pub fn read(&self, buf: &mut [u8]) -> Result<ReadOutcome> {
-        loop {
-            // SAFETY: buf is a valid writable slice; read writes at most its len.
-            let n = unsafe {
-                read(
-                    self.master.as_raw_fd(),
-                    buf.as_mut_ptr() as *mut c_void,
-                    buf.len(),
-                )
-            };
-            if n > 0 {
-                return Ok(ReadOutcome::Data(n as usize));
-            }
-            if n == 0 {
-                return Ok(ReadOutcome::Eof);
-            }
-            match errno() {
-                EINTR => continue,
-                EAGAIN => return Ok(ReadOutcome::WouldBlock),
-                // The kernel reports EIO on the master once the slave is gone and
-                // its output is drained: the child has exited.
-                EIO => return Ok(ReadOutcome::Eof),
-                e => return Err(Error::msg(format!("pty read failed: errno {e}"))),
-            }
+        match ffi::read_some(self.master.as_raw_fd(), buf) {
+            ffi::Read::Bytes(n) => Ok(ReadOutcome::Data(n)),
+            ffi::Read::Eof => Ok(ReadOutcome::Eof),
+            ffi::Read::WouldBlock => Ok(ReadOutcome::WouldBlock),
+            ffi::Read::Err(e) => Err(Error::msg(format!("pty read failed: errno {e}"))),
         }
     }
 
     /// Write as much of `bytes` as the kernel will take right now, returning how many
     /// it took. `Ok(0)` means the child's input buffer is full and the caller must come
-    /// back when the master reports `POLLOUT`; `EINTR` is retried in place.
+    /// back when the master reports `ffi::POLLOUT`; `EINTR` is retried in place.
     ///
     /// Deliberately partial. Looping here until everything is written means blocking the
     /// only thread there is, and the wait has no bound: the child decides when to read,
@@ -280,24 +254,7 @@ impl Pty {
     /// pouring out a file) never will. The caller owns a queue and drains it from the
     /// event loop instead, so a full input buffer costs latency rather than the window.
     pub fn write_some(&self, bytes: &[u8]) -> Result<usize> {
-        loop {
-            // SAFETY: bytes is a valid slice; write reads at most its len.
-            let n = unsafe {
-                write(
-                    self.master.as_raw_fd(),
-                    bytes.as_ptr() as *const c_void,
-                    bytes.len(),
-                )
-            };
-            if n >= 0 {
-                return Ok(n as usize);
-            }
-            match errno() {
-                EINTR => continue,
-                EAGAIN => return Ok(0),
-                e => return Err(Error::msg(format!("pty write failed: errno {e}"))),
-            }
-        }
+        Ok(ffi::write_some(self.master.as_raw_fd(), bytes)?)
     }
 
     /// Tell the child the window is now `cols` x `rows` cells; the kernel raises
@@ -430,7 +387,7 @@ impl ZombieChild {
         let mut status: c_int = 0;
         // SAFETY: status is a live local and WNOHANG makes the wait nonblocking.
         let r = unsafe { waitpid(self.pid, &mut status, WNOHANG) };
-        r == self.pid || (r < 0 && errno() == ECHILD)
+        r == self.pid || (r < 0 && ffi::errno() == ECHILD)
     }
 }
 
@@ -493,7 +450,7 @@ impl Drop for Pty {
 /// capacity grown so far, so the steady-state idle wait does not allocate even as
 /// the registered descriptors change.
 pub struct PollSet {
-    fds: Vec<Pollfd>,
+    fds: Vec<ffi::PollFd>,
 }
 
 impl PollSet {
@@ -511,19 +468,19 @@ impl PollSet {
     /// Register `fd` for readable, hangup, and error notification, returning the
     /// stable slot used to inspect this wait's result with [`Self::readable`].
     pub fn add(&mut self, fd: RawFd) -> usize {
-        self.push(fd, POLLIN)
+        self.push(fd, ffi::POLLIN)
     }
 
     /// Register `fd` for writability, so a wait ends when a child that was not reading
     /// makes room in its input buffer. Hangup and error arrive regardless of `events`,
     /// so a dead child wakes the loop here too.
     pub fn add_writable(&mut self, fd: RawFd) -> usize {
-        self.push(fd, POLLOUT)
+        self.push(fd, ffi::POLLOUT)
     }
 
     fn push(&mut self, fd: RawFd, events: c_short) -> usize {
         let slot = self.fds.len();
-        self.fds.push(Pollfd {
+        self.fds.push(ffi::PollFd {
             fd,
             events,
             revents: 0,
@@ -541,9 +498,9 @@ impl PollSet {
         loop {
             // SAFETY: `fds` owns `len` initialized `Pollfd` entries and remains
             // exclusively borrowed for the duration of the call.
-            let r = unsafe { poll(self.fds.as_mut_ptr(), self.fds.len() as c_ulong, millis) };
+            let r = unsafe { ffi::poll(self.fds.as_mut_ptr(), self.fds.len() as c_ulong, millis) };
             if r < 0 {
-                if errno() == EINTR {
+                if ffi::errno() == EINTR {
                     continue;
                 }
                 return Err(errno_error("poll"));
@@ -557,7 +514,7 @@ impl PollSet {
     pub fn readable(&self, idx: usize) -> bool {
         self.fds
             .get(idx)
-            .is_some_and(|fd| fd.revents & (POLLIN | POLLHUP | POLLERR) != 0)
+            .is_some_and(|fd| fd.revents & (ffi::POLLIN | ffi::POLLHUP | ffi::POLLERR) != 0)
     }
 }
 
@@ -568,18 +525,13 @@ impl Default for PollSet {
 }
 
 // ---------------------------------------------------------------------------
-// FFI. Raw libc surface for the PTY, process, and poll syscalls, wrapped so the
-// rest of the module deals only in safe types, all confined to this one place.
+// FFI. The generic fd calls (read, write, poll, errno) are `platform::ffi`'s.
 // ---------------------------------------------------------------------------
 
 // open(2) / posix_openpt(3) flags (Linux generic ABI).
 const O_RDWR: c_int = 0o2;
 const O_NOCTTY: c_int = 0o400;
-const O_NONBLOCK: c_int = 0o4000;
 const O_CLOEXEC: c_int = 0o2000000;
-// fcntl(2) commands.
-const F_GETFL: c_int = 3;
-const F_SETFL: c_int = 4;
 // tty ioctls (Linux).
 const TIOCSCTTY: c_ulong = 0x540E;
 const TIOCSWINSZ: c_ulong = 0x5414;
@@ -605,15 +557,9 @@ const ICANON: u32 = 0o2;
 const ECHO: u32 = 0o10;
 // waitpid options.
 const WNOHANG: c_int = 1;
-// poll events.
-const POLLIN: c_short = 0x001;
-const POLLOUT: c_short = 0x004;
-const POLLERR: c_short = 0x008;
-const POLLHUP: c_short = 0x010;
-// errno values we branch on.
+// The errno the PTY branches on itself; the fd layer owns poll's events and the
+// read/write errnos.
 const EINTR: c_int = 4;
-const EIO: c_int = 5;
-const EAGAIN: c_int = 11; // == EWOULDBLOCK on Linux
 const ECHILD: c_int = 10;
 
 /// `struct winsize` (`sys/ioctl.h`): the cell dimensions a `TIOCSWINSZ` carries.
@@ -624,14 +570,6 @@ struct Winsize {
     ws_col: u16,
     ws_xpixel: u16,
     ws_ypixel: u16,
-}
-
-/// `struct pollfd` (`poll.h`).
-#[repr(C)]
-struct Pollfd {
-    fd: c_int,
-    events: c_short,
-    revents: c_short,
 }
 
 /// `sigset_t` (`signal.h`), Linux generic ABI: a flat 1024-bit mask, declared by the C
@@ -680,26 +618,18 @@ extern "C" {
     /// would be a different ABI than the `open` the C library exports.
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
-    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
-    fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
-    fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
-    fn poll(fds: *mut Pollfd, nfds: c_ulong, timeout: c_int) -> c_int;
     #[cfg(test)]
     fn pipe(pipefd: *mut c_int) -> c_int;
     fn tcgetattr(fd: c_int, termios: *mut Termios) -> c_int;
     fn tcsetattr(fd: c_int, actions: c_int, termios: *const Termios) -> c_int;
     fn _exit(code: c_int) -> !;
-    fn __errno_location() -> *mut c_int;
 }
 
-fn errno() -> c_int {
-    // SAFETY: glibc/musl expose a valid thread-local errno here.
-    unsafe { *__errno_location() }
-}
-
+/// [`ffi::errno_error`] in this module's error type: the fd layer carries the
+/// platform's, and the terminal core sees the crate's.
 fn errno_error(what: &str) -> Error {
-    Error::msg(format!("{what} failed: errno {}", errno()))
+    ffi::errno_error(what).into()
 }
 
 /// The slave device path for `master`, resolved with the reentrant `ptsname_r`.
@@ -712,20 +642,6 @@ fn ptsname(master: RawFd) -> Result<CString> {
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     CString::new(&buf[..end]).map_err(|_| Error::msg("ptsname returned an embedded NUL"))
-}
-
-/// Set `master` non-blocking so the event loop can drain it without stalling.
-fn set_nonblocking(master: RawFd) -> Result<()> {
-    // SAFETY: F_GETFL takes no argument; the fd is valid.
-    let flags = unsafe { fcntl(master, F_GETFL) };
-    if flags < 0 {
-        return Err(errno_error("fcntl(F_GETFL)"));
-    }
-    // SAFETY: F_SETFL takes the new flag word; the fd is valid.
-    if unsafe { fcntl(master, F_SETFL, flags | O_NONBLOCK) } < 0 {
-        return Err(errno_error("fcntl(F_SETFL)"));
-    }
-    Ok(())
 }
 
 /// Set `IUTF8` on the tty so cooked-mode line editing treats input as UTF-8: an
@@ -875,10 +791,10 @@ mod tests {
     }
 
     #[test]
-    fn winsize_and_pollfd_match_the_c_abi() {
-        // These mirror C structs the kernel writes/reads; pin their sizes.
+    fn winsize_and_sigset_match_the_c_abi() {
+        // These mirror C structs the kernel writes/reads; pin their sizes. The
+        // `pollfd` mirror is the fd layer's, pinned there.
         assert_eq!(std::mem::size_of::<Winsize>(), 8);
-        assert_eq!(std::mem::size_of::<Pollfd>(), 8);
         // sigset_t is 1024 bits on Linux. Handing `sigprocmask` a smaller one would
         // have it read past the end of ours, and the compiler cannot catch that
         // through an `extern` declaration we wrote ourselves.
@@ -1032,7 +948,7 @@ mod tests {
         // SAFETY: slave_path is a NUL-terminated path from ptsname_r. O_NOCTTY keeps
         // the test process from adopting the pty as its controlling terminal.
         let slave = unsafe { open(slave_path.as_ptr(), O_RDWR | O_NOCTTY) };
-        assert!(slave >= 0, "open the slave: errno {}", errno());
+        assert!(slave >= 0, "open the slave: errno {}", ffi::errno());
         set_lflag(slave, ECHO, false);
 
         assert_eq!(pty.tty_mode(), Some(TtyMode::PasswordPrompt));
@@ -1276,7 +1192,7 @@ mod tests {
         // SAFETY: `pid` belonged to this test and was reaped above; this verifies
         // a second wait cannot claim it again.
         assert_eq!(unsafe { waitpid(pid, &mut status, WNOHANG) }, -1);
-        assert_eq!(errno(), ECHILD);
+        assert_eq!(ffi::errno(), ECHILD);
     }
 
     fn test_pipe() -> (OwnedFd, OwnedFd) {
@@ -1288,11 +1204,8 @@ mod tests {
     }
 
     fn write_byte(fd: RawFd) {
-        let byte = b'x';
-        // SAFETY: `fd` is the live write side of a test pipe and `byte` is a
-        // readable one-byte buffer.
         assert_eq!(
-            unsafe { write(fd, &byte as *const u8 as *const c_void, 1) },
+            ffi::write_some(fd, b"x").expect("write to the test pipe"),
             1
         );
     }

@@ -45,14 +45,29 @@ const MSG_CTRUNC: c_int = 0x8;
 /// Open the pipe with both ends close-on-exec.
 const O_CLOEXEC: c_int = 0x8_0000;
 
-const EINTR: c_int = 4;
+pub(crate) const EINTR: c_int = 4;
 /// A timed-out or would-block read (EAGAIN == EWOULDBLOCK on Linux).
 const EAGAIN: c_int = 11;
+/// The kernel reports `EIO` on a PTY master once the slave is gone and its output is
+/// drained, which is how a child's exit arrives on the read side.
+const EIO: c_int = 5;
+
+/// `poll(2)` events. Hangup and error arrive whether or not they were asked for.
+pub(crate) const POLLIN: c_short = 0x001;
+pub(crate) const POLLOUT: c_short = 0x004;
+pub(crate) const POLLERR: c_short = 0x008;
+pub(crate) const POLLHUP: c_short = 0x010;
 /// `fcntl` commands and the flag they carry here, for putting a descriptor the
 /// compositor handed us into non-blocking mode.
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 const O_NONBLOCK: c_int = 0o4000;
+/// `fcntl` command for a close-on-exec duplicate (`F_LINUX_SPECIFIC_BASE + 6`).
+const F_DUPFD_CLOEXEC: c_int = 1030;
+
+/// `eventfd2(2)` flags.
+const EFD_CLOEXEC: c_int = 0o2000000;
+const EFD_NONBLOCK: c_int = 0o4000;
 
 /// Resolve all symbols at load time, so a broken library fails at `dlopen`
 /// rather than at first call.
@@ -116,7 +131,28 @@ struct CmsgHdr {
 // FFI declarations.
 // ---------------------------------------------------------------------------
 
+/// One entry for [`poll`]: the fd to watch, the events wanted, the events that fired.
+/// The crate's only `struct pollfd`; its size is pinned against the C ABI below.
+#[repr(C)]
+pub(crate) struct PollFd {
+    pub(crate) fd: c_int,
+    pub(crate) events: c_short,
+    pub(crate) revents: c_short,
+}
+
+/// What one non-blocking read produced. `Err` carries the raw errno rather than a
+/// message, because a caller distinguishes a child's exit from a real failure by the
+/// number and reports it onward (see `gather::GatherEnd::ReadError`).
+pub(crate) enum Read {
+    Bytes(usize),
+    Eof,
+    WouldBlock,
+    Err(c_int),
+}
+
 extern "C" {
+    pub(crate) fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
+    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn mmap(
         addr: *mut c_void,
         len: usize,
@@ -130,6 +166,7 @@ extern "C" {
     fn sendmsg(sockfd: c_int, msg: *const MsgHdr, flags: c_int) -> isize;
     fn recvmsg(sockfd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
     fn pipe2(pipefd: *mut c_int, flags: c_int) -> c_int;
+    fn eventfd(initval: c_uint, flags: c_int) -> c_int;
     fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
     fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
     fn __errno_location() -> *mut c_int;
@@ -141,9 +178,15 @@ extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
 }
 
-fn errno() -> c_int {
+pub(crate) fn errno() -> c_int {
     // SAFETY: glibc/musl both expose a valid thread-local errno here.
     unsafe { *__errno_location() }
+}
+
+/// An error naming the failed call and the errno behind it, the shape every wrapper
+/// here reports.
+pub(crate) fn errno_error(what: &str) -> Error {
+    Error::msg(format!("{what} failed: errno {}", errno()))
 }
 
 /// `Ok(())` when the syscall return `rc` is zero, else an error naming `what`
@@ -419,6 +462,80 @@ pub fn write_some(fd: RawFd, bytes: &[u8]) -> Result<usize> {
     }
 }
 
+/// Read once into `buf` without blocking, retrying `EINTR` in place. A PTY master
+/// reports `EIO` rather than end-of-file once the child is gone and its output is
+/// drained, so both arrive here as [`Read::Eof`].
+pub(crate) fn read_some(fd: RawFd, buf: &mut [u8]) -> Read {
+    loop {
+        // SAFETY: buf is a valid writable slice; read writes at most its len.
+        let n = unsafe { read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+        if n > 0 {
+            return Read::Bytes(n as usize);
+        }
+        if n == 0 {
+            return Read::Eof;
+        }
+        match errno() {
+            EINTR => continue,
+            EAGAIN => return Read::WouldBlock,
+            EIO => return Read::Eof,
+            e => return Read::Err(e),
+        }
+    }
+}
+
+/// Duplicate `fd` with `F_DUPFD_CLOEXEC`: the new fd shares the same open file
+/// description (and its `O_NONBLOCK` flag), which is what a reader thread reads through
+/// while the original stays the caller's control handle.
+pub(crate) fn dup_cloexec(fd: RawFd) -> Result<OwnedFd> {
+    // SAFETY: F_DUPFD_CLOEXEC takes an int minimum-fd arg; fd is a valid descriptor.
+    let d = unsafe { fcntl(fd, F_DUPFD_CLOEXEC, 0) };
+    if d < 0 {
+        return Err(errno_error("fcntl(F_DUPFD_CLOEXEC)"));
+    }
+    // SAFETY: d is a fresh, owned descriptor returned by fcntl.
+    Ok(unsafe { OwnedFd::from_raw_fd(d) })
+}
+
+/// A close-on-exec, nonblocking counter eventfd used purely as a wakeup.
+pub(crate) fn make_eventfd() -> Result<OwnedFd> {
+    // SAFETY: eventfd with valid flags returns a fresh fd or -1.
+    let fd = unsafe { eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(errno_error("eventfd"));
+    }
+    // SAFETY: fd is a fresh, owned descriptor returned by eventfd.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Add 1 to the eventfd's counter to wake a poller. The return is unchecked because
+/// this write cannot meaningfully fail: an 8-byte write to a counter eventfd blocks
+/// (or returns `EAGAIN`) only at `u64::MAX - 1`, which is unreachable when the
+/// consumer zeroes the counter on every wake, and `EBADF` is impossible for an fd this
+/// process owns for the waiter's whole life. Nothing else can go wrong, so there is
+/// nothing to report; the poller waits with no timeout and has no other way to learn
+/// the buffer is ready.
+pub(crate) fn efd_signal(fd: RawFd) {
+    let one: u64 = 1;
+    // SAFETY: writing 8 bytes of a u64 is the eventfd contract; overflow at
+    // u64::MAX is unreachable at these rates.
+    unsafe { write(fd, &one as *const u64 as *const c_void, 8) };
+}
+
+/// Drain the eventfd's counter to zero. Nonblocking, so an already-clear fd just
+/// returns `EAGAIN`, which is fine.
+pub(crate) fn efd_clear(fd: RawFd) {
+    let mut v: u64 = 0;
+    loop {
+        // SAFETY: reading 8 bytes into a u64 is the eventfd contract.
+        let n = unsafe { read(fd, &mut v as *mut u64 as *mut c_void, 8) };
+        if n < 0 && errno() == EINTR {
+            continue;
+        }
+        return;
+    }
+}
+
 /// Put `fd` in non-blocking mode, so a read or write on it can never stall the thread.
 pub fn set_nonblocking(fd: RawFd) -> Result<()> {
     // SAFETY: F_GETFL takes no third argument and only reads the descriptor.
@@ -447,7 +564,6 @@ pub fn set_nonblocking(fd: RawFd) -> Result<()> {
 /// The deadline is absolute, so `EINTR` retries do not restart the clock. `fd` is put in
 /// non-blocking mode here rather than trusted to arrive that way.
 pub fn read_to_end_bounded(fd: RawFd, budget: Duration, max_bytes: usize) -> Result<Vec<u8>> {
-    const POLLIN: c_short = 0x0001;
     set_nonblocking(fd)?;
     let deadline = Instant::now() + budget;
     let mut out = Vec::new();
@@ -761,19 +877,6 @@ pub fn drm_syncobj_point_to_sync_file(
     drm_syncobj_export_sync_file(drm, scratch)
 }
 
-/// One entry for [`poll`]: the fd to watch, the events wanted, the events that fired.
-#[repr(C)]
-struct PollFd {
-    fd: c_int,
-    events: c_short,
-    revents: c_short,
-}
-
-extern "C" {
-    fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
-    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
-}
-
 /// Block until `fd` — a sync file — signals its fence, or `timeout_ms` elapses; returns
 /// whether it signalled. `timeout_ms == 0` polls without waiting; a negative value blocks
 /// indefinitely. A sync file becomes `POLLIN`-readable exactly when its fence has, so this is
@@ -788,7 +891,6 @@ extern "C" {
 /// `timeout_ms`. A caller must still treat a `false` as "not known released" and defer the
 /// free rather than force it.
 pub fn wait_sync_file(fd: RawFd, timeout_ms: c_int) -> bool {
-    const POLLIN: c_short = 0x0001;
     // A positive timeout gets an absolute deadline so EINTR retries do not restart the clock;
     // zero and negative pass straight through (poll, no wait / block forever).
     let deadline = (timeout_ms > 0)

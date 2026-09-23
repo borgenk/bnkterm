@@ -50,13 +50,14 @@
 //! blocks on `write` exactly as it does with a single-threaded reader.
 
 use std::collections::VecDeque;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 
-use core::ffi::{c_int, c_short, c_uint, c_ulong, c_void};
+use core::ffi::{c_int, c_ulong, c_void};
 
 use crate::error::{Error, Result};
+use crate::platform::ffi;
 
 /// Capacity of each pool buffer, matching bnkterm's live PTY read chunk so the
 /// parser sees the same batch boundaries a real shell produces.
@@ -236,39 +237,13 @@ impl BufPool {
 
 /// Outcome of one nonblocking read; `EIO` on a PTY master is EOF (the slave is
 /// gone), not an error.
-enum Rd {
-    Data(usize),
-    WouldBlock,
-    Eof,
-    Err(c_int),
-}
-
-fn do_read(fd: RawFd, buf: &mut [u8]) -> Rd {
-    loop {
-        // SAFETY: buf is a valid writable slice; read writes at most its len.
-        let n = unsafe { read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-        if n > 0 {
-            return Rd::Data(n as usize);
-        }
-        if n == 0 {
-            return Rd::Eof;
-        }
-        match errno() {
-            EINTR => continue,
-            EAGAIN => return Rd::WouldBlock,
-            EIO => return Rd::Eof,
-            e => return Rd::Err(e),
-        }
-    }
-}
-
 /// Which of the two watched fds became readable in one wait.
 struct PollBits {
     pty: bool,
     stop: bool,
 }
 
-/// Wait for the PTY read fd or the stop fd, collapsing `EINTR`.
+/// Wait for the PTY read fd or the stop fd, collapsing `ffi::EINTR`.
 ///
 /// The wait is unbounded, and can be, because both watched fds are level-triggered:
 /// a byte sitting unread in the PTY and a nonzero stop-eventfd counter each make the
@@ -278,14 +253,14 @@ struct PollBits {
 fn poll_pty_or_stop(read_fd: RawFd, stop_fd: RawFd) -> core::result::Result<PollBits, c_int> {
     loop {
         let mut fds = [
-            Pollfd {
+            ffi::PollFd {
                 fd: read_fd,
-                events: POLLIN,
+                events: ffi::POLLIN,
                 revents: 0,
             },
-            Pollfd {
+            ffi::PollFd {
                 fd: stop_fd,
-                events: POLLIN,
+                events: ffi::POLLIN,
                 revents: 0,
             },
         ];
@@ -293,13 +268,13 @@ fn poll_pty_or_stop(read_fd: RawFd, stop_fd: RawFd) -> core::result::Result<Poll
         // one of them is ready, and a null sigmask leaves the signal mask unchanged.
         let r = unsafe { ppoll(fds.as_mut_ptr(), 2, core::ptr::null(), core::ptr::null()) };
         if r < 0 {
-            let e = errno();
-            if e == EINTR {
+            let e = ffi::errno();
+            if e == ffi::EINTR {
                 continue;
             }
             return Err(e);
         }
-        let hit = |p: &Pollfd| p.revents & (POLLIN | POLLHUP | POLLERR) != 0;
+        let hit = |p: &ffi::PollFd| p.revents & (ffi::POLLIN | ffi::POLLHUP | ffi::POLLERR) != 0;
         return Ok(PollBits {
             pty: hit(&fds[0]),
             stop: hit(&fds[1]),
@@ -314,7 +289,7 @@ fn poll_pty_or_stop(read_fd: RawFd, stop_fd: RawFd) -> core::result::Result<Poll
 fn gather_loop(read_fd: RawFd, ready_efd: RawFd, stop_efd: RawFd, pool: Arc<BufPool>) {
     let wake = |woke: bool| {
         if woke {
-            efd_signal(ready_efd);
+            ffi::efd_signal(ready_efd);
         }
     };
 
@@ -349,9 +324,9 @@ fn gather_loop(read_fd: RawFd, ready_efd: RawFd, stop_efd: RawFd, pool: Arc<BufP
                 };
                 len = 0;
             }
-            match do_read(read_fd, &mut buf[len..]) {
-                Rd::Data(n) => len += n,
-                Rd::WouldBlock => {
+            match ffi::read_some(read_fd, &mut buf[len..]) {
+                ffi::Read::Bytes(n) => len += n,
+                ffi::Read::WouldBlock => {
                     // Baseline: publish any nonempty batch now, back to the wait.
                     if len > 0 {
                         wake(pool.publish(buf, len));
@@ -360,11 +335,11 @@ fn gather_loop(read_fd: RawFd, ready_efd: RawFd, stop_efd: RawFd, pool: Arc<BufP
                     }
                     continue 'outer;
                 }
-                Rd::Eof => {
+                ffi::Read::Eof => {
                     wake(pool.publish_final(buf, len, GatherEnd::Eof));
                     break 'outer;
                 }
-                Rd::Err(e) => {
+                ffi::Read::Err(e) => {
                     wake(pool.publish_final(buf, len, GatherEnd::ReadError(e)));
                     break 'outer;
                 }
@@ -432,9 +407,9 @@ impl Gatherer {
 
     /// As [`Gatherer::start`], with an explicit pool depth (buffers of [`BUF_CAP`]).
     pub fn start_with_pool(master_fd: RawFd, nbufs: usize) -> Result<Gatherer> {
-        let read_fd = dup_cloexec(master_fd)?;
-        let ready_efd = make_eventfd()?;
-        let stop_efd = make_eventfd()?;
+        let read_fd = ffi::dup_cloexec(master_fd)?;
+        let ready_efd = ffi::make_eventfd()?;
+        let stop_efd = ffi::make_eventfd()?;
         let pool = BufPool::new(nbufs);
 
         let tpool = pool.clone();
@@ -470,7 +445,7 @@ impl Gatherer {
     /// [`Gatherer::ready_fd`] readable, before pulling batches, so the next `poll`
     /// blocks until the next publish rather than spinning.
     pub fn clear_wakeup(&self) {
-        efd_clear(self.ready_efd.as_raw_fd());
+        ffi::efd_clear(self.ready_efd.as_raw_fd());
     }
 
     /// Take the next ready batch, or `None` if the ready queue is momentarily
@@ -504,7 +479,7 @@ impl Drop for Gatherer {
         // for a free buffer (shutdown flag + condvar), then join it before the
         // owned fds close.
         self.pool.request_shutdown();
-        efd_signal(self.stop_efd.as_raw_fd());
+        ffi::efd_signal(self.stop_efd.as_raw_fd());
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -512,32 +487,9 @@ impl Drop for Gatherer {
 }
 
 // ---------------------------------------------------------------------------
-// FFI. eventfd, F_DUPFD_CLOEXEC, and a two-fd ppoll, wrapped so the rest of the
-// module deals only in safe types. Isolated here; the fd-owning
-// wrappers hand back `OwnedFd` so descriptors are never leaked.
+// FFI. Everything but this `ppoll` is `platform::ffi`'s: the eventfd, the fd
+// duplicate, the read loop.
 // ---------------------------------------------------------------------------
-
-// fcntl(2) command for a close-on-exec duplicate (F_LINUX_SPECIFIC_BASE + 6).
-const F_DUPFD_CLOEXEC: c_int = 1030;
-// eventfd2(2) flags.
-const EFD_CLOEXEC: c_int = 0o2000000;
-const EFD_NONBLOCK: c_int = 0o4000;
-// poll events.
-const POLLIN: c_short = 0x001;
-const POLLERR: c_short = 0x008;
-const POLLHUP: c_short = 0x010;
-// errno values we branch on.
-const EINTR: c_int = 4;
-const EIO: c_int = 5;
-const EAGAIN: c_int = 11; // == EWOULDBLOCK on Linux
-
-/// `struct pollfd` (`poll.h`); its size is pinned against the C ABI in the tests.
-#[repr(C)]
-struct Pollfd {
-    fd: c_int,
-    events: c_short,
-    revents: c_short,
-}
 
 /// `struct timespec` (`time.h`), the `ppoll` timeout; size pinned in the tests.
 #[repr(C)]
@@ -547,78 +499,14 @@ struct KernelTimespec {
 }
 
 extern "C" {
-    fn eventfd(initval: c_uint, flags: c_int) -> c_int;
-    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
-    fn read(fd: c_int, buf: *mut c_void, count: usize) -> isize;
-    fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
+    /// `ppoll`, not `poll`: this wait blocks with no timeout, and the signal mask
+    /// argument is what keeps it that way without a race.
     fn ppoll(
-        fds: *mut Pollfd,
+        fds: *mut ffi::PollFd,
         nfds: c_ulong,
         timeout: *const KernelTimespec,
         sigmask: *const c_void,
     ) -> c_int;
-    fn __errno_location() -> *mut c_int;
-}
-
-fn errno() -> c_int {
-    // SAFETY: glibc exposes a valid thread-local errno here.
-    unsafe { *__errno_location() }
-}
-
-fn errno_error(what: &str) -> Error {
-    Error::msg(format!("{what} failed: errno {}", errno()))
-}
-
-/// Duplicate `fd` with `F_DUPFD_CLOEXEC`: the new fd shares the same open file
-/// description (and its `O_NONBLOCK` flag), which is what the gather thread reads
-/// through while the original stays the caller's control handle.
-fn dup_cloexec(fd: RawFd) -> Result<OwnedFd> {
-    // SAFETY: F_DUPFD_CLOEXEC takes an int minimum-fd arg; fd is a valid descriptor.
-    let d = unsafe { fcntl(fd, F_DUPFD_CLOEXEC, 0) };
-    if d < 0 {
-        return Err(errno_error("fcntl(F_DUPFD_CLOEXEC)"));
-    }
-    // SAFETY: d is a fresh, owned descriptor returned by fcntl.
-    Ok(unsafe { OwnedFd::from_raw_fd(d) })
-}
-
-/// A close-on-exec, nonblocking counter eventfd used purely as a wakeup.
-fn make_eventfd() -> Result<OwnedFd> {
-    // SAFETY: eventfd with valid flags returns a fresh fd or -1.
-    let fd = unsafe { eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
-    if fd < 0 {
-        return Err(errno_error("eventfd"));
-    }
-    // SAFETY: fd is a fresh, owned descriptor returned by eventfd.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// Add 1 to the eventfd's counter to wake a poller. The return is unchecked because
-/// this write cannot meaningfully fail: an 8-byte write to a counter eventfd blocks
-/// (or returns `EAGAIN`) only at `u64::MAX - 1`, which is unreachable when the
-/// consumer zeroes the counter on every wake, and `EBADF` is impossible for an fd this
-/// process owns for the gatherer's whole life. Nothing else can go wrong, so there is
-/// nothing to report; the poller waits with no timeout and has no other way to learn
-/// the buffer is ready.
-fn efd_signal(fd: RawFd) {
-    let one: u64 = 1;
-    // SAFETY: writing 8 bytes of a u64 is the eventfd contract; overflow at
-    // u64::MAX is unreachable at these rates.
-    unsafe { write(fd, &one as *const u64 as *const c_void, 8) };
-}
-
-/// Drain the eventfd's counter to zero. Nonblocking, so an already-clear fd just
-/// returns `EAGAIN`, which is fine.
-fn efd_clear(fd: RawFd) {
-    let mut v: u64 = 0;
-    loop {
-        // SAFETY: reading 8 bytes into a u64 is the eventfd contract.
-        let n = unsafe { read(fd, &mut v as *mut u64 as *mut c_void, 8) };
-        if n < 0 && errno() == EINTR {
-            continue;
-        }
-        return;
-    }
 }
 
 #[cfg(test)]
@@ -632,8 +520,8 @@ mod tests {
     // -- ABI pins -----------------------------------------------------------
 
     #[test]
-    fn pollfd_and_timespec_match_the_c_abi() {
-        assert_eq!(std::mem::size_of::<Pollfd>(), 8);
+    fn the_ppoll_timespec_matches_the_c_abi() {
+        // The `pollfd` mirror this passes is the fd layer's, pinned there.
         assert_eq!(std::mem::size_of::<KernelTimespec>(), 16);
     }
 
@@ -778,9 +666,6 @@ mod tests {
 
     const O_RDWR: c_int = 0o2;
     const O_NOCTTY: c_int = 0o400;
-    const O_NONBLOCK: c_int = 0o4000;
-    const F_GETFL: c_int = 3;
-    const F_SETFL: c_int = 4;
     const TIOCSCTTY: c_ulong = 0x540E;
 
     extern "C" {
@@ -837,8 +722,10 @@ mod tests {
                 close(master);
                 return None;
             }
-            let flags = fcntl(master, F_GETFL);
-            fcntl(master, F_SETFL, flags | O_NONBLOCK);
+            if ffi::set_nonblocking(master).is_err() {
+                close(master);
+                return None;
+            }
 
             let cargv: Vec<CString> = argv.iter().map(|a| CString::new(*a).unwrap()).collect();
             let mut ptrs: Vec<*const core::ffi::c_char> =
@@ -882,9 +769,9 @@ mod tests {
             if let Some(end) = g.completion() {
                 return end;
             }
-            let mut fds = [Pollfd {
+            let mut fds = [ffi::PollFd {
                 fd: g.ready_fd(),
-                events: POLLIN,
+                events: ffi::POLLIN,
                 revents: 0,
             }];
             let ts = KernelTimespec {
@@ -1193,9 +1080,9 @@ mod tests {
             if let Some(end) = g.completion() {
                 break end;
             }
-            let mut fds = [Pollfd {
+            let mut fds = [ffi::PollFd {
                 fd: g.ready_fd(),
-                events: POLLIN,
+                events: ffi::POLLIN,
                 revents: 0,
             }];
             let ts = KernelTimespec {
