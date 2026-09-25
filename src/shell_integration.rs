@@ -867,21 +867,32 @@ mod tests {
     /// `A` of the same prompt, so seeing `A` means the whole prompt-time contract has
     /// already been exercised and the buffer holds all of it.
     fn drive_until_prompt(argv: &[&str]) -> Vec<u8> {
-        use crate::pty::{Pty, ReadOutcome};
+        use crate::gather::Gatherer;
+        use crate::pty::Pty;
         use std::time::{Duration, Instant};
 
         const MARK: &[u8] = b"\x1b]133;A"; // OSC 133 prompt-start
         let Ok(pty) = Pty::spawn_command(80, 24, argv) else {
             return Vec::new();
         };
+        // Through the gather thread, the way a live tab reads its shell.
+        let Ok(gatherer) = Gatherer::start(pty.fd()) else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
-        let mut buf = [0u8; 4096];
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline && !contains(&out, MARK) {
-            match pty.read(&mut buf) {
-                Ok(ReadOutcome::Data(n)) => out.extend_from_slice(&buf[..n]),
-                Ok(ReadOutcome::WouldBlock) => std::thread::sleep(Duration::from_millis(20)),
-                Ok(ReadOutcome::Eof) | Err(_) => break,
+            let mut published = false;
+            while let Some(batch) = gatherer.next_batch() {
+                out.extend_from_slice(batch.bytes());
+                published = true;
+            }
+            if gatherer.completion().is_some() {
+                break;
+            }
+            if !published {
+                gatherer.clear_wakeup();
+                std::thread::sleep(Duration::from_millis(20));
             }
         }
         out
