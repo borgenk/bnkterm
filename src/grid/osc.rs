@@ -21,8 +21,8 @@
 // The grid's shared vocabulary: the types in `grid/mod.rs` and the imports it makes.
 // `Screen`'s operations are split across these sibling modules, so each one works on
 // the same definitions rather than re-importing them piecemeal.
-use super::reply::push_decimal;
 use super::*;
+use crate::platform::bytes::push_decimal;
 
 impl Screen {
     /// OSC 0/2: set the window title.
@@ -424,15 +424,10 @@ impl Screen {
 /// A decimal palette index from an OSC field. `None` for anything that is not a plain
 /// number in `0..=255`, which the caller then skips.
 pub(super) fn parse_u8(field: &[u8]) -> Option<u8> {
-    if field.is_empty() || field.len() > 3 {
+    if field.is_empty() || field.len() > 3 || !field.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    let mut n: u32 = 0;
-    for &b in field {
-        let digit = (b as char).to_digit(10)?;
-        n = n * 10 + digit;
-    }
-    u8::try_from(n).ok()
+    std::str::from_utf8(field).ok()?.parse().ok()
 }
 
 /// Percent-decode a URL path, which is how `OSC 7` carries a directory name.
@@ -549,5 +544,27 @@ pub(super) fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
         // One leftover character encodes six bits of nothing, and a padded partial group
         // is a length base64 cannot produce.
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_palette_index_is_one_to_three_digits_in_range() {
+        assert_eq!(parse_u8(b"0"), Some(0));
+        assert_eq!(parse_u8(b"007"), Some(7));
+        assert_eq!(parse_u8(b"255"), Some(255));
+        // Out of range, not a number, or absent: the caller skips the pair rather than
+        // guessing an index, so a malformed `OSC 4` cannot repaint the wrong slot.
+        assert_eq!(parse_u8(b"256"), None);
+        assert_eq!(parse_u8(b"1a"), None);
+        assert_eq!(parse_u8(b"-1"), None);
+        assert_eq!(parse_u8(b" 1"), None);
+        assert_eq!(parse_u8(b""), None);
+        // Longer than three digits is refused even when the value would fit, which is
+        // what bounds the scan.
+        assert_eq!(parse_u8(b"0001"), None);
     }
 }

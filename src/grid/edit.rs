@@ -19,14 +19,14 @@ use super::buffer::{Charsets, Cursor, Pen, Saved, Scrolled};
 use super::*;
 
 impl Screen {
-    pub fn carriage_return(&mut self) {
+    pub(super) fn carriage_return(&mut self) {
         let b = self.active_mut();
         b.cursor.col = 0;
         b.cursor.pending_wrap = false;
     }
 
     /// LF / IND: move down one row, scrolling the region up at the bottom margin.
-    pub fn line_feed(&mut self) {
+    pub(super) fn line_feed(&mut self) {
         let blank = self.blank_cell();
         let b = self.active_mut();
         b.cursor.pending_wrap = false;
@@ -41,7 +41,7 @@ impl Screen {
     }
 
     /// RI: move up one row, scrolling the region down at the top margin.
-    pub fn reverse_index(&mut self) {
+    pub(super) fn reverse_index(&mut self) {
         let blank = self.blank_cell();
         let b = self.active_mut();
         b.cursor.pending_wrap = false;
@@ -56,7 +56,7 @@ impl Screen {
     }
 
     /// NEL: carriage return plus line feed.
-    pub fn next_line(&mut self) {
+    pub(super) fn next_line(&mut self) {
         self.line_feed();
         self.carriage_return();
     }
@@ -81,7 +81,7 @@ impl Screen {
     }
 
     /// HTS: set a tab stop at the cursor column.
-    pub fn set_tab_stop(&mut self) {
+    pub(super) fn set_tab_stop(&mut self) {
         let b = self.active_mut();
         let col = b.cursor.col;
         if let Some(stop) = b.tabs.get_mut(col) {
@@ -97,7 +97,7 @@ impl Screen {
     /// sequence, or a fresh line all leave nothing to repeat, and then it does nothing —
     /// which is the behaviour a program relies on when it uses REP right after a newline
     /// and expects no output rather than a screenful of the last thing on the line above.
-    pub fn repeat_last(&mut self, n: usize) {
+    pub(super) fn repeat_last(&mut self, n: usize) {
         let Some(c) = self.last_printed else {
             return;
         };
@@ -107,7 +107,7 @@ impl Screen {
     }
 
     /// CBT: move back `n` tab stops, stopping at column 0. The mirror of [`tab`](Self::tab).
-    pub fn back_tab(&mut self, n: usize) {
+    pub(super) fn back_tab(&mut self, n: usize) {
         let b = self.active_mut();
         for _ in 0..n.max(1) {
             let Some(mut c) = b.cursor.col.checked_sub(1) else {
@@ -130,7 +130,7 @@ impl Screen {
     /// tab screen checks exactly that by sending `CSI 1 g` and `CSI 2 g` at a live tab
     /// stop and requiring the stop to survive. Treating an unknown parameter as 0 would
     /// silently delete it.
-    pub fn clear_tab_stop(&mut self, mode: u16) {
+    pub(super) fn clear_tab_stop(&mut self, mode: u16) {
         let b = self.active_mut();
         match mode {
             0 => {
@@ -144,7 +144,7 @@ impl Screen {
         }
     }
 
-    pub fn move_up(&mut self, n: usize) {
+    pub(super) fn move_up(&mut self, n: usize) {
         let b = self.active_mut();
         let n = n.max(1);
         let limit = if b.cursor.row >= b.scroll_top {
@@ -156,7 +156,7 @@ impl Screen {
         b.cursor.pending_wrap = false;
     }
 
-    pub fn move_down(&mut self, n: usize) {
+    pub(super) fn move_down(&mut self, n: usize) {
         let b = self.active_mut();
         let n = n.max(1);
         let limit = if b.cursor.row <= b.scroll_bottom {
@@ -168,14 +168,14 @@ impl Screen {
         b.cursor.pending_wrap = false;
     }
 
-    pub fn move_forward(&mut self, n: usize) {
+    pub(super) fn move_forward(&mut self, n: usize) {
         let b = self.active_mut();
         let n = n.max(1);
         b.cursor.col = (b.cursor.col + n).min(b.cols.saturating_sub(1));
         b.cursor.pending_wrap = false;
     }
 
-    pub fn move_back(&mut self, n: usize) {
+    pub(super) fn move_back(&mut self, n: usize) {
         let b = self.active_mut();
         let n = n.max(1);
         b.cursor.col = b.cursor.col.saturating_sub(n);
@@ -193,14 +193,14 @@ impl Screen {
     }
 
     /// CHA / HPA: move to an absolute column.
-    pub fn move_to_col(&mut self, col: usize) {
+    pub(super) fn move_to_col(&mut self, col: usize) {
         let b = self.active_mut();
         b.cursor.col = col.min(b.cols - 1);
         b.cursor.pending_wrap = false;
     }
 
     /// VPA: move to a row (origin-aware, like `move_to`).
-    pub fn move_to_row(&mut self, row: usize) {
+    pub(super) fn move_to_row(&mut self, row: usize) {
         let origin = self.origin_mode;
         let b = self.active_mut();
         b.cursor.row = b.origin_row(row, origin);
@@ -213,7 +213,7 @@ impl Screen {
     /// mode 0 would turn a sequence the program did not mean into an erase, which is the
     /// wrong direction to guess in: a terminal that erases too little shows stale text
     /// until the next repaint, one that erases too much has destroyed it.
-    pub fn erase_line(&mut self, mode: u16) {
+    pub(super) fn erase_line(&mut self, mode: u16) {
         if !matches!(mode, 0..=2) {
             return;
         }
@@ -239,7 +239,7 @@ impl Screen {
     ///
     /// Any other parameter does nothing at all, matching xterm's `default:` arm. Treating
     /// an unknown mode as 0 turns a sequence the program did not mean into an erase.
-    pub fn erase_display(&mut self, mode: u16) {
+    pub(super) fn erase_display(&mut self, mode: u16) {
         if mode == 3 {
             self.active_mut().clear_history();
             // The rows the view was scrolled back into no longer exist, so an offset into
@@ -286,7 +286,7 @@ impl Screen {
     /// afterwards would wrap for a glyph that no longer exists. Unconditional, and
     /// before any bounds check refuses the erase itself — a rule about the cursor does
     /// not wait on whether the cells were in range.
-    pub fn erase_chars(&mut self, n: usize) {
+    pub(super) fn erase_chars(&mut self, n: usize) {
         let blank = self.blank_cell();
         let b = self.active_mut();
         b.cursor.pending_wrap = false;
@@ -295,7 +295,7 @@ impl Screen {
     }
 
     /// ICH: insert `n` blanks at the cursor, shifting the rest of the line right.
-    pub fn insert_chars(&mut self, n: usize) {
+    pub(super) fn insert_chars(&mut self, n: usize) {
         let blank = self.blank_cell();
         let b = self.active_mut();
         // Cancels a deferred wrap: ICH shifts the text the flag was deferring for out
@@ -306,7 +306,7 @@ impl Screen {
     }
 
     /// DCH: delete `n` cells at the cursor, shifting the rest of the line left.
-    pub fn delete_chars(&mut self, n: usize) {
+    pub(super) fn delete_chars(&mut self, n: usize) {
         let blank = self.blank_cell();
         let b = self.active_mut();
         // Cancels a deferred wrap, as ICH does and for the same reason.
@@ -316,7 +316,7 @@ impl Screen {
     }
 
     /// IL: insert `n` blank lines at the cursor row, within the scroll region.
-    pub fn insert_lines(&mut self, n: usize) {
+    pub(super) fn insert_lines(&mut self, n: usize) {
         let blank = self.blank_cell();
         let b = self.active_mut();
         if b.cursor.row < b.scroll_top || b.cursor.row > b.scroll_bottom {
@@ -338,7 +338,7 @@ impl Screen {
     /// a shell redrawing a multi-line prompt at the top of the screen should not dribble
     /// prompt fragments into the scrollback. If a real program is ever found to depend on
     /// the xterm behavior, this is the line to change.
-    pub fn delete_lines(&mut self, n: usize) {
+    pub(super) fn delete_lines(&mut self, n: usize) {
         let blank = self.blank_cell();
         let b = self.active_mut();
         if b.cursor.row < b.scroll_top || b.cursor.row > b.scroll_bottom {
@@ -359,7 +359,7 @@ impl Screen {
     /// where they were. alacritty and ghostty agree. Resetting to the full screen instead
     /// hands hostile or corrupted input a way to silently drop a program's scroll region
     /// and move its cursor, which the program has no way to notice.
-    pub fn set_scroll_region(&mut self, top: usize, bottom: usize) {
+    pub(super) fn set_scroll_region(&mut self, top: usize, bottom: usize) {
         {
             let b = self.active_mut();
             let bottom = bottom.min(b.rows - 1);
@@ -378,7 +378,7 @@ impl Screen {
     /// is 0 (`xtermScroll`'s `top_marg == 0`), and alacritty and ghostty agree. A region
     /// with a top margin discards instead — those rows never touch the top of the
     /// screen, so they were never history.
-    pub fn scroll_up(&mut self, n: usize) {
+    pub(super) fn scroll_up(&mut self, n: usize) {
         let blank = self.blank_cell();
         let b = self.active_mut();
         let (top, bottom) = (b.scroll_top, b.scroll_bottom);
@@ -387,7 +387,7 @@ impl Screen {
     }
 
     /// SD: scroll the region down `n` lines (content moves down).
-    pub fn scroll_down(&mut self, n: usize) {
+    pub(super) fn scroll_down(&mut self, n: usize) {
         let blank = self.blank_cell();
         let b = self.active_mut();
         let (top, bottom) = (b.scroll_top, b.scroll_bottom);
@@ -404,7 +404,7 @@ impl Screen {
     /// set to paint a frame, then restores, is telling the terminal to put the ASCII
     /// mapping back. Without that, every letter it prints afterwards comes out as box
     /// glyphs.
-    pub fn save_cursor(&mut self) {
+    pub(super) fn save_cursor(&mut self) {
         let (pen, origin, charsets) = (self.pen, self.origin_mode, self.charsets);
         let b = self.active_mut();
         b.saved = Some(Saved {
@@ -416,7 +416,7 @@ impl Screen {
     }
 
     /// DECRC: restore what DECSC saved, or home the cursor if nothing was saved.
-    pub fn restore_cursor(&mut self) {
+    pub(super) fn restore_cursor(&mut self) {
         let saved = self.active().saved;
         match saved {
             Some(s) => {
@@ -575,9 +575,18 @@ impl Screen {
         })
     }
 
+    /// Set or reset every mode in a `h`/`l` sequence: a program may name several in one
+    /// (`CSI ?1049;1000h`), and the four spellings of that loop (ANSI or private, set or
+    /// reset) differ only in these two flags.
+    pub(super) fn set_modes(&mut self, params: &Params, private: bool, enable: bool) {
+        for i in 0..params.len() {
+            self.set_mode(params.value(i), private, enable);
+        }
+    }
+
     /// Set or reset a mode. `private` distinguishes the DEC private modes
     /// (`?`-prefixed, like DECAWM) from the ANSI modes (like IRM).
-    pub fn set_mode(&mut self, mode: u16, private: bool, enable: bool) {
+    pub(super) fn set_mode(&mut self, mode: u16, private: bool, enable: bool) {
         if private {
             match mode {
                 1 => self.app_cursor_keys = enable,
@@ -762,7 +771,7 @@ impl Screen {
     ///
     /// The saved cursor goes too (DECSC is reset to "home position"), so a stray DECRC
     /// afterwards cannot restore a cursor from before the reset.
-    pub fn soft_reset(&mut self) {
+    pub(super) fn soft_reset(&mut self) {
         self.pen = Pen::default();
         self.cursor_visible = true;
         self.insert_mode = false;
@@ -879,7 +888,7 @@ impl Screen {
     /// "sets the margins to the extremes of the page, and moves the cursor to the home
     /// position", so a screen left under a stale scroll region after an alignment test
     /// would scroll inside it.
-    pub fn decaln(&mut self) {
+    pub(super) fn decaln(&mut self) {
         let b = self.active_mut();
         b.clear_all(PackedCell::plain('E'));
         b.scroll_top = 0;

@@ -18,6 +18,8 @@
 //! cube/ramp arithmetic below match it to the byte, because that is the palette
 //! every program was written and color-tested against.
 
+use crate::platform::bytes::push_hex_nibble;
+
 /// A resolved 24-bit color: the result of looking a [`Color`] up in a [`Theme`].
 /// This is what the renderer ultimately wants; `Color` is what a cell stores.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -261,11 +263,7 @@ pub fn write_x11_color(color: Rgb, out: &mut Vec<u8>) {
         }
         let wide = u16::from(channel) * 0x101;
         for shift in [12, 8, 4, 0] {
-            let nibble = ((wide >> shift) & 0xf) as u8;
-            out.push(match nibble {
-                0..=9 => b'0' + nibble,
-                _ => b'a' + (nibble - 10),
-            });
+            push_hex_nibble(out, ((wide >> shift) & 0xf) as u8);
         }
     }
 }

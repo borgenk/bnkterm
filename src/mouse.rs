@@ -22,6 +22,7 @@
 //!   release, decimal and unbounded. The modern default programs prefer.
 
 use crate::input::Mods;
+use crate::platform::bytes::push_decimal;
 
 /// Which physical button an event names. `None` is "no button", used for the
 /// hover motion the any-event protocol reports. Wheel notches arrive as presses.
@@ -112,11 +113,11 @@ pub fn encode(
 
     if mode.sgr {
         out.extend_from_slice(b"\x1b[<");
-        push_num(out, cb);
+        push_decimal(out, cb);
         out.push(b';');
-        push_num(out, col as u32 + 1);
+        push_decimal(out, col as u32 + 1);
         out.push(b';');
-        push_num(out, row as u32 + 1);
+        push_decimal(out, row as u32 + 1);
         // A release is the same code with a lowercase final byte.
         out.push(if kind == MouseKind::Release {
             b'm'
@@ -167,22 +168,6 @@ fn modifier_bits(mods: Mods) -> u32 {
         b += 16;
     }
     b
-}
-
-/// Append `n` as decimal ASCII, allocation-free.
-fn push_num(out: &mut Vec<u8>, mut n: u32) {
-    if n == 0 {
-        out.push(b'0');
-        return;
-    }
-    let mut tmp = [0u8; 10];
-    let mut i = tmp.len();
-    while n > 0 {
-        i -= 1;
-        tmp[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    out.extend_from_slice(&tmp[i..]);
 }
 
 #[cfg(test)]

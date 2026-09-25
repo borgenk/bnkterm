@@ -295,7 +295,7 @@ impl Screen {
     /// band — scrolled off above or below it, or aged out of history entirely. The
     /// painter uses the `None` to clip: a selection whose top has scrolled away still
     /// paints the part you can see.
-    pub fn display_row(&self, abs: AbsRow) -> Option<usize> {
+    pub(super) fn display_row(&self, abs: AbsRow) -> Option<usize> {
         let b = self.active();
         let top = b.scrollback.len().saturating_sub(self.view_offset());
         let idx = b.stream_index(abs)?;

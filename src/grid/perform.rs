@@ -51,16 +51,7 @@ impl Screen {
     /// anything else. Dropping an unknown sequence is always safe. Guessing is not.
     fn csi_private(&mut self, params: &Params, private: u8, action: u8) {
         match (private, action) {
-            (b'?', b'h') => {
-                for m in params.iter() {
-                    self.set_mode(m.first().copied().unwrap_or(0), true, true);
-                }
-            }
-            (b'?', b'l') => {
-                for m in params.iter() {
-                    self.set_mode(m.first().copied().unwrap_or(0), true, false);
-                }
-            }
+            (b'?', b'h' | b'l') => self.set_modes(params, true, action == b'h'),
             (b'?', b'n') => self.device_status(params, b'?'),
             (b'>', b'c') => self.device_attributes(b'>'),
             (b'>', b'm') => self.xtmodkeys(params),
@@ -183,8 +174,8 @@ impl Perform for Screen {
             }
             b'Z' => self.back_tab(csi_count(params, 0)), // CBT
             b'b' => self.repeat_last(csi_count(params, 0)), // REP
-            b'J' => self.erase_display(csi_arg(params, 0)),
-            b'K' => self.erase_line(csi_arg(params, 0)),
+            b'J' => self.erase_display(params.value(0)),
+            b'K' => self.erase_line(params.value(0)),
             b'L' => self.insert_lines(csi_count(params, 0)),
             b'M' => self.delete_lines(csi_count(params, 0)),
             b'@' => self.insert_chars(csi_count(params, 0)),
@@ -201,26 +192,14 @@ impl Perform for Screen {
             b'r' => {
                 let (_, rows) = self.dimensions();
                 let top = csi_index(params, 0);
-                let bottom = match csi_arg(params, 1) {
-                    0 => rows - 1,
-                    v => usize::from(v) - 1,
-                };
+                let bottom = params.value(1).checked_sub(1).map_or(rows - 1, usize::from);
                 self.set_scroll_region(top, bottom);
             }
             b'm' => self.sgr(params),
-            b'h' => {
-                for m in params.iter() {
-                    self.set_mode(m.first().copied().unwrap_or(0), false, true);
-                }
-            }
-            b'l' => {
-                for m in params.iter() {
-                    self.set_mode(m.first().copied().unwrap_or(0), false, false);
-                }
-            }
+            b'h' | b'l' => self.set_modes(params, false, action == b'h'),
             b's' if params.is_empty() => self.save_cursor(),
             b'u' if params.is_empty() => self.restore_cursor(),
-            b'g' => self.clear_tab_stop(csi_arg(params, 0)),
+            b'g' => self.clear_tab_stop(params.value(0)),
             b'c' => self.device_attributes(0),
             b'n' => self.device_status(params, 0),
             _ => {}
@@ -283,19 +262,14 @@ impl Perform for Screen {
     }
 }
 
-/// A CSI numeric parameter, or 0 when absent.
-pub(super) fn csi_arg(params: &Params, i: usize) -> u16 {
-    params.value(i)
-}
-
 /// A CSI count parameter (for cursor moves, repeat counts): absent or 0 means 1.
 pub(super) fn csi_count(params: &Params, i: usize) -> usize {
-    usize::from(csi_arg(params, i).max(1))
+    usize::from(params.value(i).max(1))
 }
 
 /// A 1-based CSI position parameter as a 0-based index (default 1 maps to 0).
 pub(super) fn csi_index(params: &Params, i: usize) -> usize {
-    usize::from(csi_arg(params, i).max(1)) - 1
+    usize::from(params.value(i).max(1)) - 1
 }
 
 /// The charset an `ESC ( F` / `ESC ) F` designation selects. Only `0` (DEC

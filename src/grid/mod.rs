@@ -200,7 +200,7 @@ impl Attrs {
         }
     }
 
-    pub fn set_underline_style(&mut self, style: UnderlineStyle) {
+    fn set_underline_style(&mut self, style: UnderlineStyle) {
         let bits = match style {
             UnderlineStyle::Single => 0,
             UnderlineStyle::Double => 1,
@@ -384,7 +384,7 @@ impl LinkId {
 
     /// Whether this cell is inside a hyperlink at all. The check the hover probe runs
     /// first, before it considers scanning text.
-    pub fn is_set(self) -> bool {
+    fn is_set(self) -> bool {
         self != LinkId::NONE
     }
 }

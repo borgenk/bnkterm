@@ -20,6 +20,8 @@
 //! program to switch it on and depend on it; an unknown DECRQSS is refused rather than
 //! answered with an invented setting. A lie here is worse than the silence it replaces.
 
+use crate::platform::bytes::{push_decimal, push_hex_nibble};
+
 // The grid's shared vocabulary: the types in `grid/mod.rs` and the imports it makes.
 // `Screen`'s operations are split across these sibling modules, so each one works on
 // the same definitions rather than re-importing them piecemeal.
@@ -131,21 +133,16 @@ impl Screen {
         let ps = params.value(0);
         match (private, ps) {
             (0, 5) => self.respond(b"\x1b[0n"),
-            (0, 6) => {
+            // CPR and DECXCPR are the same report; the private form adds the `?` and a
+            // page number, which is always 1 for a terminal with one page.
+            (0, 6) | (b'?', 6) => {
                 let (row, col) = self.report_position();
-                self.respond(b"\x1b[");
+                self.respond(if private == b'?' { b"\x1b[?" } else { b"\x1b[" });
                 push_decimal(&mut self.responses, row);
                 self.responses.push(b';');
                 push_decimal(&mut self.responses, col);
-                self.responses.push(b'R');
-            }
-            (b'?', 6) => {
-                let (row, col) = self.report_position();
-                self.respond(b"\x1b[?");
-                push_decimal(&mut self.responses, row);
-                self.responses.push(b';');
-                push_decimal(&mut self.responses, col);
-                self.responses.extend_from_slice(b";1R");
+                self.responses
+                    .extend_from_slice(if private == b'?' { b";1R" } else { b"R" });
             }
             _ => {}
         }
@@ -480,22 +477,6 @@ impl Screen {
     }
 }
 
-/// Append `n` as decimal ASCII (for building query responses), allocation-free.
-pub(super) fn push_decimal(out: &mut Vec<u8>, mut n: u32) {
-    if n == 0 {
-        out.push(b'0');
-        return;
-    }
-    let mut tmp = [0u8; 10];
-    let mut i = tmp.len();
-    while n > 0 {
-        i -= 1;
-        tmp[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    out.extend_from_slice(&tmp[i..]);
-}
-
 /// Decode the hex that XTGETTCAP encodes capability names in. `None` on anything that is
 /// not an even run of hex digits, which the caller answers as "I do not have that"
 /// rather than guessing at.
@@ -516,11 +497,7 @@ pub(super) fn hex_decode(input: &[u8]) -> Option<Vec<u8>> {
 /// an escape sequence survives being sent inside one.
 pub(super) fn hex_encode(input: &[u8], out: &mut Vec<u8>) {
     for &byte in input {
-        for nibble in [byte >> 4, byte & 0x0f] {
-            out.push(match nibble {
-                0..=9 => b'0' + nibble,
-                _ => b'a' + (nibble - 10),
-            });
-        }
+        push_hex_nibble(out, byte >> 4);
+        push_hex_nibble(out, byte & 0x0f);
     }
 }

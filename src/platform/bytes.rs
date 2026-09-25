@@ -91,9 +91,51 @@ pub fn all_printable(bytes: &[u8]) -> bool {
     printable_run_len(bytes) == bytes.len()
 }
 
+/// Append `n` as decimal ASCII, allocation-free: the replies, the key encoder and the
+/// mouse encoder all build their numbers straight into an output buffer.
+pub fn push_decimal(out: &mut Vec<u8>, mut n: u32) {
+    if n == 0 {
+        out.push(b'0');
+        return;
+    }
+    // A u32 is at most ten digits, written back to front.
+    let mut tmp = [0u8; 10];
+    let mut i = tmp.len();
+    while n > 0 {
+        i -= 1;
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    out.extend_from_slice(&tmp[i..]);
+}
+
+/// Append one nibble as a lowercase hex digit. Lowercase because that is what the X11
+/// colour syntax and the OSC replies built on it use.
+pub fn push_hex_nibble(out: &mut Vec<u8>, nibble: u8) {
+    out.push(match nibble & 0xf {
+        n @ 0..=9 => b'0' + n,
+        n => b'a' + (n - 10),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decimal_and_hex_write_what_they_say() {
+        let mut out = Vec::new();
+        push_decimal(&mut out, 0);
+        push_decimal(&mut out, 7);
+        push_decimal(&mut out, 4_294_967_295); // the widest u32, ten digits
+        assert_eq!(out, b"074294967295");
+
+        out.clear();
+        for nibble in [0u8, 9, 10, 15] {
+            push_hex_nibble(&mut out, nibble);
+        }
+        assert_eq!(out, b"09af");
+    }
 
     #[test]
     fn printable_run_len_finds_ascii_runs() {

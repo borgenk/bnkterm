@@ -67,6 +67,7 @@
 //! that does not.
 
 use crate::grid::Screen;
+use crate::platform::bytes::push_decimal;
 
 /// A logical key press, already resolved by the layout. `Char` carries the
 /// character the layout produced with Shift applied but *not* Ctrl or Alt: the
@@ -661,7 +662,7 @@ fn legacy_text_byte(key: Key) -> u8 {
 /// nothing is held: it defaults to 1, and `CSI 27u` is what the spec shows.
 fn csi_u(code: u32, mods: Mods, event: KeyEvent, out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b[");
-    push_num(out, code);
+    push_decimal(out, code);
     push_modifier(mods, event, out);
     out.push(b'u');
 }
@@ -677,10 +678,10 @@ fn push_modifier(mods: Mods, event: KeyEvent, out: &mut Vec<u8>) {
         return;
     }
     out.push(b';');
-    push_num(out, modifier_param(mods));
+    push_decimal(out, modifier_param(mods));
     if event != KeyEvent::Press {
         out.push(b':');
-        push_num(out, event.code());
+        push_decimal(out, event.code());
     }
 }
 
@@ -688,9 +689,9 @@ fn push_modifier(mods: Mods, event: KeyEvent, out: &mut Vec<u8>) {
 /// always present here; xterm's parser wants the modifier in the middle.
 fn csi_27(code: u32, mods: Mods, out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b[27;");
-    push_num(out, modifier_param(mods));
+    push_decimal(out, modifier_param(mods));
     out.push(b';');
-    push_num(out, code);
+    push_decimal(out, code);
     out.push(b'~');
 }
 
@@ -749,7 +750,7 @@ fn cursor_key(final_byte: u8, mods: Mods, event: KeyEvent, modes: Modes, out: &m
 /// modified. These do not vary with the cursor-key mode.
 fn tilde_key(n: u32, mods: Mods, event: KeyEvent, out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b[");
-    push_num(out, n);
+    push_decimal(out, n);
     push_modifier(mods, event, out);
     out.push(b'~');
 }
@@ -795,22 +796,6 @@ fn alt_prefix(mods: Mods, out: &mut Vec<u8>) {
     if mods.contains(Mods::ALT) {
         out.push(0x1b);
     }
-}
-
-/// Append `n` as decimal ASCII, allocation-free.
-fn push_num(out: &mut Vec<u8>, mut n: u32) {
-    if n == 0 {
-        out.push(b'0');
-        return;
-    }
-    let mut tmp = [0u8; 10];
-    let mut i = tmp.len();
-    while n > 0 {
-        i -= 1;
-        tmp[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
-    out.extend_from_slice(&tmp[i..]);
 }
 
 /// Map a raw Linux evdev keycode (as `wl_keyboard.key` reports it, before the
