@@ -158,7 +158,7 @@ impl FeedbackState {
 
 /// Parse the format table: 16-byte entries of `u32 format`, 4 bytes padding,
 /// `u64 modifier`, all native-endian. A trailing partial entry is ignored.
-pub fn parse_format_table(bytes: &[u8]) -> Vec<FormatModifier> {
+fn parse_format_table(bytes: &[u8]) -> Vec<FormatModifier> {
     bytes
         .as_chunks::<16>()
         .0

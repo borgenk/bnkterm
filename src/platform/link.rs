@@ -57,7 +57,7 @@ const MAX_NESTING: usize = 16;
 /// The URLs in `text`, left to right and non-overlapping. A scheme *inside* an
 /// already-yielded URL (the `http://` in a `?to=` query string) belongs to that URL
 /// and is not reported again.
-pub fn urls(text: &str) -> impl Iterator<Item = Range<usize>> + '_ {
+fn urls(text: &str) -> impl Iterator<Item = Range<usize>> + '_ {
     let mut at = 0;
     std::iter::from_fn(move || {
         while at < text.len() {

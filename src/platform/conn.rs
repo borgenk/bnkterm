@@ -142,27 +142,20 @@ impl Connection {
                 _ => break,
             }
         }
-        // Scan the buffered stream for wl_display@1.error (event opcode 0), whose
-        // ids are protocol-fixed, so no interface knowledge is needed here.
-        let mut off = self.in_pos;
-        while off + 8 <= self.in_buf.len() {
-            let FrameHeader {
-                object,
-                opcode,
-                size,
-            } = frame_header(&self.in_buf[off..]);
-            if size < 8 || off + size > self.in_buf.len() {
-                break;
+        // Walk what arrived for wl_display@1.error (event opcode 0), whose ids are
+        // protocol-fixed, so no interface knowledge is needed here. The connection is
+        // being torn down, so consuming the messages costs nothing.
+        let mut msg = Message::default();
+        while matches!(self.next_message_into(&mut msg), Ok(true)) {
+            if msg.object != 1 || msg.opcode != 0 {
+                continue;
             }
-            if object == 1 && opcode == 0 {
-                let mut r = Reader::new(&self.in_buf[off + 8..off + size]);
-                if let (Ok(obj), Ok(code), Ok(msg)) = (r.u32(), r.u32(), r.string()) {
-                    return Error::msg(format!(
-                        "wayland protocol error: object {obj} code {code}: {msg}"
-                    ));
-                }
+            let mut r = Reader::new(&msg.body);
+            if let (Ok(obj), Ok(code), Ok(text)) = (r.u32(), r.u32(), r.string()) {
+                return Error::msg(format!(
+                    "wayland protocol error: object {obj} code {code}: {text}"
+                ));
             }
-            off += size;
         }
         Error::msg(format!(
             "{send_err}; the compositor closed the connection without sending a protocol error"

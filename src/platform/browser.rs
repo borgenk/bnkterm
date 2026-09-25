@@ -26,7 +26,7 @@ pub const OPENABLE_SCHEMES: [&str; 4] = ["https://", "http://", "file://", "mail
 /// Open `url` in the default browser via `xdg-open`, detached from the app.
 ///
 /// `xdg-open` is a thin shell wrapper, so the URL is vetted first: a leading dash
-/// (which it could read as an option) and any scheme not in [`has_allowed_scheme`]
+/// (which it could read as an option) and any scheme not in [`OPENABLE_SCHEMES`]
 /// are refused, so a clicked link can only ever name a web/file/mail target and never
 /// a `javascript:`/`data:`-style payload. What the *handler* then does with a `file:`
 /// URL is the desktop's business, not ours — see the note on [`OPENABLE_SCHEMES`].
@@ -56,14 +56,10 @@ pub fn open_url(url: &str) -> Result<()> {
 /// checks this before offering a link to the pointer, so a target we would refuse
 /// never presents itself as clickable in the first place.
 pub fn can_open(url: &str) -> bool {
-    !url.starts_with('-') && has_allowed_scheme(url)
-}
-
-/// Whether `url` carries a scheme we are willing to open.
-fn has_allowed_scheme(url: &str) -> bool {
-    OPENABLE_SCHEMES
-        .iter()
-        .any(|scheme| url.starts_with(scheme))
+    !url.starts_with('-')
+        && OPENABLE_SCHEMES
+            .iter()
+            .any(|scheme| url.starts_with(scheme))
 }
 
 #[cfg(test)]
@@ -72,19 +68,19 @@ mod tests {
 
     #[test]
     fn allowed_schemes_pass() {
-        assert!(has_allowed_scheme("https://example.com"));
-        assert!(has_allowed_scheme("http://example.com"));
-        assert!(has_allowed_scheme("file:///etc/hosts"));
-        assert!(has_allowed_scheme("mailto:a@b.com"));
+        assert!(can_open("https://example.com"));
+        assert!(can_open("http://example.com"));
+        assert!(can_open("file:///etc/hosts"));
+        assert!(can_open("mailto:a@b.com"));
     }
 
     #[test]
     fn disallowed_schemes_rejected() {
-        assert!(!has_allowed_scheme("javascript:alert(1)"));
-        assert!(!has_allowed_scheme("data:text/html,x"));
-        assert!(!has_allowed_scheme("ftp://example.com"));
-        assert!(!has_allowed_scheme("example.com"));
-        assert!(!has_allowed_scheme("./relative/page.md"));
+        assert!(!can_open("javascript:alert(1)"));
+        assert!(!can_open("data:text/html,x"));
+        assert!(!can_open("ftp://example.com"));
+        assert!(!can_open("example.com"));
+        assert!(!can_open("./relative/page.md"));
     }
 
     #[test]
