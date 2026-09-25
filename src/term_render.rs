@@ -362,6 +362,9 @@ pub struct ScrollLane {
     pub grab: Rect,
     /// Where the pointer expands the bar: the lane plus a margin of slack to its left.
     pub zone: Rect,
+    /// The shortest the thumb may draw, so a deep scrollback still leaves something to
+    /// grab.
+    min_thumb: i32,
 }
 
 /// The column the scrollbar hangs off: the grid's visible rows, running out to the
@@ -369,50 +372,54 @@ pub struct ScrollLane {
 /// bar, and a pointer flung at the edge of a maximized window has to land on it.
 ///
 /// Both the painter and the window's hit-test call this, so the bar cannot be drawn
-/// anywhere other than where it is grabbable.
-pub fn scroll_column(
-    surface: (i32, i32),
-    origin: (i32, i32),
-    metrics: CellMetrics,
-    rows: usize,
-) -> Rect {
-    Rect {
-        x: origin.0,
-        y: origin.1,
-        w: (surface.0 - origin.0).max(0),
-        h: rows as i32 * metrics.h,
+impl ScrollLane {
+    /// The bar's geometry for a window of `surface` device pixels whose grid starts at
+    /// `origin` and runs `rows` deep. The painter and the pointer both build it from the
+    /// same inputs, so the bar is grabbable exactly where it is drawn.
+    pub fn new(
+        surface: (i32, i32),
+        origin: (i32, i32),
+        metrics: CellMetrics,
+        rows: usize,
+        scale: Scale,
+    ) -> ScrollLane {
+        // The column the grid occupies: everything right of the origin, as deep as the
+        // rows go.
+        let (top, height) = (origin.1, rows as i32 * metrics.h);
+        let right = surface.0;
+        let wide = scale.px(SCROLL_WIDE);
+        let track = Rect {
+            x: right - scale.px(SCROLL_INSET) - wide,
+            y: top,
+            w: wide,
+            h: height,
+        };
+        let from = |x: i32| Rect {
+            x,
+            y: top,
+            w: (right - x).max(0),
+            h: height,
+        };
+        ScrollLane {
+            track,
+            grab: from(track.x),
+            zone: from(track.x - scale.px(SCROLL_NEAR)),
+            min_thumb: scale.px(SCROLL_MIN_THUMB),
+        }
     }
-}
 
-/// Split the right edge of the grid column `view` into the scrollbar's lane, its grab
-/// band, and its proximity zone.
-pub fn scroll_lane(view: Rect, scale: Scale) -> ScrollLane {
-    let wide = scale.px(SCROLL_WIDE);
-    let inset = scale.px(SCROLL_INSET);
-    let right = view.x + view.w;
-    let track = Rect {
-        x: right - inset - wide,
-        y: view.y,
-        w: wide,
-        h: view.h,
-    };
-    let from = |x: i32| Rect {
-        x,
-        y: view.y,
-        w: (right - x).max(0),
-        h: view.h,
-    };
-    ScrollLane {
-        track,
-        grab: from(track.x),
-        zone: from(track.x - scale.px(SCROLL_NEAR)),
+    /// The thumb as it is drawn for `screen` right now, or `None` when there is nothing
+    /// to scroll. One answer, so the rectangle the pointer grabs is the one on screen.
+    pub fn thumb(&self, screen: &Screen) -> Option<Rect> {
+        let (content, viewport) = screen.scroll_extent();
+        scroll::thumb(
+            self.track,
+            viewport,
+            content,
+            screen.scroll_position(),
+            self.min_thumb,
+        )
     }
-}
-
-/// The shortest thumb the bar will draw, in device pixels. The window's drag hit-test
-/// needs the same floor the painter used, or a grab would miss the thumb it can see.
-pub fn scroll_min_thumb(scale: Scale) -> i32 {
-    scale.px(SCROLL_MIN_THUMB)
 }
 
 /// Build the frame's display list into `out` (cleared first), drawing every run's
@@ -738,7 +745,7 @@ impl Painter<'_> {
         //
         // **A selection band is the case where that is wrong**, and the claim that used to
         // sit here — "reverse video and selection tint uniformly" — was only true of
-        // reverse video. A selection covers *part* of a row, and `resolve(.., false)`
+        // reverse video. A selection covers *part* of a row, and `cell_bg_of`
         // deliberately reports the cell's own background rather than the band's, so glyphs
         // painted over `SELECTION_BG` are weighted against the ground they would have had
         // without it. On a light theme (dark ink on a light page) the selected text comes
@@ -751,7 +758,7 @@ impl Painter<'_> {
         // the damage diff stays honest, and it is invisible on the default dark theme.
         // Recorded as an open question on `fixed-pitch-run-painting` rather than traded
         // for a measured regression.
-        let (_, bg) = self.resolve(first, false);
+        let bg = self.cell_bg_of(first);
         let run = self.run_style(first);
         // A run cannot outlast its row, so ask the pool for that much and let every
         // run settle on one capacity: the pool probes from the back for the first
@@ -1001,11 +1008,40 @@ impl Painter<'_> {
     /// A hidden or blank cell draws no glyph, but still takes its decorations: an
     /// underline runs under the cells it covers whether or not they have ink, the
     /// same rule [`Self::push_run`] follows for a styled trailing space.
+    /// Push one glyph as a [`DrawCmd::Text`] spanning `width_cells` columns from `x`.
+    /// The shape every standalone glyph takes: a wide character, the glyph stamped
+    /// inside a block cursor, and the lock all differ only in their colours and in what
+    /// they put in `text` (which the caller filled from [`Self::take_string`]).
+    fn push_glyph_text(
+        &mut self,
+        x: i32,
+        baseline: i32,
+        width_cells: i32,
+        style: FontStyle,
+        (color, bg): (Rgb, Rgb),
+        text: String,
+    ) {
+        let m = self.metrics;
+        self.list.push(DrawCmd::Text {
+            bounds: text_bounds(x, baseline, width_cells * m.w, m),
+            x,
+            baseline,
+            face: FaceKey::Prose {
+                size: m.size,
+                style,
+            },
+            color: color.to_u32(),
+            bg: bg.to_u32(),
+            fade: None,
+            text,
+        });
+    }
+
     fn push_glyph(&mut self, row: usize, col: usize, cell: Cell, baseline: i32) {
         let m = self.metrics;
         let x = self.cell_x(col);
         let width_cells = if cell.is_wide_leader() { 2 } else { 1 };
-        let (fg, bg) = self.resolve(cell, false);
+        let (fg, bg) = (self.cell_fg(cell), self.cell_bg_of(cell));
         let shown = self.shown(row, col, cell);
         if shown.inked {
             let mut text = self.take_string();
@@ -1013,19 +1049,8 @@ impl Painter<'_> {
             if shown.marks {
                 text.extend(self.marks(row, col));
             }
-            self.list.push(DrawCmd::Text {
-                bounds: text_bounds(x, baseline, width_cells * m.w, m),
-                x,
-                baseline,
-                face: FaceKey::Prose {
-                    size: m.size,
-                    style: style_of(cell.attrs),
-                },
-                color: fg.to_u32(),
-                bg: bg.to_u32(),
-                fade: None,
-                text,
-            });
+            let style = style_of(cell.attrs);
+            self.push_glyph_text(x, baseline, width_cells, style, (fg, bg), text);
         }
         // A wide glyph is drawn standalone, so it never rides a run's rule; without
         // this it would be the one gap in an underlined span (an SGR 4 CJK character,
@@ -1075,7 +1100,7 @@ impl Painter<'_> {
                 // The lock is the whole message, so it gets a clean cell: paint out whatever
                 // is under the cursor (blank at a real password prompt, but nothing promises
                 // where the cursor is parked) and stand the glyph on that background.
-                let (_, behind) = self.resolve(cell, false);
+                let behind = self.cell_bg_of(cell);
                 self.list.push(DrawCmd::Fill {
                     rect: Rect { x, y, w, h: m.h },
                     color: behind.to_u32(),
@@ -1083,19 +1108,8 @@ impl Painter<'_> {
                 let baseline = self.baseline(dr);
                 let mut text = self.take_string();
                 text.push(LOCK_GLYPH);
-                self.list.push(DrawCmd::Text {
-                    bounds: text_bounds(x, baseline, w, m),
-                    x,
-                    baseline,
-                    face: FaceKey::Prose {
-                        size: m.size,
-                        style: FontStyle::Regular,
-                    },
-                    color,
-                    bg: behind.to_u32(),
-                    fade: None,
-                    text,
-                });
+                let ink = self.theme.cursor;
+                self.push_glyph_text(x, baseline, 1, FontStyle::Regular, (ink, behind), text);
             }
             CursorShape::Lock => self.block_cursor(dr, cc, cursor.focused),
             CursorShape::Bar => self.list.push(DrawCmd::Fill {
@@ -1131,16 +1145,9 @@ impl Painter<'_> {
         if lit <= 0.0 {
             return;
         }
-        let view = scroll_column(surface, self.origin, self.metrics, rows);
-        let track = scroll_lane(view, self.scale).track;
-        let (content, viewport) = self.screen.scroll_extent();
-        let Some(full) = scroll::thumb(
-            track,
-            viewport,
-            content,
-            self.screen.scroll_position(),
-            scroll_min_thumb(self.scale),
-        ) else {
+        let lane = ScrollLane::new(surface, self.origin, self.metrics, rows, self.scale);
+        let track = lane.track;
+        let Some(full) = lane.thumb(self.screen) else {
             return;
         };
         let behind = self.theme.bg.to_u32();
@@ -1197,24 +1204,17 @@ impl Painter<'_> {
         // ignoring any selection so the cursor stays legible over a selection. It is
         // stamped over the cursor block, so that colour is the background the glyph
         // anti-aliasing is weighted against.
-        let (_, ink) = self.resolve(cell, false);
-        let face = FaceKey::Prose {
-            size: m.size,
-            style: style_of(cell.attrs),
-        };
-        let (color, bg) = (ink.to_u32(), self.theme.cursor.to_u32());
+        let ink = self.cell_bg_of(cell);
+        let style = style_of(cell.attrs);
+        let cursor = self.theme.cursor;
         if stands_alone(cell) {
-            self.list.push(DrawCmd::Text {
-                bounds: text_bounds(x, baseline, width_cells * m.w, m),
-                x,
-                baseline,
-                face,
-                color,
-                bg,
-                fade: None,
-                text,
-            });
+            self.push_glyph_text(x, baseline, width_cells, style, (ink, cursor), text);
         } else {
+            let face = FaceKey::Prose {
+                size: m.size,
+                style,
+            };
+            let (color, bg) = (ink.to_u32(), cursor.to_u32());
             push_owned_cells(self.list, text, x, baseline, 1, m, face, color, bg);
         }
     }
@@ -1291,16 +1291,13 @@ impl Painter<'_> {
 
     /// The resolved foreground colour of a cell (reverse and dim applied).
     ///
-    /// Deliberately not [`Self::resolve`]`(cell, false).0`. Both grounds resolve
-    /// through the theme, and the painter's two per-cell scans each want exactly one
-    /// of them — the background scan the background, the run scan the foreground — so
-    /// resolving the pair and dropping half doubled the theme lookups on the hottest
-    /// loops it has. [`Self::resolve`] stays for the callers that genuinely want both,
-    /// which run once per run or per row, not per cell.
+    /// Resolved on its own, not as half of a pair: both grounds go through the theme,
+    /// and the painter's two per-cell scans each want exactly one of them (the
+    /// background scan the background, the run scan the foreground), so resolving both
+    /// and dropping half doubled the theme lookups on the hottest loops it has.
     fn cell_fg(&self, cell: Cell) -> Rgb {
         // Reverse means the foreground is drawn from the cell's *background* colour;
-        // dim then darkens whichever one it landed on, exactly as `resolve` dims after
-        // it swaps.
+        // dim then darkens whichever one it landed on.
         let fg = if cell.attrs.contains(Attrs::REVERSE) {
             cell.bg.resolve(self.theme, Ground::Background)
         } else {
@@ -1412,7 +1409,7 @@ impl Painter<'_> {
         let Some((first, last)) = self.span_cols(hover, row) else {
             return;
         };
-        let fg = self.resolve(self.cell(row, first), false).0;
+        let fg = self.cell_fg(self.cell(row, first));
         let rect = self.underline_rect(
             self.cell_x(first),
             (last + 1 - first) as i32 * self.metrics.w,
@@ -1422,23 +1419,6 @@ impl Painter<'_> {
             rect,
             color: fg.to_u32(),
         });
-    }
-
-    /// Resolve a cell's `(fg, bg)` to concrete colours: reverse swaps the two, dim
-    /// darkens the foreground, and a selected cell takes the selection background.
-    fn resolve(&self, cell: Cell, selected: bool) -> (Rgb, Rgb) {
-        let mut fg = cell.fg.resolve(self.theme, Ground::Foreground);
-        let mut bg = cell.bg.resolve(self.theme, Ground::Background);
-        if cell.attrs.contains(Attrs::REVERSE) {
-            std::mem::swap(&mut fg, &mut bg);
-        }
-        if cell.attrs.contains(Attrs::DIM) {
-            fg = dim(fg);
-        }
-        if selected {
-            bg = SELECTION_BG;
-        }
-        (fg, bg)
     }
 
     /// Whether cell `(row, col)` has no combining marks (a blank base rune with no
@@ -1705,78 +1685,6 @@ mod tests {
     fn feed(s: &mut Screen, bytes: &[u8]) {
         let mut p = crate::vt::Parser::new();
         p.advance_bytes(s, bytes);
-    }
-
-    /// `cell_fg` and `cell_bg` each resolve one ground where [`Painter::resolve`]
-    /// resolves both, which is only sound if they arrive at the same colours it
-    /// would. Reverse and dim interact (dim lands on the foreground *after* reverse
-    /// has swapped the grounds, so it must never darken a background), and selection
-    /// overrides a background outright, so the agreement is asserted over every
-    /// combination of the attributes involved rather than argued for in a comment.
-    #[test]
-    fn the_split_grounds_resolve_exactly_as_the_pair_does() {
-        let screen = Screen::new(1, 1);
-        let theme = Theme::default();
-        let bar = Scrollbar::hidden();
-        let (mut list, mut strings) = (DisplayList::new(), Vec::new());
-        let painter = Painter {
-            screen: &screen,
-            theme: &theme,
-            bell: false,
-            metrics: M,
-            origin: (0, 0),
-            selection: None,
-            hover: None,
-            scale: Scale::ONE,
-            scrollbar: &bar,
-            list: &mut list,
-            strings: &mut strings,
-        };
-
-        let colors = [
-            Color::Default,
-            Color::Ansi(3),
-            Color::Indexed(200),
-            Color::Rgb(10, 20, 30),
-        ];
-        let attr_sets = [
-            Attrs::empty(),
-            Attrs::REVERSE,
-            Attrs::DIM,
-            Attrs::REVERSE | Attrs::DIM,
-            Attrs::BOLD | Attrs::REVERSE | Attrs::DIM,
-        ];
-        for fg in colors {
-            for bg in colors {
-                for attrs in attr_sets {
-                    let cell = Cell {
-                        rune: 'x',
-                        fg,
-                        bg,
-                        attrs,
-                        ..Cell::default()
-                    };
-                    let (want_fg, want_bg) = painter.resolve(cell, false);
-                    assert_eq!(
-                        painter.cell_fg(cell),
-                        want_fg,
-                        "foreground diverged for {fg:?} on {bg:?} with {attrs:?}"
-                    );
-                    assert_eq!(
-                        painter.cell_bg_of(cell),
-                        want_bg,
-                        "background diverged for {fg:?} on {bg:?} with {attrs:?}"
-                    );
-                    // And the reason `cell_bg` can answer a selected cell without
-                    // resolving anything at all.
-                    assert_eq!(
-                        painter.resolve(cell, true).1,
-                        SELECTION_BG,
-                        "a selected cell takes the tint whatever it holds"
-                    );
-                }
-            }
-        }
     }
 
     /// A bar at rest, for the frames that are not about the scrollbar: it is out of
@@ -2924,13 +2832,13 @@ mod tests {
         let thumb = thumb_of(&list).expect("a lit, scrollable screen draws a thumb");
         // It is drawn where a press would grab it, which is the whole contract between
         // the painter and the window's hit-test.
-        let view = scroll_column(
+        let lane = ScrollLane::new(
             (s.dimensions().0 as i32 * M.w, s.dimensions().1 as i32 * M.h),
             (0, 0),
             M,
             s.dimensions().1,
+            Scale::ONE,
         );
-        let lane = scroll_lane(view, Scale::ONE);
         assert!(
             thumb.x >= lane.grab.x && thumb.x + thumb.w <= lane.grab.x + lane.grab.w,
             "thumb {thumb:?} sits inside the grab band {:?}",
@@ -2969,13 +2877,14 @@ mod tests {
     fn the_thumb_travels_the_track_from_the_oldest_line_to_the_live_bottom() {
         let mut s = scrollable_screen();
         let bar = lit_bar();
-        let view = scroll_column(
+        let track = ScrollLane::new(
             (s.dimensions().0 as i32 * M.w, s.dimensions().1 as i32 * M.h),
             (0, 0),
             M,
             s.dimensions().1,
-        );
-        let track = scroll_lane(view, Scale::ONE).track;
+            Scale::ONE,
+        )
+        .track;
 
         // Pinned to the live bottom (view_offset 0): the thumb's bottom meets the track's.
         let bottom = thumb_of(&list_with_bar(&s, &bar)).expect("scrollable");

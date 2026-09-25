@@ -34,11 +34,10 @@ use crate::grid::{
 use crate::input;
 use crate::mouse::{self, MouseButton, MouseKind};
 use crate::platform::browser;
-use crate::platform::geom::Rect;
 use crate::platform::scroll::{self, Scrollbar};
 use crate::pty::{Launch, Pty, TtyMode, ZombieChild};
 use crate::render::display::DisplayList;
-use crate::term_render::{self, CellSpan, CursorRender, CursorShape, Selection};
+use crate::term_render::{self, CellSpan, CursorRender, CursorShape, ScrollLane, Selection};
 use crate::vt::Parser;
 
 /// The cursor blink half-period: how long each of the on/off phases lasts.
@@ -1589,25 +1588,13 @@ impl TerminalCore {
     /// The column the scrollbar hangs off: the grid's rows, out to the window's right
     /// edge. The painter derives the same rectangle from the same geometry, so the bar is
     /// grabbable exactly where it is drawn.
-    fn scroll_column(&self) -> Rect {
-        term_render::scroll_column(
+    fn scroll_lane(&self) -> ScrollLane {
+        ScrollLane::new(
             (self.geom.width as i32, self.geom.height as i32),
             (self.geom.pad, self.geom.origin_y),
             self.geom.metrics,
             self.screen.dimensions().1,
-        )
-    }
-
-    /// The thumb as it is drawn right now, or `None` when there is nothing to scroll.
-    fn scroll_thumb(&self) -> Option<Rect> {
-        let (content, viewport) = self.screen.scroll_extent();
-        let track = term_render::scroll_lane(self.scroll_column(), self.geom.scale).track;
-        scroll::thumb(
-            track,
-            viewport,
-            content,
-            self.screen.scroll_position(),
-            term_render::scroll_min_thumb(self.geom.scale),
+            self.geom.scale,
         )
     }
 
@@ -1621,10 +1608,7 @@ impl TerminalCore {
     /// Whether a device-pixel point is on the scrollbar, meaning a press there takes its
     /// thumb rather than starting a selection in the grid beneath it.
     pub(super) fn on_scrollbar(&self, x: f32, y: f32) -> bool {
-        self.scrollable()
-            && term_render::scroll_lane(self.scroll_column(), self.geom.scale)
-                .grab
-                .contains(x, y)
+        self.scrollable() && self.scroll_lane().grab.contains(x, y)
     }
 
     /// Follow the pointer with the bar: inside its proximity zone it grows into a slider,
@@ -1633,12 +1617,8 @@ impl TerminalCore {
         if self.scrollbar.grab().is_some() {
             return;
         }
-        let near = self.scrollable()
-            && at.is_some_and(|(x, y)| {
-                term_render::scroll_lane(self.scroll_column(), self.geom.scale)
-                    .zone
-                    .contains(x, y)
-            });
+        let near =
+            self.scrollable() && at.is_some_and(|(x, y)| self.scroll_lane().zone.contains(x, y));
         if self.scrollbar.set_near(near) {
             self.dirty = true;
         }
@@ -1652,7 +1632,7 @@ impl TerminalCore {
         if !self.on_scrollbar(x, y) {
             return false;
         }
-        let Some(thumb) = self.scroll_thumb() else {
+        let Some(thumb) = self.scroll_lane().thumb(&self.screen) else {
             return false;
         };
         // On the thumb, the grab keeps its offset so it does not jump under the finger;
@@ -1671,11 +1651,12 @@ impl TerminalCore {
     /// the view to match. The scroll lands on a whole line, which is the only place a
     /// terminal view can rest.
     pub(super) fn drag_scrollbar(&mut self, y: f32) {
-        let (Some(grab), Some(thumb)) = (self.scrollbar.grab(), self.scroll_thumb()) else {
+        let lane = self.scroll_lane();
+        let (Some(grab), Some(thumb)) = (self.scrollbar.grab(), lane.thumb(&self.screen)) else {
             return;
         };
         let (content, viewport) = self.screen.scroll_extent();
-        let track = term_render::scroll_lane(self.scroll_column(), self.geom.scale).track;
+        let track = lane.track;
         let at = self.screen.scroll_position();
         let to = scroll::scroll_at_thumb(track, thumb.h, viewport, content, y as i32 - grab);
         if to == at {
