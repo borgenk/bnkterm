@@ -4445,6 +4445,9 @@ fn a_program_reset_returns_to_the_configured_colours() {
         "configured cursor"
     );
 
+    // Set the foreground again, so the palette reset below has a *live* named colour
+    // to leave alone rather than one that already matches the configuration.
+    feed(&mut s, b"\x1b]10;#ff0000\x07\x1b]4;1;#010203\x07");
     feed(&mut s, b"\x1b]104\x07");
     assert_eq!(
         s.theme().indexed(1),
@@ -4453,7 +4456,7 @@ fn a_program_reset_returns_to_the_configured_colours() {
     );
     assert_eq!(
         s.theme().fg,
-        Rgb::new(0x11, 0x22, 0x33),
+        Rgb::new(0xff, 0, 0),
         "and leaves the named colours alone, as OSC 104 must"
     );
 }

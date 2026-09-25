@@ -178,7 +178,7 @@ pub(super) struct Saved {
 
 /// The character set shift state: what G0 and G1 are designated as, and which one GL
 /// reads through (SI selects G0, SO selects G1).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(super) struct Charsets {
     pub(super) g0: Charset,
     pub(super) g1: Charset,

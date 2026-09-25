@@ -164,30 +164,41 @@ impl Screen {
     /// the foreground and then the background), so the payload is a list, and each field
     /// steps to the next colour in the sequence fg → bg → cursor.
     pub(super) fn osc_named_color(&mut self, first: NamedColor, pt: &[u8], bel: bool) {
-        let mut which = Some(first);
-        for field in pt.split(|&b| b == b';') {
-            let Some(target) = which else { break };
-            let slot = match target {
-                NamedColor::Foreground => &mut self.theme.fg,
-                NamedColor::Background => &mut self.theme.bg,
-                NamedColor::Cursor => &mut self.theme.cursor,
-            };
+        let from = NamedColor::ALL
+            .iter()
+            .position(|c| *c == first)
+            .unwrap_or(0);
+        for (target, field) in NamedColor::ALL[from..].iter().zip(pt.split(|&b| b == b';')) {
+            let slot = self.named_color_mut(*target);
             if field == b"?" {
-                let (color, code) = (*slot, osc_color_code(target));
+                let color = *slot;
                 self.respond(b"\x1b]");
-                push_decimal(&mut self.responses, code);
+                push_decimal(&mut self.responses, *target as u32);
                 self.responses.push(b';');
                 color::write_x11_color(color, &mut self.responses);
                 self.end_osc(bel);
             } else if let Some(color) = color::parse_x11_color(field) {
                 *slot = color;
             }
-            which = match target {
-                NamedColor::Foreground => Some(NamedColor::Background),
-                NamedColor::Background => Some(NamedColor::Cursor),
-                NamedColor::Cursor => None,
-            };
         }
+    }
+
+    /// The theme slot a named colour names.
+    fn named_color_mut(&mut self, which: NamedColor) -> &mut crate::color::Rgb {
+        match which {
+            NamedColor::Foreground => &mut self.theme.fg,
+            NamedColor::Background => &mut self.theme.bg,
+            NamedColor::Cursor => &mut self.theme.cursor,
+        }
+    }
+
+    /// `OSC 110/111/112`: put one named colour back to what the configuration set.
+    pub(super) fn reset_named_color(&mut self, which: NamedColor) {
+        *self.named_color_mut(which) = match which {
+            NamedColor::Foreground => self.base_theme.fg,
+            NamedColor::Background => self.base_theme.bg,
+            NamedColor::Cursor => self.base_theme.cursor,
+        };
     }
 
     /// `OSC 4 ; index ; spec` sets a palette entry; `OSC 4 ; index ; ?` queries one.
@@ -215,13 +226,7 @@ impl Screen {
     /// is empty.
     pub(super) fn osc_reset_palette(&mut self, pt: &[u8]) {
         if pt.is_empty() {
-            let (fg, bg, cursor) = (self.theme.fg, self.theme.bg, self.theme.cursor);
             self.theme.reset_palette(&self.base_theme);
-            // `OSC 104` is about the *indexed* palette; the three named colours have
-            // their own resets (110/111/112) and must survive this one.
-            self.theme.fg = fg;
-            self.theme.bg = bg;
-            self.theme.cursor = cursor;
             return;
         }
         for field in pt.split(|&b| b == b';') {
@@ -413,15 +418,6 @@ impl Screen {
     /// app drains this after each parse batch, exactly as it drains query replies.
     pub fn take_clipboard_writes(&mut self) -> Vec<(ClipboardTarget, Vec<u8>)> {
         std::mem::take(&mut self.clipboard_writes)
-    }
-}
-
-/// The OSC number that names each colour, for building a reply.
-pub(super) fn osc_color_code(which: NamedColor) -> u32 {
-    match which {
-        NamedColor::Foreground => 10,
-        NamedColor::Background => 11,
-        NamedColor::Cursor => 12,
     }
 }
 

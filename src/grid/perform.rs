@@ -22,10 +22,10 @@ use super::*;
 impl Screen {
     /// The charset GL currently maps through (G0 or G1).
     pub(super) fn active_charset(&self) -> Charset {
-        if self.gl_is_g1 {
-            self.g1
+        if self.charsets.gl_is_g1 {
+            self.charsets.g1
         } else {
-            self.g0
+            self.charsets.g0
         }
     }
 
@@ -123,14 +123,14 @@ impl Perform for Screen {
 
     fn execute(&mut self, byte: u8) {
         match byte {
-            0x08 => self.backspace(),        // BS
-            0x09 => self.tab(),              // HT
-            0x0a..=0x0c => self.line_feed(), // LF, VT, FF
-            0x0d => self.carriage_return(),  // CR
-            0x0e => self.gl_is_g1 = true,    // SO (shift out to G1)
-            0x0f => self.gl_is_g1 = false,   // SI (shift in to G0)
-            0x07 => self.bell = true,        // BEL
-            _ => {}                          // NUL, XON/XOFF, ...: nothing to draw
+            0x08 => self.backspace(),               // BS
+            0x09 => self.tab(),                     // HT
+            0x0a..=0x0c => self.line_feed(),        // LF, VT, FF
+            0x0d => self.carriage_return(),         // CR
+            0x0e => self.charsets.gl_is_g1 = true,  // SO (shift out to G1)
+            0x0f => self.charsets.gl_is_g1 = false, // SI (shift in to G0)
+            0x07 => self.bell = true,               // BEL
+            _ => {}                                 // NUL, XON/XOFF, ...: nothing to draw
         }
         // Whatever it did, it was not printing: there is nothing left for REP to repeat.
         self.last_printed = None;
@@ -241,9 +241,9 @@ impl Perform for Screen {
                 b'>' => self.keypad_app = false, // DECKPNM
                 _ => {}
             },
-            Some(b'(') => self.g0 = charset_from(byte), // designate G0
-            Some(b')') => self.g1 = charset_from(byte), // designate G1
-            Some(b'#') if byte == b'8' => self.decaln(), // DECALN
+            Some(b'(') => self.charsets.g0 = charset_from(byte), // designate G0
+            Some(b')') => self.charsets.g1 = charset_from(byte), // designate G1
+            Some(b'#') if byte == b'8' => self.decaln(),         // DECALN
             _ => {}
         }
     }
@@ -275,9 +275,9 @@ impl Perform for Screen {
             b"52" => self.osc_clipboard(pt),
             b"104" => self.osc_reset_palette(pt),
             b"133" => self.osc_shell_mark(pt),
-            b"110" => self.theme.fg = self.base_theme.fg,
-            b"111" => self.theme.bg = self.base_theme.bg,
-            b"112" => self.theme.cursor = self.base_theme.cursor,
+            b"110" => self.reset_named_color(NamedColor::Foreground),
+            b"111" => self.reset_named_color(NamedColor::Background),
+            b"112" => self.reset_named_color(NamedColor::Cursor),
             _ => {}
         }
     }

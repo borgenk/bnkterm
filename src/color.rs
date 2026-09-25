@@ -153,10 +153,11 @@ impl Theme {
         self.palette[usize::from(i)] = base.palette[usize::from(i)];
     }
 
-    /// Put the whole palette, and the three named colors, back (`OSC 104` with no
-    /// parameter, and `OSC 110`/`111`/`112`).
+    /// Put every indexed entry back to its power-on value (`OSC 104` with no parameter).
+    /// The named colours are not indexed entries and keep their own resets
+    /// (`OSC 110`/`111`/`112`).
     pub fn reset_palette(&mut self, base: &Theme) {
-        *self = *base;
+        self.palette = base.palette;
     }
 }
 

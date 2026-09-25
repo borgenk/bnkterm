@@ -405,7 +405,7 @@ impl Screen {
     /// mapping back. Without that, every letter it prints afterwards comes out as box
     /// glyphs.
     pub fn save_cursor(&mut self) {
-        let (pen, origin, charsets) = (self.pen, self.origin_mode, self.charsets());
+        let (pen, origin, charsets) = (self.pen, self.origin_mode, self.charsets);
         let b = self.active_mut();
         b.saved = Some(Saved {
             cursor: b.cursor,
@@ -422,7 +422,7 @@ impl Screen {
             Some(s) => {
                 self.pen = s.pen;
                 self.origin_mode = s.origin;
-                self.set_charsets(s.charsets);
+                self.charsets = s.charsets;
                 let b = self.active_mut();
                 b.cursor = s.cursor;
                 b.cursor.row = b.cursor.row.min(b.rows - 1);
@@ -430,20 +430,6 @@ impl Screen {
             }
             None => self.move_to(0, 0),
         }
-    }
-
-    pub(super) fn charsets(&self) -> Charsets {
-        Charsets {
-            g0: self.g0,
-            g1: self.g1,
-            gl_is_g1: self.gl_is_g1,
-        }
-    }
-
-    pub(super) fn set_charsets(&mut self, c: Charsets) {
-        self.g0 = c.g0;
-        self.g1 = c.g1;
-        self.gl_is_g1 = c.gl_is_g1;
     }
 
     /// Apply an SGR sequence, updating the pen. An empty parameter list is a reset
@@ -784,9 +770,7 @@ impl Screen {
         self.autowrap = true; // xterm, not DEC. See above.
         self.app_cursor_keys = false;
         self.keypad_app = false;
-        self.g0 = Charset::Ascii;
-        self.g1 = Charset::Ascii;
-        self.gl_is_g1 = false;
+        self.charsets = Charsets::default();
         let b = self.active_mut();
         b.saved = None;
         // The margins go back to the full screen, but *without* homing the cursor the

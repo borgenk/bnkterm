@@ -58,7 +58,7 @@ mod tests;
 
 // The sibling modules reach these through `use super::*`, so this is the one list of what
 // the whole grid speaks — including the two `buffer` types `Screen`'s own fields name.
-use buffer::{Buffer, Pen};
+use buffer::{Buffer, Charsets, Pen};
 
 use crate::color::{self, Color, Theme};
 use crate::input::{KittyFlags, ModifyOtherKeys};
@@ -907,8 +907,9 @@ impl CursorAppearance {
 
 /// A designated character set. bnkterm supports ASCII and the DEC Special
 /// Graphics (line-drawing) set, which is what box-drawing TUIs rely on.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum Charset {
+    #[default]
     Ascii,
     DecSpecialGraphics,
 }
@@ -1063,9 +1064,7 @@ pub struct Screen {
     app_cursor_keys: bool, // DECCKM (?1)
     keypad_app: bool,      // DECKPAM/DECKPNM, for the input encoder (phase 3)
     /// The two designated charsets and whether GL points at G1 (SO) not G0 (SI).
-    g0: Charset,
-    g1: Charset,
-    gl_is_g1: bool,
+    charsets: Charsets,
     title: String,
     /// How many lines the *view* is scrolled up into the primary scrollback (0 =
     /// pinned to the live bottom). A display concern, not terminal state: writes
@@ -1202,12 +1201,23 @@ pub struct Screen {
     pixel_size: (u32, u32),
 }
 
-/// Which of the three named colours an `OSC 10/11/12` is about.
+/// Which of the three named colours an `OSC 10/11/12` is about. The discriminant is
+/// the OSC number itself, which is what a query echoes back, and `ALL` is the order a
+/// multi-field sequence steps through (`OSC 10 ; ? ; ?` asks fg then bg).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
 enum NamedColor {
-    Foreground,
-    Background,
-    Cursor,
+    Foreground = 10,
+    Background = 11,
+    Cursor = 12,
+}
+
+impl NamedColor {
+    const ALL: [NamedColor; 3] = [
+        NamedColor::Foreground,
+        NamedColor::Background,
+        NamedColor::Cursor,
+    ];
 }
 
 /// A prompt the shell marked, and the fate of the command typed at it.
@@ -1275,9 +1285,7 @@ impl Screen {
             bracketed_paste: false,
             app_cursor_keys: false,
             keypad_app: false,
-            g0: Charset::Ascii,
-            g1: Charset::Ascii,
-            gl_is_g1: false,
+            charsets: Charsets::default(),
             title: String::new(),
             view_offset: 0,
             epoch: RowEpoch::default(),
