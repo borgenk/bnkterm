@@ -91,37 +91,6 @@ pub fn all_printable(bytes: &[u8]) -> bool {
     printable_run_len(bytes) == bytes.len()
 }
 
-/// A bounds-checked forward cursor over a borrowed byte slice: the shared
-/// mechanics behind the wire and store readers. It only hands out sub-slices and
-/// advances past them, never decoding integers itself, so each format layers its
-/// own endianness and error messages on top.
-///
-/// That separation is load-bearing: `wire` reads native-endian and `store` reads
-/// little-endian, so their decoders are only interchangeable on little-endian
-/// targets. This program is exactly that (`ffi.rs` restricts it to Linux
-/// x86_64/arm64), but keeping the integer decoding in each wrapper means this
-/// cursor stays correct even if that ever changes.
-pub struct Cursor<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Cursor<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-
-    /// The next `n` bytes, advancing the cursor past them, or `None` when fewer
-    /// than `n` bytes remain (the cursor is left unmoved). The caller turns
-    /// `None` into its own format-specific error.
-    pub fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(n)?;
-        let slice = self.data.get(self.pos..end)?;
-        self.pos = end;
-        Some(slice)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,26 +157,5 @@ mod tests {
                 assert_eq!(printable_run_len(&buf), bad_at);
             }
         }
-    }
-
-    #[test]
-    fn cursor_takes_in_bounds_and_tracks_position() {
-        let mut c = Cursor::new(&[1, 2, 3, 4, 5]);
-        assert_eq!(c.take(2), Some(&[1, 2][..]));
-        assert_eq!(c.take(3), Some(&[3, 4, 5][..]));
-        // Zero-length reads are always fine and stay put.
-        assert_eq!(c.take(0), Some(&[][..]));
-        assert_eq!(c.take(1), None);
-    }
-
-    #[test]
-    fn cursor_rejects_overrun_without_advancing() {
-        let mut c = Cursor::new(&[1, 2, 3]);
-        assert_eq!(c.take(2), Some(&[1, 2][..]));
-        // One byte left, asking for two leaves the cursor unmoved.
-        assert_eq!(c.take(2), None);
-        // A length that would overflow the offset is rejected too.
-        assert_eq!(c.take(usize::MAX), None);
-        assert_eq!(c.take(1), Some(&[3][..]));
     }
 }

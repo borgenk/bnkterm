@@ -99,24 +99,32 @@ fn encode_str(buf: &mut Vec<u8>, s: &str) {
     }
 }
 
-/// Sequential reader over an event's argument bytes. Wraps the shared
-/// bounds-checked [`crate::platform::bytes::Cursor`], decoding each argument in native byte
-/// order (the wire format is host-endian).
+/// Sequential reader over an event's argument bytes, bounds-checked, decoding each
+/// argument in native byte order (the wire format is host-endian).
 pub struct Reader<'a> {
-    cursor: crate::platform::bytes::Cursor<'a>,
+    data: &'a [u8],
+    pos: usize,
 }
 
 impl<'a> Reader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Self {
-            cursor: crate::platform::bytes::Cursor::new(data),
-        }
+        Self { data, pos: 0 }
     }
 
+    /// The next `n` bytes, advancing past them. A short message is an error and leaves
+    /// the reader where it was, so a caller that recovers reads the same bytes again
+    /// rather than a shifted view of them.
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        self.cursor
-            .take(n)
-            .ok_or_else(|| Error::msg("truncated wayland message"))
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| Error::msg("truncated wayland message"))?;
+        let slice = self
+            .data
+            .get(self.pos..end)
+            .ok_or_else(|| Error::msg("truncated wayland message"))?;
+        self.pos = end;
+        Ok(slice)
     }
 
     pub fn u32(&mut self) -> Result<u32> {
@@ -252,6 +260,15 @@ mod tests {
     fn reader_rejects_truncation() {
         let mut r = Reader::new(&[0u8, 0, 0]);
         assert!(r.u32().is_err());
+
+        // A refused read leaves the position alone, so the three bytes are still
+        // there to be read another way. A length that would overflow the offset is
+        // refused too, rather than wrapping into an in-bounds slice.
+        let mut r = Reader::new(&[1u8, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(r.u32().unwrap(), u32::from_ne_bytes([1, 2, 3, 4]));
+        assert!(r.u32().is_err(), "three bytes left, four wanted");
+        assert!(r.take(usize::MAX).is_err());
+        assert_eq!(r.take(3).unwrap(), &[5, 6, 7]);
     }
 
     #[test]
