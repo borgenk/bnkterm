@@ -495,34 +495,18 @@ fn arc(cv: &mut Canvas, corner_x: i32, corner_y: i32) {
     }
     let direction_x = if corner_x == 0 { -1.0 } else { 1.0 };
     let direction_y = if corner_y == 0 { -1.0 } else { 1.0 };
-    const SS: i32 = 4;
-    for y in 0..h {
-        for x in 0..w {
-            let mut hits = 0;
-            for sy in 0..SS {
-                for sx in 0..SS {
-                    let px = x as f32 + (sx as f32 + 0.5) / SS as f32;
-                    let py = y as f32 + (sy as f32 + 0.5) / SS as f32;
-                    let dx = r - (px - cx) * direction_x;
-                    let dy = r - (py - cy) * direction_y;
-                    let distance = if dx < 0.0 {
-                        (py - cy).abs()
-                    } else if dy < 0.0 {
-                        (px - cx).abs()
-                    } else {
-                        ((dx * dx + dy * dy).sqrt() - r).abs()
-                    };
-                    if distance <= hw {
-                        hits += 1;
-                    }
-                }
-            }
-            if hits > 0 {
-                let v = (hits * 255 / (SS * SS)) as u8;
-                cv.blend(x, y, v);
-            }
-        }
-    }
+    supersample(cv, |px, py| {
+        let dx = r - (px - cx) * direction_x;
+        let dy = r - (py - cy) * direction_y;
+        let distance = if dx < 0.0 {
+            (py - cy).abs()
+        } else if dy < 0.0 {
+            (px - cx).abs()
+        } else {
+            ((dx * dx + dy * dy).sqrt() - r).abs()
+        };
+        distance <= hw
+    });
 }
 
 /// A corner-to-corner diagonal stroke, `rising` is bottom-left→top-right (`╱`),
@@ -541,29 +525,37 @@ fn diagonal(cv: &mut Canvas, rising: bool) {
     let (ex, ey) = (bx - ax, by - ay);
     let len2 = ex * ex + ey * ey;
     let half = light(w, h) as f32 / 2.0;
+    supersample(cv, |px, py| {
+        // Distance from the point to the (infinite, len2>0) line through A→B; the
+        // segment spans the whole cell diagonal so clamping to endpoints is
+        // unnecessary.
+        let t = ((px - ax) * ex + (py - ay) * ey) / len2;
+        let projx = ax + t * ex;
+        let projy = ay + t * ey;
+        (px - projx).powi(2) + (py - projy).powi(2) <= half * half
+    });
+}
+
+/// Blend every pixel of `cv` by how much of it `inside` covers, sampled on a 4x4 grid of
+/// sub-pixel centres. The coverage is a count of hits out of sixteen, so a curve or a
+/// slope gets a soft edge instead of a staircase; a pixel no sample lands in is left
+/// alone rather than blended with zero.
+fn supersample(cv: &mut Canvas, inside: impl Fn(f32, f32) -> bool) {
     const SS: i32 = 4;
-    for y in 0..h {
-        for x in 0..w {
+    for y in 0..cv.h {
+        for x in 0..cv.w {
             let mut hits = 0;
             for sy in 0..SS {
                 for sx in 0..SS {
                     let px = x as f32 + (sx as f32 + 0.5) / SS as f32;
                     let py = y as f32 + (sy as f32 + 0.5) / SS as f32;
-                    // Distance from the point to the (infinite, len2>0) line
-                    // through A→B; the segment spans the whole cell diagonal so
-                    // clamping to endpoints is unnecessary.
-                    let t = ((px - ax) * ex + (py - ay) * ey) / len2;
-                    let projx = ax + t * ex;
-                    let projy = ay + t * ey;
-                    let dd = (px - projx).powi(2) + (py - projy).powi(2);
-                    if dd <= half * half {
+                    if inside(px, py) {
                         hits += 1;
                     }
                 }
             }
             if hits > 0 {
-                let v = (hits * 255 / (SS * SS)) as u8;
-                cv.blend(x, y, v);
+                cv.blend(x, y, (hits * 255 / (SS * SS)) as u8);
             }
         }
     }

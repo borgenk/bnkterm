@@ -24,6 +24,7 @@ use crate::error::{Error, Result};
 use crate::platform::conn::Connection;
 use crate::platform::dmabuf;
 use crate::platform::ffi;
+use crate::platform::geom::Rect;
 use crate::platform::protocol::{
     self, wl_buffer, wl_display, wl_surface, wp_linux_drm_syncobj_manager_v1,
     wp_linux_drm_syncobj_surface_v1, wp_viewport, xdg_surface, zwp_linux_buffer_params_v1,
@@ -174,9 +175,9 @@ pub(super) struct GpuPresentation {
     pub(super) lists: term_render::DisplayListPool,
     /// The reused GPU frame data (vertices/batches), refilled in place each frame.
     pub(super) frame_scratch: gpu::FrameData,
-    /// The reused damage-diff scratch, so computing the changed regions each frame
+    /// The reused damage-diff output, so computing the changed regions each frame
     /// refills one rectangle buffer instead of allocating a fresh one.
-    pub(super) damage_scratch: display::DamageScratch,
+    pub(super) damage: Vec<Rect>,
     /// Record the capture copy into the next frame. Cleared once it is written.
     pub(super) capture: bool,
     pub(super) frame_count: u64,
@@ -631,14 +632,14 @@ impl State {
             self.presentation.lists.back(),
             sw,
             sh,
-            &mut self.presentation.damage_scratch,
+            &mut self.presentation.damage,
         );
         // Ack the latest configure paired with this commit, so the buffer the
         // compositor sees is always the one sized to the configure it just acked;
         // that is what keeps an anchored resize edge from jumping. Taken here so
         // it rides the same flush as the commit below.
         let ack = self.pending_configure.take();
-        if self.presentation.damage_scratch.rects().is_empty() {
+        if self.presentation.damage.is_empty() {
             // Nothing new to draw, but a pending configure must still be acked so
             // the compositor can finalize a state-only change; a bare commit
             // applies it against the current, already correctly sized buffer.
@@ -720,7 +721,7 @@ impl State {
         // diff, which works in the same device pixels the buffer is drawn in, and
         // `wl_surface.damage` would read them as surface-local (logical) coordinates.
         // The two spaces coincide only at scale 1.0.
-        for r in self.presentation.damage_scratch.rects() {
+        for r in &self.presentation.damage {
             self.conn.request(
                 self.surface,
                 wl_surface::DAMAGE_BUFFER,

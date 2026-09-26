@@ -61,12 +61,12 @@
 
 use crate::color::{Ground, Rgb, Theme};
 use crate::grid::{AbsRow, Attrs, Cell, RowEpoch, Screen, UnderlineStyle};
-use crate::platform::freetype::{FaceKey, FontStyle, Fonts};
+use crate::platform::freetype::{FaceKey, FontStyle, Fonts, Metrics};
 use crate::platform::geom::{Rect, Scale};
 use crate::platform::grapheme;
-use crate::platform::pixel;
 use crate::platform::scroll::{self, Scrollbar};
 use crate::render::display::{DisplayList, DrawCmd, Fade};
+use crate::width;
 
 /// The glyph whose advance defines the monospace cell width. `M` is the classic
 /// full-width reference; on a genuine monospace face every glyph shares it.
@@ -129,9 +129,8 @@ pub fn bell_background(theme: &Theme, bell: bool) -> Rgb {
 
 /// The bar's ink, and the coverages it is tinted onto the theme background at: the
 /// resting thumb, the thumb once the pointer has lifted it, and the trough behind it.
-/// The fade is these falling to zero (the display list has no alpha; see
-/// [`crate::platform::pixel::tint`]).
-const SCROLL_INK: u32 = 0x00cf_d8e3;
+/// The fade is these falling to zero (see [`Painter::scroll_tint`]).
+const SCROLL_INK: Rgb = Rgb::new(0xcf, 0xd8, 0xe3);
 const SCROLL_THUMB_COVER: f32 = 0.20;
 const SCROLL_THUMB_HOVER_COVER: f32 = 0.36;
 const SCROLL_TROUGH_COVER: f32 = 0.05;
@@ -147,7 +146,7 @@ pub struct CellMetrics {
     /// Cell height: the baseline-to-baseline line height.
     pub h: i32,
     /// Pixels from the top of a cell down to the baseline: where the text sits in
-    /// the cell. This is *not* the ascent (see [`Metrics`](crate::platform::freetype::Metrics)) — the font's line gap
+    /// the cell. This is *not* the ascent (see [`Metrics`]) — the font's line gap
     /// lies between the two, and mistaking one for the other rides the text up
     /// against the cell's top edge.
     pub baseline: i32,
@@ -167,31 +166,20 @@ pub struct CellMetrics {
 }
 
 impl CellMetrics {
-    /// Measure the cell box from the opened fonts at `size`: the line height for
-    /// the row pitch and the regular face's reference-glyph advance for the column
-    /// pitch, each rounded to a whole pixel (a fractional pitch is what drifts a
-    /// grid). Width and height are clamped to at least one pixel so a degenerate
-    /// face can never produce a zero-area cell.
+    /// Measure the cell box from the opened fonts at `size`: the line height for the row
+    /// pitch and the regular face's reference-glyph advance for the column pitch.
     pub fn from_fonts(fonts: &Fonts, size: u32) -> Self {
-        let m = fonts.metrics(size);
         let advance = fonts
             .face(size, FontStyle::Regular)
             .advance(REFERENCE_GLYPH);
-        CellMetrics {
-            size,
-            w: (advance.round() as i32).max(1),
-            h: m.line_height.max(1),
-            baseline: m.baseline,
-            ascent: m.ascent,
-            descent: m.descent,
-            lock_glyph: fonts.covers(
-                FaceKey::Prose {
-                    size,
-                    style: FontStyle::Regular,
-                },
-                LOCK_GLYPH,
-            ),
-        }
+        let lock_glyph = fonts.covers(
+            FaceKey::Prose {
+                size,
+                style: FontStyle::Regular,
+            },
+            LOCK_GLYPH,
+        );
+        Self::measure(size, fonts.metrics(size), advance, lock_glyph)
     }
 
     /// The vertical box for the proportional interface face at `size`: its own
@@ -200,8 +188,25 @@ impl CellMetrics {
     /// but proportional UI text is placed by each glyph's real advance, not this
     /// pitch, so it is not a cell width.
     pub fn from_ui(fonts: &Fonts, size: u32) -> Self {
-        let m = fonts.ui_metrics(size);
         let advance = fonts.ui_face(size, FontStyle::Regular).advance('n');
+        // The chrome never draws a cursor, and lock coverage comes from the fallback
+        // chain, not this face, so it resolves the same either way. Measuring it rather
+        // than hardcoding `false` keeps the two constructors from disagreeing.
+        let lock_glyph = fonts.covers(
+            FaceKey::Ui {
+                size,
+                style: FontStyle::Regular,
+            },
+            LOCK_GLYPH,
+        );
+        Self::measure(size, fonts.ui_metrics(size), advance, lock_glyph)
+    }
+
+    /// The cell box the two constructors share: the font's own vertical metrics, the
+    /// given advance rounded to a whole pixel for the column pitch (a fractional pitch is
+    /// what drifts a grid), and both pitches floored at one pixel so a degenerate face
+    /// can never produce a zero-area cell.
+    fn measure(size: u32, m: Metrics, advance: f32, lock_glyph: bool) -> Self {
         CellMetrics {
             size,
             w: (advance.round() as i32).max(1),
@@ -209,16 +214,7 @@ impl CellMetrics {
             baseline: m.baseline,
             ascent: m.ascent,
             descent: m.descent,
-            // The chrome never draws a cursor, and lock coverage comes from the fallback
-            // chain, not this face, so it resolves the same either way. Measuring it
-            // rather than hardcoding `false` keeps the two constructors from disagreeing.
-            lock_glyph: fonts.covers(
-                FaceKey::Ui {
-                    size,
-                    style: FontStyle::Regular,
-                },
-                LOCK_GLYPH,
-            ),
+            lock_glyph,
         }
     }
 
@@ -491,15 +487,9 @@ impl DisplayListPool {
     /// Recycle the back buffer's run strings into the pool and empty it (keeping its
     /// capacity), then hand back that empty buffer and the pool to fill.
     pub fn begin(&mut self) -> (&mut DisplayList, &mut Vec<String>) {
-        let back = self.front ^ 1;
-        let buf = &mut self.buffers[back];
-        let strings = &mut self.strings;
-        for cmd in buf.drain(..) {
-            if let Some(s) = cmd.into_text_buf() {
-                strings.push(s);
-            }
-        }
-        (buf, strings)
+        let buf = &mut self.buffers[self.front ^ 1];
+        salvage(buf, &mut self.strings);
+        (buf, &mut self.strings)
     }
 
     /// The on-screen list (the previous frame): the differ's `old` side.
@@ -520,15 +510,20 @@ impl DisplayListPool {
     /// Forget both frames (a resize wiped the buffers): recycle their strings and
     /// clear them, so the next diff sees an empty prev and repaints in full.
     pub fn reset(&mut self) {
-        let strings = &mut self.strings;
         for buf in &mut self.buffers {
-            for cmd in buf.drain(..) {
-                if let Some(s) = cmd.into_text_buf() {
-                    strings.push(s);
-                }
-            }
+            salvage(buf, &mut self.strings);
         }
         self.front = 0;
+    }
+}
+
+/// Empty `buf` (keeping its capacity) and move the text buffers its commands held into
+/// `strings`, ready for the next frame to draw from.
+fn salvage(buf: &mut DisplayList, strings: &mut Vec<String>) {
+    for cmd in buf.drain(..) {
+        if let Some(s) = cmd.into_text_buf() {
+            strings.push(s);
+        }
     }
 }
 
@@ -609,18 +604,6 @@ struct Painter<'a> {
 }
 
 impl Painter<'_> {
-    /// A cleared string buffer from the recycle pool, or a fresh empty one when the
-    /// pool is dry. Every run and glyph text is drawn from here so the frame reuses
-    /// the buffers the previous frame retired.
-    fn take_string(&mut self) -> String {
-        take_string(self.strings)
-    }
-
-    /// Recycle a buffer already large enough for the coming run when possible.
-    fn take_string_with_capacity(&mut self, min_capacity: usize) -> String {
-        take_string_with_capacity(self.strings, min_capacity)
-    }
-
     /// The left pixel of column `col`, from the content origin.
     fn cell_x(&self, col: usize) -> i32 {
         self.origin.0 + col as i32 * self.metrics.w
@@ -765,7 +748,7 @@ impl Painter<'_> {
         // buffer that fits, and uniform sizes are what make that probe hit first try.
         // It is a hint either way — combining marks push more chars than there are
         // cells, so no bound here is exact.
-        let mut text = self.take_string_with_capacity(cols - col);
+        let mut text = take_string_with_capacity(self.strings, cols - col);
         // Bytes and cell count up to and including the last cell with ink, so a
         // trailing blank never lands in the emitted text.
         let mut inked_bytes = 0;
@@ -1011,7 +994,7 @@ impl Painter<'_> {
     /// Push one glyph as a [`DrawCmd::Text`] spanning `width_cells` columns from `x`.
     /// The shape every standalone glyph takes: a wide character, the glyph stamped
     /// inside a block cursor, and the lock all differ only in their colours and in what
-    /// they put in `text` (which the caller filled from [`Self::take_string`]).
+    /// they put in `text` (which the caller filled from [`take_string`]).
     fn push_glyph_text(
         &mut self,
         x: i32,
@@ -1044,7 +1027,7 @@ impl Painter<'_> {
         let (fg, bg) = (self.cell_fg(cell), self.cell_bg_of(cell));
         let shown = self.shown(row, col, cell);
         if shown.inked {
-            let mut text = self.take_string();
+            let mut text = take_string(self.strings);
             text.push(shown.rune);
             if shown.marks {
                 text.extend(self.marks(row, col));
@@ -1106,7 +1089,7 @@ impl Painter<'_> {
                     color: behind.to_u32(),
                 });
                 let baseline = self.baseline(dr);
-                let mut text = self.take_string();
+                let mut text = take_string(self.strings);
                 text.push(LOCK_GLYPH);
                 let ink = self.theme.cursor;
                 self.push_glyph_text(x, baseline, 1, FontStyle::Regular, (ink, behind), text);
@@ -1150,14 +1133,13 @@ impl Painter<'_> {
         let Some(full) = lane.thumb(self.screen) else {
             return;
         };
-        let behind = self.theme.bg.to_u32();
         let grown = self.scrollbar.wide();
         // The bar grows out of the window edge: the thumb keeps its right edge and widens
         // leftward, and the trough appears under it as it goes.
         if grown > 0.0 {
             self.list.push(DrawCmd::Fill {
                 rect: track,
-                color: pixel::tint(behind, SCROLL_INK, SCROLL_TROUGH_COVER * grown * lit),
+                color: self.scroll_tint(SCROLL_TROUGH_COVER * grown * lit),
             });
         }
         let (thin, wide) = (self.scale.px(SCROLL_THIN), self.scale.px(SCROLL_WIDE));
@@ -1172,9 +1154,19 @@ impl Painter<'_> {
         let cover = SCROLL_THUMB_COVER + (SCROLL_THUMB_HOVER_COVER - SCROLL_THUMB_COVER) * grown;
         self.list.push(DrawCmd::RoundRect {
             rect,
-            color: pixel::tint(behind, SCROLL_INK, cover * lit),
+            color: self.scroll_tint(cover * lit),
             radius: w / 2,
         });
+    }
+
+    /// [`SCROLL_INK`] over the theme background at coverage `a` in 0..=1.
+    ///
+    /// The display list draws only opaque fills ([`crate::render::gpu`] reads a command's
+    /// colour as `0x00RRGGBB` and hands the GPU an alpha of 1), so chrome that wants to
+    /// read as translucent blends itself against the surface it is known to sit on.
+    fn scroll_tint(&self, a: f32) -> u32 {
+        let parts = (a.clamp(0.0, 1.0) * 255.0).round() as u16;
+        self.theme.bg.mix(SCROLL_INK, parts, 255).to_u32()
     }
 
     /// Re-draw the glyph beneath a focused block cursor in the cell's background
@@ -1195,7 +1187,7 @@ impl Painter<'_> {
         let m = self.metrics;
         let x = self.cell_x(col);
         let baseline = self.baseline(row);
-        let mut text = self.take_string();
+        let mut text = take_string(self.strings);
         text.push(shown.rune);
         if shown.marks {
             text.extend(self.marks(row, col));
@@ -1508,7 +1500,7 @@ pub(crate) fn push_cell_text(
     let mut pen_cells = 0usize;
     let mut run: Option<Pending> = None;
     for (_, cluster) in grapheme::graphemes(text) {
-        let width = display_cluster_width(cluster).max(1);
+        let width = usize::from(width::cluster_width(cluster)).max(1);
         if width == 1 && cluster.chars().all(cells_safe) {
             let pending = run.get_or_insert_with(|| Pending {
                 start_cell: pen_cells,
@@ -1542,15 +1534,9 @@ pub(crate) fn push_cell_text(
     }
 }
 
-/// Display columns occupied by one already-segmented grapheme cluster.
-///
-/// One line, because the rule itself now lives in `width.rs` beside the scalar width —
-/// the grid decides which cells a cluster occupies and the renderer decides how wide to
-/// draw it, and the two measuring differently is how a cursor drifts from its glyphs.
-pub(crate) fn display_cluster_width(cluster: &str) -> usize {
-    usize::from(crate::width::cluster_width(cluster))
-}
-
+/// A cleared string buffer from the recycle pool, or a fresh empty one when the pool is
+/// dry. Every run and glyph text is drawn from here so the frame reuses the buffers the
+/// previous frame retired.
 fn take_string(strings: &mut Vec<String>) -> String {
     strings.pop().unwrap_or_default()
 }

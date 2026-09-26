@@ -58,6 +58,17 @@ pub fn cluster_width(cluster: &str) -> u8 {
     cluster.chars().map(width).max().unwrap_or(0)
 }
 
+/// Display columns a whole string occupies, summed over its grapheme clusters.
+///
+/// A zero-width cluster still counts one column: nothing in a panel or a title arrives
+/// with a base character to compose onto, so the painter gives it a cell of its own and
+/// the measurement has to agree.
+pub fn text_cells(text: &str) -> usize {
+    crate::platform::grapheme::graphemes(text)
+        .map(|(_, cluster)| usize::from(cluster_width(cluster)).max(1))
+        .sum()
+}
+
 pub fn width(c: char) -> u8 {
     let cp = u32::from(c);
     let page_number = usize::try_from(cp >> WIDTH_PAGE_SHIFT).unwrap_or_default();
@@ -160,6 +171,19 @@ mod tests {
         // Hangul conjoining jamo are gc=Lo but must be width 0 to compose.
         assert_eq!(width('\u{1160}'), 0);
         assert_eq!(width('\u{11FF}'), 0);
+    }
+
+    #[test]
+    fn text_cells_sums_clusters_and_floors_at_one() {
+        assert_eq!(text_cells("abc"), 3);
+        assert_eq!(text_cells(""), 0);
+        // A wide scalar and a flag sequence each take two columns.
+        assert_eq!(text_cells("a\u{1F600}b"), 4);
+        assert_eq!(text_cells("\u{1F1F3}\u{1F1F4}"), 2);
+        // A base plus its mark is one cluster, one column.
+        assert_eq!(text_cells("e\u{0301}"), 1);
+        // A mark with nothing to compose onto still gets a cell of its own.
+        assert_eq!(text_cells("\u{0301}"), 1);
     }
 
     #[test]

@@ -33,9 +33,9 @@ use crate::color::{Rgb, Theme};
 use crate::config::ShellStartupConfig;
 use crate::platform::freetype::{FaceKey, FontStyle};
 use crate::platform::geom::Rect;
-use crate::platform::grapheme;
 use crate::render::display::{DisplayList, DrawCmd};
 use crate::term_render::{self, CellMetrics};
+use crate::width;
 use std::time::{Duration, Instant};
 
 /// How often the fade repaints. The compositor paces frames when one is already in
@@ -154,7 +154,7 @@ pub(crate) fn paint(
         return;
     }
 
-    let content_cols = cells_wide(&notice.text) as i32;
+    let content_cols = width::text_cells(&notice.text) as i32;
     let pad_x = metrics.w;
     let pad_y = (metrics.h / 2).max(1);
     let panel_w = content_cols * metrics.w + 2 * pad_x;
@@ -196,14 +196,6 @@ pub(crate) fn paint(
         faded_fg.to_u32(),
         faded_bg.to_u32(),
     );
-}
-
-/// Cells the text occupies, so the panel is sized in the same fixed pitch the run is
-/// drawn in.
-fn cells_wide(text: &str) -> usize {
-    grapheme::graphemes(text)
-        .map(|(_, cluster)| term_render::display_cluster_width(cluster).max(1))
-        .sum()
 }
 
 #[cfg(test)]

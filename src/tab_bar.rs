@@ -38,6 +38,7 @@ use crate::platform::geom::Rect;
 use crate::platform::grapheme;
 use crate::render::display::{DisplayList, DrawCmd, Fade};
 use crate::term_render::{self, CellMetrics};
+use crate::width;
 
 /// One breathing-room column each side of a label, so text never butts against a
 /// tab edge or a divider. Dropped on tabs too narrow to spare it.
@@ -459,7 +460,7 @@ fn cluster_advance(fonts: &Fonts, face: FaceKey, cluster: &str) -> f32 {
 fn sanitize_title(title: &str) -> String {
     let mut clean = String::with_capacity(title.len());
     for (_, cluster) in grapheme::graphemes(title) {
-        let width = term_render::display_cluster_width(cluster);
+        let width = width::cluster_width(cluster);
         if cluster.chars().any(char::is_control) || width == 0 || width > 2 {
             clean.push('\u{fffd}');
         } else {

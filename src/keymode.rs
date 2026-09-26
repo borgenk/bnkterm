@@ -31,9 +31,9 @@ use crate::color::{Rgb, Theme};
 use crate::input::{Key, Mods};
 use crate::platform::freetype::{FaceKey, FontStyle};
 use crate::platform::geom::Rect;
-use crate::platform::grapheme;
 use crate::render::display::{DisplayList, DrawCmd};
 use crate::term_render::{self, CellMetrics};
+use crate::width;
 
 /// The modal key-table state. `Normal` is the transparent default in which every
 /// key passes through; the others are the armed leader tables that intercept keys
@@ -203,7 +203,11 @@ pub(crate) fn paint_overlay(
 
     // The content box in cells, padded by a cell horizontally and half a cell
     // vertically, centered on the surface.
-    let content_cols = lines.iter().map(|line| cells_wide(line)).max().unwrap_or(0) as i32;
+    let content_cols = lines
+        .iter()
+        .map(|line| width::text_cells(line))
+        .max()
+        .unwrap_or(0) as i32;
     let pad_x = metrics.w;
     let pad_y = (metrics.h / 2).max(1);
     let panel_w = content_cols * metrics.w + 2 * pad_x;
@@ -232,7 +236,7 @@ pub(crate) fn paint_overlay(
     };
     for (index, line) in lines.iter().enumerate() {
         // Center each line within the content box.
-        let line_cols = cells_wide(line) as i32;
+        let line_cols = width::text_cells(line) as i32;
         let offset = (content_cols - line_cols) / 2 * metrics.w;
         let x = x0 + pad_x + offset;
         let baseline = y0 + pad_y + index as i32 * metrics.h + metrics.baseline;
@@ -250,17 +254,10 @@ pub(crate) fn paint_overlay(
     }
 }
 
-/// Display columns a line occupies, cluster-aware (every hint line here is
-/// single-width, but the measurement matches the painter's).
-fn cells_wide(text: &str) -> usize {
-    grapheme::graphemes(text)
-        .map(|(_, cluster)| term_render::display_cluster_width(cluster).max(1))
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::grapheme;
 
     const METRICS: CellMetrics = CellMetrics {
         size: 16,
@@ -501,7 +498,7 @@ mod tests {
             if let DrawCmd::Cells { color, text, .. } = cmd {
                 assert_eq!(*color, theme.fg.to_u32(), "overlay text is plain fg");
                 assert!(grapheme::graphemes(text)
-                    .all(|(_, cluster)| term_render::display_cluster_width(cluster) == 1));
+                    .all(|(_, cluster)| width::cluster_width(cluster) == 1));
             }
         }
     }

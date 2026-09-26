@@ -21,13 +21,6 @@ impl Rect {
     }
 }
 
-/// A logical (surface-local) length in device pixels at scale `factor_120` (120ths,
-/// 120 = 1.0), rounded to nearest — the `+ 60` is half a step. Device pixels are what
-/// the buffer, the grid, and every display-list rectangle are measured in.
-pub fn logical_to_device(logical: u32, factor_120: u32) -> u32 {
-    (((logical as u64) * (factor_120 as u64) + 60) / 120) as u32
-}
-
 /// The display scale the compositor reports, in 120ths.
 ///
 /// Chrome constants (the scrollbar's width, the window padding) are written once in
@@ -58,28 +51,19 @@ impl Scale {
         logical * self.0 as f32 / 120.0
     }
 
-    /// A logical length in device pixels. A negative length has no meaning in chrome
-    /// geometry, so it scales to zero rather than wrapping.
+    /// A logical length in device pixels, rounded to nearest — the `+ 60` is half a
+    /// step. Device pixels are what the buffer, the grid, and every display-list
+    /// rectangle are measured in. A negative length has no meaning in chrome geometry,
+    /// so it scales to zero rather than wrapping.
     pub fn px(self, logical: i32) -> i32 {
-        let scaled = logical_to_device(logical.max(0) as u32, self.0);
-        scaled.min(i32::MAX as u32) as i32
+        let scaled = (u64::from(logical.max(0) as u32) * u64::from(self.0) + 60) / 120;
+        scaled.min(i32::MAX as u64) as i32
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn logical_to_device_rounds_to_nearest() {
-        assert_eq!(logical_to_device(100, 120), 100); // 1.0x is identity
-        assert_eq!(logical_to_device(100, 240), 200); // 2.0x
-        assert_eq!(logical_to_device(100, 180), 150); // 1.5x
-        assert_eq!(logical_to_device(100, 150), 125); // 1.25x
-        assert_eq!(logical_to_device(101, 150), 126); // 126.25 -> 126 (nearest)
-                                                      // No overflow at the extremes (u64 math, then narrowed).
-        assert_eq!(logical_to_device(16384, 240), 32768);
-    }
 
     #[test]
     fn pxf_keeps_the_fraction_px_rounds_away() {
@@ -92,10 +76,16 @@ mod tests {
     }
 
     #[test]
-    fn scale_px_matches_the_logical_conversion() {
+    fn scale_px_rounds_to_nearest() {
         assert_eq!(Scale::ONE.px(10), 10);
         assert_eq!(Scale::from_120(240).px(10), 20);
         assert_eq!(Scale::from_120(180).px(10), 15);
+        assert_eq!(Scale::from_120(150).px(100), 125);
+        // 126.25 rounds down to 126.
+        assert_eq!(Scale::from_120(150).px(101), 126);
+        // No overflow at the extremes (u64 math, then narrowed).
+        assert_eq!(Scale::from_120(240).px(16384), 32768);
+        assert_eq!(Scale::from_120(240).px(i32::MAX), i32::MAX);
         // A nonsense scale floors at 1/120th rather than annihilating the chrome.
         assert_eq!(Scale::from_120(0).px(1200), 10);
         // Negative lengths are not geometry; they scale to nothing, never wrap.

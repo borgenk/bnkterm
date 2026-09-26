@@ -137,26 +137,10 @@ impl DrawCmd {
     }
 }
 
-/// Reusable scratch for [`damage_into`]: the rectangle list is cleared and refilled
-/// each frame, so a per-frame diff reuses one buffer instead of allocating a fresh
-/// `Vec` (and, on a full-surface collapse, a second one-element `Vec`). The
-/// presentation loop owns one and passes it in.
-#[derive(Default)]
-pub struct DamageScratch {
-    rects: Vec<Rect>,
-}
-
-impl DamageScratch {
-    /// The rectangles the last [`damage_into`] produced.
-    pub fn rects(&self) -> &[Rect] {
-        &self.rects
-    }
-}
-
-/// The screen regions that differ between the previous frame `old` and the new
-/// frame `new`, written into `scratch` and returned as a borrowed slice so a
-/// per-frame call allocates nothing. Clamped to the `width` x `height` surface and
-/// free of overlaps.
+/// The screen regions that differ between the previous frame `old` and the new frame
+/// `new`, written into `out`, which is cleared first and reused across frames so a
+/// per-frame call allocates nothing. Clamped to the `width` x `height` surface and free
+/// of overlaps.
 ///
 /// After the common prefix and suffix are stripped (lists are built in document
 /// order, so a blink or a small edit differs in only a handful of commands, and
@@ -170,14 +154,8 @@ impl DamageScratch {
 /// A frame that changed most of the surface returns one full-surface rectangle,
 /// since repainting whole then beats clipping many regions. An empty result means
 /// the two frames are identical.
-pub fn damage_into<'a>(
-    old: &[DrawCmd],
-    new: &[DrawCmd],
-    width: i32,
-    height: i32,
-    scratch: &'a mut DamageScratch,
-) -> &'a [Rect] {
-    scratch.rects.clear();
+pub fn damage_into(old: &[DrawCmd], new: &[DrawCmd], width: i32, height: i32, out: &mut Vec<Rect>) {
+    out.clear();
 
     let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
     let (old, new) = (&old[prefix..], &new[prefix..]);
@@ -196,10 +174,9 @@ pub fn damage_into<'a>(
         h: height.max(0),
     };
     {
-        let rects = &mut scratch.rects;
         let mut damage_bounds = |c: &DrawCmd| {
             if let Some(r) = intersection(c.bounds(), surface) {
-                rects.push(r);
+                out.push(r);
             }
         };
         // Pair the survivors; a differing pair damages both spots. The tails past
@@ -215,28 +192,27 @@ pub fn damage_into<'a>(
         new[paired..].iter().for_each(&mut damage_bounds);
     }
 
-    coalesce(&mut scratch.rects);
-    let area: i64 = scratch.rects.iter().map(|r| r.w as i64 * r.h as i64).sum();
+    coalesce(out);
+    let area: i64 = out.iter().map(|r| r.w as i64 * r.h as i64).sum();
     let surface_area = surface.w as i64 * surface.h as i64;
-    if scratch.rects.len() > MAX_DAMAGE_RECTS || area * 2 > surface_area {
+    if out.len() > MAX_DAMAGE_RECTS || area * 2 > surface_area {
         // A near-total change: drop the many small rectangles and repaint whole,
-        // reusing the buffer rather than returning a fresh one-element vector.
-        scratch.rects.clear();
+        // reusing the buffer rather than allocating a one-element vector.
+        out.clear();
         if surface_area > 0 {
-            scratch.rects.push(surface);
+            out.push(surface);
         }
     }
-    &scratch.rects
 }
 
-/// One-shot [`damage_into`] with a throwaway scratch, returning an owned `Vec`. For
-/// tests; the presentation loop keeps a [`DamageScratch`] and calls [`damage_into`]
-/// to avoid the per-frame allocation.
+/// One-shot [`damage_into`] into a throwaway buffer, returning an owned `Vec`. For
+/// tests; the presentation loop keeps one buffer and calls [`damage_into`] to avoid the
+/// per-frame allocation.
 #[cfg(test)]
 pub fn damage(old: &[DrawCmd], new: &[DrawCmd], width: i32, height: i32) -> Vec<Rect> {
-    let mut scratch = DamageScratch::default();
-    damage_into(old, new, width, height, &mut scratch);
-    scratch.rects
+    let mut rects = Vec::new();
+    damage_into(old, new, width, height, &mut rects);
+    rects
 }
 
 /// Merge any two overlapping rectangles into their bounding box, repeated until

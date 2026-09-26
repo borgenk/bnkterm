@@ -342,6 +342,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mix_blends_each_channel_between_the_endpoints() {
+        let (black, white) = (Rgb::new(0, 0, 0), Rgb::new(255, 255, 255));
+        assert_eq!(black.mix(white, 0, 255), black, "no parts keeps self");
+        assert_eq!(black.mix(white, 255, 255), white, "all parts is the other");
+        assert_eq!(black.mix(white, 128, 255), Rgb::new(128, 128, 128));
+        // Per channel, and the halves the chrome actually asks for.
+        assert_eq!(
+            Rgb::new(0x20, 0x40, 0x60).mix(Rgb::new(0x60, 0x40, 0x20), 1, 2),
+            Rgb::new(0x40, 0x40, 0x40)
+        );
+        assert_eq!(
+            Rgb::new(30, 60, 90).mix(Rgb::new(0, 0, 0), 1, 3),
+            Rgb::new(20, 40, 60)
+        );
+    }
+
+    #[test]
     fn x11_colors_parse_in_both_spellings() {
         assert_eq!(
             parse_x11_color(b"rgb:ff/00/80"),
