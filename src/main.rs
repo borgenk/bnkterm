@@ -1,13 +1,3 @@
-//! Argument dispatch and the process entry point: command-line flags become a
-//! call into the library crate.
-//!
-//! `--gpu-probe` reports the GPU/dmabuf presentation path
-//! without opening one, and `--demo` opens the window on a static styled grid
-//! (no shell). Everything else launches the live terminal: a shell on a PTY.
-//!
-//! The live terminal is silent on stderr but for errors; `-v`/`--verbose` adds the
-//! bring-up lines and `--stats` a per-frame timing line (see [`app::Verbosity`]).
-
 use bnkterm::app::{self, Verbosity};
 
 fn main() {

@@ -1,14 +1,3 @@
-//! The modules fall along these stage boundaries:
-//!
-//! ```text
-//!   bytes ─▶ vt::Parser ─▶ grid::Screen ─▶ display list ─▶ GPU
-//!           (state machine) (cells, cursor,   (frame as
-//!                            scrollback)        data)
-//! ```
-//!
-//! `color` is the shared vocabulary the grid and the eventual renderer both
-//! speak; `error` is the terminal-agnostic foundation.
-
 #![allow(rustdoc::private_intra_doc_links)]
 
 pub mod app;
