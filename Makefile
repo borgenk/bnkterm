@@ -1,6 +1,6 @@
 .PHONY: all build build-release install uninstall bump build-linux test test-install \
 	test-abi check flatpak flatpak-lint fix shaders screenshot clean size \
-	perf perf-save perf-lab perf-stages render-bench \
+	perf perf-save perf-lab perf-stages render-bench tables \
 	cat-stream cat-bench bench-compare
 
 APP_NAME := bnkterm
@@ -156,6 +156,11 @@ perf-stages:
 # the two separately because the counting allocator taxes the timing.
 render-bench:
 	cargo run --release --bin bnkterm-dev -- --render-bench
+
+# Regenerate src/width_tables.rs and src/platform/grapheme_tables.rs from the vendored
+# Unicode data. The only way to do it on a Unicode bump.
+tables:
+	cargo run --release --bin bnkterm-dev -- --gen-tables
 
 # Fetch the source text once, verifying the pinned checksum before using it.
 $(CAT_SOURCE):

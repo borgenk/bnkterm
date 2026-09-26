@@ -3,6 +3,7 @@ pub mod capture;
 #[cfg(test)]
 pub mod fuzz;
 pub mod gen_stream;
+pub mod gen_tables;
 pub mod perf;
 #[cfg(test)]
 pub mod png;
