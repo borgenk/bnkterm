@@ -3,8 +3,7 @@
 pub mod app;
 pub mod color;
 pub mod config;
-#[cfg(test)]
-mod dev;
+pub mod dev;
 pub mod error;
 pub mod flatpak;
 pub mod gather;

@@ -1,11 +1,26 @@
 .PHONY: all build build-release install uninstall bump build-linux test test-install \
-	test-abi check flatpak flatpak-lint fix shaders screenshot clean size
+	test-abi check flatpak flatpak-lint fix shaders screenshot clean size \
+	perf perf-save perf-lab perf-stages render-bench \
+	cat-stream cat-bench bench-compare
 
 APP_NAME := bnkterm
 APP_ID := io.github.borgenk.BnkTerm
 TARGET := x86_64-unknown-linux-gnu
 VERSION := $(shell grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 BUILD_PATH := target/$(TARGET)/release
+
+# The measurement corpus: a source text fetched once against a pinned checksum, then
+# duplicated into a 150 MB throughput stream and a 1 MB startup-baseline stream. All
+# three live under the gitignored data/, so the fetch is a one-time bootstrap and never
+# happens during a test. Pass FILE to measure a different stream.
+STREAM_URL    := https://raw.githubusercontent.com/dscape/spell/master/test/resources/big.txt
+STREAM_SHA    := fa066c7d40f0f201ac4144e652aa62430e58a6b3805ec70650f678da5804e87b
+CAT_SOURCE    := data/stream/source.txt
+CAT_STREAM    := data/stream/ascii-150mb.txt
+CAT_SIZE      := 150000000
+CAT_BASE      := data/stream/ascii-1mb.txt
+CAT_BASE_SIZE := 1000000
+FILE          ?= $(CAT_STREAM)
 TARBALL := $(APP_NAME)-v$(VERSION)-$(TARGET).tar.gz
 BIN_DIR := ~/.local/bin
 APPS_DIR := ~/.local/share/applications
@@ -24,10 +39,10 @@ RUNTIME_REPO := https://flathub.org/repo/flathub.flatpakrepo
 all: test build
 
 build:
-	cargo build
+	cargo build --bin $(APP_NAME)
 
 build-release:
-	cargo build --release
+	cargo build --release --bin $(APP_NAME)
 
 # Install the release binary, desktop entry and icon under ~/.local, the same
 # per-user location install.sh uses.
@@ -112,6 +127,61 @@ fix:
 
 screenshot:
 	cargo test -- --ignored --nocapture write_screenshot
+
+# The regression gate: speed against stats/baseline.txt, the grid's memory against
+# stats/footprint.txt. No GPU, no PTY, no network. Allocations are counted, which is
+# what perf-alloc is for.
+perf:
+	cargo run --release --features perf-alloc --bin bnkterm-dev -- --perf
+
+# Accept the current numbers as the new baseline. Every byte of footprint growth has
+# to be explained before it is saved: that gate holds at equality, not a ratio.
+perf-save:
+	cargo run --release --features perf-alloc --bin bnkterm-dev -- --perf --save
+
+# Whole-pipeline throughput over the generated streams, for finding work rather than
+# gating it. Narrow with SIZE (MiB per stream) or STREAM, e.g.
+# `make perf-lab STREAM=emoji SIZE=8`.
+perf-lab:
+	cargo run --release --features perf-alloc --bin bnkterm-dev -- --perf-lab $(if $(SIZE),--size $(SIZE)) $(STREAM)
+
+# Attribute cost across parser-only, decoded-grid-only, and the complete pipeline.
+# Local investigation, never a portable gate.
+perf-stages:
+	cargo run --release --bin bnkterm-dev -- --perf-stages $(if $(SIZE),--size $(SIZE)) $(STREAM)
+
+# Headless render-pipeline timing: grid -> display list -> damage diff -> vertices,
+# per frame, no GPU or window, so a fast parser cannot hide a slow renderer. Clean
+# timing by default; for per-frame allocation counts swap dev for perf-alloc, and read
+# the two separately because the counting allocator taxes the timing.
+render-bench:
+	cargo run --release --bin bnkterm-dev -- --render-bench
+
+# Fetch the source text once, verifying the pinned checksum before using it.
+$(CAT_SOURCE):
+	@mkdir -p data/stream
+	curl -sSfL $(STREAM_URL) -o $@
+	@echo "$(STREAM_SHA)  $@" | sha256sum -c -
+
+# Build the ASCII streams from the source text (header stripped, body duplicated).
+cat-stream: $(CAT_STREAM) $(CAT_BASE)
+$(CAT_STREAM): $(CAT_SOURCE) src/dev/gen_stream.rs
+	cargo run --release --bin bnkterm-dev -- --gen-stream --input $< --output $@ --size $(CAT_SIZE)
+$(CAT_BASE): $(CAT_SOURCE) src/dev/gen_stream.rs
+	cargo run --release --bin bnkterm-dev -- --gen-stream --input $< --output $@ --size $(CAT_BASE_SIZE)
+
+# Throughput over FILE, in-process (min and median wall time, MB/s, rendering
+# excluded): the version-to-version signal for the parser and grid. Comparing against
+# other terminals is bench-compare.
+cat-bench: $(if $(filter $(CAT_STREAM),$(FILE)),$(CAT_STREAM))
+	cargo run --release --bin bnkterm-dev -- --cat-bench $(FILE)
+
+# Compare against whichever other terminal emulators are installed: each launches a
+# window, cats the same stream and exits. Covers window and GPU startup and coalesced
+# rendering, so it needs a graphical session and opens a window per run. Runs the
+# shipping binary, never the instrumented one.
+bench-compare: build-release $(CAT_STREAM) $(CAT_BASE)
+	tools/bench_compare.sh $(CAT_STREAM) $(BUILD_PATH)/$(APP_NAME) $(CAT_BASE)
 
 # Recompile the committed SPIR-V. Needs glslc, and only when a shader changes.
 shaders:

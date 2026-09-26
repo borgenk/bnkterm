@@ -984,7 +984,6 @@ impl Fonts {
     /// Open the default font selection at each of `sizes`, with the font's own
     /// line height (a scale of 1.0, no extra leading). For tests; the app resolves
     /// its configured selection once and opens it through [`Self::with_selection`].
-    #[cfg(test)]
     pub fn new(sizes: &[u32]) -> Result<Self> {
         Self::with_selection(&FontSelection::resolve(&FontConfig::default())?, sizes, 1.0)
     }
