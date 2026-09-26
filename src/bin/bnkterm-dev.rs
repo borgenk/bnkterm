@@ -1,4 +1,4 @@
-use bnkterm::dev::{gen_stream, perf};
+use bnkterm::dev::{capture, gen_stream, perf};
 use bnkterm::error::{Error, Result};
 
 fn main() {
@@ -16,10 +16,12 @@ fn main() {
         perf::render_bench(&args)
     } else if has("--gen-stream") {
         gen_stream::run(&args)
+    } else if has("--capture") {
+        capture::run(&args)
     } else {
         Err(Error::msg(
             "usage: --perf [--save] | --perf-lab | --perf-stages | --cat-bench FILE | \
-             --render-bench | --gen-stream",
+             --render-bench | --gen-stream | --capture",
         ))
     };
     if let Err(e) = result {
