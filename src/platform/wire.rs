@@ -35,20 +35,32 @@ pub struct Message {
     pub body: Vec<u8>,
 }
 
+/// The largest request a compositor accepts. libwayland reads each client through a
+/// 4096-byte connection buffer unless the compositor raises it, and a request that does
+/// not fit is a protocol error that closes the connection.
+const MAX_REQUEST: usize = 4096;
+
+/// The longest string a request can carry as its only argument: [`MAX_REQUEST`] less the
+/// 8-byte header, the string's 4-byte length and its NUL. That total is already 4-byte
+/// aligned, so no padding is left over.
+const MAX_SOLE_STRING: usize = MAX_REQUEST - 8 - 4 - 1;
+
+/// `s` cut at a character boundary so that a request carrying it as its only argument
+/// fits in [`MAX_REQUEST`]. For strings the child controls, such as the window title.
+pub fn fit_sole_string(s: &str) -> &str {
+    let end = s.floor_char_boundary(MAX_SOLE_STRING);
+    s.get(..end).unwrap_or_default()
+}
+
 /// Append an encoded request to `buf`.
 ///
-/// A request that will not fit the header's 16-bit size field is **dropped**, not
-/// truncated: `(size << 16) | opcode` would carry the length's high bits into the opcode
-/// bits and put a frame on the wire that says it is a different, shorter request. The
-/// compositor then reads the next request's bytes as this one's arguments and every
-/// message after it is garbage — one oversized string desynchronizing the whole
-/// connection.
-///
-/// It used to be a `debug_assert!`, which is compiled out of exactly the build where the
-/// corruption would be silent. Unreachable today either way, and only for a reason two
-/// modules from here: the sole variable-length request (`xdg_toplevel.set_title`) is
-/// bounded by `OSC_MAX` in the VT parser. That is a fact about a caller, not a property
-/// of the encoder, so the encoder now holds its own invariant.
+/// A request larger than [`MAX_REQUEST`] is **dropped**, not sent: the compositor would
+/// answer it with a protocol error and close the connection, taking every tab with it.
+/// Callers with variable-length input fit it first ([`fit_sole_string`]); this check is
+/// the backstop that keeps a caller that did not from being fatal. Dropped rather than
+/// truncated, because a cut frame would put the next request's bytes where this one's
+/// arguments should be. The same bound keeps the length inside the header's 16-bit size
+/// field.
 pub fn encode(buf: &mut Vec<u8>, object: u32, opcode: u16, args: &[Arg]) {
     let start = buf.len();
     buf.extend_from_slice(&object.to_ne_bytes());
@@ -56,13 +68,12 @@ pub fn encode(buf: &mut Vec<u8>, object: u32, opcode: u16, args: &[Arg]) {
     for arg in args {
         encode_arg(buf, arg);
     }
-    // The size lives in the header's high 16 bits, so a request must be < 64 KiB.
-    // Refused in *every* build rather than asserted in one: a `debug_assert!` here made
-    // debug and release disagree about what an oversized request does, which for a wire
-    // encoder is worse than either answer on its own.
-    let Ok(size) = u16::try_from(buf.len() - start) else {
-        buf.truncate(start);
-        return;
+    let size = match u16::try_from(buf.len() - start) {
+        Ok(size) if usize::from(size) <= MAX_REQUEST => size,
+        _ => {
+            buf.truncate(start);
+            return;
+        }
     };
     let word = (u32::from(size) << 16) | u32::from(opcode);
     if let Some(header) = buf.get_mut(start + 4..start + 8) {
@@ -182,46 +193,6 @@ mod tests {
     }
 
     #[test]
-    fn a_request_too_large_for_the_header_is_dropped_not_truncated() {
-        // `(size << 16) | opcode` carries an oversized length's high bits into the opcode
-        // bits, so the frame would claim to be a different, shorter request. The
-        // compositor then reads the *next* request's bytes as this one's arguments and
-        // everything after it is garbage — one oversized string desynchronizing the whole
-        // connection. The guard was a `debug_assert!`, compiled out of exactly the build
-        // where that would be silent.
-        let mut buf = Vec::new();
-        encode(&mut buf, 1, 0, &[Arg::Uint(7)]);
-        let good = buf.clone();
-
-        let huge = "x".repeat(0x1_0000);
-        encode(&mut buf, 2, 3, &[Arg::Str(&huge)]);
-        assert_eq!(
-            buf, good,
-            "nothing of the oversized request reached the wire"
-        );
-
-        // And the stream carries on: the next request encodes normally, at the offset the
-        // dropped one would have occupied.
-        encode(&mut buf, 4, 5, &[Arg::Uint(9)]);
-        let word = u32::from_ne_bytes(buf[good.len() + 4..good.len() + 8].try_into().unwrap());
-        assert_eq!((word >> 16, word & 0xffff), (12, 5));
-
-        // The largest request that *does* fit still encodes, so the refusal is at the
-        // boundary and not short of it. A 0xfff4-byte string plus its 4-byte length and
-        // the 8-byte header is exactly 0x10000... one over, so back off one word.
-        let mut buf = Vec::new();
-        let big = "x".repeat(0xffef);
-        encode(&mut buf, 1, 0, &[Arg::Str(&big)]);
-        assert_eq!(
-            buf.len(),
-            0xfffc,
-            "8 header + 4 length + 0xfff0 padded string"
-        );
-        let word = u32::from_ne_bytes(buf[4..8].try_into().unwrap());
-        assert_eq!(word >> 16, 0xfffc);
-    }
-
-    #[test]
     fn string_then_uint_roundtrips_with_padding() {
         let mut buf = Vec::new();
         encode(&mut buf, 1, 0, &[Arg::Str("wl_shm"), Arg::Uint(7)]);
@@ -254,6 +225,51 @@ mod tests {
         assert_eq!(r.string().unwrap(), "xdg_wm_base");
         assert_eq!(r.u32().unwrap(), 1, "version");
         assert_eq!(r.u32().unwrap(), 9, "new id");
+    }
+
+    #[test]
+    fn a_request_past_the_compositor_limit_is_dropped() {
+        // The limit a libwayland compositor enforces, measured against weston on
+        // libwayland 1.26: a 4096-byte set_title is accepted, and 4100 bytes draws a
+        // protocol error and a closed connection.
+        let mut buf = Vec::new();
+        encode(&mut buf, 1, 0, &[Arg::Uint(7)]);
+        let queued = buf.clone();
+
+        // One word over is dropped whole, as is one too long for the header's 16-bit
+        // size field, and what was already queued stays intact.
+        encode(&mut buf, 8, 2, &[Arg::Str(&"x".repeat(4084))]);
+        encode(&mut buf, 8, 2, &[Arg::Str(&"x".repeat(0x1_0000))]);
+        assert_eq!(buf.len(), queued.len(), "an oversized request was queued");
+        assert_eq!(buf, queued);
+
+        // The stream carries on: the next request encodes at the offset the dropped
+        // ones would have taken.
+        encode(&mut buf, 4, 5, &[Arg::Uint(9)]);
+        let word = u32::from_ne_bytes(buf[queued.len() + 4..queued.len() + 8].try_into().unwrap());
+        assert_eq!((word >> 16, word & 0xffff), (12, 5));
+
+        // The refusal is at the limit and not short of it: 4083 bytes of string, its
+        // 4-byte length and the 8-byte header fill 4096 exactly.
+        let mut buf = Vec::new();
+        encode(&mut buf, 8, 2, &[Arg::Str(&"x".repeat(4083))]);
+        assert_eq!(buf.len(), 4096);
+    }
+
+    #[test]
+    fn a_fitted_string_makes_a_request_that_is_sent() {
+        // A child's title can be ~12 KiB. Fitting cuts it on a character boundary (the
+        // two-byte "é" lands one byte short of the 4083 limit) to a request the encoder
+        // keeps, so a long title still reaches the window.
+        let long = "é".repeat(3000);
+        let fitted = fit_sole_string(&long);
+        assert_eq!(fitted.len(), 4082);
+        assert!(long.starts_with(fitted));
+        let mut buf = Vec::new();
+        encode(&mut buf, 8, 2, &[Arg::Str(fitted)]);
+        assert_eq!(buf.len(), 4096);
+
+        assert_eq!(fit_sole_string("bnkterm"), "bnkterm");
     }
 
     #[test]

@@ -61,7 +61,7 @@ use crate::platform::protocol::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1, wp_viewporter, xdg_surface,
     xdg_toplevel, xdg_wm_base,
 };
-use crate::platform::wire::{Arg, Message, Reader};
+use crate::platform::wire::{self, Arg, Message, Reader};
 use crate::platform::xkb::Xkb;
 use crate::pty;
 use crate::pty::{EnvVar, Launch, Target};
@@ -2003,12 +2003,17 @@ impl State {
         self.tabs.mark_dirty();
     }
 
-    /// Set the toplevel title. The core deduplicates on the sending side (it only
-    /// emits a `Title` when the child's title actually changes), so this just makes
-    /// the request; bring-up calls it once for the initial app name.
+    /// Set the toplevel title, fitted to what one request can carry: the child's OSC
+    /// title can run to ~12 KiB (4 KiB of bytes, each invalid one widened to U+FFFD). The
+    /// core deduplicates on the sending side (it only emits a `Title` when the child's
+    /// title actually changes), so this just makes the request; bring-up calls it once
+    /// for the initial app name.
     fn set_toplevel_title(&mut self, title: &str) {
-        self.conn
-            .request(self.toplevel, xdg_toplevel::SET_TITLE, &[Arg::Str(title)]);
+        self.conn.request(
+            self.toplevel,
+            xdg_toplevel::SET_TITLE,
+            &[Arg::Str(wire::fit_sole_string(title))],
+        );
     }
 
     /// Act on the tabs layer's routed outbound messages after a pump (or a copy):
