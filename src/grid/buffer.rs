@@ -918,6 +918,9 @@ impl Buffer {
             }
         }
 
+        // Both cursors move with the content: the live one, and the one DECSC saved. A
+        // shell that saves its cursor at the prompt and restores it on `SIGWINCH` has to
+        // land on the row it saved, as it does across a width reflow.
         match new_rows.cmp(&self.rows) {
             Ordering::Greater => {
                 let mut grow = new_rows - self.rows;
@@ -927,13 +930,18 @@ impl Buffer {
                 // the content. The stream `scrollback ++ lines` is unchanged, only its split
                 // point moves, so every row keeps its id. Blank rows fill in below only once
                 // history runs out.
+                let mut pulled = 0;
                 while grow > 0 {
                     let Some(row) = self.scrollback.pop_back() else {
                         break;
                     };
                     self.lines.push_front(row);
-                    self.cursor.row += 1;
+                    pulled += 1;
                     grow -= 1;
+                }
+                self.cursor.row += pulled;
+                if let Some(saved) = self.saved.as_mut() {
+                    saved.cursor.row += pulled;
                 }
                 for _ in 0..grow {
                     self.lines
@@ -954,7 +962,10 @@ impl Buffer {
                     if let Some(top) = self.lines.pop_front() {
                         self.push_history(top);
                     }
-                    self.cursor.row = self.cursor.row.saturating_sub(1);
+                }
+                self.cursor.row = self.cursor.row.saturating_sub(excess);
+                if let Some(saved) = self.saved.as_mut() {
+                    saved.cursor.row = saved.cursor.row.saturating_sub(excess);
                 }
             }
             Ordering::Equal => {}

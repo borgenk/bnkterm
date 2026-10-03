@@ -1746,6 +1746,37 @@ fn feed(s: &mut Screen, bytes: &[u8]) {
 }
 
 #[test]
+fn the_saved_cursor_follows_its_row_through_a_resize() {
+    // A shell saves its cursor at the prompt (DECSC) and restores it when SIGWINCH says
+    // the window changed (DECRC), so the saved position has to move with the row it was
+    // saved on. The width path (reflow) carried it; the height-only path did not, so a
+    // restore after a height change landed on whatever row now sat at the old index.
+    let restored_row = |s: &mut Screen| {
+        feed(s, b"\x1b8");
+        let (row, _) = s.cursor();
+        s.row_string(row).trim_end().to_string()
+    };
+
+    // Taller: history comes back down onto the screen, pushing every row down.
+    let mut s = Screen::new(10, 4);
+    feed(&mut s, b"a\r\nb\r\nc\r\nd\r\ne\r\nf\x1b7");
+    s.resize(10, 6);
+    assert_eq!(restored_row(&mut s), "f", "after growing");
+
+    // Shorter: the top scrolls into history, pulling every row up.
+    let mut s = Screen::new(10, 6);
+    feed(&mut s, b"a\r\nb\r\nc\r\nd\x1b7\r\ne\r\nf");
+    s.resize(10, 4);
+    assert_eq!(restored_row(&mut s), "d", "after shrinking");
+
+    // Wider: a wrapped line joins, pulling the rows after it up.
+    let mut s = Screen::new(5, 4);
+    feed(&mut s, b"aaaaabbbbb\r\nc\x1b7\r\nd");
+    s.resize(10, 4);
+    assert_eq!(restored_row(&mut s), "c", "after a width reflow");
+}
+
+#[test]
 fn violent_resize_never_panics_and_keeps_invariants() {
     // "Resize violently narrow -> wide -> narrow" reportedly crashed the live app. This
     // drives the same at the grid level: thousands of resizes across the whole width/
