@@ -433,6 +433,15 @@ struct State {
     compositor: Option<u32>,
     wm_base: Option<u32>,
     seat: Option<u32>,
+    /// The version `seat` is bound at, which decides whether its keyboard and pointer
+    /// can be released.
+    seat_version: u32,
+    /// Keyboards released after the seat lost its keyboard, until the compositor confirms
+    /// the deletion with `wl_display.delete_id` (for good on a seat below version 3, which
+    /// cannot release them). A `keymap` it queued for one before reading the release still
+    /// arrives with an fd, which must be taken off the connection's fd queue or every later
+    /// fd-carrying event receives the one before it.
+    released_keyboards: Vec<u32>,
     /// The cursor-shape manager, absent when the compositor lacks
     /// `wp_cursor_shape_manager_v1`; the pointer then keeps the compositor's default
     /// shape (an arrow) rather than the I-beam we would ask for over the grid.
@@ -596,6 +605,8 @@ impl State {
             compositor: None,
             wm_base: None,
             seat: None,
+            seat_version: 0,
+            released_keyboards: Vec::new(),
             cursor_shape_manager: None,
             keyboard: 0,
             pointer: 0,
@@ -1059,6 +1070,7 @@ impl State {
                     let id = r.u32()?;
                     if id < SERVER_ID_BASE {
                         self.forget_destroyed_source(id);
+                        self.released_keyboards.retain(|&keyboard| keyboard != id);
                         self.free_ids.push(id);
                     }
                 }
@@ -1173,11 +1185,22 @@ impl State {
         }
 
         if Some(msg.object) == self.seat && msg.opcode == wl_seat::EV_CAPABILITIES {
+            // A capability can go and come back: a keyboard unplugged, a KVM switch, a
+            // Bluetooth device asleep. The compositor makes the old object inert when it
+            // goes, so it is released then, and a fresh one is created when it returns.
             let caps = r.u32()?;
-            if caps & wl_seat::CAP_KEYBOARD != 0 && self.keyboard == 0 {
+            let has_keyboard = caps & wl_seat::CAP_KEYBOARD != 0;
+            let has_pointer = caps & wl_seat::CAP_POINTER != 0;
+            if !has_keyboard && self.keyboard != 0 {
+                self.release_keyboard()?;
+            }
+            if !has_pointer && self.pointer != 0 {
+                self.release_pointer()?;
+            }
+            if has_keyboard && self.keyboard == 0 {
                 self.keyboard = self.create(msg.object, wl_seat::GET_KEYBOARD);
             }
-            if caps & wl_seat::CAP_POINTER != 0 && self.pointer == 0 {
+            if has_pointer && self.pointer == 0 {
                 let pointer = self.create(msg.object, wl_seat::GET_POINTER);
                 self.pointer = pointer;
                 // Pair the pointer with a cursor-shape device so we can ask for the
@@ -1188,6 +1211,13 @@ impl State {
                     self.cursor_shape_device =
                         self.create_for(manager, wp_cursor_shape_manager_v1::GET_POINTER, pointer);
                 }
+            }
+            return Ok(());
+        }
+
+        if self.released_keyboards.contains(&msg.object) {
+            if msg.opcode == wl_keyboard::EV_KEYMAP {
+                drop(self.conn.take_fd());
             }
             return Ok(());
         }
@@ -1251,16 +1281,7 @@ impl State {
             }
             wl_keyboard::EV_LEAVE => {
                 let _serial = r.u32()?;
-                self.window_focused = false;
-                self.tabs.active_mut().focus(false)?;
-                self.stop_repeat(); // drop any held-key repeat (window-side timer)
-                                    // Losing focus resets the modifier state (see `Xkb::clear_modifiers`);
-                                    // if Ctrl was down, the hand cursor it earned goes with it.
-                self.xkb.clear_modifiers();
-                // And any half-typed compose sequence, for the same reason: its second
-                // keystroke is going to another window now.
-                self.xkb.reset_compose();
-                self.update_pointer_shape();
+                self.keyboard_left()?;
             }
             wl_keyboard::EV_MODIFIERS => {
                 let _serial = r.u32()?;
@@ -1305,6 +1326,53 @@ impl State {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Keyboard focus is gone, by `leave` or because the keyboard itself went away.
+    fn keyboard_left(&mut self) -> Result<()> {
+        self.window_focused = false;
+        self.tabs.active_mut().focus(false)?;
+        // Drop any held-key repeat (window-side timer).
+        self.stop_repeat();
+        // Losing focus resets the modifier state (see `Xkb::clear_modifiers`); if Ctrl was
+        // down, the hand cursor it earned goes with it.
+        self.xkb.clear_modifiers();
+        // And any half-typed compose sequence, for the same reason: its second keystroke
+        // is going to another window now.
+        self.xkb.reset_compose();
+        self.update_pointer_shape();
+        Ok(())
+    }
+
+    /// The seat lost its keyboard: release the inert object and forget it, remembering
+    /// its id until the compositor confirms the deletion (see `released_keyboards`).
+    fn release_keyboard(&mut self) -> Result<()> {
+        let keyboard = std::mem::take(&mut self.keyboard);
+        if self.seat_version >= wl_seat::VERSION_RELEASE {
+            self.conn.request(keyboard, wl_keyboard::RELEASE, &[]);
+        }
+        self.released_keyboards.push(keyboard);
+        self.keyboard_left()
+    }
+
+    /// The seat lost its pointer: destroy its cursor-shape device, release the inert
+    /// object and forget it. Pointer events carry no fds, so nothing in flight for it
+    /// needs taking off the fd queue.
+    fn release_pointer(&mut self) -> Result<()> {
+        if self.cursor_shape_device != 0 {
+            self.conn.request(
+                self.cursor_shape_device,
+                wp_cursor_shape_device_v1::DESTROY,
+                &[],
+            );
+            self.cursor_shape_device = 0;
+        }
+        let pointer = std::mem::take(&mut self.pointer);
+        if self.seat_version >= wl_seat::VERSION_RELEASE {
+            self.conn.request(pointer, wl_pointer::RELEASE, &[]);
+        }
+        self.pointer_enter_serial = 0;
+        self.pointer_left_grid()
     }
 
     /// Cancel any auto-repeat in flight.
@@ -1909,9 +1977,13 @@ impl State {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_WM_BASE);
                 self.wm_base = Some(id);
             }
-            protocol::IFACE_SEAT => {
+            // The first seat only. The keyboard and pointer belong to the seat that created
+            // them, so a second seat whose capabilities lack a keyboard must not be able to
+            // release the first seat's.
+            protocol::IFACE_SEAT if self.seat.is_none() => {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_SEAT);
                 self.seat = Some(id);
+                self.seat_version = version.min(protocol::VERSION_SEAT);
             }
             protocol::IFACE_CURSOR_SHAPE_MANAGER => {
                 let id = self.bind_capped(

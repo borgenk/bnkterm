@@ -101,9 +101,13 @@ pub mod wl_seat {
     pub const CAP_POINTER: u32 = 1;
     /// The `keyboard` bit in the capabilities bitfield.
     pub const CAP_KEYBOARD: u32 = 2;
+    /// The seat version that added `wl_pointer.release` and `wl_keyboard.release`.
+    pub const VERSION_RELEASE: u32 = 3;
 }
 
 pub mod wl_pointer {
+    /// Release the pointer object (seat version 3 and later).
+    pub const RELEASE: u16 = 1;
     pub const EV_ENTER: u16 = 0;
     pub const EV_LEAVE: u16 = 1;
     pub const EV_MOTION: u16 = 2;
@@ -118,6 +122,8 @@ pub mod wl_pointer {
 }
 
 pub mod wl_keyboard {
+    /// Release the keyboard object (seat version 3 and later).
+    pub const RELEASE: u16 = 0;
     pub const EV_KEYMAP: u16 = 0;
     pub const EV_ENTER: u16 = 1;
     pub const EV_LEAVE: u16 = 2;
@@ -251,6 +257,7 @@ pub mod wp_cursor_shape_manager_v1 {
 }
 
 pub mod wp_cursor_shape_device_v1 {
+    pub const DESTROY: u16 = 0;
     /// Set the pointer's shape: the `enter` event's `serial`, then a shape enum.
     pub const SET_SHAPE: u16 = 1;
     /// Shape enums from the protocol (all present since version 1): the plain arrow
