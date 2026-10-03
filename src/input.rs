@@ -719,14 +719,18 @@ fn encode_char(c: char, mods: Mods, out: &mut Vec<u8>) {
 }
 
 /// The C0 control byte for `Ctrl+c`, or `None` when Ctrl has no effect on this
-/// character. The mappable set is the classic one: the letters, `@` through `_`
-/// (which `& 0x1f` sends to `0x00`-`0x1f`), plus `Space` → NUL and `?` → DEL.
+/// character. The table is the one X11's keysym translation applies, which is what xterm
+/// and every program written against it expect: `@` through `~` fold with `& 0x1f`
+/// (letters, ``[ \ ] ^ _``, `` ` `` and `{ | } ~`), `Space` and `2` are NUL, `3`
+/// through `7` are ESC, FS, GS, RS and US, `8` is DEL and `/` is US. `?` → DEL is the
+/// one entry X11 lacks; it predates this table and is kept.
 fn ctrl_byte(c: char) -> Option<u8> {
     match c {
-        ' ' => Some(0x00),
-        '?' => Some(0x7f),
-        'a'..='z' => Some((c as u8) & 0x1f),
-        '@'..='_' => Some((c as u8) & 0x1f),
+        ' ' | '2' => Some(0x00),
+        '3'..='7' => Some(c as u8 - b'3' + 0x1b),
+        '8' | '?' => Some(0x7f),
+        '/' => Some(0x1f),
+        '@'..='~' => Some((c as u8) & 0x1f),
         _ => None,
     }
 }
@@ -966,6 +970,29 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_digits_and_symbols_send_what_xterm_sends() {
+        // X11's keysym translation, which xterm inherits: readline's undo is Ctrl+/ (US),
+        // vim's alternate file is Ctrl+6 (RS), emacs's set-mark is Ctrl+2 (NUL).
+        for (c, byte) in [
+            ('2', 0x00),
+            ('3', 0x1b),
+            ('4', 0x1c),
+            ('5', 0x1d),
+            ('6', 0x1e),
+            ('7', 0x1f),
+            ('8', 0x7f),
+            ('/', 0x1f),
+            ('`', 0x00),
+            ('{', 0x1b),
+            ('|', 0x1c),
+            ('}', 0x1d),
+            ('~', 0x1e),
+        ] {
+            assert_eq!(enc(Key::plain(c), Mods::CTRL), vec![byte], "Ctrl+{c}");
+        }
+    }
+
+    #[test]
     fn ctrl_without_a_mapping_sends_the_plain_char() {
         // Ctrl+1 has no control byte on this path; the digit goes through.
         assert_eq!(enc(Key::plain('1'), Mods::CTRL), b"1");
@@ -1132,8 +1159,10 @@ mod tests {
         // Level 1 rescues only what legacy cannot express at all: Ctrl+1 has no control
         // byte, so it gets a sequence...
         assert_eq!(encoded(Key::plain('1'), Mods::CTRL, m), b"\x1b[27;5;49~");
-        // ...while everything with a well-known encoding keeps it.
+        // ...while everything with a well-known encoding keeps it, the digits X11 maps
+        // included.
         assert_eq!(encoded(Key::plain('c'), Mods::CTRL, m), vec![0x03]);
+        assert_eq!(encoded(Key::plain('6'), Mods::CTRL, m), vec![0x1e]);
         assert_eq!(encoded(Key::plain('a'), Mods::ALT, m), vec![0x1b, b'a']);
         assert_eq!(encoded(Key::Tab, Mods::CTRL, m), vec![b'\t']);
         assert_eq!(encoded(Key::Enter, Mods::SHIFT, m), vec![b'\n']);
