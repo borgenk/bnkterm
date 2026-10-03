@@ -360,7 +360,7 @@ const LINK_URL_MAX: usize = 2048;
 const LINK_BYTES_MAX: usize = 8 * 1024 * 1024;
 
 /// How many bytes of query replies may accumulate before further answers are dropped
-/// (see [`Screen::respond`]). Sized far above any real conversation: the chattiest
+/// (see [`Screen::reply`]). Sized far above any real conversation: the chattiest
 /// startup handshake in the wild is nvim's, a few hundred bytes, and this is two
 /// hundred times that. Only a flood reaches it.
 const RESPONSE_MAX: usize = 64 * 1024;

@@ -22,6 +22,7 @@
 // `Screen`'s operations are split across these sibling modules, so each one works on
 // the same definitions rather than re-importing them piecemeal.
 use super::*;
+use crate::grid::reply::push_osc_end;
 use crate::platform::bytes::push_decimal;
 
 impl Screen {
@@ -172,11 +173,15 @@ impl Screen {
             let slot = self.named_color_mut(*target);
             if field == b"?" {
                 let color = *slot;
-                self.respond(b"\x1b]");
-                push_decimal(&mut self.responses, *target as u32);
-                self.responses.push(b';');
-                color::write_x11_color(color, &mut self.responses);
-                self.end_osc(bel);
+                // Out of budget: skip this answer, but keep applying the fields after it.
+                let Some(out) = self.reply() else {
+                    continue;
+                };
+                out.extend_from_slice(b"\x1b]");
+                push_decimal(out, *target as u32);
+                out.push(b';');
+                color::write_x11_color(color, out);
+                push_osc_end(out, bel);
             } else if let Some(color) = color::parse_x11_color(field) {
                 *slot = color;
             }
@@ -211,11 +216,16 @@ impl Screen {
                 continue;
             };
             if spec == b"?" {
-                self.respond(b"\x1b]4;");
-                push_decimal(&mut self.responses, u32::from(index));
-                self.responses.push(b';');
-                color::write_x11_color(self.theme.indexed(index), &mut self.responses);
-                self.end_osc(bel);
+                let color = self.theme.indexed(index);
+                // Out of budget: skip this answer, but keep applying the pairs after it.
+                let Some(out) = self.reply() else {
+                    continue;
+                };
+                out.extend_from_slice(b"\x1b]4;");
+                push_decimal(out, u32::from(index));
+                out.push(b';');
+                color::write_x11_color(color, out);
+                push_osc_end(out, bel);
             } else if let Some(color) = color::parse_x11_color(spec) {
                 self.theme.set_indexed(index, color);
             }

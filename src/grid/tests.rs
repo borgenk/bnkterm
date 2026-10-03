@@ -4310,6 +4310,69 @@ fn base64_decodes_what_a_terminal_actually_receives() {
 }
 
 #[test]
+fn every_reply_near_the_cap_is_whole_or_absent() {
+    // The reply budget is checked once per answer: one that starts under the cap is
+    // written whole, and past it nothing is written. Several answers are built in pieces,
+    // and the cap used to be checked per piece, so `CSI ? 7 $ p` near the cap queued
+    // `\x1b[?7;1` without its `$y`, and an OSC colour query past it queued its body with
+    // no header. Each expected answer is what a fresh screen says to the same query.
+    let queries: &[&[u8]] = &[
+        b"\x1b[?7$p",         // DECRQM
+        b"\x1b[6n",           // CPR
+        b"\x1b[?6n",          // DECXCPR
+        b"\x1b[>0q",          // XTVERSION
+        b"\x1bP$qm\x1b\\",    // DECRQSS, SGR
+        b"\x1bP$qr\x1b\\",    // DECRQSS, scroll region
+        b"\x1bP+q544e\x1b\\", // XTGETTCAP, TN
+        b"\x1b]11;?\x07",     // OSC 11
+        b"\x1b]4;1;?\x1b\\",  // OSC 4
+        b"\x1b[?u",           // kitty keyboard query
+    ];
+    for &query in queries {
+        let query_text = String::from_utf8_lossy(query);
+        let query = &query_text;
+        let mut fresh = Screen::new(10, 3);
+        feed(&mut fresh, query.as_bytes());
+        let whole = fresh.take_responses();
+        assert!(!whole.is_empty(), "{query:?} has an answer");
+
+        let mut s = Screen::new(10, 3);
+        s.responses = vec![b'x'; RESPONSE_MAX - 1];
+        feed(&mut s, query.as_bytes());
+        assert_eq!(
+            String::from_utf8_lossy(&s.responses()[RESPONSE_MAX - 1..]),
+            String::from_utf8_lossy(&whole),
+            "{query:?} just under the cap is answered whole"
+        );
+
+        let mut s = Screen::new(10, 3);
+        s.responses = vec![b'x'; RESPONSE_MAX];
+        feed(&mut s, query.as_bytes());
+        assert_eq!(
+            String::from_utf8_lossy(&s.responses()[RESPONSE_MAX..]),
+            "",
+            "{query:?} at the cap is not answered at all"
+        );
+    }
+
+    // Several XTGETTCAP names are several answers: the first starts under the cap and goes
+    // whole, and the second, starting past it, is dropped whole.
+    let mut fresh = Screen::new(10, 3);
+    feed(&mut fresh, b"\x1bP+q544e\x1b\\");
+    let first = fresh.take_responses();
+    let mut s = Screen::new(10, 3);
+    s.responses = vec![b'x'; RESPONSE_MAX - 1];
+    feed(&mut s, b"\x1bP+q544e;436f\x1b\\");
+    assert_eq!(&s.responses()[RESPONSE_MAX - 1..], &first[..]);
+
+    // A kitty push answers nothing, so a spent budget must not drop it.
+    let mut s = Screen::new(10, 3);
+    s.responses = vec![b'x'; RESPONSE_MAX];
+    feed(&mut s, b"\x1b[>1u");
+    assert_ne!(s.kitty_flags(), crate::input::KittyFlags::NONE);
+}
+
+#[test]
 fn a_flood_of_queries_cannot_mint_unbounded_replies() {
     // The child decides how many questions it asks, so reply generation has to be
     // bounded here rather than trusting the far side to drain. A file full of `\x1b[c`

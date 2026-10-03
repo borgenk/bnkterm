@@ -50,7 +50,8 @@ impl Screen {
         std::mem::take(&mut self.responses)
     }
 
-    /// Whether there is room to begin another answer.
+    /// The buffer to write one whole answer into, or `None` once the reply budget is
+    /// spent.
     ///
     /// Reply *generation* has to be bounded here, because the child controls how many
     /// questions it asks and nothing guarantees anything is draining the answers. A
@@ -59,26 +60,23 @@ impl Screen {
     /// reads its own stdin. `OSC_MAX` bounds one sequence's payload and says nothing
     /// about how many sequences arrive.
     ///
-    /// Checked *before* an answer is built, never during, which is what makes
-    /// [`RESPONSE_MAX`] a soft cap: a reply already under way runs to completion and may
-    /// carry the buffer a few tens of bytes past it. That is the point. Several replies
-    /// are assembled in pieces (a prefix through [`respond`](Self::respond), then decimal
-    /// fields pushed straight onto the buffer), and cutting one in half would deliver a
-    /// malformed escape sequence into the child's input — strictly worse than silence,
-    /// because a program waiting on an answer merely times out, while a program handed a
-    /// broken one may act on it.
-    fn can_reply(&self) -> bool {
-        self.responses.len() < RESPONSE_MAX
+    /// Checked once per answer, before it is built, which makes [`RESPONSE_MAX`] a soft
+    /// cap: an answer that starts under it is written whole and may carry the buffer a few
+    /// tens of bytes past it. Cutting one in half would deliver a malformed escape sequence
+    /// into the child's input, which is worse than silence: a program waiting on an answer
+    /// merely times out, while a program handed a broken one may act on it. A builder
+    /// computes what it needs first, then takes this buffer and writes the whole answer;
+    /// the borrow holds `self` until it is done, so it cannot ask again halfway through.
+    pub(super) fn reply(&mut self) -> Option<&mut Vec<u8>> {
+        (self.responses.len() < RESPONSE_MAX).then_some(&mut self.responses)
     }
 
-    /// Queue bytes to be written back to the child, if there is budget for another
-    /// answer. See [`can_reply`](Self::can_reply) for why the cap exists and why it is
-    /// checked per answer rather than per byte.
+    /// Queue a one-piece answer, if there is budget for another (see
+    /// [`reply`](Self::reply)).
     pub(super) fn respond(&mut self, bytes: &[u8]) {
-        if !self.can_reply() {
-            return;
+        if let Some(out) = self.reply() {
+            out.extend_from_slice(bytes);
         }
-        self.responses.extend_from_slice(bytes);
     }
 
     /// DECRQM (`CSI ? Ps $ p`, and `CSI Ps $ p` for the ANSI modes): "do you know this
@@ -95,19 +93,19 @@ impl Screen {
     /// off", which invites the program to switch it on and then depend on it. A lie here
     /// is worse than the silence it replaces.
     pub(super) fn report_mode(&mut self, mode: u16, private: bool) {
-        if !self.can_reply() {
-            return;
-        }
         let state = match self.mode_state(mode, private) {
             Some(true) => 1,
             Some(false) => 2,
             None => 0,
         };
-        self.respond(if private { b"\x1b[?" } else { b"\x1b[" });
-        push_decimal(&mut self.responses, u32::from(mode));
-        self.responses.push(b';');
-        push_decimal(&mut self.responses, state);
-        self.respond(b"$y");
+        let Some(out) = self.reply() else {
+            return;
+        };
+        out.extend_from_slice(if private { b"\x1b[?" } else { b"\x1b[" });
+        push_decimal(out, u32::from(mode));
+        out.push(b';');
+        push_decimal(out, state);
+        out.extend_from_slice(b"$y");
     }
 
     /// DA (Send Device Attributes): answer a program's "what are you?" probe.
@@ -127,9 +125,6 @@ impl Screen {
     /// the cursor position (CPR). The `?6 n` private form is the extended report
     /// (DECXCPR) some programs use. The position is 1-based and origin-mode aware.
     pub(super) fn device_status(&mut self, params: &Params, private: u8) {
-        if !self.can_reply() {
-            return;
-        }
         let ps = params.value(0);
         match (private, ps) {
             (0, 5) => self.respond(b"\x1b[0n"),
@@ -137,12 +132,14 @@ impl Screen {
             // page number, which is always 1 for a terminal with one page.
             (0, 6) | (b'?', 6) => {
                 let (row, col) = self.report_position();
-                self.respond(if private == b'?' { b"\x1b[?" } else { b"\x1b[" });
-                push_decimal(&mut self.responses, row);
-                self.responses.push(b';');
-                push_decimal(&mut self.responses, col);
-                self.responses
-                    .extend_from_slice(if private == b'?' { b";1R" } else { b"R" });
+                let Some(out) = self.reply() else {
+                    return;
+                };
+                out.extend_from_slice(if private == b'?' { b"\x1b[?" } else { b"\x1b[" });
+                push_decimal(out, row);
+                out.push(b';');
+                push_decimal(out, col);
+                out.extend_from_slice(if private == b'?' { b";1R" } else { b"R" });
             }
             _ => {}
         }
@@ -179,20 +176,20 @@ impl Screen {
         if !self.in_band_resize {
             return;
         }
-        if !self.can_reply() {
-            return;
-        }
         let (cols, rows) = self.dimensions();
         let (w, h) = self.pixel_size;
-        self.respond(b"\x1b[48;");
-        push_decimal(&mut self.responses, rows as u32);
-        self.responses.push(b';');
-        push_decimal(&mut self.responses, cols as u32);
-        self.responses.push(b';');
-        push_decimal(&mut self.responses, h);
-        self.responses.push(b';');
-        push_decimal(&mut self.responses, w);
-        self.responses.push(b't');
+        let Some(out) = self.reply() else {
+            return;
+        };
+        out.extend_from_slice(b"\x1b[48;");
+        push_decimal(out, rows as u32);
+        out.push(b';');
+        push_decimal(out, cols as u32);
+        out.push(b';');
+        push_decimal(out, h);
+        out.push(b';');
+        push_decimal(out, w);
+        out.push(b't');
     }
 
     /// Tell the child the window gained or lost focus (`CSI I` / `CSI O`), if it asked to
@@ -213,9 +210,12 @@ impl Screen {
     /// it is what a terminal is *supposed* to say when asked, and the only way a program
     /// could recognise us deliberately rather than not at all.
     pub(super) fn xtversion(&mut self) {
-        self.respond(b"\x1bP>|bnkterm ");
-        self.respond(env!("CARGO_PKG_VERSION").as_bytes());
-        self.respond(b"\x1b\\");
+        let Some(out) = self.reply() else {
+            return;
+        };
+        out.extend_from_slice(b"\x1bP>|bnkterm ");
+        out.extend_from_slice(env!("CARGO_PKG_VERSION").as_bytes());
+        out.extend_from_slice(b"\x1b\\");
     }
 
     /// DECRQSS (`DCS $ q <setting> ST`): "what is this setting currently set to?" The
@@ -227,15 +227,16 @@ impl Screen {
     /// query". Answering 1 with an empty or invented setting would be worse than silence:
     /// the program would take the reply at face value and restore garbage.
     pub(super) fn decrqss(&mut self, setting: &[u8]) {
-        if !self.can_reply() {
-            return;
-        }
         match setting {
             b"m" => {
                 // SGR. We report the *pen*, which is what a program restoring a rendition
                 // needs; the attribute bits are spelled out in the order xterm uses.
-                self.respond(b"\x1bP1$r0");
-                let attrs = self.pen.attrs;
+                let pen = self.pen;
+                let attrs = pen.attrs;
+                let Some(out) = self.reply() else {
+                    return;
+                };
+                out.extend_from_slice(b"\x1bP1$r0");
                 for (bit, code) in [
                     (Attrs::BOLD, b"1".as_slice()),
                     (Attrs::DIM, b"2"),
@@ -254,13 +255,13 @@ impl Screen {
                     (Attrs::STRIKE, b"9"),
                 ] {
                     if attrs.contains(bit) {
-                        self.responses.push(b';');
-                        self.respond(code);
+                        out.push(b';');
+                        out.extend_from_slice(code);
                     }
                 }
-                self.push_sgr_color(true);
-                self.push_sgr_color(false);
-                self.respond(b"m\x1b\\");
+                push_sgr_color(out, pen.fg, 30);
+                push_sgr_color(out, pen.bg, 40);
+                out.extend_from_slice(b"m\x1b\\");
             }
             b"r" => {
                 // DECSTBM, the scroll region, 1-based as the sequence that sets it.
@@ -268,11 +269,14 @@ impl Screen {
                     let b = self.active();
                     (b.scroll_top, b.scroll_bottom)
                 };
-                self.respond(b"\x1bP1$r");
-                push_decimal(&mut self.responses, top as u32 + 1);
-                self.responses.push(b';');
-                push_decimal(&mut self.responses, bottom as u32 + 1);
-                self.respond(b"r\x1b\\");
+                let Some(out) = self.reply() else {
+                    return;
+                };
+                out.extend_from_slice(b"\x1bP1$r");
+                push_decimal(out, top as u32 + 1);
+                out.push(b';');
+                push_decimal(out, bottom as u32 + 1);
+                out.extend_from_slice(b"r\x1b\\");
             }
             _ => self.respond(b"\x1bP0$r\x1b\\"),
         }
@@ -292,40 +296,6 @@ impl Screen {
         }
     }
 
-    /// One colour of the pen, as the SGR parameters that would set it, appended to a
-    /// DECRQSS reply. Nothing is appended for a default colour: `SGR 0` already said it.
-    pub(super) fn push_sgr_color(&mut self, foreground: bool) {
-        let color = if foreground { self.pen.fg } else { self.pen.bg };
-        let base = if foreground { 30 } else { 40 };
-        match color {
-            Color::Default => {}
-            Color::Ansi(i) if i < 8 => {
-                self.responses.push(b';');
-                push_decimal(&mut self.responses, u32::from(base + i));
-            }
-            Color::Ansi(i) => {
-                self.responses.push(b';');
-                push_decimal(&mut self.responses, u32::from(base + 60 + (i & 7)));
-            }
-            Color::Indexed(i) => {
-                self.responses.push(b';');
-                push_decimal(&mut self.responses, u32::from(base + 8));
-                self.respond(b";5;");
-                push_decimal(&mut self.responses, u32::from(i));
-            }
-            Color::Rgb(r, g, b) => {
-                self.responses.push(b';');
-                push_decimal(&mut self.responses, u32::from(base + 8));
-                self.respond(b";2;");
-                push_decimal(&mut self.responses, u32::from(r));
-                self.responses.push(b';');
-                push_decimal(&mut self.responses, u32::from(g));
-                self.responses.push(b';');
-                push_decimal(&mut self.responses, u32::from(b));
-            }
-        }
-    }
-
     /// XTGETTCAP (`DCS + q <hex-encoded names> ST`): "what does your terminfo say about
     /// these capabilities?" Names and values travel hex-encoded, which is how a value
     /// containing an escape sequence survives the trip.
@@ -338,12 +308,13 @@ impl Screen {
     /// protocol's way of saying "I do not have that" — and it is a real answer, not a
     /// silence, so the program stops waiting.
     pub(super) fn xtgettcap(&mut self, data: &[u8]) {
-        if !self.can_reply() {
-            return;
-        }
         for name in data.split(|&b| b == b';') {
+            // Each name gets an answer of its own, whole or not at all.
+            let Some(out) = self.reply() else {
+                return;
+            };
             let Some(decoded) = hex_decode(name) else {
-                self.respond(b"\x1bP0+r\x1b\\");
+                out.extend_from_slice(b"\x1bP0+r\x1b\\");
                 continue;
             };
             let value: Option<&[u8]> = match decoded.as_slice() {
@@ -359,16 +330,16 @@ impl Screen {
                 Some(value) => {
                     // The name goes back exactly as it arrived: it is already hex on the
                     // wire, and re-encoding it here would hex the hex.
-                    self.respond(b"\x1bP1+r");
-                    self.respond(name);
-                    self.responses.push(b'=');
-                    hex_encode(value, &mut self.responses);
-                    self.respond(b"\x1b\\");
+                    out.extend_from_slice(b"\x1bP1+r");
+                    out.extend_from_slice(name);
+                    out.push(b'=');
+                    hex_encode(value, out);
+                    out.extend_from_slice(b"\x1b\\");
                 }
                 None => {
-                    self.respond(b"\x1bP0+r");
-                    self.respond(name);
-                    self.respond(b"\x1b\\");
+                    out.extend_from_slice(b"\x1bP0+r");
+                    out.extend_from_slice(name);
+                    out.extend_from_slice(b"\x1b\\");
                 }
             }
         }
@@ -389,15 +360,15 @@ impl Screen {
     /// that wants key-release events and reads back that it is not getting them can
     /// fall back; one that is told yes and then never sees a release would hang.
     pub(super) fn kitty_keyboard(&mut self, params: &Params, private: u8) {
-        if !self.can_reply() {
-            return;
-        }
         match private {
             b'?' => {
-                self.respond(b"\x1b[?");
                 let flags = self.kitty_flags().bits();
-                push_decimal(&mut self.responses, flags);
-                self.respond(b"u");
+                let Some(out) = self.reply() else {
+                    return;
+                };
+                out.extend_from_slice(b"\x1b[?");
+                push_decimal(out, flags);
+                out.push(b'u');
             }
             b'=' => {
                 let flags = KittyFlags::from_request(params.value(0));
@@ -465,14 +436,43 @@ impl Screen {
             ModifyOtherKeys::Off
         };
     }
+}
 
-    /// Close a reply that opened with `OSC`, with the same terminator the request used.
-    /// A client that asked with BEL may only be listening for BEL.
-    pub(super) fn end_osc(&mut self, bel: bool) {
-        if bel {
-            self.responses.push(0x07);
-        } else {
-            self.respond(b"\x1b\\");
+/// Close a reply that opened with `OSC`, with the same terminator the request used.
+/// A client that asked with BEL may only be listening for BEL.
+pub(super) fn push_osc_end(out: &mut Vec<u8>, bel: bool) {
+    out.extend_from_slice(if bel { b"\x07" } else { b"\x1b\\" });
+}
+
+/// One colour of the pen, as the SGR parameters that would set it, appended to a DECRQSS
+/// reply. `base` is 30 for the foreground and 40 for the background. Nothing is appended
+/// for a default colour: `SGR 0` already said it.
+fn push_sgr_color(out: &mut Vec<u8>, color: Color, base: u8) {
+    match color {
+        Color::Default => {}
+        Color::Ansi(i) if i < 8 => {
+            out.push(b';');
+            push_decimal(out, u32::from(base + i));
+        }
+        Color::Ansi(i) => {
+            out.push(b';');
+            push_decimal(out, u32::from(base + 60 + (i & 7)));
+        }
+        Color::Indexed(i) => {
+            out.push(b';');
+            push_decimal(out, u32::from(base + 8));
+            out.extend_from_slice(b";5;");
+            push_decimal(out, u32::from(i));
+        }
+        Color::Rgb(r, g, b) => {
+            out.push(b';');
+            push_decimal(out, u32::from(base + 8));
+            out.extend_from_slice(b";2;");
+            push_decimal(out, u32::from(r));
+            out.push(b';');
+            push_decimal(out, u32::from(g));
+            out.push(b';');
+            push_decimal(out, u32::from(b));
         }
     }
 }
