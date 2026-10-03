@@ -60,7 +60,6 @@ impl Screen {
             }
         }
 
-        let pen = self.packed_pen();
         let insert = self.insert_mode;
         let (row, col) = {
             let cur = self.active().cursor;
@@ -70,6 +69,8 @@ impl Screen {
             let blank = self.blank_cell();
             self.active_mut().insert_blanks(row, col, cw, blank);
         }
+        // After the insert's blank, which interns a style (see `packed_pen`).
+        let pen = self.packed_pen();
         // A wide glyph needs two columns and there is exactly one screen narrow enough to
         // deny it: a single-column grid, where the wrap has nowhere to go and the back-up
         // for no-autowrap lands on the same cell. Marking it a leader there would set the
@@ -129,14 +130,13 @@ impl Screen {
     /// Caller guarantees (upheld by `<Screen as Perform>::print_ascii`): every byte
     /// is `0x20..=0x7e`, the active charset is identity ASCII, and insert mode is
     /// off, so no per-char glyph mapping, wide-cell, or shift handling is needed.
-    /// `write_cell` still runs per cell, so wide-pair and combining-mark cleanup at
-    /// the run's edges is preserved.
+    /// `fill_ascii_run` still breaks wide pairs at the run's edges and drops the
+    /// combining marks it covers, as the per-character path would.
     pub(super) fn print_ascii_run(&mut self, bytes: &[u8]) {
         let cols = self.active().cols;
         if cols == 0 {
             return;
         }
-        let pen = self.packed_pen();
         let autowrap = self.autowrap;
 
         let mut rest = bytes;
@@ -145,6 +145,8 @@ impl Screen {
             if self.active().cursor.pending_wrap {
                 self.wrap_line();
             }
+            // Per row, after the wrap, whose line feed interns a style (see `packed_pen`).
+            let pen = self.packed_pen();
             let (row, start_col) = {
                 let c = self.active().cursor;
                 (c.row, c.col)

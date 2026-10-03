@@ -1384,6 +1384,10 @@ impl Screen {
 
     /// The pen in the form the write paths store: rendition interned once, ready to be
     /// stamped into every cell of a run.
+    ///
+    /// Valid only until the next style is interned. Interning into a full table sweeps
+    /// it, and the sweep renumbers ids, so a write path takes the pen after anything that
+    /// interns (a wrap's line feed, an insert's blank), never before.
     pub(super) fn packed_pen(&mut self) -> PackedPen {
         PackedPen {
             style: self.pen_style_id(),

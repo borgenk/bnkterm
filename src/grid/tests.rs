@@ -133,6 +133,47 @@ fn dead_styles_are_collected_and_the_grid_keeps_its_colours() {
 }
 
 #[test]
+fn a_style_sweep_mid_print_does_not_strand_the_pen() {
+    // Interning into a full style table sweeps it, and the sweep renumbers ids. A wrap's
+    // line feed and an insert's blank both intern, so a print path that took the pen's
+    // id before them wrote the rest of its text with an id that now names another style,
+    // or none. Truecolour output (half-block images, video) fills the table routinely.
+    fn nearly_full(cols: usize, rows: usize) -> Screen {
+        let mut s = Screen::with_scrollback(cols, rows, 0);
+        for i in 0..STYLE_LIMIT - 1 {
+            let dead = Style {
+                fg: Color::Rgb((i >> 8) as u8, i as u8, 7),
+                ..Style::default()
+            };
+            let _ = s.styles.intern(dead);
+        }
+        s
+    }
+    let pen = b"\x1b[38;2;9;9;9;48;2;1;2;3m";
+
+    // A run of ASCII that wraps: the wrap's blank is what fills the table.
+    let mut s = nearly_full(4, 3);
+    feed(&mut s, &[&pen[..], b"abcdx"].concat());
+    for (row, col) in [(0, 0), (1, 0)] {
+        let cell = s.cell(row, col);
+        assert_eq!(
+            (cell.fg, cell.bg),
+            (Color::Rgb(9, 9, 9), Color::Rgb(1, 2, 3)),
+            "cell ({row}, {col}) keeps the pen"
+        );
+    }
+
+    // Insert mode: the blank the insert opens is interned after the pen was.
+    let mut s = nearly_full(4, 3);
+    feed(&mut s, &[b"\x1b[4h".as_slice(), pen, b"x"].concat());
+    let cell = s.cell(0, 0);
+    assert_eq!(
+        (cell.fg, cell.bg),
+        (Color::Rgb(9, 9, 9), Color::Rgb(1, 2, 3))
+    );
+}
+
+#[test]
 fn a_spent_style_table_degrades_without_losing_text() {
     // The id space is a `u16`, so a child printing nothing but distinct truecolour
     // renditions can exhaust it. The rule is then the one a spent `LinkId` space
