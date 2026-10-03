@@ -68,15 +68,17 @@ struct RetiredImage {
 /// live GPU backend when the compositor advertises the manager. Two DRM syncobj
 /// timelines the compositor shares: we signal `acquire` with each frame's
 /// render-done fence, and it signals `release` when done reading a buffer. A
-/// scratch binary syncobj carries the sync-file transfers. `point` increments
-/// per present; `buffer_release[i]` is the release point last published for
-/// buffer slot `i`, so that slot's next reuse waits on it. Dropping this closes
-/// the render-node fd, which frees every syncobj created on it.
+/// scratch binary syncobj carries the sync-file transfers, and a binary syncobj
+/// created signalled is the acquire fence of a frame with no render-done fence.
+/// `point` increments per present; `buffer_release[i]` is the release point last
+/// published for buffer slot `i`, so that slot's next reuse waits on it. Dropping
+/// this closes the render-node fd, which frees every syncobj created on it.
 pub(super) struct ExplicitSync {
     drm: OwnedFd,
     acquire_syncobj: u32,
     release_syncobj: u32,
     scratch: u32,
+    signalled: u32,
     acquire_timeline: u32,
     release_timeline: u32,
     surface: u32,
@@ -104,16 +106,30 @@ impl ExplicitSync {
     /// and claim the matching release point on a fresh timeline value, so the
     /// compositor waits for the GPU before reading and signals the point when it
     /// is done (the buffer's next reuse waits on that via [`Self::release_fence`]).
-    fn publish(&mut self, conn: &mut Connection, fence: &OwnedFd, idx: usize) -> Result<()> {
+    ///
+    /// `None` is a frame the CPU already waited out: its acquire point is published
+    /// already signalled. Both points are set either way, because a commit that
+    /// attaches a buffer without them is the `no_acquire_point` protocol error,
+    /// which closes the connection.
+    fn publish(
+        &mut self,
+        conn: &mut Connection,
+        fence: Option<&OwnedFd>,
+        idx: usize,
+    ) -> Result<()> {
         self.point += 1;
         let p = self.point;
-        ffi::drm_syncobj_sync_file_to_point(
-            self.drm.as_raw_fd(),
-            fence.as_raw_fd(),
-            self.acquire_syncobj,
-            p,
-            self.scratch,
-        )?;
+        let drm = self.drm.as_raw_fd();
+        match fence {
+            Some(fence) => ffi::drm_syncobj_sync_file_to_point(
+                drm,
+                fence.as_raw_fd(),
+                self.acquire_syncobj,
+                p,
+                self.scratch,
+            )?,
+            None => ffi::drm_syncobj_signal_point(drm, self.acquire_syncobj, p, self.signalled)?,
+        }
         self.buffer_release[idx] = Some(p);
         let (hi, lo) = ((p >> 32) as u32, p as u32);
         conn.request(
@@ -280,8 +296,9 @@ impl State {
         }
     }
 
-    /// Create the two client-owned timelines plus a scratch syncobj, share the
-    /// timelines with the compositor, and attach explicit sync to the surface.
+    /// Create the two client-owned timelines plus the scratch and signalled
+    /// syncobjs, share the timelines with the compositor, and attach explicit sync
+    /// to the surface.
     pub(super) fn negotiate_explicit_sync(
         &mut self,
         manager: u32,
@@ -292,6 +309,7 @@ impl State {
         let acquire_syncobj = ffi::drm_syncobj_create(fd, false)?;
         let release_syncobj = ffi::drm_syncobj_create(fd, false)?;
         let scratch = ffi::drm_syncobj_create(fd, false)?;
+        let signalled = ffi::drm_syncobj_create(fd, true)?;
         let acquire_timeline = self.import_timeline(manager, fd, acquire_syncobj)?;
         let release_timeline = self.import_timeline(manager, fd, release_syncobj)?;
         let surface = self.create_for(
@@ -304,6 +322,7 @@ impl State {
             acquire_syncobj,
             release_syncobj,
             scratch,
+            signalled,
             acquire_timeline,
             release_timeline,
             surface,
@@ -702,20 +721,17 @@ impl State {
             wl_surface::ATTACH,
             &[Arg::Object(buffer), Arg::Int(0), Arg::Int(0)],
         );
-        // Explicit sync: publish this frame's render-done fence as the acquire
-        // point and claim a release point, so the compositor waits before reading
-        // and signals when done. With no exportable fence the frame was
-        // CPU-waited: set no points.
-        match (render_done, self.presentation.explicit_sync.as_mut()) {
-            (Some(fence), Some(es)) => {
-                es.publish(&mut self.conn, &fence, idx)?;
+        // Explicit sync: publish this frame's acquire point and claim a release
+        // point, so the compositor waits before reading and signals when done. A
+        // frame with no exportable fence was CPU-waited, and its acquire point goes
+        // out already signalled.
+        if let Some(es) = self.presentation.explicit_sync.as_mut() {
+            es.publish(&mut self.conn, render_done.as_ref(), idx)?;
+            if render_done.is_some() {
                 self.presentation.explicit_fence_frames += 1;
-            }
-            (None, Some(es)) => {
-                es.buffer_release[idx] = None;
+            } else {
                 self.presentation.explicit_cpu_wait_frames += 1;
             }
-            _ => {}
         }
         // `damage_buffer`, not `damage`: these rectangles come out of the display-list
         // diff, which works in the same device pixels the buffer is drawn in, and

@@ -617,9 +617,9 @@ impl Gpu {
     /// (the compositor's release point for this buffer's previous frame, `None`
     /// on first use) instead of the dmabuf's implicit fences, and return the
     /// render-done sync file for the caller to publish as this frame's acquire
-    /// point. `Ok(None)` means the driver could not export a fence, so the frame
-    /// was CPU-waited to completion and the caller must set no points on the
-    /// commit (the buffer is already safe to read).
+    /// point. `Ok(None)` means no fence was exported, so the frame was CPU-waited
+    /// to completion and the caller publishes an already-signalled acquire point
+    /// (the buffer is already safe to read).
     pub fn render_list_explicit(
         &mut self,
         img: &mut GpuImage,
@@ -737,8 +737,8 @@ impl Gpu {
 
     /// Submit under explicit sync: after the submit, hand back the render-done
     /// sync file so the caller can publish it as this frame's acquire point. If
-    /// the driver cannot export one, CPU-wait to completion and return `None` so
-    /// the caller commits with no sync points.
+    /// none is exported, CPU-wait to completion and return `None`, for which the
+    /// caller publishes an already-signalled acquire point.
     fn submit_frame_explicit(
         &self,
         img: &mut GpuImage,
@@ -792,7 +792,9 @@ impl Gpu {
     }
 
     /// Export the just-submitted release semaphore as a sync file. `None` when
-    /// the driver cannot, in which case the caller must CPU-wait.
+    /// the driver cannot, or when it reports the semaphore already signalled by
+    /// returning fd -1, which the spec allows. The caller CPU-waits either way,
+    /// which returns at once in the second case.
     fn render_done_fence(&self, img: &GpuImage) -> Result<Option<OwnedFd>> {
         let info = VkSemaphoreGetFdInfoKHR {
             s_type: VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,

@@ -863,6 +863,19 @@ pub fn drm_syncobj_sync_file_to_point(
     drm_syncobj_transfer(drm, scratch, 0, timeline, point)
 }
 
+/// Put an already-signalled fence at timeline `point` of `timeline`, copied from
+/// the caller-owned binary syncobj `signalled` (created signalled, never
+/// re-armed). Publishes the acquire point of a frame the CPU has already waited
+/// out, so the compositor reads it without waiting.
+pub fn drm_syncobj_signal_point(
+    drm: RawFd,
+    timeline: u32,
+    point: u64,
+    signalled: u32,
+) -> Result<()> {
+    drm_syncobj_transfer(drm, signalled, 0, timeline, point)
+}
+
 /// Export timeline `point` of `timeline` as a sync file, via the caller-owned
 /// binary `scratch` syncobj: transfer the point to scratch point 0, then export
 /// it. Used to turn the compositor's release point into a fence the next render
@@ -1219,6 +1232,19 @@ mod tests {
             wait_sync_file(round_tripped.as_raw_fd(), 0),
             "the fence must stay signalled across the timeline round-trip",
         );
+
+        // A point published from the signalled syncobj (a CPU-waited frame's
+        // acquire point) reads back signalled, and publishing it again at a later
+        // point still works, so the source is not consumed.
+        for point in [POINT + 1, POINT + 2] {
+            drm_syncobj_signal_point(fd, timeline, point, src).expect("signal point");
+            let read = drm_syncobj_point_to_sync_file(fd, timeline, point, scratch)
+                .expect("read signalled point back");
+            assert!(
+                wait_sync_file(read.as_raw_fd(), 0),
+                "a point published from the signalled syncobj must read back signalled",
+            );
+        }
         // Dropping `drm` closes the render node, freeing every syncobj on it.
     }
 }
