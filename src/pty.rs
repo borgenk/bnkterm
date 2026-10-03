@@ -121,6 +121,9 @@ pub enum TtyMode {
 pub struct Pty {
     master: OwnedFd,
     pid: i32,
+    /// A pidfd for the child, readable once it exits; `None` on a kernel without
+    /// `pidfd_open`, where the end of the PTY stream is the only exit signal.
+    exited: Option<OwnedFd>,
     target: Target,
 }
 
@@ -224,6 +227,7 @@ impl Pty {
         Ok(Pty {
             master,
             pid,
+            exited: ffi::pidfd_open(pid).ok(),
             target,
         })
     }
@@ -231,6 +235,12 @@ impl Pty {
     /// The master fd, for the event loop to `poll` alongside the Wayland socket.
     pub fn fd(&self) -> RawFd {
         self.master.as_raw_fd()
+    }
+
+    /// A pidfd that becomes readable when the child exits, for the gather thread to
+    /// end the stream on (see [`crate::gather`]); `None` without `pidfd_open`.
+    pub fn exit_fd(&self) -> Option<RawFd> {
+        self.exited.as_ref().map(AsRawFd::as_raw_fd)
     }
 
     /// Read whatever the child has produced into `buf`, non-blocking. `Eof` means
@@ -373,8 +383,9 @@ impl Pty {
         // the plain pid into the lightweight handoff object.
         let mut this = std::mem::ManuallyDrop::new(self);
         let pid = this.pid;
+        drop(this.exited.take());
         // SAFETY: `ManuallyDrop` suppresses `Pty::drop`; `master` is initialized
-        // and is dropped exactly here. The only remaining field is the Copy pid.
+        // and is dropped exactly here. The other fields are Copy or already taken.
         unsafe { std::ptr::drop_in_place(&mut this.master) };
         ZombieChild { pid }
     }

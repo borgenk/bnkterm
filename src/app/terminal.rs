@@ -440,7 +440,7 @@ impl TerminalCore {
     /// label. Shared by the live path and the tests, so both bring a tab up identically.
     fn spawn_pty(&mut self, pty: Pty) -> Result<(usize, usize)> {
         let (cols, rows) = self.screen.dimensions();
-        let gatherer = match Gatherer::start(pty.fd()) {
+        let gatherer = match Gatherer::start(pty.fd(), pty.exit_fd()) {
             Ok(gatherer) => gatherer,
             Err(error) => {
                 // Retain the successfully spawned PTY in the core so an owner
@@ -2360,7 +2360,7 @@ mod tests {
             eprintln!("fork/exec unavailable; skipping the end-of-stream pump test");
             return;
         };
-        let Ok(gatherer) = Gatherer::start(pty.fd()) else {
+        let Ok(gatherer) = Gatherer::start(pty.fd(), pty.exit_fd()) else {
             eprintln!("gatherer unavailable; skipping the end-of-stream pump test");
             return;
         };
@@ -2393,6 +2393,58 @@ mod tests {
             core.screen.row_string(0).chars().next(),
             Some('\u{FFFD}'),
             "pump flushed the held half-character to a replacement at end of stream"
+        );
+    }
+
+    #[test]
+    fn a_shell_that_leaves_a_job_running_still_ends_its_stream() {
+        // `sleep 300 & exit` in an interactive shell: the job outlives the shell and keeps
+        // the PTY slave open, so the master never reports end of file. Ignoring SIGHUP
+        // keeps this job alive past the shell's exit as job control would. The stream must
+        // end when the shell does, after the shell's last output.
+        let script = "trap '' HUP; sleep 10 & printf done";
+        let Ok(pty) = Pty::spawn_command(40, 10, &["/bin/sh", "-c", script]) else {
+            eprintln!("fork/exec unavailable; skipping the outliving-job test");
+            return;
+        };
+        if pty.exit_fd().is_none() {
+            eprintln!("pidfd_open unavailable; skipping the outliving-job test");
+            return;
+        }
+        let Ok(gatherer) = Gatherer::start(pty.fd(), pty.exit_fd()) else {
+            eprintln!("gatherer unavailable; skipping the outliving-job test");
+            return;
+        };
+        let mut core = TerminalCore::new(false, geom(40, 10, 400, 200));
+        core.pty = Some(pty);
+        core.gatherer = Some(gatherer);
+
+        // Bounded well inside the job's lifetime, so only the shell's exit can end it.
+        let mut poll = crate::pty::PollSet::new();
+        let stop = Instant::now() + Duration::from_secs(5);
+        let mut ended = false;
+        while Instant::now() < stop {
+            let outcome = core
+                .pump(1 << 20, Instant::now() + Duration::from_millis(50))
+                .expect("pump");
+            if outcome.end.is_some() {
+                ended = true;
+                break;
+            }
+            poll.clear();
+            if let Some(g) = &core.gatherer {
+                poll.add(g.ready_fd());
+            }
+            let _ = poll.wait(Some(Duration::from_millis(50)));
+        }
+        assert!(
+            ended,
+            "the stream stayed open while the shell's job held the PTY"
+        );
+        assert_eq!(
+            core.screen.row_string(0).trim_end(),
+            "done",
+            "the shell's last output arrived before the end"
         );
     }
 

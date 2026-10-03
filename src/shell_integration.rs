@@ -876,7 +876,7 @@ mod tests {
             return Vec::new();
         };
         // Through the gather thread, the way a live tab reads its shell.
-        let Ok(gatherer) = Gatherer::start(pty.fd()) else {
+        let Ok(gatherer) = Gatherer::start(pty.fd(), pty.exit_fd()) else {
             return Vec::new();
         };
         let mut out = Vec::new();

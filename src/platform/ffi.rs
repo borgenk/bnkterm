@@ -17,7 +17,7 @@
 //! Struct layouts (`msghdr`, `iovec`, `cmsghdr`) mirror the Linux x86_64/arm64
 //! ABI; this targets Linux/Wayland and nothing else.
 
-use core::ffi::{c_char, c_int, c_short, c_uint, c_ulong, c_void, CStr};
+use core::ffi::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_void, CStr};
 use std::mem;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
@@ -176,6 +176,7 @@ extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlclose(handle: *mut c_void) -> c_int;
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    fn syscall(number: c_long, ...) -> c_long;
 }
 
 pub(crate) fn errno() -> c_int {
@@ -505,6 +506,25 @@ pub(crate) fn make_eventfd() -> Result<OwnedFd> {
         return Err(errno_error("eventfd"));
     }
     // SAFETY: fd is a fresh, owned descriptor returned by eventfd.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `pidfd_open(2)`'s syscall number, the same on x86_64 and arm64: syscalls added since
+/// Linux 5.1 share one number across architectures.
+const SYS_PIDFD_OPEN: c_long = 434;
+
+/// A pidfd for `pid`: it becomes readable when the process exits, so a `poll` can wait
+/// for a child's exit beside other fds. Close-on-exec, as every pidfd is. Needs Linux
+/// 5.3; reached through `syscall` because glibc only wraps it from 2.36.
+pub(crate) fn pidfd_open(pid: i32) -> Result<OwnedFd> {
+    let flags: c_long = 0;
+    // SAFETY: pidfd_open takes a pid and a flags word and returns a new fd or -1.
+    let rc = unsafe { syscall(SYS_PIDFD_OPEN, c_long::from(pid), flags) };
+    let fd = c_int::try_from(rc).unwrap_or(-1);
+    if fd < 0 {
+        return Err(errno_error("pidfd_open"));
+    }
+    // SAFETY: fd is a fresh, owned descriptor returned by pidfd_open.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 

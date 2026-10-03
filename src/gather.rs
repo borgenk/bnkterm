@@ -34,6 +34,14 @@
 //! state crosses the boundary: the gather thread produces `bytes`, the main thread
 //! feeds them to `vt::Parser`, preserving `bytes → vt::Parser → grid::Screen`.
 //!
+//! # The end of the stream
+//!
+//! The stream ends when the child does, which is not always when the PTY does: a job
+//! the shell left running in the background (`sleep 300 & exit`) keeps the slave open,
+//! so the master never reports end of file. The thread therefore also watches the
+//! child's pidfd. When it signals, the thread drains what the child left buffered and
+//! publishes the end after it, exactly as a PTY end of file does.
+//!
 //! # The buffer pool state machine
 //!
 //! ```text
@@ -72,8 +80,8 @@ pub const DEFAULT_POOL_BUFS: usize = 64;
 /// consumed, so the main thread never observes the end ahead of pending bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatherEnd {
-    /// The child closed the slave (it exited): `read` returned 0, or the master
-    /// reported `EIO` after draining.
+    /// The child is gone: its pidfd signalled and its last output was drained, or the
+    /// slave closed (`read` returned 0, or the master reported `EIO` after draining).
     Eof,
     /// An unexpected read/poll error, carrying its `errno` for the caller to
     /// report. Never a panic: the gather thread consumes attacker-controlled bytes.
@@ -235,38 +243,36 @@ impl BufPool {
 // The gather thread
 // ---------------------------------------------------------------------------
 
-/// Outcome of one nonblocking read; `EIO` on a PTY master is EOF (the slave is
-/// gone), not an error.
-/// Which of the two watched fds became readable in one wait.
+/// Which of the watched fds became readable in one wait.
 struct PollBits {
     pty: bool,
     stop: bool,
+    exited: bool,
 }
 
-/// Wait for the PTY read fd or the stop fd, collapsing `ffi::EINTR`.
+/// Wait for the PTY read fd, the stop fd, or the child's exit fd (`-1` when there is
+/// none, which `ppoll` ignores), collapsing `ffi::EINTR`.
 ///
-/// The wait is unbounded, and can be, because both watched fds are level-triggered:
-/// a byte sitting unread in the PTY and a nonzero stop-eventfd counter each make the
-/// *next* `ppoll` return immediately, so there is no edge to miss and no wake to lose.
-/// A periodic timeout would buy nothing and cost a timer wakeup per thread per tick,
-/// on a thread whose entire job is to sleep until the child says something.
-fn poll_pty_or_stop(read_fd: RawFd, stop_fd: RawFd) -> core::result::Result<PollBits, c_int> {
+/// The wait is unbounded, and can be, because every watched fd is level-triggered:
+/// a byte sitting unread in the PTY, a nonzero stop-eventfd counter, and an exited
+/// child's pidfd each make the *next* `ppoll` return immediately, so there is no edge
+/// to miss and no wake to lose. A periodic timeout would buy nothing and cost a timer
+/// wakeup per thread per tick, on a thread whose entire job is to sleep until the
+/// child says something.
+fn wait_for_child(
+    read_fd: RawFd,
+    stop_fd: RawFd,
+    exit_fd: RawFd,
+) -> core::result::Result<PollBits, c_int> {
     loop {
-        let mut fds = [
-            ffi::PollFd {
-                fd: read_fd,
-                events: ffi::POLLIN,
-                revents: 0,
-            },
-            ffi::PollFd {
-                fd: stop_fd,
-                events: ffi::POLLIN,
-                revents: 0,
-            },
-        ];
-        // SAFETY: fds points at two valid pollfd entries; a null timeout blocks until
+        let mut fds = [read_fd, stop_fd, exit_fd].map(|fd| ffi::PollFd {
+            fd,
+            events: ffi::POLLIN,
+            revents: 0,
+        });
+        // SAFETY: fds points at three valid pollfd entries; a null timeout blocks until
         // one of them is ready, and a null sigmask leaves the signal mask unchanged.
-        let r = unsafe { ppoll(fds.as_mut_ptr(), 2, core::ptr::null(), core::ptr::null()) };
+        let r = unsafe { ppoll(fds.as_mut_ptr(), 3, core::ptr::null(), core::ptr::null()) };
         if r < 0 {
             let e = ffi::errno();
             if e == ffi::EINTR {
@@ -278,15 +284,23 @@ fn poll_pty_or_stop(read_fd: RawFd, stop_fd: RawFd) -> core::result::Result<Poll
         return Ok(PollBits {
             pty: hit(&fds[0]),
             stop: hit(&fds[1]),
+            exited: hit(&fds[2]),
         });
     }
 }
 
-/// The gather loop: wait for the PTY to be readable (or a stop), then drain it into
-/// pool buffers, publishing full buffers at once and any nonempty partial on the
-/// first `EAGAIN` (baseline policy). The pool mutex is never held across a read,
-/// poll, or eventfd write.
-fn gather_loop(read_fd: RawFd, ready_efd: RawFd, stop_efd: RawFd, pool: Arc<BufPool>) {
+/// The gather loop: wait for the PTY to be readable (or a stop, or the child's exit),
+/// then drain it into pool buffers, publishing full buffers at once and any nonempty
+/// partial on the first `EAGAIN` (baseline policy). Once the child has exited, that
+/// `EAGAIN` is the end of the stream (see the module header). The pool mutex is never
+/// held across a read, poll, or eventfd write.
+fn gather_loop(
+    read_fd: RawFd,
+    exit_fd: RawFd,
+    ready_efd: RawFd,
+    stop_efd: RawFd,
+    pool: Arc<BufPool>,
+) {
     let wake = |woke: bool| {
         if woke {
             ffi::efd_signal(ready_efd);
@@ -294,20 +308,21 @@ fn gather_loop(read_fd: RawFd, ready_efd: RawFd, stop_efd: RawFd, pool: Arc<BufP
     };
 
     'outer: loop {
-        match poll_pty_or_stop(read_fd, stop_efd) {
+        let child_exited = match wait_for_child(read_fd, stop_efd, exit_fd) {
             Ok(bits) => {
                 if bits.stop {
                     break; // clean shutdown
                 }
-                if !bits.pty {
+                if !bits.pty && !bits.exited {
                     continue; // spurious wake
                 }
+                bits.exited
             }
             Err(e) => {
                 wake(pool.finish(GatherEnd::ReadError(e)));
                 break;
             }
-        }
+        };
 
         let mut buf = match pool.take_free() {
             Some(b) => b,
@@ -326,6 +341,12 @@ fn gather_loop(read_fd: RawFd, ready_efd: RawFd, stop_efd: RawFd, pool: Arc<BufP
             }
             match ffi::read_some(read_fd, &mut buf[len..]) {
                 ffi::Read::Bytes(n) => len += n,
+                ffi::Read::WouldBlock if child_exited => {
+                    // A PTY read flushes the line discipline's pending input before
+                    // it reports EAGAIN, so the child's last write has been read.
+                    wake(pool.publish_final(buf, len, GatherEnd::Eof));
+                    break 'outer;
+                }
                 ffi::Read::WouldBlock => {
                     // Baseline: publish any nonempty batch now, back to the wait.
                     if len > 0 {
@@ -395,35 +416,45 @@ pub struct Gatherer {
     /// The duplicated master fd the gather thread reads through. Held here so it
     /// outlives the thread: `Drop` joins the thread *before* this closes.
     _read_fd: OwnedFd,
+    /// A duplicate of the child's pidfd, held for the same reason.
+    _exit_fd: Option<OwnedFd>,
 }
 
 impl Gatherer {
-    /// Start gathering from `master_fd` (a PTY master). The fd is duplicated with
-    /// `F_DUPFD_CLOEXEC` for the gather thread, so the caller keeps sole use of the
-    /// original for writes and control. Uses the default 4 MiB pool.
-    pub fn start(master_fd: RawFd) -> Result<Gatherer> {
-        Gatherer::start_with_pool(master_fd, DEFAULT_POOL_BUFS)
+    /// Start gathering from `master_fd` (a PTY master), ending the stream when the
+    /// child behind `exit_fd` (its pidfd, [`crate::pty::Pty::exit_fd`]) exits even if
+    /// the PTY stays open. Both fds are duplicated with `F_DUPFD_CLOEXEC` for the gather
+    /// thread, so the caller keeps sole use of the originals. Uses the default 4 MiB
+    /// pool.
+    pub fn start(master_fd: RawFd, exit_fd: Option<RawFd>) -> Result<Gatherer> {
+        Gatherer::start_with_pool(master_fd, exit_fd, DEFAULT_POOL_BUFS)
     }
 
     /// As [`Gatherer::start`], with an explicit pool depth (buffers of [`BUF_CAP`]).
-    pub fn start_with_pool(master_fd: RawFd, nbufs: usize) -> Result<Gatherer> {
+    pub fn start_with_pool(
+        master_fd: RawFd,
+        exit_fd: Option<RawFd>,
+        nbufs: usize,
+    ) -> Result<Gatherer> {
         let read_fd = ffi::dup_cloexec(master_fd)?;
+        let exit_fd = exit_fd.map(ffi::dup_cloexec).transpose()?;
         let ready_efd = ffi::make_eventfd()?;
         let stop_efd = ffi::make_eventfd()?;
         let pool = BufPool::new(nbufs);
 
         let tpool = pool.clone();
-        let (rfd, refd, sefd) = (
+        let (rfd, xfd, refd, sefd) = (
             read_fd.as_raw_fd(),
+            exit_fd.as_ref().map_or(-1, AsRawFd::as_raw_fd),
             ready_efd.as_raw_fd(),
             stop_efd.as_raw_fd(),
         );
-        // The thread reads through `rfd` and signals/waits on `refd`/`sefd`, all
-        // owned by this struct. Drop joins the thread before those fds close, so
-        // the raw descriptors the thread holds never dangle.
+        // The thread reads through `rfd`, watches `xfd`, and signals/waits on
+        // `refd`/`sefd`, all owned by this struct. Drop joins the thread before those
+        // fds close, so the raw descriptors the thread holds never dangle.
         let handle = thread::Builder::new()
             .name("pty-gather".to_string())
-            .spawn(move || gather_loop(rfd, refd, sefd, tpool))
+            .spawn(move || gather_loop(rfd, xfd, refd, sefd, tpool))
             .map_err(|e| Error::msg(format!("spawn gather thread: {e}")))?;
 
         Ok(Gatherer {
@@ -432,6 +463,7 @@ impl Gatherer {
             ready_efd,
             stop_efd,
             _read_fd: read_fd,
+            _exit_fd: exit_fd,
         })
     }
 
@@ -848,7 +880,7 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             return;
         };
-        let g = Gatherer::start(child.master).unwrap();
+        let g = Gatherer::start(child.master, None).unwrap();
         let (want_hash, want_len) = expected_fnv(&data);
         let hash = AtomicU64::new(0xcbf29ce484222325u64);
         let got = AtomicU64::new(0);
@@ -874,7 +906,7 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             return;
         };
-        let g = Gatherer::start(child.master).unwrap();
+        let g = Gatherer::start(child.master, None).unwrap();
         let (want_hash, want_len) = expected_fnv(&data);
         let hash = AtomicU64::new(0xcbf29ce484222325u64);
         let got = AtomicU64::new(0);
@@ -901,7 +933,7 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             return;
         };
-        let g = Gatherer::start_with_pool(child.master, 2).unwrap();
+        let g = Gatherer::start_with_pool(child.master, None, 2).unwrap();
         let (want_hash, want_len) = expected_fnv(&data);
         let hash = AtomicU64::new(0xcbf29ce484222325u64);
         let got = AtomicU64::new(0);
@@ -934,7 +966,7 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             return;
         };
-        let g = Gatherer::start_with_pool(child.master, 4).unwrap();
+        let g = Gatherer::start_with_pool(child.master, None, 4).unwrap();
         let (want_hash, want_len) = expected_fnv(&data);
         let hash = AtomicU64::new(0xcbf29ce484222325u64);
         let got = AtomicU64::new(0);
@@ -969,7 +1001,7 @@ mod tests {
         let Some(child) = spawn_on_pty(&["/bin/sleep", "30"]) else {
             return;
         };
-        let g = Gatherer::start(child.master).unwrap();
+        let g = Gatherer::start(child.master, None).unwrap();
         thread::sleep(Duration::from_millis(30)); // ensure it is parked in poll
         let start = Instant::now();
         drop(g); // must wake via the stop eventfd and join
@@ -989,7 +1021,7 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             return;
         };
-        let g = Gatherer::start_with_pool(child.master, 1).unwrap();
+        let g = Gatherer::start_with_pool(child.master, None, 1).unwrap();
         // Never call next_batch: the one buffer fills, publishes, and the thread
         // blocks in take_free waiting for the free queue.
         thread::sleep(Duration::from_millis(50));
@@ -1011,7 +1043,7 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             return;
         };
-        let g = Gatherer::start(child.master).unwrap();
+        let g = Gatherer::start(child.master, None).unwrap();
         // Let the child finish and exit before we start draining, so batches and
         // the EOF marker are all queued when we begin.
         thread::sleep(Duration::from_millis(100));
@@ -1063,7 +1095,7 @@ mod tests {
             let _ = std::fs::remove_file(&path);
             return;
         };
-        let g = Gatherer::start_with_pool(child.master, 8).unwrap();
+        let g = Gatherer::start_with_pool(child.master, None, 8).unwrap();
         let original: std::collections::HashSet<*const u8> = {
             let inner = g.pool.lock();
             inner.free.iter().map(|b| b.as_ptr()).collect()
