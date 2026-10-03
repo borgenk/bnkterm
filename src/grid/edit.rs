@@ -747,6 +747,9 @@ impl Screen {
         let responses = std::mem::take(&mut self.responses);
         // xterm's RIS does not reset the window title, so neither does this.
         let title = std::mem::take(&mut self.title);
+        // The configured colours are the app's, pushed once when the tab opens. RIS undoes
+        // the child's OSC colour changes by returning to them, not to the built-in theme.
+        let base_theme = Rc::clone(&self.base_theme);
 
         *self = Screen::new(cols, rows);
 
@@ -756,6 +759,7 @@ impl Screen {
         self.pixel_size = pixel_size;
         self.responses = responses;
         self.title = title;
+        self.set_theme(base_theme);
     }
 
     /// DECSTR (`CSI ! p`): soft reset. Puts the *settings* back to their defaults while

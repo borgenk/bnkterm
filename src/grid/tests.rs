@@ -4715,8 +4715,8 @@ fn a_reset_takes_the_keyboard_protocols_with_it() {
 
 #[test]
 fn a_reset_does_not_take_what_was_never_the_childs_to_reset() {
-    // RIS wipes the terminal, and the terminal is the part the child owns. Three things
-    // are not that, and rebuilding the whole `Screen` took all three.
+    // RIS wipes the terminal, and the terminal is the part the child owns. Four things
+    // are not that, and rebuilding the whole `Screen` took all four.
     let mut s = Screen::new(80, 24);
     s.set_pixel_size(640, 384); // the app's, from the window
     feed(&mut s, b"\x1b]0;a title\x07");
@@ -4742,6 +4742,26 @@ fn a_reset_does_not_take_what_was_never_the_childs_to_reset() {
     // child asks a question the terminal knows the answer to and is told zero.
     feed(&mut s, b"\x1b[?2048h");
     assert_eq!(s.take_responses(), b"\x1b[48;24;80;384;640t");
+
+    // The configured colours are the app's as well, set once when the tab opens. RIS
+    // undoes the child's OSC 11 back to the configured background, not the built-in one,
+    // and an OSC reset afterwards still has the configured value to return to.
+    let mut s = Screen::new(80, 24);
+    let mut configured = Theme::default();
+    configured.bg = Rgb::new(1, 2, 3);
+    s.set_theme(std::rc::Rc::new(configured));
+    feed(&mut s, b"\x1b]11;#ff0000\x07\x1bc");
+    assert_eq!(
+        s.theme().bg,
+        Rgb::new(1, 2, 3),
+        "RIS keeps the configured colours"
+    );
+    feed(&mut s, b"\x1b]11;#ff0000\x07\x1b]111\x07");
+    assert_eq!(
+        s.theme().bg,
+        Rgb::new(1, 2, 3),
+        "and OSC 111 still finds them"
+    );
 
     // What the child *did* set is gone, which is the whole point of RIS.
     let mut s = Screen::new(80, 24);
