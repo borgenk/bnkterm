@@ -147,6 +147,47 @@ impl SelectionTransport {
             state: SelectionState::new(),
         }
     }
+
+    /// Which of this transport's objects a message is for, or `None` when it is not for
+    /// this transport. Three object families: the device, the source we own while we hold
+    /// the selection, and the offer being described to us, plus sources we destroyed that
+    /// the compositor may still send to.
+    fn route(&self, object: u32, opcode: u16) -> Option<Route> {
+        if self.device != 0 && object == self.device {
+            return Some(Route::Device);
+        }
+        if self.state.is_destroyed_source(object) {
+            return Some(if opcode == self.ops.ev_send {
+                Route::StaleSend
+            } else {
+                Route::Stale
+            });
+        }
+        if self.state.source != 0 && object == self.state.source {
+            return Some(Route::Source);
+        }
+        if self.state.incoming_offer != 0
+            && object == self.state.incoming_offer
+            && opcode == self.ops.ev_offer
+        {
+            return Some(Route::OfferMime);
+        }
+        None
+    }
+}
+
+/// Where [`SelectionTransport::route`] sends a message.
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    Device,
+    /// An event for the source we own.
+    Source,
+    /// One MIME type of the offer being described to us.
+    OfferMime,
+    /// A `send` to a source we destroyed. It carries a pipe fd that must still be taken.
+    StaleSend,
+    /// Any other event for a source we destroyed.
+    Stale,
 }
 
 /// One selection transport's bookkeeping. When we own the selection, `source` is
@@ -159,6 +200,12 @@ pub(super) struct SelectionState {
     pub(super) incoming_text_mime: Option<String>,
     pub(super) selection_offer: u32,
     pub(super) selection_text_mime: Option<String>,
+    /// Sources we destroyed whose deletion the compositor has not yet confirmed with
+    /// `wl_display.delete_id`. A `send` it queued for one before reading our destroy
+    /// still arrives, and it carries a pipe fd that must be taken off the connection's
+    /// fd queue, or every later fd-carrying event receives the fd meant for the one
+    /// before it.
+    destroyed_sources: Vec<u32>,
 }
 
 impl SelectionState {
@@ -170,17 +217,41 @@ impl SelectionState {
             incoming_text_mime: None,
             selection_offer: 0,
             selection_text_mime: None,
+            destroyed_sources: Vec::new(),
         }
+    }
+
+    /// Give up the source we own. Returns it for the caller to destroy, and remembers
+    /// it until [`Self::forget_destroyed`] hears the compositor confirm the deletion.
+    fn retire_source(&mut self) -> Option<u32> {
+        let source = std::mem::take(&mut self.source);
+        self.data.clear();
+        if source == 0 {
+            return None;
+        }
+        self.destroyed_sources.push(source);
+        Some(source)
+    }
+
+    /// Whether `object` is a source we destroyed and the compositor may still send to.
+    fn is_destroyed_source(&self, object: u32) -> bool {
+        self.destroyed_sources.contains(&object)
+    }
+
+    /// The compositor deleted `id`: nothing more arrives for it, and the id may be
+    /// handed out again, so it must stop counting as a destroyed source.
+    fn forget_destroyed(&mut self, id: u32) {
+        self.destroyed_sources.retain(|&source| source != id);
     }
 
     /// Record an offer the compositor has just introduced. Returns the offer this one
     /// supersedes, which the caller must destroy.
     ///
-    /// Something has to be returned, because an offer nobody destroys is a leak — a
-    /// client id (`alloc_id` never reuses them) plus a compositor resource. And offers
-    /// that are introduced and never named are not an edge case: `wl_data_device` carries
-    /// drag-and-drop offers on the same object, bnkterm handles no DnD events at all, so
-    /// every drag over the surface introduces one that no `selection` will ever claim.
+    /// Something has to be returned, because an offer nobody destroys leaks a compositor
+    /// resource. And offers that are introduced and never named are not an edge case:
+    /// `wl_data_device` carries drag-and-drop offers on the same object, bnkterm handles
+    /// no DnD events at all, so every drag over the surface introduces one that no
+    /// `selection` will ever claim.
     ///
     /// Never the selection's own offer. The compositor introduces an offer and then names
     /// it, so `incoming_offer` and `selection_offer` are routinely the same id, and that
@@ -254,28 +325,29 @@ impl State {
         }
     }
 
-    /// Route a Wayland message to whichever selection transport owns its object, or
-    /// `None` when neither does. Three object families per transport: the device, the
-    /// source we own while we hold the selection, and the offer being described to us.
+    /// Handle a Wayland message for whichever selection transport owns its object, or
+    /// return `None` when neither does (see [`SelectionTransport::route`]).
     pub(super) fn on_selection_message(
         &mut self,
         msg: &Message,
         r: &mut Reader,
     ) -> Option<Result<()>> {
         for t in [Transport::Clipboard, Transport::Primary] {
-            let sel = self.sel(t);
-            if sel.device != 0 && msg.object == sel.device {
-                return Some(self.on_selection_device(t, msg.opcode, r));
-            }
-            if sel.state.source != 0 && msg.object == sel.state.source {
-                return Some(self.on_selection_source(t, msg.opcode, r));
-            }
-            if sel.state.incoming_offer != 0
-                && msg.object == sel.state.incoming_offer
-                && msg.opcode == sel.ops.ev_offer
-            {
-                return Some(self.on_selection_offer_mime(t, r));
-            }
+            let Some(route) = self.sel(t).route(msg.object, msg.opcode) else {
+                continue;
+            };
+            return Some(match route {
+                Route::Device => self.on_selection_device(t, msg.opcode, r),
+                Route::Source => self.on_selection_source(t, msg.opcode, r),
+                Route::OfferMime => self.on_selection_offer_mime(t, r),
+                // Taking the fd and closing it keeps the fd queue in step, and gives the
+                // paster EOF for a selection that has since been replaced.
+                Route::StaleSend => {
+                    drop(self.conn.take_fd());
+                    Ok(())
+                }
+                Route::Stale => Ok(()),
+            });
         }
         None
     }
@@ -313,15 +385,18 @@ impl State {
                 .ok_or_else(|| Error::msg("selection source.send arrived without its fd"))?;
             self.begin_selection_send(t, fd);
         } else if opcode == ops.ev_cancelled {
-            let source = self.sel(t).state.source;
-            if source != 0 {
+            if let Some(source) = self.sel_mut(t).state.retire_source() {
                 self.conn.request(source, ops.source_destroy, &[]);
             }
-            let st = &mut self.sel_mut(t).state;
-            st.source = 0;
-            st.data.clear();
         }
         Ok(())
+    }
+
+    /// The compositor deleted object `id`, so stop treating it as a destroyed source.
+    pub(super) fn forget_destroyed_source(&mut self, id: u32) {
+        for sel in &mut self.selections {
+            sel.state.forget_destroyed(id);
+        }
     }
 
     /// One MIME type of an incoming offer; keep the best text one seen so a paste knows
@@ -344,8 +419,7 @@ impl State {
             return;
         }
         let ops = self.sel(t).ops;
-        let old_source = self.sel(t).state.source;
-        if old_source != 0 {
+        if let Some(old_source) = self.sel_mut(t).state.retire_source() {
             self.conn.request(old_source, ops.source_destroy, &[]);
         }
         let source = self.create(manager, ops.create_source);
@@ -497,15 +571,49 @@ fn mime_rank(mime: &str) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use crate::app::clipboard::SelectionState;
+    use crate::app::clipboard::{Route, SelectionState, SelectionTransport, CLIPBOARD_OPS};
+
+    #[test]
+    fn a_send_to_a_replaced_source_still_has_its_fd_taken() {
+        // A `send` the compositor queued before reading our destroy still arrives, with a
+        // pipe fd. It must route to having that fd taken, or the fd stays at the front of
+        // the connection's queue and every later fd-carrying event gets the one before it.
+        let [mut clipboard, _] = SelectionTransport::pair();
+        let (send, cancelled) = (CLIPBOARD_OPS.ev_send, CLIPBOARD_OPS.ev_cancelled);
+        clipboard.device = 3;
+        clipboard.state.source = 7;
+        clipboard.state.data = b"old".to_vec();
+        assert_eq!(clipboard.route(7, send), Some(Route::Source));
+
+        // Replaced by source 8.
+        assert_eq!(clipboard.state.retire_source(), Some(7));
+        assert!(clipboard.state.data.is_empty());
+        clipboard.state.source = 8;
+        assert_eq!(clipboard.route(7, send), Some(Route::StaleSend));
+        assert_eq!(clipboard.route(7, cancelled), Some(Route::Stale));
+        assert_eq!(clipboard.route(8, send), Some(Route::Source));
+        assert_eq!(clipboard.route(3, 0), Some(Route::Device));
+
+        // After `delete_id` nothing more arrives for 7 and the id may be handed out
+        // again, so a new object on it must not be mistaken for the destroyed source.
+        clipboard.state.forget_destroyed(7);
+        assert_eq!(clipboard.route(7, send), None);
+        assert_eq!(clipboard.state.retire_source(), Some(8));
+        clipboard.state.source = 7;
+        assert_eq!(clipboard.route(7, send), Some(Route::Source));
+
+        // No source, nothing to destroy.
+        let [mut fresh, _] = SelectionTransport::pair();
+        assert_eq!(fresh.state.retire_source(), None);
+    }
 
     #[test]
     fn an_offer_that_never_becomes_the_selection_is_still_destroyed() {
         // `wl_data_device` carries drag-and-drop offers on the same object as clipboard
         // ones, and bnkterm handles no DnD events at all — so every drag over the surface
         // introduces an offer that no `selection` will ever claim. Only offers that
-        // *became* the selection were destroyed, so each of those drags leaked a client
-        // id (never reused) and a compositor resource.
+        // *became* the selection were destroyed, so each of those drags leaked a
+        // compositor resource.
         let mut st = SelectionState::new();
 
         assert_eq!(st.introduce(10), None, "nothing to supersede yet");

@@ -1058,6 +1058,7 @@ impl State {
                 wl_display::EV_DELETE_ID => {
                     let id = r.u32()?;
                     if id < SERVER_ID_BASE {
+                        self.forget_destroyed_source(id);
                         self.free_ids.push(id);
                     }
                 }
