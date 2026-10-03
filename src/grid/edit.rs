@@ -596,7 +596,8 @@ impl Screen {
                 }
                 7 => self.autowrap = enable,
                 25 => self.cursor_visible = enable,
-                47 | 1047 => self.switch_alt(enable, false),
+                47 => self.switch_alt(enable, AltClear::Never),
+                1047 => self.switch_alt(enable, AltClear::OnExit),
                 // `?1048` is DECSC/DECRC on its own, and `?1049` is defined as `?1047`
                 // plus `?1048` plus a clear. A program emitting the pre-1049 pair got the
                 // screen switch and silently no cursor save.
@@ -610,9 +611,9 @@ impl Screen {
                 1049 => {
                     if enable {
                         self.save_cursor();
-                        self.switch_alt(true, true);
+                        self.switch_alt(true, AltClear::OnEntry);
                     } else {
-                        self.switch_alt(false, false);
+                        self.switch_alt(false, AltClear::OnEntry);
                         self.restore_cursor();
                     }
                 }
@@ -668,10 +669,10 @@ impl Screen {
         };
     }
 
-    /// Enter or leave the alternate screen. Entering clears it and carries the cursor
-    /// across unchanged (it is one cursor shared by both buffers, see below); the
-    /// primary buffer is untouched, so leaving reveals it intact.
-    fn switch_alt(&mut self, enable: bool, clear_on_entry: bool) {
+    /// Enter or leave the alternate screen, clearing it when the mode's [`AltClear`] rule
+    /// says to, and carrying the cursor across unchanged (it is one cursor shared by both
+    /// buffers, see below); the primary buffer is untouched, so leaving reveals it intact.
+    fn switch_alt(&mut self, enable: bool, clear: AltClear) {
         if enable == self.on_alt {
             return;
         }
@@ -692,14 +693,7 @@ impl Screen {
             // that then restores expects to land where it started, not at the origin.
             // The deferred-wrap flag rides along with it for the same reason.
             let cursor = self.active().cursor;
-            // Only `?1049h` clears on the way in. Per xterm, `?47h` and `?1047h` switch
-            // to whatever the alt screen already held — `?1047` clears on *exit*, and
-            // `?1049` is `?1047` plus `?1048` plus the entry clear. The net observable is
-            // identical for a 1047/1049 cycle, so this only shows for a program that
-            // leaves and re-enters through `?47`, which is nearly extinct; it is here
-            // because "the modes differ only in ways nobody can see" is a claim that stops
-            // being true the moment someone uses the one you skipped.
-            if clear_on_entry {
+            if matches!(clear, AltClear::OnEntry) {
                 self.alt.clear_all(blank);
             }
             self.alt.cursor = cursor;
@@ -716,6 +710,10 @@ impl Screen {
             // `?1049l` restores a saved cursor immediately after this and so cannot
             // tell; `?47l` and `?1047l` do not, and are what a program using the alt
             // screen without the save/restore pair sends.
+            if matches!(clear, AltClear::OnExit) {
+                let blank = self.blank_cell();
+                self.alt.clear_all(blank);
+            }
             let cursor = self.alt.cursor;
             self.primary.cursor = cursor;
             self.on_alt = false;
@@ -999,4 +997,17 @@ pub(super) fn parse_ext_color(param: &[u16], params: &Params, at: usize) -> (Opt
         }
         _ => (None, 0),
     }
+}
+
+/// When a switch between the main and alt screens clears the alt one. It is the one thing
+/// that tells xterm's three alt-screen modes apart, besides `?1049` saving and restoring
+/// the cursor around the switch. A mode passes its rule for both directions.
+#[derive(Clone, Copy)]
+enum AltClear {
+    /// `?47`: never, so re-entering shows what was left there.
+    Never,
+    /// `?1047`: on the way out, so the next entry finds it blank.
+    OnExit,
+    /// `?1049`: on the way in.
+    OnEntry,
 }

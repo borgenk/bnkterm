@@ -3283,25 +3283,34 @@ fn an_invalid_scroll_region_is_refused_whole() {
 }
 
 #[test]
-fn mode_47_does_not_clear_the_alt_screen_on_entry() {
-    // Per xterm, `?47h` and `?1047h` switch to whatever the alt screen already held;
-    // `?1047` clears on *exit* and `?1049` on entry. The net observable is identical for
-    // a 1047/1049 cycle, which is exactly why this went unnoticed.
-    let mut s = Screen::new(12, 3);
-    feed(&mut s, b"\x1b[?47h"); // enter
-    feed(&mut s, b"\x1b[1;1HALTCONTENT");
-    feed(&mut s, b"\x1b[?47l"); // leave; `?47` does not clear on exit either
-    feed(&mut s, b"\x1b[?47h"); // and back
+fn each_alt_screen_mode_clears_when_xterm_does() {
+    // xterm's three alt-screen modes differ in when they clear the alt screen: `?47`
+    // never, `?1047` on the way out, `?1049` on the way in.
+    let reenter = |modes: &[u8]| {
+        let mut s = Screen::new(12, 3);
+        feed(&mut s, modes);
+        s.row_string(0).trim_end().to_string()
+    };
+
+    // `?47` re-enters the screen it left, rather than a blank one.
     assert_eq!(
-        s.row_string(0).trim_end(),
-        "ALTCONTENT",
-        "?47 re-entered the screen it left, rather than a blank one"
+        reenter(b"\x1b[?47h\x1b[1;1HALTCONTENT\x1b[?47l\x1b[?47h"),
+        "ALTCONTENT"
     );
 
-    // `?1049h` is the one that clears on entry, and still does.
-    let mut s = Screen::new(12, 3);
-    feed(&mut s, b"\x1b[?1049h\x1b[1;1HALT\x1b[?1049l\x1b[?1049h");
-    assert_eq!(s.row_string(0).trim_end(), "", "?1049h clears on entry");
+    // `?1047` clears on the way out, so re-entering finds it blank whichever mode
+    // re-enters, including `?47`, which clears nothing itself.
+    assert_eq!(
+        reenter(b"\x1b[?1047h\x1b[1;1HALT\x1b[?1047l\x1b[?1047h"),
+        ""
+    );
+    assert_eq!(reenter(b"\x1b[?1047h\x1b[1;1HALT\x1b[?1047l\x1b[?47h"), "");
+
+    // `?1049h` clears on the way in.
+    assert_eq!(
+        reenter(b"\x1b[?1049h\x1b[1;1HALT\x1b[?1049l\x1b[?1049h"),
+        ""
+    );
 }
 
 #[test]
