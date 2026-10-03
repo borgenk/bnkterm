@@ -535,10 +535,11 @@ const O_CLOEXEC: c_int = 0o2000000;
 // tty ioctls (Linux).
 const TIOCSCTTY: c_ulong = 0x540E;
 const TIOCSWINSZ: c_ulong = 0x5414;
-/// `SIGPIPE` and the `SIG_DFL` disposition, plus the `sigprocmask` "replace the whole
-/// mask" op. The child restores both before exec (see [`fork_child_in_pty`]); the
-/// numbers are the Linux generic ABI and are pinned in the tests.
-const SIGPIPE: c_int = 13;
+/// The highest signal number (`SIGRTMAX`), the `SIG_DFL` disposition, and the
+/// `sigprocmask` "replace the whole mask" op. The child restores every disposition and the
+/// mask before exec (see [`fork_child_in_pty`]); the numbers are the Linux generic ABI
+/// and are pinned in the tests.
+const SIGRTMAX: c_int = 64;
 const SIG_DFL: usize = 0;
 const SIG_SETMASK: c_int = 2;
 
@@ -709,12 +710,17 @@ unsafe fn fork_child_in_pty(
     // and it does not touch the signal mask at all, so whatever we leave here is what
     // the shell and everything the shell ever runs inherits.
     //
-    // The Rust runtime sets `SIGPIPE` to `SIG_IGN` process-wide at startup, which the
-    // parent needs (serving a clipboard selection wants `EPIPE` when the paster goes
-    // away, not death) and the child must not have: a shell whose children ignore it has
-    // no working pipelines, because `yes | head -1` never gets the signal that is
-    // supposed to stop it and prints a write error instead.
-    signal(SIGPIPE, SIG_DFL);
+    // So every disposition goes back to the default, not only the ones we set. The Rust
+    // runtime ignores `SIGPIPE`, which the parent needs (serving a clipboard selection
+    // wants `EPIPE` when the paster goes away, not death) and the child must not have:
+    // `yes | head -1` would never get the signal that is supposed to stop it. And the
+    // parent can inherit ignores of its own: `nohup` ignores `SIGHUP`, and a shell
+    // starting us with `&` ignores `SIGINT` and `SIGQUIT`, after which `Ctrl+C` stops
+    // nothing in any tab. `SIGKILL`, `SIGSTOP` and glibc's internal signals refuse the
+    // change, which is harmless.
+    for sig in 1..=SIGRTMAX {
+        signal(sig, SIG_DFL);
+    }
     let empty = SigSet { words: [0; 16] };
     sigprocmask(SIG_SETMASK, &empty as *const SigSet, core::ptr::null_mut());
     setsid();
@@ -801,6 +807,9 @@ mod tests {
         assert_eq!(std::mem::size_of::<SigSet>(), 128);
     }
 
+    /// The signal the Rust runtime ignores and the child must not.
+    const SIGPIPE: c_int = 13;
+
     #[test]
     fn the_signal_numbers_match_the_c_abi() {
         // `SIGPIPE` is 13 and the Rust runtime ignores it: both read straight out of the
@@ -816,6 +825,14 @@ mod tests {
             "SIGPIPE is not {SIGPIPE}, or the Rust runtime no longer ignores it (SigIgn \
              {ignored:#x}); either way the child's restore is aimed at the wrong thing"
         );
+
+        // The child's restore loop stops at SIGRTMAX, so it must be the real one: a lower
+        // value would leave the top real-time signals as whatever the parent inherited.
+        unsafe extern "C" {
+            fn __libc_current_sigrtmax() -> c_int;
+        }
+        // SAFETY: a glibc query with no arguments and no preconditions.
+        assert_eq!(unsafe { __libc_current_sigrtmax() }, SIGRTMAX);
 
         // SIG_SETMASK *replaces* the mask rather than adding to it, which is what the
         // child wants: it is starting a shell, not amending an inherited state. An empty
@@ -1112,12 +1129,18 @@ mod tests {
     }
 
     #[test]
-    fn the_child_does_not_inherit_the_runtimes_ignored_sigpipe() {
-        // The Rust runtime sets SIGPIPE to SIG_IGN process-wide, and exec preserves
-        // *ignored* dispositions where it would reset a caught one. So unless the child
-        // restores it by hand, every shell this terminal ever runs -- and everything
-        // those shells run -- has broken pipelines. Ask the kernel directly rather than
-        // inferring it from behaviour.
+    fn the_child_starts_with_every_signal_at_its_default() {
+        // `exec` preserves *ignored* dispositions where it would reset a caught one, so
+        // whatever this process ignores, every shell the terminal runs ignores too. The
+        // Rust runtime ignores SIGPIPE (pipelines would never stop), and a parent started
+        // under `nohup` or with `&` also ignores SIGHUP, SIGINT or SIGQUIT (Ctrl+C would
+        // stop nothing). SIGUSR2 stands in for those: nothing in the suite uses it, and
+        // ignoring it is idempotent. Ask the kernel directly rather than inferring it.
+        const SIGUSR2: c_int = 12;
+        const SIG_IGN: usize = 1;
+        // SAFETY: setting a disposition is always sound; nothing in this test binary
+        // handles or raises SIGUSR2.
+        unsafe { signal(SIGUSR2, SIG_IGN) };
         let Some(out) = output_of(&["/bin/sh", "-c", "cat /proc/self/status"]) else {
             eprintln!("pty spawn unavailable in this environment; skipping");
             return;
@@ -1126,12 +1149,9 @@ mod tests {
             eprintln!("no SigIgn in /proc/self/status; skipping");
             return;
         };
-        // Signal N occupies bit N-1, so SIGPIPE (13) is bit 12.
         assert_eq!(
-            ignored & (1 << (SIGPIPE - 1)),
-            0,
-            "the child still ignores SIGPIPE (SigIgn {ignored:#x}); `yes | head` would \
-             never die and every pipeline in every tab misbehaves"
+            ignored, 0,
+            "the child ignores signals (SigIgn {ignored:#x}; signal N is bit N-1)"
         );
         // The mask is empty in this process today, so this pins that it stays that way
         // through the fork rather than proving the sigprocmask did work.
