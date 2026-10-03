@@ -59,9 +59,10 @@ const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 /// [`TerminalCore::pump_writes`]), but an unbounded queue just moves the failure from
 /// "frozen" to "out of memory". A child can mint outbound bytes on its own — every
 /// `\x1b[c` in its output is a device-attributes query the terminal answers — so this has
-/// to be bounded by something other than the user's patience. 1 MiB is far past anything
-/// legitimate: the largest real payload is a paste, and a paste to a child that is
-/// actually reading never accumulates at all.
+/// to be bounded by something other than the user's patience. The bound is checked before
+/// a message is queued and a message is never cut (see [`enqueue`]), so a paste into a
+/// queue with room always goes whole, however large, and the queue holds at most this
+/// plus one message.
 const OUT_QUEUE_MAX: usize = 1024 * 1024;
 
 /// How much written prefix accumulates before the queue reclaims it. Compaction is a
@@ -1816,21 +1817,23 @@ fn cursor_shape(style: CursorStyle, tty: TtyMode) -> CursorShape {
     }
 }
 
-/// Append `bytes` to a tab's outbound queue, dropping whatever would take it past
-/// [`OUT_QUEUE_MAX`]. `head` is how far the queue has already been written.
+/// Append one message (a keystroke, a paste, a mouse report, a batch of replies) to a
+/// tab's outbound queue whole, or drop it whole once [`OUT_QUEUE_MAX`] bytes are already
+/// owed. `head` is how far the queue has already been written.
 ///
-/// Overflow drops the *new* bytes rather than the old ones. The old ones are further
-/// along a byte stream the child is still parsing, and cutting from the middle of that
-/// would hand it a truncated escape sequence; losing the tail is the only lossy choice
-/// that leaves what does arrive well-formed.
+/// A message is never cut. Half a key sequence or reply is a malformed escape sequence in
+/// the child's input, and a bracketed paste cut short loses its closing `ESC [ 201 ~`,
+/// which leaves the shell treating every later keystroke as pasted text. The check comes
+/// before the append, so the queue can overshoot the cap by one message; each message is
+/// bounded where it is made (a paste by `PASTE_MAX`, a reply batch by `RESPONSE_MAX`).
 ///
 /// A free function rather than a method so the caller can pass a slice borrowed from
 /// another of its own fields (the grid's reply buffer) without the borrow checker
 /// seeing a conflict.
-fn enqueue(out: &mut Vec<u8>, head: usize, bytes: &[u8]) {
-    let queued = out.len() - head;
-    let room = OUT_QUEUE_MAX.saturating_sub(queued);
-    out.extend_from_slice(&bytes[..bytes.len().min(room)]);
+fn enqueue(out: &mut Vec<u8>, head: usize, message: &[u8]) {
+    if out.len() - head < OUT_QUEUE_MAX {
+        out.extend_from_slice(message);
+    }
 }
 
 /// Append `text` to `out` as the bytes a paste is allowed to deliver: printable text,
@@ -2022,11 +2025,12 @@ mod tests {
             "a paste blocked on a child that will never read"
         );
 
-        // Whatever the child would not take is owed, not lost, and never unbounded.
+        // Whatever the child would not take is owed, not lost, and never unbounded: the
+        // cap is checked before a paste is queued, so it overshoots by one paste at most.
+        let owed = core.out_buf.len() - core.out_head;
         assert!(
-            core.out_buf.len() - core.out_head <= OUT_QUEUE_MAX,
-            "the queue is capped at {OUT_QUEUE_MAX}, holding {}",
-            core.out_buf.len() - core.out_head
+            owed < OUT_QUEUE_MAX + big.len(),
+            "the queue is capped at {OUT_QUEUE_MAX} plus one paste, holding {owed}"
         );
         assert_eq!(
             core.wants_write(),
@@ -2042,32 +2046,74 @@ mod tests {
     }
 
     #[test]
-    fn the_outbound_queue_drops_the_tail_rather_than_growing_without_bound() {
-        // The cap's semantics on their own, with no kernel in the way. Overflow drops the
-        // *new* bytes: the old ones are further along a byte stream the child is still
-        // parsing, and cutting from the middle would hand it a truncated escape sequence,
-        // so losing the tail is the only lossy choice that leaves what does arrive
-        // well-formed.
+    fn a_message_is_queued_whole_or_not_at_all() {
+        // The cap's semantics on their own, with no kernel in the way. A message that
+        // starts below the cap goes in whole, even past it: cutting it would hand the
+        // child half an escape sequence, or a paste without its closing bracket.
         let mut out = Vec::new();
         enqueue(&mut out, 0, &vec![b'a'; OUT_QUEUE_MAX - 4]);
-        assert_eq!(out.len(), OUT_QUEUE_MAX - 4);
-
         enqueue(&mut out, 0, b"bbbbbbbb");
-        assert_eq!(out.len(), OUT_QUEUE_MAX, "filled exactly to the cap");
-        assert_eq!(
-            &out[OUT_QUEUE_MAX - 4..],
-            b"bbbb",
-            "and the head of the tail"
-        );
+        assert_eq!(out.len(), OUT_QUEUE_MAX + 4, "overshoots by one message");
+        assert!(out.ends_with(b"bbbbbbbb"));
 
+        // Once the cap is owed, the next message is dropped whole.
         enqueue(&mut out, 0, b"cccc");
-        assert_eq!(out.len(), OUT_QUEUE_MAX, "a full queue takes nothing more");
+        assert_eq!(
+            out.len(),
+            OUT_QUEUE_MAX + 4,
+            "a full queue takes nothing more"
+        );
 
         // `head` is what has already gone to the child, so it frees budget: the queue is
         // bounded by what is still *owed*, not by everything ever written.
-        enqueue(&mut out, OUT_QUEUE_MAX, b"dddd");
-        assert_eq!(out.len(), OUT_QUEUE_MAX + 4);
-        assert_eq!(&out[OUT_QUEUE_MAX..], b"dddd");
+        enqueue(&mut out, 8, b"dddd");
+        assert!(out.ends_with(b"dddd"));
+
+        // A paste larger than the cap still goes whole into a queue with room.
+        let mut out = Vec::new();
+        enqueue(&mut out, 0, &vec![b'p'; 2 * OUT_QUEUE_MAX]);
+        assert_eq!(out.len(), 2 * OUT_QUEUE_MAX);
+    }
+
+    #[test]
+    fn a_large_paste_reaches_a_reading_child_whole() {
+        // A 2 MiB bracketed paste into a child that reads everything. The queue used to
+        // keep only its first 1 MiB before the first write, so the rest and the closing
+        // `ESC [ 201 ~` never arrived and the shell stayed in paste mode. Raw mode, since
+        // canonical mode caps a line at 4095 bytes; the child reports the last six bytes
+        // it received, which must be the closing bracket.
+        let mut core = TerminalCore::new(false, geom(80, 24, 640, 384));
+        let payload = 2 * 1024 * 1024;
+        let total = b"\x1b[200~".len() + payload + b"\x1b[201~".len();
+        let script = format!(
+            "stty raw -echo; echo ready; head -c {total} | tail -c 6 | od -An -tx1 | tr -d ' \\n'; echo; sleep 1"
+        );
+        if core.spawn_program(&["/bin/sh", "-c", &script]).is_err() {
+            eprintln!("pty spawn unavailable in this environment; skipping");
+            return;
+        }
+        let screen_has = |core: &TerminalCore, needle: &str| {
+            (0..24).any(|row| core.row_string(row).contains(needle))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !screen_has(&core, "ready") {
+            assert!(Instant::now() < deadline, "the child never came up");
+            let _ = core.pump(1 << 20, Instant::now() + Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        core.feed_test_bytes(b"\x1b[?2004h");
+        core.paste(vec![b'x'; payload]).expect("paste");
+        while !screen_has(&core, "1b5b3230317e") {
+            assert!(
+                Instant::now() < deadline,
+                "the child never received the whole paste and its closing bracket"
+            );
+            core.pump_writes().expect("write");
+            let _ = core.pump(1 << 20, Instant::now() + Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let _ = core.into_child();
     }
 
     #[test]
