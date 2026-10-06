@@ -1,0 +1,14 @@
+size 12x2
+cursor 0,8
+flags alt=false autowrap=true origin=false insert=false cursor_vis=true bracketed=false appcursor=false keypad=false
+title ""
+grid:
+|aがb世😀    |
+|            |
+style:
+r0c1 'か' fg=Default bg=Default Attrs(-) Leader
+r0c2 ' ' fg=Default bg=Default Attrs(-) Spacer
+r0c4 '世' fg=Default bg=Default Attrs(-) Leader
+r0c5 ' ' fg=Default bg=Default Attrs(-) Spacer
+r0c6 '😀' fg=Default bg=Default Attrs(-) Leader
+r0c7 ' ' fg=Default bg=Default Attrs(-) Spacer

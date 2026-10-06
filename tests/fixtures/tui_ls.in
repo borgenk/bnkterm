@@ -1,0 +1,30 @@
+docs:
+PROTOCOL_SUPPORT.md  TABS.md  TESTING.md  THREAT_MODEL.md
+
+shaders:
+quad.frag  quad.frag.spv  quad.vert  quad.vert.spv
+
+src:
+[0m[01;34mapp[0m        [01;34mdev[0m        grid.rs     main.rs   [01;34mrender[0m          width.rs
+app.rs     error.rs   input.rs    mouse.rs  tab_bar.rs      width_tables.rs
+color.rs   fuzz.rs    keymode.rs  [01;34mplatform[0m  term_render.rs
+config.rs  gather.rs  lib.rs      pty.rs    vt.rs
+
+src/app:
+clipboard.rs  message.rs  present.rs  tabs.rs  terminal.rs
+
+src/dev:
+alloc.rs    gen_stream.rs  mod.rs   sha256.rs  sys.rs
+capture.rs  gen_tables.rs  perf.rs  stream.rs
+
+src/platform:
+browser.rs  emoji.rs       freetype.rs         link.rs      scroll.rs
+bytes.rs    error.rs       geom.rs             mod.rs       shape.rs
+conn.rs     ffi.rs         grapheme.rs         pixel.rs     wire.rs
+dmabuf.rs   fontconfig.rs  grapheme_tables.rs  protocol.rs  xkb.rs
+
+src/render:
+boxdraw.rs  display.rs  gpu.rs  mod.rs  [01;34mvulkan[0m
+
+src/render/vulkan:
+abi.rs  mod.rs  renderer.rs  target.rs

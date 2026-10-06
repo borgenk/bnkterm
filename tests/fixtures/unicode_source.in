@@ -1,0 +1,101 @@
+        for w in 0..words {
+            if w > 0 {
+                out.push(b' ');
+            }
+            out.extend_from_slice(WORDS[rng.below(WORDS.len())].as_bytes());
+        }
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Combining-mark-free, ZWJ-free lines of mixed scripts, including wide (CJK,
+/// kana, Hangul) runs: the UTF-8 decode path and the wide-cell placement, with
+/// no per-cell allocation so it doubles as a zero-allocation steady-state check.
+const SCRIPTS: &[&str] = &[
+    "Съешь ещё этих мягких французских булок да выпей чаю",
+    "Ελληνικά γράμματα και δοκιμή κειμένου ροής",
+    "いろはにほへとちりぬるをわかよたれそ日本語文字",
+    "동해물과 백두산이 마르고 닳도록 하느님이 보우하사",
+    "中文字符测试文本包含常用的汉字组合与标点",
+];
+
+fn unicode(target: usize) -> Vec<u8> {
+    let mut rng = Rng::new(4);
+    let mut out = Vec::with_capacity(target + 256);
+    while out.len() < target {
+        out.extend_from_slice(SCRIPTS[rng.below(SCRIPTS.len())].as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Non-ASCII prose whose scalars are all one cell wide. This separates UTF-8
+/// decoding and Unicode property lookup from the grid's wide-pair bookkeeping.
+const WIDTH1_PROSE: &[&str] = &[
+    "På vår øy står blåbær ved siden av røde epler",
+    "Zażółć gęślą jaźń, bientôt déjà vu après l'été",
+    "Съешь ещё этих мягких французских булок",
+    "Ελληνικά γράμματα σε μία γραμμή κειμένου",
+];
+
+fn unicode_width1(target: usize) -> Vec<u8> {
+    let mut rng = Rng::new(11);
+    let mut out = Vec::with_capacity(target + 256);
+    while out.len() < target {
+        out.extend_from_slice(WIDTH1_PROSE[rng.below(WIDTH1_PROSE.len())].as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// CJK, kana, and Hangul prose: nearly every decoded scalar needs a two-cell
+/// leader/spacer pair, isolating the wide-cell half of a future batch writer.
+const CJK_PROSE: &[&str] = &[
+    "日本語文字列と端末表示の性能測定",
+    "中文字符测试包含常用汉字与标点",
+    "동해물과 백두산이 마르고 닳도록",
+    "かなカナ漢字を含む文章の描画試験",
+];
+
+fn unicode_cjk(target: usize) -> Vec<u8> {
+    let mut rng = Rng::new(12);
+    let mut out = Vec::with_capacity(target + 256);
+    while out.len() < target {
+        out.extend_from_slice(CJK_PROSE[rng.below(CJK_PROSE.len())].as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// The shape source listings, compiler diagnostics, and shell prompts usually
+/// have: long ASCII identifiers and punctuation interrupted by short Unicode
+/// words. It prevents a fast path from winning only on uninterrupted non-ASCII.
+const MIXED_LINES: &[&str] = &[
+    "src/parser.rs:184: melding = \"ugyldig tegnfølge\"; status=avvist",
+    "warning[E0308]: ожидается `Result<T>`, получено `Option<T>`",
+    "render[row=17]: 日本語 text, width=2, fallback=false",
+    "test unicode_width: Ελληνικά + ASCII_123 + 中文 passed",
+];
+
+fn unicode_mixed(target: usize) -> Vec<u8> {
+    let mut rng = Rng::new(13);
+    let mut out = Vec::with_capacity(target + 256);
+    while out.len() < target {
+        out.extend_from_slice(MIXED_LINES[rng.below(MIXED_LINES.len())].as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+/// Emoji-dense lines, including a ZWJ family and a flag: the wide-cluster path,
+/// and (via the zero-width joiner/variation-selector) the combining side table.
+/// This one allocates by design; it is a lab stream, not a zero-alloc scenario.
+const EMOJI: &[&str] = &["😀", "🚀", "🎉", "🌍", "🔥", "✨", "👍", "🧪", "👨‍👩‍👧‍👦", "🏳️‍🌈"];
+
+fn emoji(target: usize) -> Vec<u8> {
+    let mut rng = Rng::new(5);
+    let mut out = Vec::with_capacity(target + 256);
+    while out.len() < target {
+        let count = 8 + rng.below(16);
+        for _ in 0..count {

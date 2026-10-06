@@ -1,0 +1,21 @@
+[?1049h[22;0;0t[>4;2m[?1h=[?2004h[1;24r[?12h[?12l[22;2t[22;1t[27m[23m[29m[m[H[2J[?25l[24;1H"src/vt.rs" 1586 lines, 60275 bytes[1;1H[38;5;130m    390 [m[12C[34m// fall through: handle `byte` fresh[m
+[38;5;130m    391 [m[8C}
+[38;5;130m    392 
+    393 [m[8C[34m// CAN/SUB abort any sequence to ground; ESC (re)starts one, endd[5;1Hing an OSC[m
+[38;5;130m    394 [m[8C[34m// string first. These act in every state.[m
+[38;5;130m    395 [8Cmatch[m byte {
+[38;5;130m    396 [m[12C[31m0x18[m [38;5;130m|[m [31m0x1a[m [38;5;130m=>[m {
+[38;5;130m    397 [m[16C[31mself[m.state [38;5;130m=[m [35mState[m[35m::[mGround;
+[38;5;130m    398 [16Creturn[m;
+[38;5;130m    399 [m[12C}
+[38;5;130m    400 [m[12C[31m0x1b[m [38;5;130m=>[m {
+[38;5;130m    401 [16Cif[m [31mself[m.state [38;5;130m==[m [35mState[m[35m::[mOscString {
+[38;5;130m    402 [m[20C[34m// ESC ends the string; the ST that follows is consuu[15;1Hmed by the escape[m
+[38;5;130m    403 [m[20C[34m// state as a no-op final byte. Not BEL, so an answee[17;1Hr uses ST.[m
+[38;5;130m    404 [m[20C[31mself[m.[36mfinish_osc[m(p, [31mfalse[m);
+[38;5;130m    405 [m[16C} [38;5;130melse[m [38;5;130mif[m [31mself[m.state [38;5;130m==[m [35mState[m[35m::[mDcsPassthrough {
+[38;5;130m    406 [m[20C[31mself[m.[36mfinish_dcs[m(p);
+[38;5;130m    407 [m[16C}
+[38;5;130m    408 [m[16C[31mself[m.[36mclear[m();
+[38;5;130m    409 [m[16C[31mself[m.state [38;5;130m=[m [35mState[m[35m::[mEscape;[?25h
+[?2004l[>4;m[23;2t[23;1t[24;1H[K[24;1H[?2004l[?1l>[?1049l[23;0;0t[>4;m

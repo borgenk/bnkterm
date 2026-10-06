@@ -1,0 +1,9 @@
+size 12x3
+cursor 1,9
+flags alt=false autowrap=true origin=false insert=false cursor_vis=true bracketed=false appcursor=false keypad=false
+title ""
+grid:
+|Z           |
+|line edit   |
+|three       |
+style:

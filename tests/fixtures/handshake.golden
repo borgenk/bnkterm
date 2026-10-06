@@ -1,0 +1,47 @@
+size 80x24
+cursor 0,14
+flags alt=false autowrap=true origin=false insert=false cursor_vis=true bracketed=true appcursor=false keypad=false
+title ""
+grid:
+|handshake done                                                                  |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+|                                                                                |
+style:
+replies:
+<ESC>[?1;2c
+<ESC>[>0;0;0c
+<ESC>P>|bnkterm 0.2.0<ESC>\
+<ESC>[0n
+<ESC>[1;1R
+<ESC>[?0u
+<ESC>[?3u
+<ESC>[?2026;2$y
+<ESC>[?2027;2$y
+<ESC>[?2031;0$y
+<ESC>[?2048;2$y
+<ESC>[?69;0$y
+<ESC>]11;rgb:2828/2c2c/3434<BEL>
+<ESC>]10;rgb:ffff/ffff/ffff<BEL>
+<ESC>P1$r0m<ESC>\
+<ESC>P1+r544e=626e6b7465726d<ESC>\

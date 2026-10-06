@@ -1,0 +1,10 @@
+size 6x4
+cursor 2,0
+flags alt=false autowrap=true origin=false insert=false cursor_vis=true bracketed=false appcursor=false keypad=false
+title ""
+grid:
+|AAAA  |
+|CCCC  |
+|      |
+|DDDD  |
+style:

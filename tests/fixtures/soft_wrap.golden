@@ -1,0 +1,10 @@
+size 8x4
+cursor 3,3
+flags alt=false autowrap=true origin=false insert=false cursor_vis=true bracketed=false appcursor=false keypad=false
+title ""
+grid:
+|abcdefgh| wrapped
+|ij      |
+|12345678|
+|end     |
+style:

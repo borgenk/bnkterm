@@ -1,0 +1,22 @@
+size 30x3
+cursor 0,21
+flags alt=false autowrap=true origin=false insert=false cursor_vis=true bracketed=false appcursor=false keypad=false
+title ""
+grid:
+|norm bold red c256 tc         |
+|                              |
+|                              |
+style:
+r0c5 'b' fg=Default bg=Default Attrs(BOLD) Narrow
+r0c6 'o' fg=Default bg=Default Attrs(BOLD) Narrow
+r0c7 'l' fg=Default bg=Default Attrs(BOLD) Narrow
+r0c8 'd' fg=Default bg=Default Attrs(BOLD) Narrow
+r0c10 'r' fg=Ansi(1) bg=Default Attrs(-) Narrow
+r0c11 'e' fg=Ansi(1) bg=Default Attrs(-) Narrow
+r0c12 'd' fg=Ansi(1) bg=Default Attrs(-) Narrow
+r0c14 'c' fg=Indexed(208) bg=Default Attrs(-) Narrow
+r0c15 '2' fg=Indexed(208) bg=Default Attrs(-) Narrow
+r0c16 '5' fg=Indexed(208) bg=Default Attrs(-) Narrow
+r0c17 '6' fg=Indexed(208) bg=Default Attrs(-) Narrow
+r0c19 't' fg=Default bg=Rgb(10, 20, 30) Attrs(-) Narrow
+r0c20 'c' fg=Default bg=Rgb(10, 20, 30) Attrs(-) Narrow
