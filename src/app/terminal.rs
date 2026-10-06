@@ -684,19 +684,20 @@ impl TerminalCore {
         // is best-effort: a resize on a dead child just surfaces as EOF on
         // the next read, which shuts down cleanly.
         self.geom = geom;
+        // An in-progress drag cannot survive: the button is held on a window that is
+        // being resized. It ends here, and copies what it selected (below) the way its
+        // release would have.
+        let ended_drag = self.drag.take().is_some();
         if self.demo {
             // The grid is replaced wholesale, so no row id minted against the
             // old one survives it.
             self.screen = demo_screen(cols, rows);
             self.set_selection(None);
-            self.drag = None;
         } else {
             // A width reflow re-wraps the grid and renumbers its rows; the returned
             // effect says how to carry the selection over that (a height change leaves
-            // ids alone). An in-progress drag cannot survive — the button is held on a
-            // window that is being resized — so it goes regardless.
+            // ids alone).
             let effect = self.screen.resize(cols, rows);
-            self.drag = None;
             let carried = self.carry_selection(effect);
             self.set_selection(carried);
             self.screen.set_pixel_size(geom.width, geom.height);
@@ -709,6 +710,9 @@ impl TerminalCore {
         // Prune catches the leftover cases the carry does not: a kept selection whose
         // end row a shrink dropped off the screen.
         self.prune_selection();
+        if ended_drag {
+            self.offer_selection(true);
+        }
         self.dirty = true;
     }
 
@@ -769,8 +773,18 @@ impl TerminalCore {
     /// mouse, or drive local selection / scrollback scroll / hyperlinks. The window
     /// already mapped the event to a cell and supplied the modifier chord (Shift
     /// forces local use even while a program is reporting the mouse).
+    ///
+    /// Shift decides who owns a gesture when its button goes down, and the gesture
+    /// stays with that owner until the button comes up: letting go of Shift halfway
+    /// through a Shift+drag still ends the selection, and pressing it halfway through
+    /// a reported drag still reports the release. A release whose press nobody took
+    /// (the Ctrl+click that opened a link) does nothing.
     pub(super) fn pointer(&mut self, event: PointerEvent, mods: input::Mods) -> Result<()> {
-        let reporting = self.screen.mouse_mode().reports() && !mods.contains(input::Mods::SHIFT);
+        let reports = self.screen.mouse_mode().reports();
+        let reporting = reports && !mods.contains(input::Mods::SHIFT);
+        // A button the program heard go down keeps the pointer the program's until it
+        // comes up, or until the program stops listening.
+        let program_gesture = reports && self.mouse_held.is_some();
         match event {
             PointerEvent::Button {
                 button,
@@ -780,7 +794,13 @@ impl TerminalCore {
                 count,
                 side,
             } => {
-                if reporting {
+                if !pressed && button == MouseButton::Left && self.drag.is_some() {
+                    // A local drag ends here and offers the text to the clipboard and
+                    // primary selection, whatever Shift says now.
+                    self.drag = None;
+                    self.finish_selection();
+                    self.dirty = true;
+                } else if reporting || program_gesture {
                     self.mouse_held = pressed.then_some(button);
                     // A press or release starts a new gesture, so the next motion is
                     // news whatever cell it lands in.
@@ -799,16 +819,12 @@ impl TerminalCore {
                     if pressed && mods.contains(input::Mods::CTRL) && self.open_link(row, col) {
                         return Ok(());
                     }
-                    // Local selection: a press begins one at the click's granularity
-                    // (character/word/line), a release ends the drag and offers the
-                    // text to the clipboard and primary selection.
+                    // A press begins a local selection at the click's granularity
+                    // (character/word/line).
                     if pressed {
                         self.begin_selection(row, col, side, count);
-                    } else {
-                        self.drag = None;
-                        self.finish_selection();
+                        self.dirty = true;
                     }
-                    self.dirty = true;
                 } else if button == MouseButton::Middle && pressed {
                     // Middle-click pastes the primary selection (the Linux
                     // convention). The window owns the data device, so it does the
@@ -819,7 +835,7 @@ impl TerminalCore {
             PointerEvent::Motion { col, row, side } => {
                 if self.drag.is_some() {
                     self.extend_selection(row, col, side);
-                } else if reporting && self.reported_cell != Some((row, col)) {
+                } else if (reporting || program_gesture) && self.reported_cell != Some((row, col)) {
                     // Report motion to a program that asked for it (drag under ?1002,
                     // any move under ?1003) — once per *cell*, which is the only
                     // resolution the report has. See `reported_cell`.
@@ -829,7 +845,8 @@ impl TerminalCore {
                 }
                 // A hover is live only when the gesture is not already spoken for: a
                 // drag is a selection, and a grabbed mouse belongs to the program.
-                self.track_hover(row, col, !reporting && self.drag.is_none());
+                let live = !reporting && !program_gesture && self.drag.is_none();
+                self.track_hover(row, col, live);
             }
             PointerEvent::Left => {
                 // Off the grid entirely: the next motion back onto it is a fresh
@@ -3046,6 +3063,7 @@ mod tests {
         hover_at(&mut core, 10, 0, input::Mods::NONE);
         assert!(!core.hovering_link(), "the program owns the pointer");
         click_mods(&mut core, true, 10, 0, input::Mods::CTRL);
+        click_mods(&mut core, false, 10, 0, input::Mods::CTRL);
         assert!(
             opened_url(&mut core).is_none(),
             "the click went to the child"
@@ -3065,6 +3083,95 @@ mod tests {
             opened_url(&mut core).as_deref(),
             Some("https://example.com/a")
         );
+    }
+
+    #[test]
+    fn letting_go_of_shift_before_the_button_still_ends_the_selection() {
+        // Shift+drag selects text under a program grabbing the mouse, and people let go
+        // of Shift a moment before the button. The release still belongs to the
+        // selection: it copies, and the program never hears a release it saw no press
+        // for.
+        let mut core = core_showing("\x1b[?1000h\x1b[?1006hhello world");
+        core.key_buf.clear();
+        click_mods(&mut core, true, 0, 0, input::Mods::SHIFT);
+        hover_at(&mut core, 5, 0, input::Mods::SHIFT);
+        hover_at(&mut core, 5, 0, input::Mods::NONE);
+        click_mods(&mut core, false, 5, 0, input::Mods::NONE);
+
+        assert!(core.key_buf.is_empty(), "nothing reached the program");
+        assert!(core.drag.is_none(), "the drag ended with the button");
+        assert_eq!(primary_offer(&mut core).as_deref(), Some("hello"));
+        hover_at(&mut core, 8, 0, input::Mods::NONE);
+        assert_eq!(
+            core.selection_text, "hello",
+            "the highlight no longer follows a pointer with no button held"
+        );
+    }
+
+    #[test]
+    fn pressing_shift_mid_drag_leaves_the_gesture_with_the_program() {
+        // The reverse: a drag the program heard begin is the program's to the end, so
+        // Shift arriving halfway neither hands the pointer to the terminal (no link
+        // hover, no selection) nor swallows the release, which would leave the program
+        // thinking the button is still down.
+        let mut core = core_showing("\x1b[?1002h\x1b[?1006hsee https://example.com/a here");
+        core.key_buf.clear();
+        click_mods(&mut core, true, 1, 0, input::Mods::NONE);
+        assert_eq!(core.key_buf, b"\x1b[<0;2;1M");
+
+        core.key_buf.clear();
+        hover_at(&mut core, 10, 0, input::Mods::SHIFT);
+        assert_eq!(
+            core.key_buf, b"\x1b[<36;11;1M",
+            "the drag is still reported"
+        );
+        assert!(
+            !core.hovering_link(),
+            "the link under it is not the terminal's"
+        );
+        assert!(core.drag.is_none());
+
+        core.key_buf.clear();
+        click_mods(&mut core, false, 10, 0, input::Mods::SHIFT);
+        assert_eq!(core.key_buf, b"\x1b[<4;11;1m", "and so is its release");
+        assert!(
+            primary_offer(&mut core).is_none(),
+            "which offers no selection"
+        );
+    }
+
+    #[test]
+    fn a_ctrl_click_on_a_link_leaves_the_clipboard_alone() {
+        // The press opens the link and takes nothing else. Its release must not finish a
+        // selection either: that re-offered whatever was last selected, overwriting
+        // whatever the user had copied since.
+        let mut core = core_showing("see https://example.com/a here");
+        press(&mut core, MouseButton::Left, true, 0, 0);
+        drag_to(&mut core, 3, 0);
+        press(&mut core, MouseButton::Left, false, 3, 0);
+        assert_eq!(primary_offer(&mut core).as_deref(), Some("see"));
+
+        click_mods(&mut core, true, 10, 0, input::Mods::CTRL);
+        click_mods(&mut core, false, 10, 0, input::Mods::CTRL);
+        let out = core.take_outbox();
+        assert!(out.iter().any(|m| matches!(m, ToWindow::OpenUrl(_))));
+        assert!(
+            !out.iter()
+                .any(|m| matches!(m, ToWindow::OfferPrimary(_) | ToWindow::OfferSelection(_))),
+            "the old selection was not offered again"
+        );
+    }
+
+    #[test]
+    fn a_resize_that_ends_a_drag_still_copies_its_selection() {
+        // A resize ends a drag while the button is still down, so its release finds no
+        // drag to finish. What the drag selected is copied all the same.
+        let mut core = core_showing("hello world");
+        press(&mut core, MouseButton::Left, true, 0, 0);
+        drag_to(&mut core, 5, 0);
+        core.resize(geom(40, 12, 40 * 8, 12 * 16));
+        press(&mut core, MouseButton::Left, false, 5, 0);
+        assert_eq!(primary_offer(&mut core).as_deref(), Some("hello"));
     }
 
     #[test]
