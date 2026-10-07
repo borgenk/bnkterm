@@ -43,6 +43,11 @@ use crate::vt::Parser;
 /// The cursor blink half-period: how long each of the on/off phases lasts.
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
+/// How many phase flips a blink gets before it rests on a lit cursor: ~10s at
+/// [`BLINK_INTERVAL`], after which a focused idle terminal would otherwise keep
+/// presenting a frame twice a second forever. Any activity refills it.
+const BLINK_TOGGLES: u16 = 20;
+
 /// How long a child may hold a frame under synchronized output (`?2026`) before we show
 /// it anyway.
 ///
@@ -249,6 +254,8 @@ pub(super) struct TerminalCore {
     /// when not blinking, e.g. unfocused). Activity resets it to on.
     blink_on: bool,
     blink_at: Option<Instant>,
+    /// Phase flips left before the blink rests; refilled by any activity.
+    blinks_left: u16,
     /// When a settled resize should be pushed to the child (`TIOCSWINSZ`), or `None` when
     /// none is pending. The grid is already reflowed; this debounces only the child's
     /// `SIGWINCH` so a drag does not flood it. See [`resize_settle`].
@@ -380,6 +387,7 @@ impl TerminalCore {
             focused: false,
             blink_on: true,
             blink_at: None,
+            blinks_left: BLINK_TOGGLES,
             winsize_at: None,
             winsize_settle: resize_settle(),
             sync_until: None,
@@ -1780,18 +1788,30 @@ impl TerminalCore {
         self.focused && self.screen.cursor_visible() && self.screen.cursor_blinks()
     }
 
-    /// Flip the blink phase and schedule the next toggle.
+    /// Flip the blink phase and schedule the next toggle, or rest the cursor once the
+    /// budget is spent. It rests *lit*: a blink that stopped on its off phase is a
+    /// cursor that vanished.
     fn tick_blink(&mut self, now: Instant) {
+        self.blinks_left = self.blinks_left.saturating_sub(1);
+        if self.blinks_left == 0 {
+            self.blink_at = None;
+            if !self.blink_on {
+                self.blink_on = true;
+                self.dirty = true;
+            }
+            return;
+        }
         self.blink_on = !self.blink_on;
         self.blink_at = Some(now + BLINK_INTERVAL);
         self.dirty = true;
     }
 
-    /// Reset the cursor to its lit phase and restart the blink timer, so it shows
-    /// solid immediately after activity (a keystroke, output) and blinks only when
-    /// idle. A no-op's timer stays `None` while unfocused.
+    /// Reset the cursor to its lit phase, refill the toggle budget, and restart the
+    /// blink timer, so it shows solid immediately after activity (a keystroke, output)
+    /// and blinks only when idle. A no-op's timer stays `None` while unfocused.
     fn bump_cursor(&mut self) {
         self.blink_on = true;
+        self.blinks_left = BLINK_TOGGLES;
         self.blink_at = self.focused.then(|| Instant::now() + BLINK_INTERVAL);
     }
 }
@@ -2648,6 +2668,35 @@ mod tests {
             core.holds_frame(),
             "so the new frame is held like any other"
         );
+    }
+
+    #[test]
+    fn a_blinking_cursor_rests_lit_and_wakes_on_activity() {
+        // Each toggle marks the frame dirty, so a blink that never rests is a GPU
+        // present twice a second for as long as the window holds focus.
+        let mut core = TerminalCore::new(false, geom(80, 24, 640, 384));
+        core.feed_test_bytes(b"\x1b[?12h");
+        assert!(core.screen.cursor_blinks(), "the child asked for a blink");
+        core.focus(true).expect("focus");
+        assert!(core.next_deadline().is_some(), "focus arms it");
+
+        // One half-period per turn, as the loop's wake delivers them.
+        let start = Instant::now();
+        for i in 1..=u32::from(BLINK_TOGGLES) {
+            core.service_due(start + BLINK_INTERVAL * i);
+        }
+        assert_eq!(core.next_deadline(), None, "the blink rests");
+        assert!(core.blink_on, "lit: a rested cursor must still be visible");
+
+        // No deadline means no wake, however long the window then sits.
+        core.service_due(start + BLINK_INTERVAL * 10_000);
+        assert_eq!(core.next_deadline(), None);
+        assert!(core.blink_on);
+
+        // Activity refills the budget, so it blinks where someone is watching.
+        core.feed_test_bytes(b"x");
+        let rearmed = core.next_deadline().expect("output wakes the blink");
+        assert!(rearmed > Instant::now(), "and ahead of us, not behind");
     }
 
     #[test]
