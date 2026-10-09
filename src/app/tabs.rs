@@ -640,16 +640,17 @@ impl Tabs {
 
     /// The soonest moment the event loop must wake for, or `None` when nothing is armed
     /// and it can block indefinitely. `frame_pending` says a compositor frame callback is
-    /// outstanding, which carries an in-progress scrollbar fade on its own.
+    /// outstanding, which carries both fades on its own.
     pub(super) fn next_deadline(&self, now: Instant, frame_pending: bool) -> Option<Instant> {
         let active = self.entries.get(self.active);
-        let scrollbar = (!frame_pending)
-            .then(|| active.and_then(|entry| entry.core.scrollbar_retry_at()))
-            .flatten();
+        // An outstanding frame callback already paces the two fades: the compositor
+        // brings the loop back for the next step, and a wake of our own would only beat
+        // it there and find a frame it may not paint.
+        let paced = |at: Option<Instant>| at.filter(|_| !frame_pending);
         [
             active.and_then(|entry| entry.core.next_deadline()),
-            scrollbar,
-            self.notice.as_ref().and_then(|notice| notice.retry_at(now)),
+            paced(active.and_then(|entry| entry.core.scrollbar_retry_at())),
+            paced(self.notice.as_ref().and_then(|notice| notice.retry_at(now))),
             self.entries
                 .iter()
                 .filter_map(|entry| entry.core.winsize_deadline())
@@ -898,6 +899,43 @@ mod tests {
             tabs.next_deadline(due, false),
             None,
             "delivering it takes the deadline back out of the wait"
+        );
+    }
+
+    #[test]
+    fn an_outstanding_frame_callback_paces_the_notice_fade() {
+        // The fade's 16 ms cadence is the loop's own, for when no callback is in flight.
+        // Waking for it while one is outstanding buys nothing: that turn may not paint.
+        let mut tabs = live_tabs();
+        assert_eq!(
+            tabs.next_deadline(Instant::now(), true),
+            None,
+            "idle: the notice is the only thing armed below"
+        );
+
+        tabs.notice = Notice::shell_startup(
+            Duration::from_millis(200),
+            &ShellStartupConfig {
+                warn_after: Some(Duration::ZERO),
+                hold: Duration::ZERO,
+                fade: Duration::from_millis(400),
+            },
+        );
+        let now = Instant::now();
+        assert!(
+            tabs.notice
+                .as_ref()
+                .is_some_and(|notice| notice.fading(now)),
+            "a zero hold raises it straight into its fade"
+        );
+        assert!(
+            tabs.next_deadline(now, false).is_some(),
+            "with no callback in flight the loop paces the fade itself"
+        );
+        assert_eq!(
+            tabs.next_deadline(now, true),
+            None,
+            "with one outstanding the compositor paces it instead"
         );
     }
 
