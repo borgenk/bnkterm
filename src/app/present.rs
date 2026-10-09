@@ -411,8 +411,8 @@ impl State {
         if let Some(es) = self.presentation.explicit_sync.as_mut() {
             es.forget_buffers();
         }
-        // Fresh images hold no known frame, so forget what was on screen: the
-        // screen diff gates whether the next frame presents at all.
+        // Fresh images hold no known frame, so forget what was on screen; the next
+        // frame into them repaints whole rather than trusting the diff.
         self.presentation.lists.reset();
         Ok(())
     }
@@ -646,13 +646,26 @@ impl State {
         // Nothing changed since the on-screen frame: nothing to present (idle). The
         // rectangles land in the reused scratch and are read from there at each use
         // point below, so the per-frame diff allocates nothing.
-        display::damage_into(
-            self.presentation.lists.front(),
-            self.presentation.lists.back(),
-            sw,
-            sh,
-            &mut self.presentation.damage,
-        );
+        if self.presentation.lists.front_presented() {
+            display::damage_into(
+                self.presentation.lists.front(),
+                self.presentation.lists.back(),
+                sw,
+                sh,
+                &mut self.presentation.damage,
+            );
+        } else {
+            // Fresh buffers (startup, or a resize that reallocated them) hold no known
+            // image, so there is nothing to diff against and an empty diff would read
+            // as "already on screen". The first frame into them repaints whole.
+            self.presentation.damage.clear();
+            self.presentation.damage.push(Rect {
+                x: 0,
+                y: 0,
+                w: sw.max(0),
+                h: sh.max(0),
+            });
+        }
         // Ack the latest configure paired with this commit, so the buffer the
         // compositor sees is always the one sized to the configure it just acked;
         // that is what keeps an anchored resize edge from jumping. Taken here so

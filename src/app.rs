@@ -2067,7 +2067,7 @@ impl State {
 
     /// Arm a capture of the next frame.
     ///
-    /// The pool is reset and the tabs marked dirty so the diff sees a full repaint:
+    /// The pool is reset and the tabs marked dirty so the next frame repaints whole:
     /// an idle terminal presents nothing, and a capture needs a frame to ride.
     #[cfg(test)]
     fn request_capture(&mut self) {
