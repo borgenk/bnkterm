@@ -57,7 +57,7 @@ impl Hostname {
 pub enum Host<'a> {
     /// The scheme names no host (`mailto:`).
     Absent,
-    /// The host as written: ASCII labels of letters, digits and hyphens, canonical
+    /// The host as written: ASCII labels of letters, digits, hyphens and `_`, canonical
     /// dotted-decimal IPv4, or bracketed IPv6. Compared without regard to case. Empty
     /// only for `file:`, where it means this machine.
     Name(&'a str),
@@ -146,16 +146,16 @@ fn port_is_plain(port: &str) -> bool {
     }
 }
 
-/// Whether `host` is dot-separated labels of ASCII letters, digits and hyphens whose
-/// last label does not read as a number, or is canonical dotted-decimal IPv4. A
+/// Whether `host` is dot-separated labels of ASCII letters, digits, hyphens and `_`
+/// whose last label does not read as a number, or is canonical dotted-decimal IPv4. A
 /// browser reads a numeric last label as an address: `2130706433` and `0x7f.1` are
-/// both `127.0.0.1`.
+/// both `127.0.0.1`. It keeps `_` as written, so `my_service` is the host reached.
 fn is_domain(host: &str) -> bool {
     let ldh = host.split('.').all(|label| {
         !label.is_empty()
             && label
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
     });
     let last = host.rsplit('.').next().unwrap_or_default();
     ldh && (!reads_as_number(last) || is_canonical_ipv4(host))
@@ -199,7 +199,6 @@ mod tests {
             "http://127.0.0.01/",
             "http://1.2.3/",
             "http://example.com./",
-            "http://exa_mple.com/",
             "https:///x",
             "http://[::1/",
             "http://[zz]/",
@@ -223,6 +222,8 @@ mod tests {
             ("https://Example.COM?q#f", "Example.COM"),
             ("http://localhost:/", "localhost"),
             ("http://0x7f.example.com/", "0x7f.example.com"),
+            ("http://my_service:8080/", "my_service"),
+            ("https://_dmarc.example.com/", "_dmarc.example.com"),
             ("file:///etc/hosts", ""),
             ("file://localhost/etc/hosts", "localhost"),
             ("https://de.wikipedia.org/wiki/Grüße", "de.wikipedia.org"),
@@ -238,6 +239,10 @@ mod tests {
         for host in ["", "localhost", "LocalHost", "bnk-desktop", "BNK-Desktop"] {
             assert!(here.is_local(host), "{host:?}");
         }
+        // `_` is legal in a hostname, and a `file:` link names it as written.
+        let here = Hostname::new("bnk_box");
+        assert_eq!(read("file://bnk_box/etc/hosts"), Host::Name("bnk_box"));
+        assert!(here.is_local("BNK_box"));
         for host in ["other", "bnk-desktop.lan", "bnk"] {
             assert!(!here.is_local(host), "{host:?}");
         }
