@@ -3,8 +3,8 @@
 //! anywhere.
 //!
 //! `--perf` is the regression gate: a handful of hot-path microbenchmarks (parse
-//! ASCII, UTF-8 and escape-heavy chunks; grid scroll and print; a tab-bar frame)
-//! timed against `stats/baseline.txt`. It writes `data/latest.txt` and exits nonzero
+//! ASCII, UTF-8 and escape-heavy chunks; grid scroll and print; a tab-bar frame; a
+//! hyperlink lookup) timed against `stats/baseline.txt`. It writes `data/latest.txt` and exits nonzero
 //! when a scenario is slower than the baseline by [`REGRESSION_RATIO`]. `--save`
 //! accepts the current numbers as the new baseline. Built with `perf-alloc` it also
 //! reports allocations per operation: the steady-state parse and print scenarios must
@@ -45,7 +45,7 @@
 
 use crate::dev::{alloc, profile, stream, sys};
 use crate::error::{Error, Result};
-use crate::grid::Screen;
+use crate::grid::{LinkId, LinkProbe, Screen};
 use crate::platform::geom::Scale;
 use crate::platform::scroll::Scrollbar;
 use crate::vt::{Params, Parser, Perform};
@@ -130,7 +130,7 @@ pub fn run(args: &[String]) -> Result<()> {
     if !alloc::ENABLED {
         eprintln!("  allocations unmeasured; build --features perf-alloc (or `make perf`)");
     }
-    let samples = measure();
+    let samples = measure()?;
     write_samples(LATEST_PATH, &samples)?;
     let mut regressed = gate_samples(&samples, save)?;
     regressed.extend(gate_footprints(&measure_footprints(), save)?);
@@ -174,7 +174,7 @@ fn gate_samples(samples: &[Sample], save: bool) -> Result<Vec<&'static str>> {
 /// Measure every gate scenario. Each drives a persistent, pre-warmed grid so
 /// the numbers are steady state, not first-touch: the parse and print scenarios
 /// then allocate nothing per op, which the allocation column records and gates.
-fn measure() -> Vec<Sample> {
+fn measure() -> Result<Vec<Sample>> {
     let ascii = stream::generate("ascii", CHUNK).unwrap_or_default();
     let unicode = stream::generate("unicode", CHUNK).unwrap_or_default();
     let escape = stream::generate("escape_heavy", CHUNK).unwrap_or_default();
@@ -201,7 +201,7 @@ fn measure() -> Vec<Sample> {
     let combining_chunk = repeated_lines("a\u{0301}\u{0302}", 40, 24);
     let emoji_chunk = repeated_lines("🇳🇴", 40, 24);
 
-    vec![
+    let mut samples = vec![
         stream_scenario("parse_ascii", &ascii, 128),
         stream_scenario("parse_utf8", &unicode, 128),
         stream_scenario("parse_escape", &escape, 128),
@@ -213,7 +213,115 @@ fn measure() -> Vec<Sample> {
         frame_tabbar_scenario(),
         frame_damage_scenario(),
         grid_reflow_scenario(),
+    ];
+    for fixture in link_fixtures() {
+        samples.push(link_scenario(&fixture)?);
+    }
+    Ok(samples)
+}
+
+/// The display row each hyperlink scenario prints its line on.
+const LINK_ROW: usize = 40;
+
+/// A signed download URL, long enough to wrap across three rows of [`BENCH_COLS`].
+const LINK_LONG_URL: &str = "https://example.com/releases/download/v0.3.0/\
+    bnkterm-v0.3.0-x86_64-unknown-linux-gnu.tar.gz?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+    &X-Amz-Credential=EXAMPLE%2F20261010%2Fus-east-1%2Fs3%2Faws4_request\
+    &X-Amz-Date=20261010T120000Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host\
+    &X-Amz-Signature=5f2b8c0e9a7d4e31b6c8f0a2d4e6b8c0e2f4a6b8d0c2e4f6a8b0c2d4e6f8a0b2";
+
+/// One hyperlink lookup: the line printed at [`LINK_ROW`], the display cell the pointer
+/// rests on, and what [`Screen::link_at`] must find there.
+struct LinkFixture {
+    name: &'static str,
+    line: String,
+    pointer: (usize, usize),
+    url: &'static str,
+    /// Whether the pointer's cell is inside an OSC 8 anchor rather than plain text.
+    anchored: bool,
+    /// Display rows the found link spans.
+    rows: usize,
+    /// Timed lookups per round, sized so each round times about a millisecond.
+    iters: u64,
+}
+
+/// One fixture per path through [`Screen::link_at`]: a bare URL the text scan finds, an
+/// OSC 8 anchor read off its cells, and a bare URL soft-wrapped across three rows.
+fn link_fixtures() -> [LinkFixture; 3] {
+    const URL: &str = "https://example.com/docs/terminal/hyperlinks.html";
+    [
+        LinkFixture {
+            name: "link_bare",
+            line: format!("  docs: see {URL} for the details"),
+            pointer: (LINK_ROW, 30),
+            url: URL,
+            anchored: false,
+            rows: 1,
+            iters: 2048,
+        },
+        LinkFixture {
+            name: "link_anchor",
+            // Labelled with its own target, so the text under the anchor is a URL too.
+            line: format!("  docs: see \x1b]8;;{URL}\x1b\\{URL}\x1b]8;;\x1b\\ for the details"),
+            pointer: (LINK_ROW, 30),
+            url: URL,
+            anchored: true,
+            rows: 1,
+            iters: 8192,
+        },
+        LinkFixture {
+            name: "link_wrapped",
+            line: format!("  download: {LINK_LONG_URL}"),
+            pointer: (LINK_ROW + 1, 60),
+            url: LINK_LONG_URL,
+            anchored: false,
+            rows: 3,
+            iters: 512,
+        },
     ]
+}
+
+/// A grid holding `fixture`'s line at [`LINK_ROW`] and nothing else, since a lookup reads
+/// only the logical line under the pointer.
+fn link_screen(fixture: &LinkFixture) -> Screen {
+    let mut screen = Screen::new(BENCH_COLS, BENCH_ROWS);
+    let bytes = format!("\x1b[{};1H{}", LINK_ROW + 1, fixture.line);
+    Parser::new().advance_bytes(&mut screen, bytes.as_bytes());
+    screen
+}
+
+/// Look up the link under a resting pointer, which the window does on every cell the
+/// pointer enters and after every output turn while it is parked over the grid. A warmed
+/// probe reuses its buffers, so the lookup allocates nothing.
+///
+/// A fixture whose lookup misses its link, or finds it by the other path, is an error
+/// rather than a sample, since it would time something else and read as a speedup.
+fn link_scenario(fixture: &LinkFixture) -> Result<Sample> {
+    let screen = link_screen(fixture);
+    let mut probe = LinkProbe::default();
+    let (row, col) = fixture.pointer;
+    let anchored = screen.cell(row, col).link != LinkId::NONE;
+    let rows = screen
+        .link_at(row, col, &mut probe)
+        .map(|((first, _), (last, _))| last - first + 1);
+    if anchored != fixture.anchored || probe.url() != fixture.url || rows != Some(fixture.rows) {
+        return Err(Error::msg(format!(
+            "{}: expected {:?} over {} rows (anchored: {}), found {:?} over {rows:?} (anchored: {anchored})",
+            fixture.name,
+            fixture.url,
+            fixture.rows,
+            fixture.anchored,
+            probe.url(),
+        )));
+    }
+    let (ns, allocs) = best_of(GATE_ROUNDS, fixture.iters, || {
+        screen.link_at(row, col, &mut probe)
+    });
+    Ok(Sample {
+        name: fixture.name,
+        ns,
+        allocs,
+    })
 }
 
 /// One column of an interactive width drag against a full scrollback ring: the grid
@@ -1824,7 +1932,35 @@ fn append(path: &str, text: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dev::perf::*;
+
+    #[test]
+    fn a_link_scenario_times_only_the_lookup_it_names() {
+        for f in link_fixtures() {
+            link_scenario(&LinkFixture { iters: 1, ..f }).unwrap();
+        }
+        let [bare, anchor, wrapped] = link_fixtures();
+        assert!(link_scenario(&LinkFixture {
+            anchored: true,
+            ..bare
+        })
+        .is_err());
+        assert!(link_scenario(&LinkFixture {
+            url: "https://example.com/",
+            ..anchor
+        })
+        .is_err());
+        assert!(link_scenario(&LinkFixture { rows: 2, ..wrapped }).is_err());
+    }
+
+    #[cfg(feature = "perf-alloc")]
+    #[test]
+    fn a_warmed_link_lookup_allocates_nothing() {
+        for f in link_fixtures() {
+            let s = link_scenario(&LinkFixture { iters: 8, ..f }).unwrap();
+            assert_eq!(s.allocs, 0, "{} allocated {} per lookup", s.name, s.allocs);
+        }
+    }
 
     #[cfg(feature = "perf-alloc")]
     #[test]
