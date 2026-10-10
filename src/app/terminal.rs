@@ -33,6 +33,7 @@ use crate::grid::{
 };
 use crate::input;
 use crate::mouse::{self, MouseButton, MouseKind};
+use crate::platform::host::Hostname;
 use crate::platform::scroll::{self, Scrollbar};
 use crate::platform::verdict::Verdict;
 use crate::pty::{Launch, Pty, TtyMode, ZombieChild};
@@ -418,6 +419,11 @@ impl TerminalCore {
     /// Adopt the configured colours (see [`Screen::set_theme`]).
     pub(super) fn set_theme(&mut self, theme: Rc<Theme>) {
         self.screen.set_theme(theme);
+    }
+
+    /// This machine's name, which decides whether a `file:` link names it.
+    pub(super) fn set_hostname(&mut self, hostname: Hostname) {
+        self.screen.set_hostname(hostname);
     }
 
     /// Spawn the shell on a PTY sized to the current grid, returning the grid it

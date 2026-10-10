@@ -73,7 +73,7 @@ impl Screen {
         if url.len() > LINK_URL_MAX {
             return LinkId::NONE;
         }
-        if let Some(id) = self.links.intern(url) {
+        if let Some(id) = self.links.intern(url, &self.hostname) {
             return id;
         }
         // The table is full, of ids or of bytes. A sweep is worth doing once — and worth
@@ -85,7 +85,7 @@ impl Screen {
             return LinkId::NONE;
         }
         self.collect_links();
-        match self.links.intern(url) {
+        match self.links.intern(url, &self.hostname) {
             Some(id) => id,
             None => {
                 self.links.swept_dry_at = Some(grid_at);

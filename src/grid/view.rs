@@ -590,7 +590,7 @@ impl Screen {
         let start = probe.cell_at(found.start)?;
         let mut end = probe.cell_at(found.end.checked_sub(1)?)?;
         probe.url.push_str(probe.text.get(found)?);
-        probe.verdict = Some(verdict::judge(&probe.url));
+        probe.verdict = Some(verdict::judge(&probe.url, &self.hostname));
         if self.view_cell(end.0, end.1).is_wide_leader() && end.1 + 1 < cols {
             end.1 += 1;
         }

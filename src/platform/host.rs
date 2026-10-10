@@ -18,6 +18,39 @@
 //! [host]: https://url.spec.whatwg.org/#host-parsing
 
 use std::net::Ipv6Addr;
+use std::rc::Rc;
+
+/// Where the kernel keeps this machine's hostname. A Flatpak sandbox shares the UTS
+/// namespace, so it reads the same name there.
+const HOSTNAME_PATH: &str = "/proc/sys/kernel/hostname";
+
+/// This machine's hostname, as `file:` links name it (`ls --hyperlink` prints
+/// `file://HOSTNAME/path`). Empty when it could not be read, which leaves only an empty
+/// host and `localhost` naming this machine.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct Hostname(Rc<str>);
+
+impl Hostname {
+    /// Read the hostname once, at startup.
+    pub fn read() -> Hostname {
+        std::fs::read_to_string(HOSTNAME_PATH)
+            .map(|name| Hostname(name.trim().into()))
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn new(name: &str) -> Hostname {
+        Hostname(name.into())
+    }
+
+    /// Whether a `file:` URL's `host` names this machine: empty, `localhost`, or this
+    /// hostname, without regard to case.
+    pub fn is_local(&self, host: &str) -> bool {
+        host.is_empty()
+            || host.eq_ignore_ascii_case("localhost")
+            || (!self.0.is_empty() && host.eq_ignore_ascii_case(&self.0))
+    }
+}
 
 /// What [`read`] found where a link's host would be.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -196,5 +229,19 @@ mod tests {
             assert_eq!(read(url), Host::Name(host), "{url}");
         }
         assert_eq!(read("mailto:a@b.com"), Host::Absent);
+    }
+
+    #[test]
+    fn a_file_host_is_local_when_it_names_this_machine() {
+        let here = Hostname::new("bnk-desktop");
+        for host in ["", "localhost", "LocalHost", "bnk-desktop", "BNK-Desktop"] {
+            assert!(here.is_local(host), "{host:?}");
+        }
+        for host in ["other", "bnk-desktop.lan", "bnk"] {
+            assert!(!here.is_local(host), "{host:?}");
+        }
+        // An unread hostname names nothing, not everything.
+        assert!(!Hostname::default().is_local("bnk-desktop"));
+        assert!(Hostname::default().is_local("localhost"));
     }
 }

@@ -64,6 +64,7 @@ use crate::color::{self, Color, Theme};
 use crate::input::{KittyFlags, ModifyOtherKeys};
 use crate::mouse::{MouseMode, MouseProtocol};
 use crate::platform::grapheme;
+use crate::platform::host::Hostname;
 use crate::platform::verdict::{self, Verdict};
 use crate::vt::{Params, Perform};
 use crate::width::width;
@@ -441,7 +442,7 @@ impl LinkTable {
     /// A URL longer than [`LINK_URL_MAX`] never reaches here: [`Screen::intern_link`]
     /// turns it away first, because no amount of collecting would make room for it and
     /// the sweep walks every cell in both buffers.
-    fn intern(&mut self, url: &str) -> Option<LinkId> {
+    fn intern(&mut self, url: &str, hostname: &Hostname) -> Option<LinkId> {
         if let Some(&id) = self.index.get(url) {
             return Some(id);
         }
@@ -456,7 +457,7 @@ impl LinkTable {
         let id = LinkId(u16::try_from(self.targets.len() + 1).ok()?);
         self.targets.push(LinkTarget {
             url: url.to_string(),
-            verdict: verdict::judge(url),
+            verdict: verdict::judge(url, hostname),
         });
         self.index.insert(url.to_string(), id);
         self.bytes = self.bytes.saturating_add(cost);
@@ -1113,6 +1114,8 @@ pub struct Screen {
     /// its own link namespace, so an id means the same thing whichever buffer holds it
     /// and switching buffers costs nothing.
     links: LinkTable,
+    /// This machine's name, which decides whether a `file:` link's host is local.
+    hostname: Hostname,
     /// The renditions the grid's cells cite by [`StyleId`]. Shared by both buffers for
     /// exactly the reason [`Self::links`] is, and swept the same way.
     styles: StyleTable,
@@ -1313,6 +1316,7 @@ impl Screen {
             cursor_appearance: CursorAppearance::default(),
             responses: Vec::new(),
             links: LinkTable::default(),
+            hostname: Hostname::default(),
             styles: StyleTable::default(),
             pen_style: (Style::default(), StyleId::DEFAULT),
             kitty_primary: Vec::new(),

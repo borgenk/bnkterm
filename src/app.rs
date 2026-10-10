@@ -57,6 +57,7 @@ use crate::platform::conn::{Connection, Fill};
 use crate::platform::ffi;
 use crate::platform::freetype::{FontConfig, FontSelection, Fonts};
 use crate::platform::geom::Scale;
+use crate::platform::host::Hostname;
 use crate::platform::protocol::{
     self, wl_buffer, wl_callback, wl_compositor, wl_display, wl_keyboard, wl_output, wl_pointer,
     wl_registry, wl_seat, wl_surface, wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
@@ -606,6 +607,7 @@ impl State {
                 core,
                 tab_bar_config.clone(),
                 theme,
+                Hostname::read(),
                 launch,
                 config.shell_startup,
             ),

@@ -31,6 +31,7 @@ use crate::gather::GatherEnd;
 use crate::keymode::Dir;
 use crate::notice::Notice;
 use crate::platform::freetype::Fonts;
+use crate::platform::host::Hostname;
 use crate::pty::{Launch, ZombieChild};
 use crate::render::display::DisplayList;
 use crate::tab_bar::{self, BarGeom, Lift, Slot, TabLabel};
@@ -91,6 +92,8 @@ pub(super) struct Tabs {
     cfg: TabBarConfig,
     /// The configured grid colours.
     theme: Rc<Theme>,
+    /// This machine's name, handed to every tab's grid for judging `file:` links.
+    hostname: Hostname,
     /// How every shell this session spawns is started. Held here because a tab opened an
     /// hour in has to start the way the first one did, integration shims included.
     launch: Launch,
@@ -110,9 +113,10 @@ impl Tabs {
     /// launch every tab in this session starts its shell with and the budget a shell's own
     /// startup is held to.
     pub(super) fn new(
-        core: TerminalCore,
+        mut core: TerminalCore,
         cfg: TabBarConfig,
         theme: Rc<Theme>,
+        hostname: Hostname,
         launch: Launch,
         shell_startup: ShellStartupConfig,
     ) -> Self {
@@ -128,11 +132,13 @@ impl Tabs {
             drag: None,
             cfg,
             theme,
+            hostname,
             launch,
             shell_startup,
             notice: None,
             outbox: Vec::new(),
         };
+        core.set_hostname(tabs.hostname.clone());
         let id = tabs.allocate_id();
         tabs.entries.push(TabEntry { id, core });
         tabs
@@ -180,6 +186,7 @@ impl Tabs {
     pub(super) fn open(&mut self, geom: TerminalGeometry, window_focused: bool) -> Result<TabId> {
         let mut core = TerminalCore::new(false, geom);
         core.set_theme(Rc::clone(&self.theme));
+        core.set_hostname(self.hostname.clone());
         if let Err(error) = core.spawn_shell(&self.launch) {
             if let Some(child) = core.into_child() {
                 self.reaping.push(child);
@@ -207,6 +214,7 @@ impl Tabs {
     pub(super) fn push_demo_tab(&mut self, geom: TerminalGeometry, title: &str) {
         let mut core = TerminalCore::new(true, geom);
         core.set_theme(Rc::clone(&self.theme));
+        core.set_hostname(self.hostname.clone());
         core.feed_test_bytes(format!("\x1b]2;{title}\x07").as_bytes());
         let id = self.allocate_id();
         self.entries.push(TabEntry { id, core });
@@ -824,7 +832,7 @@ mod tests {
     use crate::app::tabs::*;
     use crate::input::{Key, Mods};
     use crate::platform::geom::Scale;
-    use crate::platform::verdict::Verdict;
+    use crate::platform::verdict::{Refusal, Verdict};
     use crate::pty::{Launch, PollSet, Target};
     use crate::render::display::DrawCmd;
     use crate::term_render::CellMetrics;
@@ -880,6 +888,7 @@ mod tests {
             core(false, 80, 24),
             TabBarConfig::default(),
             Rc::new(Theme::default()),
+            Hostname::default(),
             Launch::new(Vec::new(), Target::Local),
             ShellStartupConfig::default(),
         )
@@ -950,6 +959,7 @@ mod tests {
             core(true, 80, 24),
             TabBarConfig::default(),
             Rc::new(Theme::default()),
+            Hostname::default(),
             Launch::new(Vec::new(), Target::Local),
             ShellStartupConfig::default(),
         );
@@ -1033,6 +1043,7 @@ mod tests {
             core,
             TabBarConfig::default(),
             Rc::new(Theme::default()),
+            Hostname::default(),
             Launch::new(Vec::new(), Target::Local),
             cfg,
         );
@@ -1061,6 +1072,7 @@ mod tests {
             core,
             TabBarConfig::default(),
             Rc::new(Theme::default()),
+            Hostname::default(),
             Launch::new(Vec::new(), Target::Local),
             cfg,
         );
@@ -1093,6 +1105,7 @@ mod tests {
             core,
             TabBarConfig::default(),
             Rc::new(Theme::default()),
+            Hostname::default(),
             Launch::new(Vec::new(), Target::Local),
             ShellStartupConfig::default(),
         );
@@ -1446,6 +1459,41 @@ mod tests {
     }
 
     #[test]
+    fn every_tab_judges_file_links_against_this_machine() {
+        let mut first = core(false, 40, 10);
+        if first.spawn_program(&["/bin/cat"]).is_err() {
+            eprintln!("fork/exec unavailable; skipping");
+            return;
+        }
+        let mut tabs = Tabs::new(
+            first,
+            TabBarConfig::default(),
+            Rc::new(Theme::default()),
+            Hostname::new("here"),
+            Launch::new(vec!["/bin/cat".to_string()], Target::Local),
+            ShellStartupConfig::default(),
+        );
+        if tabs.open(geom(40, 10), false).is_err() {
+            eprintln!("second PTY unavailable; skipping");
+            return;
+        }
+        for entry in &mut tabs.entries {
+            let core = &mut entry.core;
+            core.feed_test_bytes(
+                b"\x1b]8;;file://here/a\x1b\\local\x1b]8;;\x1b\\ \x1b]8;;file://there/a\x1b\\remote\x1b]8;;\x1b\\",
+            );
+            let hover = |core: &mut TerminalCore, col| {
+                let side = Side::Left;
+                let motion = PointerEvent::Motion { col, row: 0, side };
+                core.pointer(motion, Mods::NONE).unwrap();
+                core.hovered_link()
+            };
+            assert_eq!(hover(core, 1), Some(Verdict::Open));
+            assert_eq!(hover(core, 8), Some(Verdict::Refused(Refusal::ForeignHost)));
+        }
+    }
+
+    #[test]
     fn two_live_pty_streams_land_on_their_own_grids() {
         let mut first = core(false, 40, 10);
         if first.spawn_program(&["/bin/cat"]).is_err() {
@@ -1456,6 +1504,7 @@ mod tests {
             first,
             TabBarConfig::default(),
             Rc::new(Theme::default()),
+            Hostname::default(),
             Launch::new(vec!["/bin/cat".to_string()], Target::Local),
             ShellStartupConfig::default(),
         );

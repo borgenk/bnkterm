@@ -3558,6 +3558,44 @@ fn a_link_whose_host_a_browser_would_rewrite_is_refused() {
 }
 
 #[test]
+fn a_file_link_naming_another_machine_is_refused() {
+    // `ls --hyperlink` names the machine it ran on, so over ssh its links name the
+    // remote host, and opening one here would open a different file.
+    let mut s = Screen::new(60, 2);
+    s.set_hostname(Hostname::new("here"));
+    let mut bytes = anchor("file://there/home/u/a.txt", "a.txt");
+    bytes.push(b' ');
+    bytes.extend(anchor("file://here/home/u/a.txt", "b.txt"));
+    bytes.extend_from_slice(b" file://there/home/u/c.txt");
+    feed(&mut s, &bytes);
+    assert_eq!(
+        anchor_verdict(&s, 0, 0),
+        Some(Verdict::Refused(Refusal::ForeignHost))
+    );
+    assert_eq!(anchor_verdict(&s, 0, 6), Some(Verdict::Open));
+    let mut probe = LinkProbe::default();
+    assert!(s.link_at(0, 15, &mut probe).is_some());
+    assert_eq!(
+        probe.verdict(),
+        Some(Verdict::Refused(Refusal::ForeignHost)),
+        "a bare file: URL too"
+    );
+}
+
+#[test]
+fn setting_the_hostname_judges_stored_links_again() {
+    let mut s = Screen::new(40, 2);
+    feed(&mut s, &anchor("file://here/a", "a"));
+    assert_eq!(
+        anchor_verdict(&s, 0, 0),
+        Some(Verdict::Refused(Refusal::ForeignHost)),
+        "an unread hostname names nothing"
+    );
+    s.set_hostname(Hostname::new("here"));
+    assert_eq!(anchor_verdict(&s, 0, 0), Some(Verdict::Open));
+}
+
+#[test]
 fn a_bare_url_never_runs_into_an_anchor() {
     // Probed from plain text beside an anchor, the scan must not read the anchor's label
     // as part of a bare URL: that opens a URL built from text the anchor owns, and shows
@@ -3656,7 +3694,7 @@ fn a_sweep_keeps_each_surviving_link_its_verdict() {
     for target in &s.links.targets {
         assert_eq!(
             target.verdict,
-            verdict::judge(&target.url),
+            verdict::judge(&target.url, &Hostname::default()),
             "{}",
             target.url
         );

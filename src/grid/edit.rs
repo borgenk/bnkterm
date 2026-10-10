@@ -930,6 +930,15 @@ impl Screen {
         self.base_theme = theme;
     }
 
+    /// This machine's name, for judging `file:` links. Links already stored are judged
+    /// again, so the order this is set in against output cannot leave a stale verdict.
+    pub(crate) fn set_hostname(&mut self, hostname: Hostname) {
+        for target in &mut self.links.targets {
+            target.verdict = verdict::judge(&target.url, &hostname);
+        }
+        self.hostname = hostname;
+    }
+
     /// The window's pixel size, which the in-band resize report carries alongside the
     /// cell count. The grid does not otherwise care about pixels; it is told.
     pub fn set_pixel_size(&mut self, width: u32, height: u32) {
