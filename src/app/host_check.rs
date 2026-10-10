@@ -141,6 +141,28 @@ mod tests {
     use crate::platform::file_url;
     use crate::pty::PollSet;
 
+    /// A fresh directory under the temp dir, removed on drop, so a failing test cleans
+    /// up too.
+    struct FixtureDir(std::path::PathBuf);
+
+    impl FixtureDir {
+        fn new() -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos());
+            let dir = std::env::temp_dir()
+                .join(format!("bnkterm-host-check-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(std::fs::canonicalize(dir).unwrap())
+        }
+    }
+
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// Wait for `checks` to signal, then take what came back.
     fn wait_for(checks: &mut HostChecks) -> Vec<Finished> {
         let fd = checks.wake_fd().expect("a verdict is owed");
@@ -154,13 +176,8 @@ mod tests {
     #[test]
     fn a_check_reports_back_what_to_open_or_refuse_and_wakes_the_loop() {
         use std::os::unix::fs::{symlink, PermissionsExt};
-        let dir = std::env::temp_dir().join(format!(
-            "bnkterm-host-check-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(dir).unwrap();
+        let fixture = FixtureDir::new();
+        let dir = fixture.0.as_path();
         let script = dir.join("build.sh");
         std::fs::write(&script, b"x").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -192,6 +209,5 @@ mod tests {
                 token: Some("token".to_string())
             }]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
