@@ -74,6 +74,10 @@ impl Launch {
     pub fn new(argv: Vec<String>, target: Target) -> Self {
         Self { argv, target }
     }
+
+    pub fn target(&self) -> Target {
+        self.target
+    }
 }
 
 /// The outcome of a non-blocking read from the master fd.

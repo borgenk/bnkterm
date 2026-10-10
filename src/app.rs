@@ -25,6 +25,7 @@
 //! `run_demo` keeps the phase-2 static grid (no PTY, no shell) for isolating a
 //! render question from the live pipeline.
 
+mod activation;
 mod clipboard;
 mod layout;
 mod message;
@@ -36,6 +37,7 @@ use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use self::activation::Activation;
 use self::clipboard::{PendingSend, SelectionTransport, Transport};
 use self::layout::{TerminalGeometry, WindowLayout, WINDOW_PADDING};
 use self::message::{PointerEvent, Side, ToWindow};
@@ -166,6 +168,9 @@ impl Verbosity {
 /// Open the window, spawn the user's shell, and run the terminal until the shell exits or
 /// the window is closed.
 pub fn run(verbosity: Verbosity) -> crate::error::Result<()> {
+    // First, while this is the only thread: every child spawned from here on, a local
+    // shell, `flatpak-spawn` or a link's `xdg-open`, starts without the token.
+    let launch_token = activation::take_launch_token();
     let host = flatpak_host();
     let shell = match &host {
         Some(host) => host.var("SHELL"),
@@ -199,7 +204,7 @@ pub fn run(verbosity: Verbosity) -> crate::error::Result<()> {
         env.iter().for_each(EnvVar::apply);
         Launch::new(argv, Target::Local)
     };
-    let mut state = State::new(false, verbosity, launch)?;
+    let mut state = State::new(false, verbosity, launch, launch_token)?;
     state.bring_up()?;
     Ok(())
 }
@@ -240,7 +245,13 @@ fn terminal_env() -> Vec<EnvVar> {
 /// `--demo`: open the window on a static styled grid, without a PTY. The phase-2
 /// bring-up, kept for isolating a render question from the live shell.
 pub fn run_demo(verbosity: Verbosity) -> crate::error::Result<()> {
-    let mut state = State::new(true, verbosity, Launch::new(Vec::new(), Target::Local))?;
+    let launch_token = activation::take_launch_token();
+    let mut state = State::new(
+        true,
+        verbosity,
+        Launch::new(Vec::new(), Target::Local),
+        launch_token,
+    )?;
     state.bring_up()?;
     Ok(())
 }
@@ -263,6 +274,7 @@ pub(crate) fn capture_demo_frame(path: &std::path::Path) -> crate::error::Result
         true,
         Verbosity::Quiet,
         Launch::new(Vec::new(), Target::Local),
+        None,
     )?;
     // Derive the font from the point size rather than this machine's configured pixels,
     // so the asset is the same everywhere, and take the scale before pinning the grid:
@@ -295,6 +307,7 @@ pub fn gpu_probe() -> crate::error::Result<()> {
         true,
         Verbosity::Quiet,
         Launch::new(Vec::new(), Target::Local),
+        None,
     )?
     .probe_dmabuf()?;
     Ok(())
@@ -488,8 +501,11 @@ struct State {
     /// transports. Serving is asynchronous because the receiver decides when to read and
     /// a pipe holds only 64 KiB (see `State::begin_selection_send`).
     pending_sends: Vec<PendingSend>,
-    /// The latest input-event serial, needed to claim a selection.
+    /// The latest input-event serial, needed to claim a selection and cited by a clicked
+    /// link's activation token.
     last_serial: u32,
+    /// The launcher's activation token and the links waiting on theirs.
+    activation: Activation,
     /// GPU/dmabuf presentation resources.
     presentation: GpuPresentation,
 
@@ -529,8 +545,14 @@ struct State {
 
 impl State {
     /// `launch` is how every tab this window opens starts its shell; the paths that never
-    /// spawn one (`--demo`, `--gpu-probe`) pass an empty one.
-    fn new(demo: bool, verbosity: Verbosity, launch: Launch) -> Result<Self> {
+    /// spawn one (`--demo`, `--gpu-probe`) pass an empty one. `launch_token` is the
+    /// activation token the launcher passed in, which the first frame spends.
+    fn new(
+        demo: bool,
+        verbosity: Verbosity,
+        launch: Launch,
+        launch_token: Option<String>,
+    ) -> Result<Self> {
         let (config, problems) = config::load::load();
         for problem in &problems {
             eprintln!("bnkterm: {problem}");
@@ -571,6 +593,7 @@ impl State {
         let mut core = TerminalCore::new(demo, geom);
         let theme = Rc::new(config.theme);
         core.set_theme(Rc::clone(&theme));
+        let activation = Activation::new(launch_token, launch.target());
 
         Ok(Self {
             conn,
@@ -627,6 +650,7 @@ impl State {
             selections: SelectionTransport::pair(),
             pending_sends: Vec::new(),
             last_serial: 0,
+            activation,
             presentation: GpuPresentation::with_gamma(config_text_gamma()),
             next_id: 2, // 1 is wl_display
             free_ids: Vec::new(),
@@ -1231,6 +1255,10 @@ impl State {
         }
 
         if let Some(result) = self.on_selection_message(msg, &mut r) {
+            return result;
+        }
+
+        if let Some(result) = self.on_activation_message(msg, &mut r) {
             return result;
         }
 
@@ -2040,6 +2068,10 @@ impl State {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_VIEWPORTER);
                 self.scale.viewporter = Some(id);
             }
+            protocol::IFACE_ACTIVATION => {
+                let id = self.bind_capped(name, interface, version, protocol::VERSION_ACTIVATION);
+                self.activation.global = Some(id);
+            }
             _ => {}
         }
         Ok(())
@@ -2103,7 +2135,7 @@ impl State {
                 ToWindow::OfferSelection(bytes) => self.set_selection(Transport::Clipboard, bytes),
                 ToWindow::OfferPrimary(bytes) => self.set_selection(Transport::Primary, bytes),
                 ToWindow::PastePrimary => self.paste_from(Transport::Primary)?,
-                ToWindow::OpenUrl(url) => open_url(&url),
+                ToWindow::OpenUrl(url) => self.launch_link(url),
                 ToWindow::Closed => self.closed = true,
             }
         }
@@ -2263,16 +2295,6 @@ fn config_text_gamma() -> TextGamma {
     TextGamma {
         light_on_dark: dial("BNKTERM_TEXT_GAMMA", shipping.light_on_dark),
         dark_on_light: dial("BNKTERM_TEXT_GAMMA_DARK_ON_LIGHT", shipping.dark_on_light),
-    }
-}
-
-/// Launch a Ctrl+clicked hyperlink in whatever the desktop has set as its handler.
-/// The core already vetted the scheme, so a refusal here means the desktop could not
-/// start a handler at all: report it and carry on, because a link that will not open
-/// is an annoyance and must never be allowed to take the terminal down with it.
-fn open_url(url: &str) {
-    if let Err(err) = crate::platform::browser::open_url(url) {
-        eprintln!("bnkterm: could not open {url}: {err}");
     }
 }
 

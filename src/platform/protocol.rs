@@ -219,6 +219,19 @@ pub mod xdg_toplevel {
     pub const EV_CLOSE: u16 = 1;
 }
 
+pub mod xdg_activation_v1 {
+    pub const GET_ACTIVATION_TOKEN: u16 = 1;
+    pub const ACTIVATE: u16 = 2;
+}
+
+pub mod xdg_activation_token_v1 {
+    pub const SET_SERIAL: u16 = 0;
+    pub const SET_SURFACE: u16 = 2;
+    pub const COMMIT: u16 = 3;
+    pub const DESTROY: u16 = 4;
+    pub const EV_DONE: u16 = 0;
+}
+
 pub mod zwp_linux_dmabuf_v1 {
     /// Create a params object to assemble one dmabuf-backed wl_buffer.
     pub const CREATE_PARAMS: u16 = 1;
@@ -303,6 +316,7 @@ pub const IFACE_DRM_SYNCOBJ: &str = "wp_linux_drm_syncobj_manager_v1";
 pub const IFACE_OUTPUT: &str = "wl_output";
 pub const IFACE_FRACTIONAL_SCALE_MANAGER: &str = "wp_fractional_scale_manager_v1";
 pub const IFACE_VIEWPORTER: &str = "wp_viewporter";
+pub const IFACE_ACTIVATION: &str = "xdg_activation_v1";
 
 pub const VERSION_COMPOSITOR: u32 = 4;
 pub const VERSION_WM_BASE: u32 = 1;
@@ -323,3 +337,5 @@ pub const VERSION_OUTPUT: u32 = 2;
 /// Both scale protocols are single-version.
 pub const VERSION_FRACTIONAL_SCALE_MANAGER: u32 = 1;
 pub const VERSION_VIEWPORTER: u32 = 1;
+/// Activation is single-version.
+pub const VERSION_ACTIVATION: u32 = 1;

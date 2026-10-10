@@ -761,6 +761,8 @@ impl State {
         self.frame_callback = callback;
         self.conn.request(self.surface, wl_surface::COMMIT, &[]);
         self.presentation.busy[idx] = true;
+        // The first commit with a buffer maps the window, which activation needs to act on.
+        self.spend_launch_token();
 
         if let Some(started) = started {
             self.log_frame_stats(started);
