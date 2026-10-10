@@ -3583,6 +3583,16 @@ fn a_file_link_naming_another_machine_is_refused() {
 }
 
 #[test]
+fn a_file_link_whose_path_decodes_more_than_one_way_is_refused() {
+    let mut s = Screen::new(60, 2);
+    feed(&mut s, &anchor("file:///tmp/payload.desktop%0A", "notes"));
+    assert_eq!(
+        anchor_verdict(&s, 0, 0),
+        Some(Verdict::Refused(Refusal::FilePath))
+    );
+}
+
+#[test]
 fn setting_the_hostname_judges_stored_links_again() {
     let mut s = Screen::new(40, 2);
     feed(&mut s, &anchor("file://here/a", "a"));

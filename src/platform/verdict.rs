@@ -7,7 +7,7 @@
 //! outcome to confirm.
 
 use crate::platform::host::{self, Host, Hostname};
-use crate::platform::{browser, link};
+use crate::platform::{browser, file_url, link};
 
 /// What the rules decided about a link.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -30,6 +30,10 @@ pub enum Refusal {
     /// A `file:` target names another machine. The opener would open the file at the
     /// same path on this one.
     ForeignHost,
+    /// A `file:` target's path could be read more than one way
+    /// ([`file_url::path_is_unambiguous`]), so the file checked may not be the file
+    /// opened.
+    FilePath,
 }
 
 /// Judge `url` against every rule, on the machine named `hostname`.
@@ -40,11 +44,13 @@ pub fn judge(url: &str, hostname: &Hostname) -> Verdict {
     if !url.is_ascii() && url.chars().any(link::is_hidden) {
         return Verdict::Refused(Refusal::Hidden);
     }
+    let file = url.starts_with("file:");
     match host::read(url) {
         Host::Refused => Verdict::Refused(Refusal::Host),
-        Host::Name(name) if url.starts_with("file:") && !hostname.is_local(name) => {
+        Host::Name(name) if file && !hostname.is_local(name) => {
             Verdict::Refused(Refusal::ForeignHost)
         }
+        _ if file && !file_url::path_is_unambiguous(url) => Verdict::Refused(Refusal::FilePath),
         Host::Name(_) | Host::Absent => Verdict::Open,
     }
 }
@@ -145,5 +151,27 @@ mod tests {
             .unwrap();
         assert!(uri.starts_with("file://"), "{uri}");
         assert_eq!(judge(uri, &Hostname::read()), Verdict::Open, "{uri}");
+    }
+
+    #[test]
+    fn a_file_link_whose_path_decodes_more_than_one_way_is_refused() {
+        let here = Hostname::default();
+        for url in [
+            "file:///tmp/payload.desktop%0A",
+            "file:///tmp/a%zz",
+            "file:///tmp/a?b",
+            "file:///tmp/a#b",
+        ] {
+            assert_eq!(
+                judge(url, &here),
+                Verdict::Refused(Refusal::FilePath),
+                "{url}"
+            );
+        }
+        assert!(matches!(
+            judge("file:///tmp/a\\nb", &here),
+            Verdict::Refused(_)
+        ));
+        assert_eq!(judge("file:///tmp/a%20b", &here), Verdict::Open);
     }
 }
