@@ -6,6 +6,7 @@
 //! interns it. A link either opens or is refused with a [`Refusal`]; there is no third
 //! outcome to confirm.
 
+use crate::platform::host::{self, Host};
 use crate::platform::{browser, link};
 
 /// What the rules decided about a link.
@@ -23,6 +24,9 @@ pub enum Refusal {
     /// The target carries a character that draws nothing ([`link::is_hidden`]), so the
     /// text the user reads is not the target that opens.
     Hidden,
+    /// The target's host is one a browser would rewrite before resolving it
+    /// ([`host::read`]), so the host the user reads is not the one reached.
+    Host,
 }
 
 /// Judge `url` against every rule.
@@ -31,6 +35,8 @@ pub fn judge(url: &str) -> Verdict {
         Verdict::Refused(Refusal::Scheme)
     } else if !url.is_ascii() && url.chars().any(link::is_hidden) {
         Verdict::Refused(Refusal::Hidden)
+    } else if host::read(url) == Host::Refused {
+        Verdict::Refused(Refusal::Host)
     } else {
         Verdict::Open
     }
@@ -57,5 +63,23 @@ mod tests {
         assert_eq!(judge("https://example.com/a%E2%80%8Bb"), Verdict::Open);
         // So does a character that draws something.
         assert_eq!(judge("https://de.wikipedia.org/wiki/Grüße"), Verdict::Open);
+    }
+
+    #[test]
+    fn a_target_whose_host_a_browser_would_rewrite_is_refused() {
+        for url in [
+            "https://github.com@evil.com/",
+            "https://p%D0%B0ypal.com/",
+            "http://2130706433/",
+        ] {
+            assert_eq!(judge(url), Verdict::Refused(Refusal::Host), "{url}");
+        }
+        for url in [
+            "https://xn--pypal-4ve.com/",
+            "http://[::1]/",
+            "mailto:a@b.com",
+        ] {
+            assert_eq!(judge(url), Verdict::Open, "{url}");
+        }
     }
 }

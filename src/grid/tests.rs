@@ -3540,6 +3540,24 @@ fn a_url_hiding_a_character_is_one_refused_link() {
 }
 
 #[test]
+fn a_link_whose_host_a_browser_would_rewrite_is_refused() {
+    let url = "https://github.com@evil.com/x";
+    let mut s = Screen::new(60, 2);
+    feed(&mut s, format!("see {url} ok").as_bytes());
+    let mut probe = LinkProbe::default();
+    assert_eq!(s.link_at(0, 8, &mut probe), Some(((0, 4), (0, 32))));
+    assert_eq!(probe.url(), url);
+    assert_eq!(probe.verdict(), Some(Verdict::Refused(Refusal::Host)));
+
+    let mut s = Screen::new(60, 2);
+    feed(&mut s, &anchor(url, "github.com"));
+    assert_eq!(
+        anchor_verdict(&s, 0, 0),
+        Some(Verdict::Refused(Refusal::Host))
+    );
+}
+
+#[test]
 fn a_bare_url_never_runs_into_an_anchor() {
     // Probed from plain text beside an anchor, the scan must not read the anchor's label
     // as part of a bare URL: that opens a URL built from text the anchor owns, and shows
