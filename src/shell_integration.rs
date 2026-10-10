@@ -75,8 +75,8 @@
 //!
 //! Best-effort throughout: a missing `$SHELL`, a shell none of the three, an opt-out, or
 //! any I/O failure installs nothing. [`install`] returns the variables and arguments a shell
-//! needs rather than setting them: [`crate::app::run`] applies them to its own environment
-//! for a local shell, before any thread starts, and passes them to `flatpak-spawn` for one
+//! needs rather than setting them: [`crate::app::run`] hands them to the spawn for a local
+//! shell, which gives them to that shell alone, and passes them to `flatpak-spawn` for one
 //! on the host.
 
 use std::ffi::{OsStr, OsString};
@@ -610,6 +610,7 @@ end
 
 #[cfg(test)]
 mod tests {
+    use crate::pty::{Launch, Target};
     use crate::shell_integration::*;
 
     #[test]
@@ -866,13 +867,13 @@ mod tests {
     /// The mark is the right thing to wait for: every shim emits its report *before* the
     /// `A` of the same prompt, so seeing `A` means the whole prompt-time contract has
     /// already been exercised and the buffer holds all of it.
-    fn drive_until_prompt(argv: &[&str]) -> Vec<u8> {
+    fn drive_until_prompt(launch: &Launch) -> Vec<u8> {
         use crate::gather::Gatherer;
         use crate::pty::Pty;
         use std::time::{Duration, Instant};
 
         const MARK: &[u8] = b"\x1b]133;A"; // OSC 133 prompt-start
-        let Ok(pty) = Pty::spawn_command(80, 24, argv) else {
+        let Ok(pty) = Pty::spawn(80, 24, launch) else {
             return Vec::new();
         };
         // Through the gather thread, the way a live tab reads its shell.
@@ -939,32 +940,29 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spawns a real zsh under a PTY and mutates the environment; run manually: \
-                cargo test --lib injected_integration_marks_a_real -- --ignored \
-                --test-threads=1"]
+    #[ignore = "spawns a real zsh under a PTY; run manually: cargo test --lib \
+                injected_integration_marks_a_real -- --ignored"]
     fn injected_integration_marks_a_real_zsh_prompt() {
         let Some(zsh) = find_shell(&["zsh"]) else {
             eprintln!("no zsh available; skipping");
             return;
         };
 
-        // Lay down the shims and point the child at them, as a local launch does: the child
-        // inherits this environment across the fork.
+        // Lay down the shims and point the child at them, as a local launch does.
         let dir = create_integration_dir(&local_bases()).expect("create dir");
         let shims = Shell::Zsh
             .install_into(&dir, &|name| std::env::var_os(name))
             .expect("install");
-        shims.env.iter().for_each(EnvVar::apply);
+        let launch = Launch::new(vec![zsh], Target::Local).with_env(shims.env);
 
-        let out = drive_until_prompt(&[&zsh]);
+        let out = drive_until_prompt(&launch);
         std::fs::remove_dir_all(&dir).ok();
         assert_prompt_contract("zsh", &out);
     }
 
     #[test]
     #[ignore = "spawns a real bash under a PTY and sources the user's ~/.bashrc; run \
-                manually: cargo test --lib injected_integration_marks_a_real -- --ignored \
-                --test-threads=1"]
+                manually: cargo test --lib injected_integration_marks_a_real -- --ignored"]
     fn injected_integration_marks_a_real_bash_prompt() {
         let Some(bash) = find_shell(&["bash"]) else {
             eprintln!("no bash available; skipping");
@@ -977,11 +975,9 @@ mod tests {
         let shims = Shell::Bash
             .install_into(&dir, &|name| std::env::var_os(name))
             .expect("install");
-        let argv: Vec<&str> = std::iter::once(bash.as_str())
-            .chain(shims.args.iter().map(String::as_str))
-            .collect();
+        let argv = std::iter::once(bash).chain(shims.args).collect();
 
-        let out = drive_until_prompt(&argv);
+        let out = drive_until_prompt(&Launch::new(argv, Target::Local));
         std::fs::remove_dir_all(&dir).ok();
         assert_prompt_contract("bash", &out);
         // PS0 is expanded when a command is read, so the mark for it cannot appear before
@@ -994,9 +990,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spawns a real fish under a PTY and mutates the environment; run manually: \
-                cargo test --lib injected_integration_marks_a_real -- --ignored \
-                --test-threads=1"]
+    #[ignore = "spawns a real fish under a PTY; run manually: cargo test --lib \
+                injected_integration_marks_a_real -- --ignored"]
     fn injected_integration_marks_a_real_fish_prompt() {
         let Some(fish) = find_shell(&["fish"]) else {
             eprintln!("no fish available; skipping");
@@ -1007,9 +1002,9 @@ mod tests {
         let shims = Shell::Fish
             .install_into(&dir, &|name| std::env::var_os(name))
             .expect("install");
-        shims.env.iter().for_each(EnvVar::apply);
+        let launch = Launch::new(vec![fish], Target::Local).with_env(shims.env);
 
-        let out = drive_until_prompt(&[&fish]);
+        let out = drive_until_prompt(&launch);
         std::fs::remove_dir_all(&dir).ok();
         assert_prompt_contract("fish", &out);
     }

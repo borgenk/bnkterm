@@ -12,18 +12,19 @@
 //!
 //! By the time we spawn, the Vulkan driver may have started threads, so between
 //! `fork` and `exec` the child may touch only async-signal-safe calls: no heap,
-//! no `Result`, no panic. Every buffer the child needs (the argv pointers, the
-//! slave path) is therefore built in the parent *before* the fork, and the child
-//! branch calls nothing but raw syscalls and `_exit`.
+//! no `Result`, no panic. Every buffer the child needs (the argv and environment
+//! pointers, the slave path) is therefore built in the parent *before* the fork, and
+//! the child branch calls nothing but raw syscalls and `_exit`.
 //!
-//! # Process environment
+//! # Environment
 //!
-//! `TERM` and `COLORTERM` are process-wide settings inherited by every local child.
-//! The app exports them once at startup, before a gather thread exists;
-//! [`Pty::spawn`] deliberately never mutates the environment because later calls
-//! happen while the process is multi-threaded. A shell on the Flatpak host inherits
-//! nothing from this process, so it gets them as `flatpak-spawn` arguments instead
-//! (see [`crate::flatpak`]).
+//! A local shell's variables (`TERM`, the shell-integration `ZDOTDIR`) belong to the
+//! shell alone. A [`Launch`] carries them as changes, and [`Pty::spawn`] builds the
+//! shell's whole environment in the parent, this process's with the changes on top, and
+//! hands it to `execve`. The process environment is never written, so a link's opener,
+//! which inherits it, starts with the user's own variables. A shell on the Flatpak host
+//! inherits nothing from this process, so it gets them as `flatpak-spawn` arguments
+//! instead (see [`crate::flatpak`]).
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -42,17 +43,6 @@ pub struct EnvVar {
     pub value: Option<String>,
 }
 
-impl EnvVar {
-    /// Set or remove this variable in the process environment, which every local child
-    /// inherits. Sound only before any other thread exists.
-    pub fn apply(&self) {
-        match &self.value {
-            Some(value) => std::env::set_var(self.name, value),
-            None => std::env::remove_var(self.name),
-        }
-    }
-}
-
 /// Where the shell a [`Launch`] starts ends up running.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
@@ -63,16 +53,30 @@ pub enum Target {
     FlatpakHost,
 }
 
-/// How every tab's shell is started: the whole argv, program first, and where it runs.
+/// How every tab's shell is started: the whole argv, program first, where it runs, and
+/// the changes its environment gets over this process's.
 #[derive(Clone, Debug)]
 pub struct Launch {
     argv: Vec<String>,
     target: Target,
+    env: Vec<EnvVar>,
 }
 
 impl Launch {
     pub fn new(argv: Vec<String>, target: Target) -> Self {
-        Self { argv, target }
+        Self {
+            argv,
+            target,
+            env: Vec::new(),
+        }
+    }
+
+    /// The same launch with `env` set and removed in the shell's environment, and nowhere
+    /// else. A later change to a name wins over an earlier one. For a local shell: one on
+    /// the Flatpak host takes its variables as `flatpak-spawn` arguments in its argv.
+    pub fn with_env(mut self, env: Vec<EnvVar>) -> Self {
+        self.env = env;
+        self
     }
 
     pub fn target(&self) -> Target {
@@ -141,13 +145,12 @@ pub struct ZombieChild {
 impl Pty {
     /// Open a PTY, size it to `cols` x `rows`, and start `launch` on the slave. The master
     /// is non-blocking (so the event loop can drain it without stalling) and close-on-exec
-    /// (so it is never inherited by another tab's shell). The caller sets process-wide
-    /// terminal capability variables once, before any gather threads start, so every
-    /// local child inherits them without mutating the environment from a multi-threaded
-    /// process.
+    /// (so it is never inherited by another tab's shell). The shell starts with this
+    /// process's environment and the launch's changes on top, built here rather than
+    /// written into the process, which is multi-threaded by now.
     pub fn spawn(cols: usize, rows: usize, launch: &Launch) -> Result<Pty> {
         let argv: Vec<&str> = launch.argv.iter().map(String::as_str).collect();
-        Self::spawn_on(cols, rows, &argv, launch.target)
+        Self::spawn_on(cols, rows, &argv, launch.target, &launch.env)
     }
 
     /// The general form of [`spawn`](Self::spawn): fork `argv` (with `argv[0]` the
@@ -156,12 +159,19 @@ impl Pty {
     /// both share this one fork/exec dance so the `unsafe` never leaves this module.
     /// Errors on an empty `argv` or an argument carrying an interior NUL.
     pub fn spawn_command(cols: usize, rows: usize, argv: &[&str]) -> Result<Pty> {
-        Self::spawn_on(cols, rows, argv, Target::Local)
+        Self::spawn_on(cols, rows, argv, Target::Local, &[])
     }
 
-    /// Open the PTY and start `argv` on it, claiming the slave as the child's controlling
-    /// terminal unless `target` leaves that to the host side of `flatpak-spawn`.
-    fn spawn_on(cols: usize, rows: usize, argv: &[&str], target: Target) -> Result<Pty> {
+    /// Open the PTY and start `argv` on it with `env` over this process's environment,
+    /// claiming the slave as the child's controlling terminal unless `target` leaves that
+    /// to the host side of `flatpak-spawn`.
+    fn spawn_on(
+        cols: usize,
+        rows: usize,
+        argv: &[&str],
+        target: Target,
+        env: &[EnvVar],
+    ) -> Result<Pty> {
         if argv.is_empty() {
             return Err(Error::msg("spawn_command needs a program to run"));
         }
@@ -200,7 +210,7 @@ impl Pty {
         // allocator is safe to use. The `CString`s own the bytes; `ptrs` is the
         // NUL-terminated argv (a trailing null past the arguments) the child execs.
         //
-        // The `$PATH` search is part of "everything": the child runs `execv`, not
+        // The `$PATH` search is part of "everything": the child runs `execve`, not
         // `execvp`, so a bare program name has to become a path *before* the fork. See
         // [`resolve_program`] and the note in [`fork_child_in_pty`].
         let program = resolve_program(argv.first().copied().unwrap_or_default());
@@ -213,15 +223,20 @@ impl Pty {
             .collect::<Result<_>>()?;
         let mut ptrs: Vec<*const c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
         ptrs.push(core::ptr::null());
+        let environment = child_environment(env)?;
+        let mut env_ptrs: Vec<*const c_char> = environment.iter().map(|c| c.as_ptr()).collect();
+        env_ptrs.push(core::ptr::null());
 
-        // SAFETY: all pointers outlive the call; slave_path and the argv strings are
-        // NUL-terminated and stay alive through the fork. The child branch runs
-        // only async-signal-safe syscalls before exec (see the module header).
+        // SAFETY: all pointers outlive the call; slave_path, the argv strings and the
+        // environment entries are NUL-terminated and stay alive through the fork. The
+        // child branch runs only async-signal-safe syscalls before exec (see the module
+        // header).
         let pid = unsafe {
             fork_child_in_pty(
                 master.as_raw_fd(),
                 slave_path.as_ptr(),
                 &ptrs,
+                &env_ptrs,
                 target == Target::Local,
             )
         };
@@ -416,7 +431,7 @@ fn parse_tpgid(stat: &str) -> Option<i32> {
     after_comm.split_whitespace().nth(5)?.parse().ok()
 }
 
-/// Resolve `program` to a path the child can `execv`, searching `$PATH` when it has no
+/// Resolve `program` to a path the child can `execve`, searching `$PATH` when it has no
 /// `/` in it. Returns `program` unchanged when nothing matches, so the failure is the
 /// child's `_exit(127)` rather than a different error here.
 ///
@@ -623,10 +638,11 @@ extern "C" {
     fn setsid() -> c_int;
     fn signal(signum: c_int, handler: usize) -> usize;
     fn sigprocmask(how: c_int, set: *const SigSet, oldset: *mut SigSet) -> c_int;
-    /// `execv`, not `execvp`: the `p` variant searches `$PATH` and may allocate, so it
+    /// `execve`, not `execvp`: the `p` variant searches `$PATH` and may allocate, so it
     /// is not async-signal-safe and has no business in a post-fork child.
     /// [`resolve_program`] does the search in the parent instead.
-    fn execv(path: *const c_char, argv: *const *const c_char) -> c_int;
+    fn execve(path: *const c_char, argv: *const *const c_char, envp: *const *const c_char)
+        -> c_int;
     fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
     fn close(fd: c_int) -> c_int;
     /// Variadic because POSIX says so: a third `mode_t` argument is read only when
@@ -640,6 +656,34 @@ extern "C" {
     fn tcgetattr(fd: c_int, termios: *mut Termios) -> c_int;
     fn tcsetattr(fd: c_int, actions: c_int, termios: *const Termios) -> c_int;
     fn _exit(code: c_int) -> !;
+}
+
+/// The environment a child starts with: this process's, with `changes` set and removed
+/// on top, as `NAME=VALUE` entries for `execve`. Built in the parent, before the fork,
+/// because the child may not allocate. When a name is changed twice the later change
+/// wins.
+fn child_environment(changes: &[EnvVar]) -> Result<Vec<CString>> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let entry = |name: Vec<u8>, value: Vec<u8>| {
+        let mut entry = name;
+        entry.push(b'=');
+        entry.extend(value);
+        CString::new(entry).map_err(|_| Error::msg("an environment variable contains a NUL"))
+    };
+    let mut out = std::env::vars_os()
+        .filter(|(name, _)| !changes.iter().any(|change| name == change.name))
+        .map(|(name, value)| entry(name.into_vec(), value.into_vec()))
+        .collect::<Result<Vec<_>>>()?;
+    for (at, change) in changes.iter().enumerate() {
+        let overridden = changes
+            .get(at + 1..)
+            .is_some_and(|later| later.iter().any(|later| later.name == change.name));
+        if let (Some(value), false) = (&change.value, overridden) {
+            out.push(entry(change.name.into(), value.clone().into_bytes())?);
+        }
+    }
+    Ok(out)
 }
 
 /// [`ffi::errno_error`] in this module's error type: the fd layer carries the
@@ -698,20 +742,22 @@ fn set_winsize(master: RawFd, cols: usize, rows: usize) -> Result<()> {
 }
 
 /// Fork, and in the child put the slave on stdio, claim it as the controlling terminal
-/// when `claim_tty`, and exec `argv`. Returns the child pid to the parent, or -1 on a fork
-/// failure.
+/// when `claim_tty`, and exec `argv` with the environment `envp`. Returns the child pid to
+/// the parent, or -1 on a fork failure.
 ///
 /// # Safety
 ///
 /// The child branch runs between `fork` and `exec` in a possibly-threaded
 /// process, so it calls only async-signal-safe syscalls and never allocates,
-/// returns a `Result`, or panics; `slave_path` and `argv` must be valid,
-/// NUL-terminated, and outlive the call (the caller builds them before forking).
-/// `argv` must be non-empty (`argv[0]` is the program), which the callers ensure.
+/// returns a `Result`, or panics; `slave_path`, `argv` and `envp` must be valid,
+/// NUL-terminated (each array ending in a null pointer), and outlive the call (the
+/// caller builds them before forking). `argv` must be non-empty (`argv[0]` is the
+/// program), which the callers ensure.
 unsafe fn fork_child_in_pty(
     master: RawFd,
     slave_path: *const c_char,
     argv: &[*const c_char],
+    envp: &[*const c_char],
     claim_tty: bool,
 ) -> c_int {
     let pid = fork();
@@ -763,17 +809,13 @@ unsafe fn fork_child_in_pty(
         close(slave);
     }
     close(master);
-    // `execv`, not `execvp`. POSIX's list of async-signal-safe functions has `execve` on
+    // `execve`, not `execvp`. POSIX's list of async-signal-safe functions has `execve` on
     // it and not `execvp`, and this is a post-`fork` child in a threaded process: `execvp`
     // walks `$PATH` and may allocate inside glibc, either of which can deadlock against a
-    // lock another thread held at the moment of the fork.
-    //
-    // Unreachable in the live terminal — glibc short-circuits to `execve` whenever the
-    // path contains a `/`, and `argv[0]` is `$SHELL` — but reachable
-    // with a bare program name, and "safe because of what the callers happen to pass" is
-    // not the guarantee to rely on here. `resolve_program` does the `$PATH` search up
-    // front, in the parent, where searching is allowed.
-    execv(argv[0], argv.as_ptr());
+    // lock another thread held at the moment of the fork. `resolve_program` does the
+    // `$PATH` search up front, in the parent, where searching is allowed, and the
+    // environment was built there too.
+    execve(argv[0], argv.as_ptr(), envp.as_ptr());
     // Only reached if exec failed.
     _exit(127);
 }

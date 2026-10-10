@@ -193,19 +193,7 @@ pub fn run(verbosity: Verbosity) -> crate::error::Result<()> {
             &crate::shell_integration::local_bases(),
         ),
     };
-    let mut env = terminal_env();
-    let mut argv = vec![shell];
-    if let Some(session) = &shell_integration {
-        argv.extend_from_slice(session.shell_args());
-        env.extend_from_slice(session.env());
-    }
-    let launch = if host.is_some() {
-        Launch::new(crate::flatpak::host_argv(&argv, &env), Target::FlatpakHost)
-    } else {
-        // Before State exists, so before any gather thread: every local shell inherits these.
-        env.iter().for_each(EnvVar::apply);
-        Launch::new(argv, Target::Local)
-    };
+    let launch = shell_launch(shell, shell_integration.as_ref(), host.is_some());
     let mut state = State::new(false, verbosity, launch, launch_token)?;
     state.bring_up()?;
     Ok(())
@@ -221,6 +209,29 @@ fn flatpak_host() -> Option<crate::flatpak::Host> {
     crate::flatpak::Host::query()
         .map_err(|error| eprintln!("bnkterm: {error}; the shell runs inside the sandbox"))
         .ok()
+}
+
+/// How every tab starts `shell`: with the shell integration's arguments, and with the
+/// terminal's variables and the integration's in the shell's environment alone. On the
+/// Flatpak host they travel as `flatpak-spawn` arguments; for a local shell they are
+/// handed to the spawn, so this process's environment, which a link's opener inherits,
+/// keeps the user's own values.
+fn shell_launch(
+    shell: String,
+    integration: Option<&crate::shell_integration::Session>,
+    on_host: bool,
+) -> Launch {
+    let mut env = terminal_env();
+    let mut argv = vec![shell];
+    if let Some(session) = integration {
+        argv.extend_from_slice(session.shell_args());
+        env.extend_from_slice(session.env());
+    }
+    if on_host {
+        Launch::new(crate::flatpak::host_argv(&argv, &env), Target::FlatpakHost)
+    } else {
+        Launch::new(argv, Target::Local).with_env(env)
+    }
 }
 
 /// The terminal's side of every shell's environment: what it can do and what it is.
@@ -2592,6 +2603,86 @@ mod tests {
                 assert_ne!(pointer_shape_for(facts), 0, "{facts:?}");
             }
         }
+    }
+
+    /// The environment `launch` gives a child: `env` run under a PTY, read to its end.
+    fn spawned_environment(launch: &Launch) -> std::collections::HashMap<String, String> {
+        use crate::pty::{Pty, ReadOutcome};
+        let pty = Pty::spawn(80, 24, launch).expect("spawn env");
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match pty.read(&mut buf) {
+                Ok(ReadOutcome::Data(n)) => out.extend_from_slice(&buf[..n]),
+                Ok(ReadOutcome::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                Ok(ReadOutcome::Eof) | Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&out)
+            .lines()
+            .filter_map(|line| line.trim_end_matches('\r').split_once('='))
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_local_shell_gets_its_environment_at_spawn_and_the_process_keeps_its_own() {
+        // Changing this process's environment races every other test in the binary, so
+        // the checks run in a child test process started with the environment they need.
+        const PROBE: &str = "BNKTERM_ENV_PROBE";
+        const NAME: &str =
+            "app::tests::a_local_shell_gets_its_environment_at_spawn_and_the_process_keeps_its_own";
+        if std::env::var_os(PROBE).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+                .env(PROBE, "1")
+                .env("TERM", "foo")
+                .env("BNKTERM_KEEP", "kept")
+                .env("BNKTERM_ORIG_ZDOTDIR", "/stale/from/a/parent/bnkterm")
+                .env_remove("ZDOTDIR")
+                .env_remove("BNKTERM_SHELL_INTEGRATION")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // A probe that matched no test would pass having checked nothing.
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "the probe failed: {stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        let base = std::env::temp_dir();
+        let session =
+            crate::shell_integration::install("zsh", &|name| std::env::var_os(name), &[base])
+                .expect("zsh integration");
+        let zdotdir = session
+            .env()
+            .iter()
+            .find(|var| var.name == "ZDOTDIR")
+            .and_then(|var| var.value.clone())
+            .unwrap();
+        // `env` in the shell's place, so the launch prints what the shell would start with.
+        let launch = shell_launch("env".to_string(), Some(&session), false);
+        for tab in ["first", "second"] {
+            let env = spawned_environment(&launch);
+            let get = |name: &str| env.get(name).map(String::as_str);
+            assert_eq!(get("BNKTERM_KEEP"), Some("kept"), "{tab} tab: inherited");
+            assert_eq!(get("TERM"), Some("xterm-256color"), "{tab} tab: overridden");
+            assert_eq!(get("ZDOTDIR"), Some(zdotdir.as_str()), "{tab} tab: set");
+            assert_eq!(get("BNKTERM_ORIG_ZDOTDIR"), None, "{tab} tab: removed");
+        }
+        // What a link's opener inherits is this process's environment, untouched.
+        assert_eq!(std::env::var("TERM").as_deref(), Ok("foo"));
+        assert_eq!(
+            std::env::var("BNKTERM_ORIG_ZDOTDIR").as_deref(),
+            Ok("/stale/from/a/parent/bnkterm")
+        );
+        assert_eq!(std::env::var_os("ZDOTDIR"), None);
     }
 
     #[test]
