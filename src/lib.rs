@@ -10,6 +10,7 @@ pub mod gather;
 pub mod grid;
 pub mod input;
 mod keymode;
+mod link_preview;
 pub mod mouse;
 mod notice;
 mod platform;

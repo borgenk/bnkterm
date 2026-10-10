@@ -483,6 +483,9 @@ struct State {
     /// or `0` when none is set yet. Tracked so motion only re-sends `set_shape` when
     /// the pointer crosses between the grid (I-beam) and the tab strip (arrow).
     pointer_shape: u32,
+    /// Whether the frame shows the hovered link's preview: the pointer offers a Ctrl+click
+    /// on a link ([`link_preview_shown`]).
+    link_preview: bool,
     /// The serial of the latest `wl_pointer.enter`, which `set_shape` must cite to
     /// change the cursor (`0` before the pointer has entered).
     pointer_enter_serial: u32,
@@ -661,6 +664,7 @@ impl State {
             pointer: 0,
             cursor_shape_device: 0,
             pointer_shape: 0,
+            link_preview: false,
             pointer_enter_serial: 0,
             pointer_x: 0.0,
             pointer_y: 0.0,
@@ -1362,7 +1366,8 @@ impl State {
                 // hand waits for focus. Either way, honouring it is correct.
                 self.xkb.update_modifiers(depressed, latched, locked, group);
                 // Ctrl is what turns a hovered link into a clickable one, so taking it
-                // or letting it go changes the cursor with the pointer standing still.
+                // or letting it go changes the cursor, and shows or hides the link's
+                // preview, with the pointer standing still.
                 self.update_pointer_shape();
             }
             wl_keyboard::EV_KEY => {
@@ -1772,7 +1777,9 @@ impl State {
     /// [`pointer_shape_for`] picks from it. Only re-sent when the shape changes, so a
     /// stream of motion events never spams `set_shape`. A no-op when the compositor
     /// lacks `wp_cursor_shape_manager_v1` (no device, so its default arrow stands) or
-    /// before the pointer has entered (no serial to cite).
+    /// before the pointer has entered (no serial to cite). The hovered link's preview
+    /// follows the same facts ([`link_preview_shown`]), with or without the protocol, and
+    /// the frame repaints when it comes or goes.
     ///
     /// Every shape here is a promise about what the next gesture does, which is why
     /// both of the modifier-gated facts are read live rather than cached: the hand
@@ -1793,7 +1800,7 @@ impl State {
     /// it) before the button press is delivered.
     fn update_pointer_shape(&mut self) {
         let (px, py) = self.pointer_device();
-        let shape = pointer_shape_for(PointerFacts {
+        let facts = PointerFacts {
             tab_dragging: self.tabs.dragging(),
             // A scrollbar is a control, not text, so over its grab band (and for as
             // long as its thumb is held) the I-beam gives way to the arrow.
@@ -1807,7 +1814,13 @@ impl State {
                 .filter(|_| self.xkb.ctrl_active()),
             reporting: self.tabs.active().mouse_reporting(),
             shift: self.xkb.shift_active(),
-        });
+        };
+        let preview = link_preview_shown(facts);
+        if preview != self.link_preview {
+            self.link_preview = preview;
+            self.tabs.mark_dirty();
+        }
+        let shape = pointer_shape_for(facts);
         if shape == self.pointer_shape {
             return;
         }
@@ -2227,13 +2240,15 @@ struct PointerFacts {
 }
 
 /// Pick the pointer shape the facts call for, most specific claim first: a held tab
-/// owns the pointer outright, then chrome, then a link under Ctrl (the hand if it
-/// opens, `not_allowed` if it is refused), then a program reporting the mouse, and
-/// failing all of those the grid is plain selectable text.
+/// owns the pointer outright, then chrome, then a program reporting the mouse, then a
+/// link under Ctrl (the hand if it opens, `not_allowed` if it is refused), and failing
+/// all of those the grid is plain selectable text.
 ///
 /// The ordering is the point. Chrome outranks `reporting` because the strip and the
-/// scrollbar are ours no matter what the child asked for, and `ctrl_link` outranks it
-/// because Ctrl+click acts on a link whether or not a program is watching the mouse.
+/// scrollbar are ours no matter what the child asked for. `reporting` outranks a link
+/// because a program grabbing the mouse owns its clicks, Ctrl+click included, until
+/// Shift takes the gesture back; a hover left over from before it grabbed the mouse
+/// must not promise a click it will not get.
 fn pointer_shape_for(f: PointerFacts) -> u32 {
     if f.tab_dragging {
         // The grabbing hand is the whole visual affordance of a tab drag, and it wins
@@ -2241,21 +2256,30 @@ fn pointer_shape_for(f: PointerFacts) -> u32 {
         wp_cursor_shape_device_v1::SHAPE_GRABBING
     } else if f.on_chrome {
         wp_cursor_shape_device_v1::SHAPE_DEFAULT
-    } else if f.ctrl_link == Some(Verdict::Open) {
-        wp_cursor_shape_device_v1::SHAPE_POINTER
-    } else if f.ctrl_link.is_some() {
-        // Only the terminal sets the pointer, so a program cannot draw its way past
-        // this the way it can fake an underline.
-        wp_cursor_shape_device_v1::SHAPE_NOT_ALLOWED
     } else if f.reporting && !f.shift {
         // The grid belongs to a program grabbing the mouse, so a drag is its event to
         // interpret, not a selection. Shift is the same override the terminal half
         // applies to the event itself, so the two never disagree about who the next
         // drag belongs to.
         wp_cursor_shape_device_v1::SHAPE_DEFAULT
+    } else if f.ctrl_link == Some(Verdict::Open) {
+        wp_cursor_shape_device_v1::SHAPE_POINTER
+    } else if f.ctrl_link.is_some() {
+        // Only the terminal sets the pointer, so a program cannot draw its way past
+        // this the way it can fake an underline.
+        wp_cursor_shape_device_v1::SHAPE_NOT_ALLOWED
     } else {
         wp_cursor_shape_device_v1::SHAPE_TEXT
     }
+}
+
+/// Whether the hovered link's preview shows: exactly when the pointer says a Ctrl+click
+/// acts on a link, so the preview never names a target the click would not reach.
+fn link_preview_shown(f: PointerFacts) -> bool {
+    matches!(
+        pointer_shape_for(f),
+        wp_cursor_shape_device_v1::SHAPE_POINTER | wp_cursor_shape_device_v1::SHAPE_NOT_ALLOWED
+    )
 }
 
 /// Convert a point size to device pixels at compositor scale `scale_120` (120ths;
@@ -2566,7 +2590,7 @@ mod tests {
     }
 
     #[test]
-    fn chrome_and_links_outrank_a_reporting_program() {
+    fn chrome_and_a_reporting_program_outrank_a_link() {
         // The strip and the scrollbar are ours whatever the child asked for.
         assert_eq!(
             pointer_shape_for(PointerFacts {
@@ -2576,12 +2600,24 @@ mod tests {
             }),
             wp_cursor_shape_device_v1::SHAPE_DEFAULT
         );
-        // Ctrl+click follows a link whether or not a program watches the mouse, so the
-        // hand must survive reporting rather than collapse to the arrow.
+        // A program grabbing the mouse owns its clicks, Ctrl+click included, so a hover
+        // left over from before it grabbed the mouse does not get the hand.
+        for verdict in [Verdict::Open, Verdict::Refused(Refusal::Scheme)] {
+            assert_eq!(
+                pointer_shape_for(PointerFacts {
+                    ctrl_link: Some(verdict),
+                    reporting: true,
+                    ..OVER_TEXT
+                }),
+                wp_cursor_shape_device_v1::SHAPE_DEFAULT
+            );
+        }
+        // Shift takes the gesture back, and the link with it.
         assert_eq!(
             pointer_shape_for(PointerFacts {
                 ctrl_link: Some(Verdict::Open),
                 reporting: true,
+                shift: true,
                 ..OVER_TEXT
             }),
             wp_cursor_shape_device_v1::SHAPE_POINTER
@@ -2590,6 +2626,7 @@ mod tests {
             pointer_shape_for(PointerFacts {
                 ctrl_link: Some(Verdict::Refused(Refusal::Scheme)),
                 reporting: true,
+                shift: true,
                 ..OVER_TEXT
             }),
             wp_cursor_shape_device_v1::SHAPE_NOT_ALLOWED
@@ -2605,6 +2642,47 @@ mod tests {
             }),
             wp_cursor_shape_device_v1::SHAPE_GRABBING
         );
+    }
+
+    #[test]
+    fn the_preview_shows_exactly_where_a_ctrl_click_acts_on_a_link() {
+        let link = |verdict| PointerFacts {
+            ctrl_link: Some(verdict),
+            ..OVER_TEXT
+        };
+        assert!(link_preview_shown(link(Verdict::Open)));
+        assert!(link_preview_shown(link(Verdict::Refused(Refusal::Scheme))));
+        assert!(!link_preview_shown(OVER_TEXT), "no link under Ctrl");
+        for (facts, why) in [
+            (
+                PointerFacts {
+                    on_chrome: true,
+                    ..link(Verdict::Open)
+                },
+                "over the scrollbar, which takes the click",
+            ),
+            (
+                PointerFacts {
+                    reporting: true,
+                    ..link(Verdict::Open)
+                },
+                "a program grabbing the mouse takes the click",
+            ),
+            (
+                PointerFacts {
+                    tab_dragging: true,
+                    ..link(Verdict::Open)
+                },
+                "a tab is held",
+            ),
+        ] {
+            assert!(!link_preview_shown(facts), "{why}");
+        }
+        assert!(link_preview_shown(PointerFacts {
+            reporting: true,
+            shift: true,
+            ..link(Verdict::Open)
+        }));
     }
 
     #[test]

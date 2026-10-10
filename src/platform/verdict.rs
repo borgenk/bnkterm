@@ -64,6 +64,24 @@ pub enum Refusal {
     Unreachable,
 }
 
+impl Refusal {
+    /// Why the link does not open, as a clause the user reads after "refused: ".
+    pub fn reason(self) -> &'static str {
+        match self {
+            Refusal::Scheme => "bnkterm does not open this kind of link",
+            Refusal::Hidden => "it hides a character",
+            Refusal::Host => "a browser would rewrite its host",
+            Refusal::ForeignHost => "it names a file on another machine",
+            Refusal::FilePath => "its path reads more than one way",
+            Refusal::MailField => "it sets mail fields beyond to, cc, bcc, subject and body",
+            Refusal::LabelHost => "its text names another host",
+            Refusal::Executable => "it is an executable file",
+            Refusal::Launcher => "it is a desktop launcher",
+            Refusal::Unreachable => "the file could not be checked",
+        }
+    }
+}
+
 /// The one rule that needs the filesystem, judged when a `file:` link is clicked: the URL
 /// to hand the opener, or why it is refused.
 ///

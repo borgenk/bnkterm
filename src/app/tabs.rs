@@ -701,14 +701,16 @@ impl Tabs {
 
     /// Compose the visible terminal's display list, then the tab strip over it. The
     /// strip's labels are the proportional interface font, so `fonts` is threaded to
-    /// [`tab_bar::fill_bar`] to measure and fit them.
+    /// [`tab_bar::fill_bar`] to measure and fit them. `link_preview` shows the hovered
+    /// link's preview.
     pub(super) fn fill_frame_list(
         &self,
         out: &mut DisplayList,
         strings: &mut Vec<String>,
         fonts: &Fonts,
+        link_preview: bool,
     ) {
-        self.active().fill_frame_list(out, strings);
+        self.active().fill_frame_list(out, strings, link_preview);
         if self.shows_bar() {
             if let Some(bar) = &self.bar_geom {
                 // A lifted drag resolves to the slot its id now sits in (a background
@@ -1410,7 +1412,7 @@ mod tests {
         let one = demo_tabs(1);
         let mut one_list = Vec::new();
         let mut one_strings = Vec::new();
-        one.fill_frame_list(&mut one_list, &mut one_strings, &fonts);
+        one.fill_frame_list(&mut one_list, &mut one_strings, &fonts, false);
         let one_baseline = one_list.iter().find_map(|cmd| match cmd {
             DrawCmd::Cells { baseline, .. } => Some(*baseline),
             _ => None,
@@ -1421,7 +1423,7 @@ mod tests {
         two.resize_all(layout(80, 23, 640, 384));
         let mut two_list = Vec::new();
         let mut two_strings = Vec::new();
-        two.fill_frame_list(&mut two_list, &mut two_strings, &fonts);
+        two.fill_frame_list(&mut two_list, &mut two_strings, &fonts, false);
         let two_baseline = two_list.iter().find_map(|cmd| match cmd {
             DrawCmd::Cells { baseline, .. } => Some(*baseline),
             _ => None,
@@ -1456,7 +1458,7 @@ mod tests {
 
         let mut list = Vec::new();
         let mut strings = Vec::new();
-        two.fill_frame_list(&mut list, &mut strings, &fonts);
+        two.fill_frame_list(&mut list, &mut strings, &fonts, false);
 
         // Both no-PTY demo cores label their tab with the directory fallback "shell".
         // Each lands as its own clean `Text` run: exactly "shell", never " shell" or

@@ -214,6 +214,7 @@ fn measure() -> Result<Vec<Sample>> {
         frame_tabbar_scenario(),
         frame_damage_scenario(),
         grid_reflow_scenario(),
+        link_preview_scenario()?,
     ];
     for fixture in link_fixtures() {
         samples.push(link_scenario(&fixture)?);
@@ -345,6 +346,91 @@ fn link_scenario(fixture: &LinkFixture) -> Result<Sample> {
     });
     Ok(Sample {
         name: fixture.name,
+        ns,
+        allocs,
+    })
+}
+
+/// Ctrl held over a refused link: write its preview line, as a hover onto it does, then
+/// build the 80x24 frame that shows it, with its hidden character escaped and the line
+/// cut to the grid, through the window's pooled display-list path. Warm, it allocates
+/// nothing: the line goes into a reused buffer and the frame's strings are recycled.
+fn link_preview_scenario() -> Result<Sample> {
+    use crate::color::Theme;
+    use crate::term_render::{
+        build_display_list_into, CellMetrics, CellSpan, CursorRender, DisplayListPool, FrameInputs,
+        LinkHover,
+    };
+
+    const COLS: usize = 80;
+    const ROWS: usize = 24;
+    const METRICS: CellMetrics = CellMetrics {
+        size: 16,
+        w: 8,
+        h: 16,
+        baseline: 12,
+        ascent: 12,
+        descent: 4,
+        lock_glyph: true,
+    };
+    let url = LINK_LONG_URL.replacen("download", "down\u{200B}load", 1);
+    let mut screen = Screen::new(COLS, ROWS);
+    Parser::new().advance_bytes(&mut screen, format!("\x1b[3Hsee {url} here").as_bytes());
+    let mut probe = LinkProbe::default();
+    let verdict = Verdict::Refused(Refusal::Hidden);
+    let span = screen.link_at(2, 10, &mut probe);
+    let Some((start, end)) =
+        span.filter(|_| probe.url() == url && probe.verdict() == Some(verdict))
+    else {
+        return Err(Error::msg(format!(
+            "link_preview: expected the long URL refused as hidden, found {:?} ({:?})",
+            probe.url(),
+            probe.verdict()
+        )));
+    };
+    let hover = LinkHover {
+        span: CellSpan { start, end },
+        verdict,
+    };
+
+    let theme = Theme::default();
+    let surface = (COLS as i32 * METRICS.w, ROWS as i32 * METRICS.h);
+    let room = crate::term_render::preview_room(COLS, METRICS);
+    let mut line = String::new();
+    let mut lists = DisplayListPool::default();
+    let mut build = || {
+        crate::link_preview::write(&mut line, &url, verdict, room);
+        let len = {
+            let (out, strings) = lists.begin();
+            build_display_list_into(
+                out,
+                strings,
+                &FrameInputs {
+                    screen: &screen,
+                    bell: false,
+                    theme: &theme,
+                    metrics: METRICS,
+                    surface,
+                    origin: (0, 0),
+                    cursor: CursorRender::default(),
+                    selection: None,
+                    hover: Some(hover),
+                    preview: Some(&line),
+                    scale: Scale::ONE,
+                    scrollbar: &HIDDEN_SCROLLBAR,
+                },
+            );
+            out.len()
+        };
+        lists.commit();
+        len
+    };
+    for _ in 0..4 {
+        black_box(build());
+    }
+    let (ns, allocs) = best_of(GATE_ROUNDS, 512, &mut build);
+    Ok(Sample {
+        name: "link_preview",
         ns,
         allocs,
     })
@@ -536,6 +622,7 @@ fn frame_tabbar_scenario() -> Sample {
                     cursor: CursorRender::default(),
                     selection: None,
                     hover: None,
+                    preview: None,
                     scale: Scale::ONE,
                     scrollbar: &HIDDEN_SCROLLBAR,
                 },
@@ -1153,6 +1240,7 @@ pub fn render_bench(args: &[String]) -> Result<()> {
                 cursor,
                 selection: None,
                 hover: None,
+                preview: None,
                 scale: Scale::ONE,
                 scrollbar: &HIDDEN_SCROLLBAR,
             },
@@ -1194,6 +1282,7 @@ pub fn render_bench(args: &[String]) -> Result<()> {
                 cursor,
                 selection: None,
                 hover: None,
+                preview: None,
                 scale: Scale::ONE,
                 scrollbar: &HIDDEN_SCROLLBAR,
             },
@@ -1239,6 +1328,7 @@ pub fn render_bench(args: &[String]) -> Result<()> {
                     cursor,
                     selection: None,
                     hover: None,
+                    preview: None,
                     scale: Scale::ONE,
                     scrollbar: &HIDDEN_SCROLLBAR,
                 },
@@ -1295,6 +1385,7 @@ pub fn render_bench(args: &[String]) -> Result<()> {
                     cursor,
                     selection: None,
                     hover: None,
+                    preview: None,
                     scale: Scale::ONE,
                     scrollbar: &HIDDEN_SCROLLBAR,
                 },
@@ -1348,6 +1439,7 @@ pub fn render_bench(args: &[String]) -> Result<()> {
                     cursor,
                     selection: None,
                     hover: None,
+                    preview: None,
                     scale: Scale::ONE,
                     scrollbar: &HIDDEN_SCROLLBAR,
                 },
@@ -1434,6 +1526,7 @@ pub fn render_bench(args: &[String]) -> Result<()> {
                         cursor,
                         selection: None,
                         hover: None,
+                        preview: None,
                         scale: Scale::ONE,
                         scrollbar: &HIDDEN_SCROLLBAR,
                     },

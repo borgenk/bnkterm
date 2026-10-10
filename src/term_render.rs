@@ -48,9 +48,10 @@
 //! foreground as fixed-pitch [`DrawCmd::Cells`] runs (with wide glyphs and
 //! astral-plane runes broken out into their own [`DrawCmd::Text`] so the pitch
 //! stays uniform), then underline/strike rules and the hovered link's rule, and
-//! finally the cursor on top. Everything past the base fill is emitted only where it
-//! is not the default, so an idle screen of mostly-blank cells produces a short list
-//! and an unchanged frame diffs to nothing.
+//! finally the cursor on top. Over the whole grid come the overlay scrollbar and, while
+//! Ctrl is held over a link, the plate that previews its target. Everything past the
+//! base fill is emitted only where it is not the default, so an idle screen of
+//! mostly-blank cells produces a short list and an unchanged frame diffs to nothing.
 //!
 //! The two overlays the app hands in — the selection band and the hovered hyperlink's
 //! underline — both cover a [`CellSpan`], and both resolve to *one inclusive column
@@ -334,6 +335,10 @@ pub struct FrameInputs<'a> {
     /// The hyperlink under the pointer, which paints underlined. The app finds it
     /// (the grid holds the text); the painter only draws it.
     pub hover: Option<LinkHover>,
+    /// The hovered link's preview line ([`crate::link_preview`]), shown while Ctrl is
+    /// held: drawn on a plate beside [`Self::hover`], over the grid and its scrollbar.
+    /// `None` draws nothing.
+    pub preview: Option<&'a str>,
     /// The display scale, so the scrollbar's logical pixel constants land at the right
     /// device size. [`Scale::ONE`] in a test or a headless build.
     pub scale: Scale,
@@ -459,6 +464,9 @@ pub fn build_display_list_into(
     }
     painter.cursor(inputs.cursor, cols, rows);
     painter.push_scrollbar(inputs.surface, rows);
+    if let Some(text) = inputs.preview {
+        painter.push_link_preview(text, cols, rows);
+    }
 }
 
 /// Build a fresh display list, allocating its vector and run strings. The one-shot
@@ -1445,6 +1453,98 @@ impl Painter<'_> {
         }
     }
 
+    /// The hovered link's preview `text` on a plate just below the link's last row, or
+    /// just above its first when the grid has no room below, cut with `…` to the grid's
+    /// width. It starts under the link when the link sits on one row, and at the grid's
+    /// left edge for a link that wraps. A grid too small to hold the plate shows none.
+    ///
+    /// ```text
+    ///   see https://github.com/x/y for details
+    ///       ┌────────────────────────────────────┐
+    ///       │ github.com  https://github.com/x/y │
+    ///       └────────────────────────────────────┘
+    /// ```
+    fn push_link_preview(&mut self, text: &str, cols: usize, rows: usize) {
+        let Some(hover) = self.hover else {
+            return;
+        };
+        let m = self.metrics;
+        if m.w <= 0 || m.h <= 0 {
+            return;
+        }
+        let (pad_x, pad_y) = preview_pad(m);
+        let grid_w = cols as i32 * m.w;
+        let room = preview_room(cols, m);
+        let (top, bottom) = (self.cell_y(0), self.cell_y(rows));
+        let panel_h = m.h + 2 * pad_y;
+        if room == 0 || panel_h > bottom - top {
+            return;
+        }
+        let (shown, cut) = fit_cells(text, room);
+        let text_w = (width::text_cells(shown) + usize::from(cut)) as i32 * m.w;
+        let panel_w = text_w + 2 * pad_x;
+
+        let below = self.cell_y(hover.span.end.0 + 1);
+        let above = self.cell_y(hover.span.start.0) - panel_h;
+        let y0 = if below + panel_h <= bottom || above < top {
+            below.min(bottom - panel_h).max(top)
+        } else {
+            above
+        };
+        let left = if hover.span.start.0 == hover.span.end.0 {
+            self.cell_x(hover.span.start.1)
+        } else {
+            self.cell_x(0)
+        };
+        let x0 = left
+            .min(self.cell_x(0) + grid_w - panel_w)
+            .max(self.cell_x(0));
+
+        // The same darkened plate the corner notice and the leader overlay float on.
+        let plate = self.theme.bg.mix(Rgb::new(0, 0, 0), 1, 2).to_u32();
+        let fg = self.theme.fg.to_u32();
+        self.list.push(DrawCmd::RoundRect {
+            rect: Rect {
+                x: x0,
+                y: y0,
+                w: panel_w,
+                h: panel_h,
+            },
+            color: plate,
+            radius: (m.h / 4).max(2),
+        });
+        let face = FaceKey::Prose {
+            size: m.size,
+            style: FontStyle::Regular,
+        };
+        let (x, baseline) = (x0 + pad_x, y0 + pad_y + m.baseline);
+        push_cell_text(
+            self.list,
+            self.strings,
+            shown,
+            x,
+            baseline,
+            m,
+            face,
+            fg,
+            plate,
+        );
+        if cut {
+            let x = x + text_w - m.w;
+            push_cell_text(
+                self.list,
+                self.strings,
+                "…",
+                x,
+                baseline,
+                m,
+                face,
+                fg,
+                plate,
+            );
+        }
+    }
+
     /// Whether cell `(row, col)` has no combining marks (a blank base rune with no
     /// marks draws nothing).
     fn marks_empty(&self, row: usize, col: usize) -> bool {
@@ -1489,6 +1589,41 @@ pub(crate) fn push_text_run(
         fade,
         text: owned,
     });
+}
+
+/// The preview plate's padding: half a cell either side, a sixth of a cell above and
+/// below.
+fn preview_pad(m: CellMetrics) -> (i32, i32) {
+    ((m.w / 2).max(1), (m.h / 6).max(1))
+}
+
+/// How many cells of a link's preview fit across a grid `cols` wide, inside the plate's
+/// padding: what [`crate::link_preview::write`] fits its line to.
+pub(crate) fn preview_room(cols: usize, m: CellMetrics) -> usize {
+    if m.w <= 0 {
+        return 0;
+    }
+    let inside = cols as i32 * m.w - 2 * preview_pad(m).0;
+    usize::try_from(inside / m.w).unwrap_or(0)
+}
+
+/// The longest start of `text` that fits `cols` cells with room left for a `…`, and
+/// whether it had to be cut; all of it when it fits whole. Measured the way
+/// [`width::text_cells`] measures, so the cut lands where the drawn text would overflow,
+/// and read only until it overflows, however long the text.
+fn fit_cells(text: &str, cols: usize) -> (&str, bool) {
+    let mut used = 0;
+    let mut cut = 0;
+    for (at, cluster) in grapheme::graphemes(text) {
+        if used < cols {
+            cut = at;
+        }
+        used += usize::from(width::cluster_width(cluster)).max(1);
+        if used > cols {
+            return (text.get(..cut).unwrap_or_default(), true);
+        }
+    }
+    (text, false)
 }
 
 /// Append styled cell text at a fixed-pitch origin, recycling every command's
@@ -1728,6 +1863,7 @@ mod tests {
             },
             selection: None,
             hover: None,
+            preview: None,
             scale: Scale::ONE,
             scrollbar: &HIDDEN_BAR,
         }
@@ -1797,6 +1933,34 @@ mod tests {
             hover: Some(LinkHover { span, verdict }),
             ..inputs(s, &Theme::default())
         })
+    }
+
+    /// [`list_of`] with a hovered link that opens over it, previewed as `text`, the way a
+    /// frame draws while Ctrl is held.
+    fn list_previewing(s: &Screen, span: CellSpan, text: &str) -> DisplayList {
+        build_display_list(&FrameInputs {
+            hover: Some(LinkHover {
+                span,
+                verdict: Verdict::Open,
+            }),
+            preview: Some(text),
+            ..inputs(s, &Theme::default())
+        })
+    }
+
+    /// The preview's plate, and the text drawn after it.
+    fn preview_plate(list: &[DrawCmd]) -> Option<(Rect, String)> {
+        let at = list
+            .iter()
+            .rposition(|c| matches!(c, DrawCmd::RoundRect { .. }))?;
+        let DrawCmd::RoundRect { rect, .. } = list[at] else {
+            return None;
+        };
+        let text = cells_runs(&list[at..])
+            .into_iter()
+            .map(|(_, _, t)| t)
+            .collect();
+        Some((rect, text))
     }
 
     fn cells_runs(list: &[DrawCmd]) -> Vec<(i32, i32, String)> {
@@ -2531,6 +2695,77 @@ mod tests {
         let inked: i32 = dashes.iter().map(|(r, _)| r.w).sum();
         assert!(inked < solid.w, "with gaps between the dashes");
         assert_eq!(cells_runs(&refused), cells_runs(&list_of(&s)));
+    }
+
+    #[test]
+    fn the_preview_sits_under_the_hovered_link_or_above_it_on_the_last_row() {
+        let mut s = Screen::new(40, 4);
+        feed(&mut s, b"see https://github.com/x");
+        let line = "github.com  https://github.com/x";
+        let span = CellSpan {
+            start: (0, 4),
+            end: (0, 23),
+        };
+        let (rect, text) = preview_plate(&list_previewing(&s, span, line)).unwrap();
+        assert_eq!(text, line);
+        assert_eq!(
+            (rect.x, rect.y),
+            (4 * M.w, M.h),
+            "on the row below, under it"
+        );
+        assert!(
+            preview_plate(&list_hovering(&s, span)).is_none(),
+            "nothing while Ctrl is up"
+        );
+
+        let span = CellSpan {
+            start: (3, 4),
+            end: (3, 23),
+        };
+        let (rect, _) = preview_plate(&list_previewing(&s, span, line)).unwrap();
+        assert_eq!(
+            rect.y + rect.h,
+            3 * M.h,
+            "above the link's row, with none below"
+        );
+    }
+
+    #[test]
+    fn a_preview_is_cut_to_the_grid_and_kept_inside_it() {
+        let s = Screen::new(20, 3);
+        let span = CellSpan {
+            start: (0, 15),
+            end: (0, 19),
+        };
+        let long = "refused: it hides a character  https://example.com/a";
+        let (rect, text) = preview_plate(&list_previewing(&s, span, long)).unwrap();
+        let kept = text.strip_suffix('…').expect("cut with an ellipsis");
+        assert!(long.starts_with(kept), "{text}");
+        assert_eq!(
+            width::text_cells(&text),
+            19,
+            "every cell inside the padding"
+        );
+        assert!(rect.x >= 0 && rect.x + rect.w <= 20 * M.w, "{rect:?}");
+
+        let (rect, text) = preview_plate(&list_previewing(&s, span, "github.com")).unwrap();
+        assert_eq!(text, "github.com");
+        assert_eq!(rect.x + rect.w, 20 * M.w, "moved left to fit, not cut");
+    }
+
+    #[test]
+    fn a_grid_too_small_for_the_plate_shows_no_preview() {
+        let span = CellSpan {
+            start: (0, 0),
+            end: (0, 0),
+        };
+        for (cols, rows) in [(1, 4), (40, 1)] {
+            let s = Screen::new(cols, rows);
+            assert!(
+                preview_plate(&list_previewing(&s, span, "github.com")).is_none(),
+                "{cols}x{rows}"
+            );
+        }
     }
 
     #[test]

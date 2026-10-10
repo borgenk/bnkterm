@@ -344,6 +344,11 @@ pub(super) struct TerminalCore {
     /// [`TerminalCore::refresh_hover`] re-probes from when the text scrolls out from
     /// under a parked pointer.
     hover_cell: Option<(usize, usize)>,
+    /// The hovered link's target, and the line previewing it ([`crate::link_preview`])
+    /// that shows while Ctrl is held. Both empty off a link, and rebuilt only when the
+    /// hovered link or its target changes.
+    hover_url: String,
+    preview: String,
     /// Reused scratch for the hyperlink probe, so hovering allocates nothing once its
     /// buffers have grown (see [`LinkProbe`]).
     probe: LinkProbe,
@@ -410,6 +415,8 @@ impl TerminalCore {
             drag: None,
             hover: None,
             hover_cell: None,
+            hover_url: String::new(),
+            preview: String::new(),
             probe: LinkProbe::default(),
             dirty: true,
             geom,
@@ -978,13 +985,30 @@ impl TerminalCore {
         self.set_hover(None);
     }
 
-    /// Adopt a new hovered link, repainting only when it actually changed (a pointer
-    /// crossing cells *within* one link must not redraw the frame).
+    /// Adopt a new hovered link, just probed into [`Self::probe`], repainting only when it
+    /// actually changed (a pointer crossing cells *within* one link must not redraw the
+    /// frame). Output can rewrite a link in place, so the same cells with a different
+    /// target are a change too: the preview must name what a click would open.
     fn set_hover(&mut self, hover: Option<LinkHover>) {
-        if self.hover != hover {
-            self.hover = hover;
-            self.dirty = true;
+        let url = if hover.is_some() {
+            self.probe.url()
+        } else {
+            ""
+        };
+        if self.hover == hover && self.hover_url == url {
+            return;
         }
+        self.hover = hover;
+        self.hover_url.clear();
+        self.hover_url.push_str(url);
+        match hover {
+            Some(hover) => {
+                let room = term_render::preview_room(self.screen.dimensions().0, self.geom.metrics);
+                crate::link_preview::write(&mut self.preview, url, hover.verdict, room);
+            }
+            None => self.preview.clear(),
+        }
+        self.dirty = true;
     }
 
     /// Follow a Ctrl+clicked hyperlink at display `(row, col)`, returning whether one
@@ -1647,7 +1671,14 @@ impl TerminalCore {
     /// Compose the window's display list: the visible grid painted at the current
     /// size, cursor on top (solid when focused, hollow when not). Reads the
     /// window-shipped geometry, so it stays a pure function of the grid state.
-    pub(super) fn fill_frame_list(&self, out: &mut DisplayList, strings: &mut Vec<String>) {
+    /// `link_preview` shows the hovered link's preview, when there is one: the window
+    /// decides, from what the pointer offers.
+    pub(super) fn fill_frame_list(
+        &self,
+        out: &mut DisplayList,
+        strings: &mut Vec<String>,
+        link_preview: bool,
+    ) {
         // The child chose the shape (DECSCUSR); blink hides it on the off phase
         // while focused, and DECTCEM hides it entirely.
         let blinked_off = self.cursor_blinking() && !self.blink_on;
@@ -1669,6 +1700,7 @@ impl TerminalCore {
                 cursor,
                 selection: self.selection,
                 hover: self.hover,
+                preview: (link_preview && self.hover.is_some()).then_some(self.preview.as_str()),
                 scale: self.geom.scale,
                 scrollbar: &self.scrollbar,
             },
@@ -2338,7 +2370,7 @@ mod tests {
         // background, and no other cursor shape is round. So this counts padlocks.
         let locked = |core: &TerminalCore| {
             let (mut list, mut strings) = (DisplayList::new(), Vec::new());
-            core.fill_frame_list(&mut list, &mut strings);
+            core.fill_frame_list(&mut list, &mut strings, false);
             list.iter().any(|c| {
                 matches!(
                     c,
@@ -2561,7 +2593,7 @@ mod tests {
         // background, and no other cursor shape is round. So this counts padlocks.
         let locked = |core: &TerminalCore| {
             let (mut list, mut strings) = (DisplayList::new(), Vec::new());
-            core.fill_frame_list(&mut list, &mut strings);
+            core.fill_frame_list(&mut list, &mut strings, false);
             list.iter().any(|c| {
                 matches!(
                     c,
@@ -2953,6 +2985,7 @@ mod tests {
             cursor: CursorRender::default(),
             selection: None,
             hover: None,
+            preview: None,
             scale: Scale::ONE,
             scrollbar: &bar,
         });
@@ -3565,6 +3598,38 @@ mod tests {
                 end: (1, 20)
             })
         );
+    }
+
+    #[test]
+    fn the_preview_names_what_the_hovered_link_would_open() {
+        use crate::render::display::DrawCmd;
+        let mut core = core_showing("https://github.com/a https://evil.example/b");
+        let plates = |core: &TerminalCore, ctrl| {
+            let (mut list, mut strings) = (DisplayList::new(), Vec::new());
+            core.fill_frame_list(&mut list, &mut strings, ctrl);
+            list.iter()
+                .filter(|c| matches!(c, DrawCmd::RoundRect { .. }))
+                .count()
+        };
+
+        hover_at(&mut core, 5, 0, input::Mods::NONE);
+        assert_eq!(core.preview, "github.com  https://github.com/a");
+        assert_eq!(plates(&core, false), 0, "drawn only while Ctrl is held");
+        assert_eq!(plates(&core, true), 1);
+
+        hover_at(&mut core, 25, 0, input::Mods::NONE);
+        assert_eq!(core.preview, "evil.example  https://evil.example/b");
+
+        // Output rewrites the link under the parked pointer: the same cells, judged the
+        // same, but a click would now open another target.
+        let mut parser = Parser::new();
+        parser.advance_bytes(&mut core.screen, b"\x1b[1;22Hhttps://evil.example/c");
+        core.after_output();
+        assert_eq!(core.preview, "evil.example  https://evil.example/c");
+
+        hover_at(&mut core, 20, 0, input::Mods::NONE);
+        assert!(core.preview.is_empty(), "off a link");
+        assert_eq!(plates(&core, true), 0);
     }
 
     #[test]

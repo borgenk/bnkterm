@@ -87,15 +87,8 @@ impl Notice {
     /// The notice for a clicked link refused by the rule judged only at the click, held
     /// and faded on the same timings as the startup notice.
     pub(crate) fn link_refused(refusal: Refusal, cfg: &ShellStartupConfig) -> Self {
-        let why = match refusal {
-            Refusal::Executable => "it is an executable file",
-            Refusal::Launcher => "it is a desktop launcher",
-            Refusal::Unreachable => "the file could not be checked",
-            Refusal::FilePath => "its path reads more than one way",
-            _ => "it is refused",
-        };
         Self {
-            text: format!("link not opened: {why}"),
+            text: format!("link not opened: {}", refusal.reason()),
             raised: Instant::now(),
             hold: cfg.hold,
             fade: cfg.fade,
