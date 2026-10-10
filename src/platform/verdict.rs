@@ -1,13 +1,24 @@
 //! Whether a link may open: the rules a link's target must pass before the terminal
 //! offers it to the pointer or hands it to an opener.
 //!
-//! Every rule is a pure function of the target, so a verdict is worked out where a link
-//! enters the terminal and kept with it: an OSC 8 anchor is judged once, when the grid
-//! interns it. A link either opens or is refused with a [`Refusal`]; there is no third
-//! outcome to confirm.
+//! Every rule but one is a pure function of the target, so a verdict is worked out where
+//! a link enters the terminal and kept with it: an OSC 8 anchor is judged once, when the
+//! grid interns it. The exception needs the filesystem and is judged at the click: what a
+//! `file:` link reaches ([`judge_file`], or [`judge_host_file`] for a shell on the Flatpak
+//! host). A link either opens or is refused with a [`Refusal`]; there is no third outcome
+//! to confirm.
+
+use std::process::{Command, Stdio};
 
 use crate::platform::host::{self, Host, Hostname};
 use crate::platform::{browser, file_url, link, mailto};
+
+/// The argv prefix that runs a command on the Flatpak host, where a host shell's files are.
+const ON_HOST: [&str; 2] = ["flatpak-spawn", "--host"];
+
+/// `st_mode`'s file-type bits, and their value for a regular file.
+const S_IFMT: u32 = 0o170_000;
+const S_IFREG: u32 = 0o100_000;
 
 /// What the rules decided about a link.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -47,8 +58,9 @@ pub enum Refusal {
     /// A `file:` target resolves to a `.desktop` file, which an opener launches. Judged
     /// at the click.
     Launcher,
-    /// A `file:` target could not be checked: it is missing, or not readable. Judged at
-    /// the click, and refused because a check that cannot run must not open.
+    /// A `file:` target could not be checked: it is missing, not readable, or on a host
+    /// the check could not reach. Judged at the click, and refused because a check that
+    /// cannot run must not open.
     Unreachable,
 }
 
@@ -62,20 +74,74 @@ pub enum Refusal {
 /// handed a URL encoded from exactly that path, so the path checked is the path opened.
 pub fn judge_file(url: &str) -> Result<String, Refusal> {
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::MetadataExt;
 
     let path = file_url::decoded_path(url).ok_or(Refusal::FilePath)?;
     let canonical = std::fs::canonicalize(path).map_err(|_| Refusal::Unreachable)?;
     let resolved =
         file_url::plain_path(canonical.as_os_str().as_bytes()).ok_or(Refusal::FilePath)?;
-    let meta = std::fs::metadata(resolved).map_err(|_| Refusal::Unreachable)?;
+    let mode = std::fs::metadata(resolved)
+        .map_err(|_| Refusal::Unreachable)?
+        .mode();
+    judge_resolved(resolved, mode)
+}
+
+/// [`judge_file`] for a link printed by a shell on the Flatpak host, whose files the
+/// sandbox cannot see. The host resolves the path and reads its mode, two `flatpak-spawn`
+/// round trips, so this blocks for as long as they take and runs off the event loop.
+pub fn judge_host_file(url: &str) -> Result<String, Refusal> {
+    judge_file_through(&ON_HOST, url)
+}
+
+/// [`judge_file`], with the path resolved by `realpath` and its mode read by `stat`, each
+/// run through `prefix`. The resolved path comes back NUL-terminated rather than through
+/// anything that trims it, so a trailing newline in a name reaches [`file_url::plain_path`]
+/// and is refused there.
+fn judge_file_through(prefix: &[&str], url: &str) -> Result<String, Refusal> {
+    let path = file_url::decoded_path(url).ok_or(Refusal::FilePath)?;
+    let canonical = output(prefix, &["realpath", "-z", "-e", "--", &path])?;
+    let canonical = canonical
+        .strip_suffix(b"\0")
+        .filter(|path| !path.contains(&0))
+        .ok_or(Refusal::Unreachable)?;
+    let resolved = file_url::plain_path(canonical).ok_or(Refusal::FilePath)?;
+    let mode = output(prefix, &["stat", "-c", "%f", "--", resolved])?;
+    let mode = std::str::from_utf8(&mode)
+        .ok()
+        .and_then(|hex| u32::from_str_radix(hex.trim_end(), 16).ok())
+        .ok_or(Refusal::Unreachable)?;
+    judge_resolved(resolved, mode)
+}
+
+/// What `command`, run through `prefix`, printed, or [`Refusal::Unreachable`] when it
+/// could not start or failed.
+fn output(prefix: &[&str], command: &[&str]) -> Result<Vec<u8>, Refusal> {
+    let mut argv = prefix.iter().chain(command);
+    let program = argv.next().ok_or(Refusal::Unreachable)?;
+    let output = Command::new(program)
+        .args(argv)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| Refusal::Unreachable)?;
+    output
+        .status
+        .success()
+        .then_some(output.stdout)
+        .ok_or(Refusal::Unreachable)
+}
+
+/// The verdict on `resolved`, a path [`file_url::plain_path`] accepted after every symlink
+/// in it was followed, whose `st_mode` is `mode`: refused when it is a `.desktop` launcher
+/// or a regular file with an exec bit, else the URL that names exactly it.
+fn judge_resolved(resolved: &str, mode: u32) -> Result<String, Refusal> {
     let name = resolved.rsplit('/').next().unwrap_or_default();
     let launcher = name
         .get(name.len().saturating_sub(".desktop".len())..)
         .is_some_and(|ext| ext.eq_ignore_ascii_case(".desktop"));
     if launcher {
         Err(Refusal::Launcher)
-    } else if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+    } else if mode & S_IFMT == S_IFREG && mode & 0o111 != 0 {
         Err(Refusal::Executable)
     } else {
         Ok(file_url::encode(resolved))
@@ -370,6 +436,63 @@ mod tests {
             let opened = judge_file(&url_of(&path)).unwrap();
             assert!(opened.is_ascii(), "{opened}");
             assert_eq!(file_url::decoded_path(&opened).as_deref(), path.to_str());
+        }
+    }
+
+    #[test]
+    fn a_file_judged_through_realpath_and_stat_gets_the_local_verdict() {
+        // The host check runs the same two commands through `flatpak-spawn --host`. Run
+        // here with no prefix, each must reach the verdict the local check does.
+        use std::os::unix::fs::symlink;
+        let fixture = fixture_dir("judge-through");
+        let dir = fixture.0.as_path();
+        let launcher = write_file(dir, "payload.desktop", 0o644);
+        let trailing = write_file(dir, "payload.desktop\n", 0o600);
+        let alias = dir.join("readme.txt");
+        symlink(&launcher, &alias).unwrap();
+        let newline_alias = dir.join("notes.txt");
+        symlink(&trailing, &newline_alias).unwrap();
+        let sub = dir.join("docs");
+        std::fs::create_dir(&sub).unwrap();
+        let cases = [
+            (write_file(dir, "plain.txt", 0o644), None),
+            (write_file(dir, "файл #3.txt", 0o644), None),
+            (sub, None),
+            (
+                write_file(dir, "build.sh", 0o755),
+                Some(Refusal::Executable),
+            ),
+            (
+                write_file(dir, "group.sh", 0o610),
+                Some(Refusal::Executable),
+            ),
+            (launcher, Some(Refusal::Launcher)),
+            (alias, Some(Refusal::Launcher)),
+            (newline_alias, Some(Refusal::FilePath)),
+            (dir.join("missing.txt"), Some(Refusal::Unreachable)),
+        ];
+        for (path, refusal) in cases {
+            let url = url_of(&path);
+            let through = judge_file_through(&[], &url);
+            assert_eq!(through, judge_file(&url), "{url}");
+            assert_eq!(through.as_ref().err(), refusal.as_ref(), "{url}");
+            if let Ok(opened) = through {
+                assert_eq!(file_url::decoded_path(&opened).as_deref(), path.to_str());
+            }
+        }
+    }
+
+    #[test]
+    fn a_host_check_that_cannot_run_refuses() {
+        let fixture = fixture_dir("judge-unreachable");
+        let url = url_of(&write_file(fixture.0.as_path(), "notes.txt", 0o644));
+        assert!(judge_file_through(&[], &url).is_ok());
+        for prefix in [&["false"][..], &["/nonexistent/bnkterm-no-such-program"]] {
+            assert_eq!(
+                judge_file_through(prefix, &url),
+                Err(Refusal::Unreachable),
+                "{prefix:?}"
+            );
         }
     }
 }

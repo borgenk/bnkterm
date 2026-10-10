@@ -930,11 +930,13 @@ impl Screen {
         self.base_theme = theme;
     }
 
-    /// Refuse the anchor shown at display `(row, col)` for `refusal`, a rule judged only at
-    /// the click, so the next hover shows it refused. A cell with no anchor (a bare URL,
-    /// judged afresh on every lookup) is left alone.
-    pub(crate) fn refuse_anchor(&mut self, row: usize, col: usize, refusal: Refusal) {
-        let id = self.view_cell(row, col).link;
+    /// Refuse every anchor to `url` for `refusal`, a rule judged only at the click, so the
+    /// next hover over any of them shows it refused. A URL no anchor names (a bare URL,
+    /// judged afresh on every lookup) has nothing stored to change.
+    pub(crate) fn refuse_link(&mut self, url: &str, refusal: Refusal) {
+        let Some(&id) = self.links.index.get(url) else {
+            return;
+        };
         if let Some(target) = self.links.get_mut(id) {
             target.verdict = Verdict::Refused(refusal);
         }

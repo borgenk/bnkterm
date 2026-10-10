@@ -996,13 +996,12 @@ impl TerminalCore {
     /// window: the text came from the child, which can print anything. A refused link
     /// still consumes the click, so Ctrl+click on one does nothing at all.
     ///
-    /// A local `file:` link is judged once more here against the filesystem
-    /// ([`verdict::judge_file`]), and opens as the URL of the path that was checked. If
-    /// that refuses it, the corner notice says why, and when the refusal is a fact about
-    /// the file (an executable, a launcher) rather than a check that could not run, the
-    /// anchor's verdict flips so the hover shows it from now on. A file that was missing
-    /// is checked again on the next click. A shell on the Flatpak host is judged there
-    /// instead.
+    /// A `file:` link is judged once more against the filesystem it names, and opens as
+    /// the URL of the path that was checked. A local shell's is judged here
+    /// ([`verdict::judge_file`]). A shell on the Flatpak host names host files the sandbox
+    /// cannot see, so the window judges its links there, off the event loop
+    /// ([`verdict::judge_host_file`]), and hands a refusal back to [`Self::refuse_link`].
+    /// Either way a refusal raises the corner notice.
     fn open_link(&mut self, row: usize, col: usize) -> bool {
         if self.screen.link_at(row, col, &mut self.probe).is_none() {
             return false;
@@ -1010,23 +1009,33 @@ impl TerminalCore {
         if self.probe.verdict() != Some(Verdict::Open) {
             return true;
         }
-        let url = self.probe.url();
-        let checked = if self.shell_target == Target::Local && url.starts_with("file:") {
-            verdict::judge_file(url)
-        } else {
-            Ok(url.to_string())
-        };
-        match checked {
-            Ok(url) => self.outbox.push(ToWindow::OpenUrl(url)),
-            Err(refusal) => {
-                if refusal != Refusal::Unreachable {
-                    self.screen.refuse_anchor(row, col, refusal);
-                    self.refresh_hover();
+        let url = self.probe.url().to_string();
+        if !url.starts_with("file:") {
+            self.outbox.push(ToWindow::OpenUrl(url));
+            return true;
+        }
+        match self.shell_target {
+            Target::FlatpakHost => self.outbox.push(ToWindow::OpenHostFile(url)),
+            Target::Local => match verdict::judge_file(&url) {
+                Ok(checked) => self.outbox.push(ToWindow::OpenUrl(checked)),
+                Err(refusal) => {
+                    self.refuse_link(&url, refusal);
+                    self.outbox.push(ToWindow::LinkRefused(refusal));
                 }
-                self.outbox.push(ToWindow::LinkRefused(refusal));
-            }
+            },
         }
         true
+    }
+
+    /// A click found the link to `url` refused by what its file is. When that is a fact
+    /// about the file (an executable, a launcher), every anchor to it flips so the hover
+    /// shows it from now on. A check that could not run (a missing file) leaves it, and
+    /// the next click checks again.
+    pub(super) fn refuse_link(&mut self, url: &str, refusal: Refusal) {
+        if refusal != Refusal::Unreachable {
+            self.screen.refuse_link(url, refusal);
+            self.refresh_hover();
+        }
     }
 
     /// Encode one mouse event under the current mouse mode and write it to the child
@@ -3363,9 +3372,9 @@ mod tests {
     }
 
     #[test]
-    fn a_file_link_from_a_shell_on_the_flatpak_host_is_not_judged_here() {
-        // The sandbox cannot see the host's files, so checking here would judge some
-        // other file or none.
+    fn a_file_link_from_a_shell_on_the_flatpak_host_is_handed_over_to_be_judged_there() {
+        // The sandbox cannot see the host's files, so a check here would judge whatever
+        // sits at the same path in the sandbox, or nothing.
         use std::os::unix::fs::PermissionsExt;
         let fixture = FixtureDir::new("host");
         let script = fixture.0.join("build.sh");
@@ -3378,11 +3387,29 @@ mod tests {
             return;
         }
         let mut parser = Parser::new();
-        parser.advance_bytes(&mut core.screen, file_anchor(&script, "build").as_bytes());
+        let shown = format!(
+            "{} \x1b]8;;https://example.com/\x1b\\web\x1b]8;;\x1b\\",
+            file_anchor(&script, "build")
+        );
+        parser.advance_bytes(&mut core.screen, shown.as_bytes());
+
         click_mods(&mut core, true, 2, 0, input::Mods::CTRL);
+        let out = core.take_outbox();
+        assert!(
+            !out.iter()
+                .any(|m| matches!(m, ToWindow::OpenUrl(_) | ToWindow::LinkRefused(_))),
+            "neither opened unchecked nor judged against the sandbox"
+        );
+        let url = format!("file://{}", script.display());
+        assert!(out
+            .iter()
+            .any(|m| matches!(m, ToWindow::OpenHostFile(handed) if *handed == url)));
+
+        click_mods(&mut core, true, 7, 0, input::Mods::CTRL);
         assert_eq!(
-            opened_url(&mut core),
-            Some(format!("file://{}", script.display()))
+            opened_url(&mut core).as_deref(),
+            Some("https://example.com/"),
+            "a web link is no host file"
         );
     }
 

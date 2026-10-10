@@ -21,9 +21,9 @@ use std::os::fd::RawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use super::message::ToWindow;
-use super::terminal::{PumpOutcome, TerminalCore};
 use crate::app::layout::{TerminalGeometry, WindowLayout};
+use crate::app::message::ToWindow;
+use crate::app::terminal::{PumpOutcome, TerminalCore};
 use crate::color::Theme;
 use crate::config::{ShellStartupConfig, TabBarConfig};
 use crate::error::Result;
@@ -32,6 +32,7 @@ use crate::keymode::Dir;
 use crate::notice::Notice;
 use crate::platform::freetype::Fonts;
 use crate::platform::host::Hostname;
+use crate::platform::verdict::Refusal;
 use crate::pty::{Launch, ZombieChild};
 use crate::render::display::DisplayList;
 use crate::tab_bar::{self, BarGeom, Lift, Slot, TabLabel};
@@ -584,6 +585,17 @@ impl Tabs {
     /// The notice the window should paint, if one stands.
     pub(super) fn notice(&self) -> Option<&Notice> {
         self.notice.as_ref()
+    }
+
+    /// A `file:` link judged on the Flatpak host was refused. Every tab's shell runs on
+    /// that host, so every tab's anchors to it take the refusal, and the corner notice
+    /// says why.
+    pub(super) fn host_link_refused(&mut self, url: &str, refusal: Refusal) {
+        for entry in &mut self.entries {
+            entry.core.refuse_link(url, refusal);
+        }
+        self.notice = Some(Notice::link_refused(refusal, &self.shell_startup));
+        self.mark_dirty();
     }
 
     /// Drain and route every core's outbound facts, then return the translated
@@ -1488,6 +1500,51 @@ mod tests {
         assert!(
             tabs.notice().is_some(),
             "the refusal is stated in the corner"
+        );
+    }
+
+    #[test]
+    fn a_link_refused_on_the_host_shows_refused_in_every_tab_and_raises_the_notice() {
+        let url = "file:///home/u/build.sh";
+        let mut tabs = demo_tabs(2);
+        let hovered = |tabs: &mut Tabs| -> Vec<Option<Verdict>> {
+            tabs.entries
+                .iter_mut()
+                .map(|entry| {
+                    let motion = PointerEvent::Motion {
+                        col: 1,
+                        row: 0,
+                        side: Side::Left,
+                    };
+                    entry.core.pointer(motion, Mods::NONE).unwrap();
+                    entry.core.hovered_link()
+                })
+                .collect()
+        };
+        for entry in &mut tabs.entries {
+            entry.core.feed_test_bytes(
+                format!("\x1b[2J\x1b[H\x1b]8;;{url}\x1b\\build\x1b]8;;\x1b\\").as_bytes(),
+            );
+        }
+
+        tabs.host_link_refused(url, Refusal::Unreachable);
+        assert!(
+            tabs.notice().is_some(),
+            "a check that could not run says so"
+        );
+        assert_eq!(
+            hovered(&mut tabs),
+            [Some(Verdict::Open); 2],
+            "and the next click checks again"
+        );
+
+        tabs.notice = None;
+        tabs.host_link_refused(url, Refusal::Executable);
+        assert!(tabs.notice().is_some());
+        assert_eq!(
+            hovered(&mut tabs),
+            [Some(Verdict::Refused(Refusal::Executable)); 2],
+            "the host's file is the same file in every tab"
         );
     }
 

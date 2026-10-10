@@ -38,9 +38,18 @@ pub(super) struct Activation {
     launch_token: Option<String>,
     /// Which `xdg-open` a clicked link goes to: the one beside the shell.
     opener: Opener,
-    /// Token requests in flight for clicked links: the request object and the URL that
-    /// opens when its token arrives.
-    pending_links: Vec<(u32, String)>,
+    /// Token requests in flight for clicked links: the request object and the link that
+    /// is followed when its token arrives.
+    pending_links: Vec<(u32, ClickedLink)>,
+}
+
+/// A Ctrl+clicked link, waiting on its activation token.
+pub(super) enum ClickedLink {
+    /// Judged in full by the core: it opens as it is.
+    Url(String),
+    /// A `file:` link from a shell on the Flatpak host, judged there before it opens
+    /// ([`crate::app::host_check`]).
+    HostFile(String),
 }
 
 impl Activation {
@@ -85,11 +94,11 @@ impl State {
         }
     }
 
-    /// Open a clicked link. With the global, a token is requested for the click first,
-    /// citing its serial, and the link opens when the token arrives.
-    pub(super) fn launch_link(&mut self, url: String) {
+    /// Follow a clicked link. With the global, a token is requested for the click first,
+    /// citing its serial, and the link is followed when the token arrives.
+    pub(super) fn launch_link(&mut self, link: ClickedLink) {
         let (Some(global), Some(seat)) = (self.activation.global, self.seat) else {
-            open_url(&url, None, self.activation.opener);
+            self.follow(link, None);
             return;
         };
         let request = self.create(global, xdg_activation_v1::GET_ACTIVATION_TOKEN);
@@ -105,7 +114,26 @@ impl State {
         );
         self.conn
             .request(request, xdg_activation_token_v1::COMMIT, &[]);
-        self.activation.pending_links.push((request, url));
+        self.activation.pending_links.push((request, link));
+    }
+
+    /// Open `link` with `token`, or start judging it on the host first.
+    fn follow(&mut self, link: ClickedLink, token: Option<String>) {
+        match link {
+            ClickedLink::Url(url) => self.open_url(&url, token.as_deref()),
+            ClickedLink::HostFile(url) => self.check_on_host(url, token),
+        }
+    }
+
+    /// Launch a link in whatever the desktop has set as its handler, beside the shell. The
+    /// link was already judged, so a refusal here means the desktop could not start a
+    /// handler at all: report it and carry on, because a link that will not open is an
+    /// annoyance and must never be allowed to take the terminal down with it.
+    pub(super) fn open_url(&self, url: &str, activation_token: Option<&str>) {
+        let opener = self.activation.opener;
+        if let Err(err) = crate::platform::browser::open_url(url, activation_token, opener) {
+            eprintln!("bnkterm: could not open {url}: {err}");
+        }
     }
 
     /// A `done` for a link's token request: destroy the request and open its link with the
@@ -123,23 +151,13 @@ impl State {
             .pending_links
             .iter()
             .position(|(request, _)| *request == msg.object)?;
-        let (request, url) = self.activation.pending_links.swap_remove(at);
+        let (request, link) = self.activation.pending_links.swap_remove(at);
         self.conn
             .request(request, xdg_activation_token_v1::DESTROY, &[]);
         // An undecodable token is dropped, not fatal: the link opens without one.
         let token = r.string().ok().filter(|token| !token.is_empty());
-        open_url(&url, token, self.activation.opener);
+        self.follow(link, token.map(str::to_string));
         Some(Ok(()))
-    }
-}
-
-/// Launch a Ctrl+clicked hyperlink in whatever the desktop has set as its handler.
-/// The core already vetted the scheme, so a refusal here means the desktop could not
-/// start a handler at all: report it and carry on, because a link that will not open
-/// is an annoyance and must never be allowed to take the terminal down with it.
-fn open_url(url: &str, activation_token: Option<&str>, opener: Opener) {
-    if let Err(err) = crate::platform::browser::open_url(url, activation_token, opener) {
-        eprintln!("bnkterm: could not open {url}: {err}");
     }
 }
 

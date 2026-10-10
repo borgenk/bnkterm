@@ -27,6 +27,7 @@
 
 mod activation;
 mod clipboard;
+mod host_check;
 mod layout;
 mod message;
 mod present;
@@ -37,8 +38,9 @@ use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use self::activation::Activation;
+use self::activation::{Activation, ClickedLink};
 use self::clipboard::{PendingSend, SelectionTransport, Transport};
+use self::host_check::HostChecks;
 use self::layout::{TerminalGeometry, WindowLayout, WINDOW_PADDING};
 use self::message::{PointerEvent, Side, ToWindow};
 use self::present::GpuPresentation;
@@ -519,6 +521,9 @@ struct State {
     last_serial: u32,
     /// The launcher's activation token and the links waiting on theirs.
     activation: Activation,
+    /// Host shells' `file:` links being judged on the Flatpak host, off the loop. `None`
+    /// for a local shell, or when the wake could not be made, which refuses them all.
+    host_checks: Option<HostChecks>,
     /// GPU/dmabuf presentation resources.
     presentation: GpuPresentation,
 
@@ -607,6 +612,13 @@ impl State {
         let theme = Rc::new(config.theme);
         core.set_theme(Rc::clone(&theme));
         let activation = Activation::new(launch_token, launch.target());
+        let host_checks = (launch.target() == Target::FlatpakHost)
+            .then(HostChecks::new)
+            .and_then(|checks| {
+                checks
+                    .map_err(|error| eprintln!("bnkterm: host file links refused: {error}"))
+                    .ok()
+            });
 
         Ok(Self {
             conn,
@@ -665,6 +677,7 @@ impl State {
             pending_sends: Vec::new(),
             last_serial: 0,
             activation,
+            host_checks,
             presentation: GpuPresentation::with_gamma(config_text_gamma()),
             next_id: 2, // 1 is wl_display
             free_ids: Vec::new(),
@@ -892,11 +905,20 @@ impl State {
             for send in &self.pending_sends {
                 self.poll_set.add_writable(send.fd());
             }
+            // Registered only while a host check owes a verdict.
+            let host_check_slot = self
+                .host_checks
+                .as_ref()
+                .and_then(HostChecks::wake_fd)
+                .map(|fd| self.poll_set.add(fd));
             self.poll_set.wait(wait)?;
             // Before anything else: whatever the far side will now take. Cheap when
             // nothing is owed, and it is what keeps a queued paste or copy moving.
             self.tabs.pump_writes()?;
             self.pump_selection_sends();
+            if host_check_slot.is_some_and(|slot| self.poll_set.readable(slot)) {
+                self.finish_host_checks();
+            }
             if self.poll_set.readable(wayland_slot) {
                 // poll said the socket has data (or hung up); this recv returns
                 // immediately, its short timeout only a safety net.
@@ -2154,7 +2176,8 @@ impl State {
                 ToWindow::OfferSelection(bytes) => self.set_selection(Transport::Clipboard, bytes),
                 ToWindow::OfferPrimary(bytes) => self.set_selection(Transport::Primary, bytes),
                 ToWindow::PastePrimary => self.paste_from(Transport::Primary)?,
-                ToWindow::OpenUrl(url) => self.launch_link(url),
+                ToWindow::OpenUrl(url) => self.launch_link(ClickedLink::Url(url)),
+                ToWindow::OpenHostFile(url) => self.launch_link(ClickedLink::HostFile(url)),
                 // The tabs raise the corner notice for it; nothing reaches here.
                 ToWindow::LinkRefused(_) => {}
                 ToWindow::Closed => self.closed = true,

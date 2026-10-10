@@ -82,6 +82,10 @@ pub enum ToWindow {
     /// [`crate::platform::verdict`]); the window spawns the opener, since
     /// launching a process is a window-side concern like every other action here.
     OpenUrl(String),
+    /// A Ctrl+click landed on a `file:` link printed by a shell on the Flatpak host, where
+    /// its file is. The window judges it there off the event loop
+    /// ([`crate::platform::verdict::judge_host_file`]) and opens it only if that lets it.
+    OpenHostFile(String),
     /// A Ctrl+click landed on a link refused by the rule judged only at the click (a
     /// `file:` link to an executable or a launcher): the corner notice says so.
     LinkRefused(Refusal),
