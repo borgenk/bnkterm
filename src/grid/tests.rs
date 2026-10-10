@@ -5,6 +5,7 @@ use super::buffer::MAX_LOGICAL_COLS;
 use super::osc::base64_decode;
 use super::*;
 use crate::color::{Ground, Rgb};
+use crate::platform::verdict::Refusal;
 
 #[test]
 fn cell_layout_is_pinned() {
@@ -2584,6 +2585,19 @@ fn reflow_keeps_hyperlinks() {
 }
 
 #[test]
+fn reflow_keeps_a_trailing_blank_inside_an_anchor_open_or_refused() {
+    // A space printed inside an anchor is part of the link, so like a coloured blank it is
+    // content, not padding: narrowed, it wraps onto the next row rather than being trimmed.
+    for uri in ["https://e.com/a", "javascript:x"] {
+        let mut s = Screen::new(10, 3);
+        feed(&mut s, &anchor(uri, "ab  "));
+        s.resize(3, 3);
+        assert!(s.row_wraps(0), "{uri}");
+        assert_eq!(s.cell(1, 0).link, s.cell(0, 0).link, "{uri}");
+    }
+}
+
+#[test]
 fn reflow_trims_plain_trailing_blanks() {
     let mut s = Screen::new(10, 3);
     feed(&mut s, b"hi");
@@ -3446,24 +3460,109 @@ fn an_anchor_outranks_the_text_underneath_it() {
     assert_eq!(probe.url(), "https://real.example/x");
 }
 
+/// The verdict stored for the anchor shown at display `(row, col)`, `None` off any anchor.
+fn anchor_verdict(s: &Screen, row: usize, col: usize) -> Option<Verdict> {
+    s.links.get(s.view_cell(row, col).link).map(|t| t.verdict)
+}
+
 #[test]
-fn an_anchor_we_would_refuse_to_open_is_not_a_link_at_all() {
-    // A child prints whatever it likes. A scheme outside `OPENABLE_SCHEMES` is
-    // rejected when the anchor *opens*, so the label stays ordinary text and never
-    // underlines. Decorating a link and then refusing to follow it is the bug this
-    // exists to prevent (see `browser::OPENABLE_SCHEMES`).
+fn a_refused_anchor_is_kept_with_its_reason_and_not_offered() {
+    // A scheme outside `OPENABLE_SCHEMES` is judged when the anchor is interned and
+    // stored refused, so its cells still say a link is there. The lookup does not
+    // offer it to the pointer.
     for uri in [
         "javascript:alert(1)",
         "data:text/html,<script>x</script>",
+        "vscode://file/etc/passwd",
         "ftp://host/x",
         "-flag-that-xdg-open-would-eat",
     ] {
         let mut s = Screen::new(20, 2);
         feed(&mut s, &anchor(uri, "click"));
+        assert_eq!(
+            anchor_verdict(&s, 0, 4),
+            Some(Verdict::Refused(Refusal::Scheme)),
+            "{uri}"
+        );
         let mut probe = LinkProbe::default();
-        assert_eq!(s.cell(0, 0).link, LinkId::NONE, "{uri}");
         assert_eq!(s.link_at(0, 2, &mut probe), None, "{uri}");
     }
+}
+
+#[test]
+fn an_anchor_with_no_readable_target_leaves_its_text_plain() {
+    // Bad UTF-8 or an empty URI has nothing to keep, so it closes the open anchor.
+    let mut s = Screen::new(20, 2);
+    feed(&mut s, b"\x1b]8;;https://e.com/a\x1b\\ab");
+    feed(&mut s, b"\x1b]8;;https://e.com/\xff\x1b\\cd");
+    feed(&mut s, b"\x1b]8;;https://e.com/a\x1b\\ef\x1b]8;;\x1b\\gh");
+    assert_eq!(anchor_verdict(&s, 0, 0), Some(Verdict::Open));
+    assert_eq!(s.cell(0, 2).link, LinkId::NONE, "bad UTF-8");
+    assert_eq!(anchor_verdict(&s, 0, 4), Some(Verdict::Open));
+    assert_eq!(s.cell(0, 6).link, LinkId::NONE, "an empty URI");
+    assert_eq!(s.links.targets.len(), 1);
+}
+
+#[test]
+fn refused_anchors_count_against_the_link_budgets() {
+    // A refused anchor is stored like any other, so a stream of distinct long refused
+    // URIs meets the same byte budget and the same fruitless-sweep guard.
+    let mut s = Screen::new(20, 2);
+    let filler = "b".repeat(LINK_URL_MAX - 32);
+    for i in 0..4000 {
+        feed(&mut s, &anchor(&format!("javascript:{i}/{filler}"), "z"));
+        feed(&mut s, b"\r\n");
+    }
+    assert!(
+        s.links.bytes <= LINK_BYTES_MAX,
+        "the table held {} bytes, past its {LINK_BYTES_MAX} budget",
+        s.links.bytes
+    );
+    assert!(s.links.targets.len() < 4000, "the budget stopped it");
+    assert!(s.links.swept_dry_at.is_some());
+}
+
+#[test]
+fn a_sweep_keeps_each_surviving_link_its_verdict() {
+    // Burn the id space on alternately refused and open anchors, most of which scroll
+    // out of history, then force a sweep. The survivors are renumbered, and each must
+    // keep the verdict of its own URL rather than one shifted from a neighbour.
+    let mut s = Screen::new(20, 2);
+    let mut bytes = Vec::new();
+    for i in 0..LINK_LIMIT {
+        let uri = if i % 2 == 0 {
+            format!("javascript:{i}")
+        } else {
+            format!("https://e.com/{i}")
+        };
+        bytes.extend(anchor(&uri, "x"));
+        bytes.extend_from_slice(b"\r\n");
+    }
+    feed(&mut s, &bytes);
+    assert_eq!(
+        s.links.targets.len(),
+        LINK_LIMIT,
+        "refused anchors spent ids too"
+    );
+
+    feed(&mut s, &anchor("https://e.com/fresh", "NEW"));
+    assert!(s.links.targets.len() < LINK_LIMIT, "the sweep ran");
+    for target in &s.links.targets {
+        assert_eq!(
+            target.verdict,
+            verdict::judge(&target.url),
+            "{}",
+            target.url
+        );
+    }
+    // Row 0 shows the last anchor printed before the fresh one, which was open; the
+    // one before it, a line up in history, was refused.
+    assert_eq!(anchor_verdict(&s, 0, 0), Some(Verdict::Open));
+    s.scroll_view_up(1);
+    assert_eq!(
+        anchor_verdict(&s, 0, 0),
+        Some(Verdict::Refused(Refusal::Scheme))
+    );
 }
 
 #[test]
@@ -3598,7 +3697,7 @@ fn a_full_link_table_collects_dead_ids_and_keeps_linking() {
         bytes.extend_from_slice(b"\r\n");
     }
     feed(&mut s, &bytes);
-    assert_eq!(s.links.urls.len(), LINK_LIMIT, "the id space is spent");
+    assert_eq!(s.links.targets.len(), LINK_LIMIT, "the id space is spent");
 
     // Row 0 shows the last anchor printed; row 1 is where the cursor now sits.
     let last = format!("https://e.com/{}", LINK_LIMIT - 1);
@@ -3609,7 +3708,7 @@ fn a_full_link_table_collects_dead_ids_and_keeps_linking() {
     // One more distinct URL: intern finds the table full, collects, and succeeds.
     feed(&mut s, &anchor("https://e.com/fresh", "NEW"));
     assert!(
-        s.links.urls.len() < LINK_LIMIT,
+        s.links.targets.len() < LINK_LIMIT,
         "the ids of the scrolled-out anchors came back"
     );
     assert_eq!(s.link_at(1, 1, &mut probe), Some(((1, 0), (1, 2))));
@@ -3637,7 +3736,7 @@ fn the_link_table_is_bounded_in_bytes_and_not_only_in_count() {
     // A URL past the per-URL cap is not clickable, and does not grow the table at all.
     let huge = format!("https://e.com/{}", "a".repeat(LINK_URL_MAX));
     feed(&mut s, &anchor(&huge, "x"));
-    assert!(s.links.urls.is_empty(), "nothing was interned");
+    assert!(s.links.targets.is_empty(), "nothing was interned");
     let mut probe = LinkProbe::default();
     assert_eq!(s.link_at(0, 0, &mut probe), None, "and the cell is plain");
     assert_eq!(s.cell(0, 0).rune, 'x', "the text still reads, as always");
@@ -3646,7 +3745,7 @@ fn the_link_table_is_bounded_in_bytes_and_not_only_in_count() {
     let big = format!("https://e.com/{}", "a".repeat(LINK_URL_MAX - 15));
     assert_eq!(big.len(), LINK_URL_MAX - 1);
     feed(&mut s, &anchor(&big, "y"));
-    assert_eq!(s.links.urls.len(), 1);
+    assert_eq!(s.links.targets.len(), 1);
     assert_eq!(s.link_at(0, 1, &mut probe), Some(((0, 1), (0, 1))));
     assert_eq!(probe.url(), big);
 
@@ -3666,7 +3765,7 @@ fn the_link_table_is_bounded_in_bytes_and_not_only_in_count() {
         s.links.bytes
     );
     assert!(
-        s.links.urls.len() < 4000,
+        s.links.targets.len() < 4000,
         "the budget, not the id space, is what stopped it"
     );
 

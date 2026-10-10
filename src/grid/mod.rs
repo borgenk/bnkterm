@@ -64,6 +64,7 @@ use crate::color::{self, Color, Theme};
 use crate::input::{KittyFlags, ModifyOtherKeys};
 use crate::mouse::{MouseMode, MouseProtocol};
 use crate::platform::grapheme;
+use crate::platform::verdict::{self, Verdict};
 use crate::vt::{Params, Perform};
 use crate::width::width;
 use std::cmp::Ordering;
@@ -335,7 +336,7 @@ const LINK_LIMIT: usize = u16::MAX as usize - 1;
 /// A cap is needed because the only other bound on one URL is `OSC_MAX` (4096), and
 /// **count** was the only thing capped. 65534 distinct 4 KB URIs, one anchored cell each,
 /// pins about 537 MB that `collect_links` can never reclaim — because each one is stored
-/// twice (once in `urls`, once as the `index` key) and every one is live. That is forty
+/// twice (once in `targets`, once as the `index` key) and every one is live. That is forty
 /// times what the scrollback's own cells cost, from a child that merely prints.
 const LINK_URL_MAX: usize = 2048;
 
@@ -382,18 +383,17 @@ impl LinkId {
     /// `Default` cell — is linkless without anyone saying so.
     pub const NONE: LinkId = LinkId(0);
 
-    /// Whether this cell is inside a hyperlink at all. The check the hover probe runs
-    /// first, before it considers scanning text.
+    /// Whether this cell is inside a hyperlink at all, refused or not.
     fn is_set(self) -> bool {
         self != LinkId::NONE
     }
 }
 
-/// The URLs of the OSC 8 hyperlinks a screen is holding, each interned once and cited
-/// by [`LinkId`].
+/// The targets of the OSC 8 hyperlinks a screen is holding, each interned once and
+/// cited by [`LinkId`], refused ones included.
 ///
-/// Ids are 1-based, so `urls[i]` is the URL of `LinkId(i + 1)` and zero is free to
-/// mean "no link". The URL is stored twice — once in `urls` to go id → URL in O(1)
+/// Ids are 1-based, so `targets[i]` is the target of `LinkId(i + 1)` and zero is free to
+/// mean "no link". The URL is stored twice — once in `targets` to go id → URL in O(1)
 /// for the hover probe, once as the `index` key to go URL → id on intern so a link
 /// printed a thousand times is interned once. That duplication buys both directions
 /// their natural cost, which a single structure could not — and it is why the table is
@@ -403,7 +403,7 @@ impl LinkId {
 /// the length too.
 #[derive(Default)]
 struct LinkTable {
-    urls: Vec<String>,
+    targets: Vec<LinkTarget>,
     index: HashMap<String, LinkId>,
     /// Bytes of URL text held, counting both copies. Tracked rather than summed so the
     /// budget check stays O(1) on a path a child can drive.
@@ -425,9 +425,16 @@ struct LinkTable {
     swept_dry_at: Option<(RowEpoch, u64)>,
 }
 
+/// One interned hyperlink: where it leads, and the verdict on it, judged when it was
+/// first interned.
+struct LinkTarget {
+    url: String,
+    verdict: Verdict,
+}
+
 impl LinkTable {
-    /// The id for `url`, interning it if this is the first time we have seen it.
-    /// `None` when the table is full — of ids or of bytes — which is the caller's cue to
+    /// The id for `url`, interning and judging it if this is the first time we have seen
+    /// it. `None` when the table is full — of ids or of bytes — which is the caller's cue to
     /// collect the dead ids and try once more ([`Screen::intern_link`]). A sweep can free
     /// either, so both failures are worth retrying after one.
     ///
@@ -438,7 +445,7 @@ impl LinkTable {
         if let Some(&id) = self.index.get(url) {
             return Some(id);
         }
-        if self.urls.len() >= LINK_LIMIT {
+        if self.targets.len() >= LINK_LIMIT {
             return None;
         }
         let cost = url.len().checked_mul(2)?;
@@ -446,8 +453,11 @@ impl LinkTable {
             return None;
         }
         // Ids are 1-based and the table is capped below `u16::MAX`, so this fits.
-        let id = LinkId(u16::try_from(self.urls.len() + 1).ok()?);
-        self.urls.push(url.to_string());
+        let id = LinkId(u16::try_from(self.targets.len() + 1).ok()?);
+        self.targets.push(LinkTarget {
+            url: url.to_string(),
+            verdict: verdict::judge(url),
+        });
         self.index.insert(url.to_string(), id);
         self.bytes = self.bytes.saturating_add(cost);
         Some(id)
@@ -459,25 +469,25 @@ impl LinkTable {
     /// that is empty in every session without hyperlinks.
     fn storage_bytes(&self) -> usize {
         self.bytes
-            + self.urls.capacity() * std::mem::size_of::<String>()
+            + self.targets.capacity() * std::mem::size_of::<LinkTarget>()
             + self.index.capacity()
                 * (std::mem::size_of::<String>() + std::mem::size_of::<LinkId>())
     }
 
-    /// The URL behind `id`, or `None` for [`LinkId::NONE`] and any id this table does
-    /// not hold.
-    fn url(&self, id: LinkId) -> Option<&str> {
+    /// The target behind `id`, or `None` for [`LinkId::NONE`] and any id this table
+    /// does not hold.
+    fn get(&self, id: LinkId) -> Option<&LinkTarget> {
         let slot = usize::from(id.0).checked_sub(1)?;
-        self.urls.get(slot).map(String::as_str)
+        self.targets.get(slot)
     }
 
-    /// Drop every URL `live` does not mark and renumber the survivors, returning the
+    /// Drop every target `live` does not mark and renumber the survivors, returning the
     /// old-id → new-id map (indexed by the old id's raw value) that the caller must
     /// then apply to every cell it kept. `live[i]` speaks for `LinkId(i)`, so slot
-    /// zero is [`LinkId::NONE`] and is never a URL.
+    /// zero is [`LinkId::NONE`] and is never a target.
     fn compact(&mut self, live: &[bool]) -> Vec<LinkId> {
-        let mut remap = vec![LinkId::NONE; self.urls.len() + 1];
-        let old = std::mem::take(&mut self.urls);
+        let mut remap = vec![LinkId::NONE; self.targets.len() + 1];
+        let old = std::mem::take(&mut self.targets);
         self.index.clear();
         // Rebuilt from the survivors below, so the byte budget frees exactly what the
         // sweep dropped.
@@ -485,7 +495,7 @@ impl LinkTable {
         // Counts only survivors, so it is bounded by the table we came in with and
         // cannot pass `LINK_LIMIT`, let alone wrap.
         let mut next: u16 = 0;
-        for (slot, url) in old.into_iter().enumerate() {
+        for (slot, target) in old.into_iter().enumerate() {
             if live.get(slot + 1) != Some(&true) {
                 continue;
             }
@@ -494,9 +504,11 @@ impl LinkTable {
             if let Some(entry) = remap.get_mut(slot + 1) {
                 *entry = id;
             }
-            self.bytes = self.bytes.saturating_add(url.len().saturating_mul(2));
-            self.index.insert(url.clone(), id);
-            self.urls.push(url);
+            self.bytes = self
+                .bytes
+                .saturating_add(target.url.len().saturating_mul(2));
+            self.index.insert(target.url.clone(), id);
+            self.targets.push(target);
         }
         remap
     }

@@ -46,24 +46,19 @@ impl Screen {
     /// for, and honouring an attacker-chosen id would let a child fuse two unrelated
     /// runs into one hover target.
     ///
-    /// The URI is vetted **here**, when the anchor opens, not at click time. That is
-    /// the rule [`crate::platform::browser::OPENABLE_SCHEMES`] states: a link we
-    /// decorate and then refuse to follow is worse than one we never decorated. So a
-    /// `javascript:` or `data:` anchor is not a link at all — it prints as plain text
-    /// and never underlines, rather than underlining and then doing nothing. Anything
-    /// we cannot make sense of (bad UTF-8, an unopenable scheme, an empty URI) closes
-    /// whatever anchor was open, which is also the safe reading of a malformed
-    /// sequence.
+    /// The URI is judged once, when it is first interned, and the verdict is kept with
+    /// it ([`crate::platform::verdict`]). A refused anchor (`javascript:`, `data:`) is
+    /// stored like any other, so its cells still carry a link; the lookup does not offer
+    /// it to the pointer. An anchor with nothing to keep — bad UTF-8, an empty URI, one
+    /// over [`LINK_URL_MAX`] — closes whatever anchor was open, which is also the safe
+    /// reading of a malformed sequence.
     pub(super) fn set_hyperlink(&mut self, pt: &[u8]) {
         let mut fields = pt.splitn(2, |&b| b == b';');
         let _params = fields.next();
         let uri = fields.next().unwrap_or(&[]);
-        let opened = std::str::from_utf8(uri)
-            .ok()
-            .filter(|uri| crate::platform::browser::can_open(uri));
-        self.pen.link = match opened {
-            Some(uri) => self.intern_link(uri),
-            None => LinkId::NONE,
+        self.pen.link = match std::str::from_utf8(uri) {
+            Ok(uri) if !uri.is_empty() => self.intern_link(uri),
+            _ => LinkId::NONE,
         };
     }
 
@@ -114,7 +109,7 @@ impl Screen {
     /// open with no text printed under it yet.
     pub(super) fn collect_links(&mut self) {
         // `live[i]` speaks for `LinkId(i)`; slot 0 is `LinkId::NONE` and is never a URL.
-        let mut live = vec![false; self.links.urls.len() + 1];
+        let mut live = vec![false; self.links.targets.len() + 1];
         let mark = |id: LinkId, live: &mut Vec<bool>| {
             if let Some(slot) = live.get_mut(usize::from(id.0)) {
                 *slot = true;

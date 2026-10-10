@@ -526,10 +526,10 @@ impl Screen {
     /// right half of a character is the character), and a range ending on a leader is
     /// widened over its spacer, so the underline never stops half a glyph short.
     ///
-    /// An OSC 8 anchor short-circuits all of that. When the cell carries a [`LinkId`],
-    /// the child has *told* us these cells are this link, so there is nothing to infer:
-    /// the extent is the run of cells sharing the id and the URL is the one it interned.
-    /// The text scan is only ever the fallback for output that was never marked up.
+    /// An OSC 8 anchor short-circuits all of that. When the cell carries the [`LinkId`]
+    /// of an anchor that opens, the child has *told* us these cells are this link, so
+    /// there is nothing to infer: the extent is the run of cells sharing the id and the
+    /// URL is the one it interned. The text scan is the fallback for every other cell.
     pub fn link_at(
         &self,
         row: usize,
@@ -552,9 +552,11 @@ impl Screen {
         probe.url.clear();
 
         let id = self.view_cell(row, col).link;
-        if id.is_set() {
-            probe.url.push_str(self.links.url(id)?);
-            return Some(self.anchor_span(row, col, id));
+        if let Some(target) = self.links.get(id) {
+            if target.verdict == Verdict::Open {
+                probe.url.push_str(&target.url);
+                return Some(self.anchor_span(row, col, id));
+            }
         }
         // Byte offset of the probed cell's rune, recorded as that rune is pushed.
         let mut at = None;
