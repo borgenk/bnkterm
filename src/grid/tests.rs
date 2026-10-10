@@ -3506,6 +3506,40 @@ fn a_refused_anchor_labelled_with_a_url_is_not_offered_the_label() {
 }
 
 #[test]
+fn a_url_hiding_a_character_is_one_refused_link() {
+    for hidden in [
+        '\u{200B}',
+        '\u{00AD}',
+        '\u{034F}',
+        '\u{FE0F}',
+        '\u{E0100}',
+        '\u{202E}',
+    ] {
+        let url = format!("https://example.com/a{hidden}b");
+        let mut s = Screen::new(60, 2);
+        feed(&mut s, format!("see {url} ok").as_bytes());
+        let mut probe = LinkProbe::default();
+        let (start, end) = s.link_at(0, 6, &mut probe).unwrap();
+        assert_eq!(probe.url(), url, "{hidden:?}");
+        assert_eq!(start, (0, 4));
+        assert_eq!(
+            s.cell(end.0, end.1).rune,
+            'b',
+            "{hidden:?}: the link runs on past it"
+        );
+        assert_eq!(probe.verdict(), Some(Verdict::Refused(Refusal::Hidden)));
+
+        let mut s = Screen::new(60, 2);
+        feed(&mut s, &anchor(&url, "docs"));
+        assert_eq!(
+            anchor_verdict(&s, 0, 0),
+            Some(Verdict::Refused(Refusal::Hidden)),
+            "{hidden:?} in an anchor"
+        );
+    }
+}
+
+#[test]
 fn a_bare_url_never_runs_into_an_anchor() {
     // Probed from plain text beside an anchor, the scan must not read the anchor's label
     // as part of a bare URL: that opens a URL built from text the anchor owns, and shows

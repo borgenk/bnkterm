@@ -7,7 +7,8 @@
 //!   ucd/GraphemeBreakProperty.txt   ─┐
 //!   ucd/emoji-data.txt              ─┼─▶ src/platform/grapheme_tables.rs
 //!   ucd/DerivedCoreProperties.txt   ─┘   (GCB, EXTENDED_PICTOGRAPHIC, INCB)
-//!   ucd/DerivedGeneralCategory.txt  ───▶ src/platform/link_tables.rs (PUNCTUATION)
+//!   ucd/DerivedGeneralCategory.txt  ─┐
+//!   ucd/DerivedCoreProperties.txt   ─┴─▶ src/platform/link_tables.rs (PUNCTUATION, HIDDEN)
 //! ```
 //!
 //! The inputs are vendored and version-pinned, so a regeneration is a pure offline
@@ -317,31 +318,57 @@ fn gen_grapheme(version: &str) -> Result<String> {
     Ok(out)
 }
 
-/// The non-ASCII punctuation a bare URL treats as prose, by General_Category: brackets
-/// and quotation marks (`Ps`, `Pe`, `Pi`, `Pf`) end a URL, and other punctuation (`Po`)
-/// may not end one. ASCII is classified by hand in `link.rs`, so it is left out.
+/// The tables `link.rs` reads. `PUNCTUATION` is the non-ASCII punctuation a bare URL
+/// treats as prose, by General_Category: brackets and quotation marks (`Ps`, `Pe`, `Pi`,
+/// `Pf`) end a URL, and other punctuation (`Po`) may not end one; ASCII is classified by
+/// hand in `link.rs`, so it is left out. `HIDDEN` is every character that draws nothing,
+/// `Default_Ignorable_Code_Point` together with category `Cf`, with no exceptions.
 fn gen_link(version: &str) -> Result<String> {
     let dgc = read(&ucd("DerivedGeneralCategory.txt"))?;
-    let mut ranges = Vec::new();
+    let mut punctuation = Vec::new();
+    let mut hidden = Vec::new();
     for (lo, hi, f) in dgc.lines().filter_map(ucd_fields) {
         let tag = match f.first().copied() {
             Some("Ps" | "Pe" | "Pi" | "Pf") => "Punct::Fence",
             Some("Po") => "Punct::Prose",
+            Some("Cf") => {
+                hidden.push((lo, hi));
+                continue;
+            }
             _ => continue,
         };
         let lo = lo.max(0x80);
         if lo <= hi {
-            ranges.push((lo, hi, tag));
+            punctuation.push((lo, hi, tag));
+        }
+    }
+    let dcp = read(&ucd("DerivedCoreProperties.txt"))?;
+    for (lo, hi, f) in dcp.lines().filter_map(ucd_fields) {
+        if f.first() == Some(&"Default_Ignorable_Code_Point") {
+            hidden.push((lo, hi));
         }
     }
 
     let mut out = String::new();
-    header(&mut out, version, &["ucd/DerivedGeneralCategory.txt"]);
+    header(
+        &mut out,
+        version,
+        &[
+            "ucd/DerivedGeneralCategory.txt",
+            "ucd/DerivedCoreProperties.txt",
+        ],
+    );
     let _ = writeln!(
         out,
         "/// Every non-ASCII punctuation range, tagged with what it does to a bare URL."
     );
-    emit_tagged(&mut out, "PUNCTUATION", "Punct", &merge_tagged(ranges));
+    emit_tagged(&mut out, "PUNCTUATION", "Punct", &merge_tagged(punctuation));
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "/// Every Default_Ignorable_Code_Point or Cf range: the characters that draw nothing."
+    );
+    emit_ranges(&mut out, "HIDDEN", &merge(hidden));
     Ok(out)
 }
 

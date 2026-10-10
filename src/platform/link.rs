@@ -192,6 +192,9 @@ fn classify(c: char) -> Class {
         // of quoting a link — `<http://x>`, `"http://x"` — come out clean with no
         // special case for them.
         c if c.is_ascii() => Class::Hard,
+        // A character that draws nothing carries the URL on, so the verdict refuses the
+        // whole link rather than the underline stopping where nothing shows.
+        c if is_hidden(c) => Class::Url,
         // Non-ASCII punctuation is the prose around a link in another script, and is
         // split the way the ASCII above is.
         c => match punctuation(c) {
@@ -217,17 +220,33 @@ enum Punct {
 fn punctuation(c: char) -> Option<Punct> {
     let u = u32::from(c);
     let at = PUNCTUATION
-        .binary_search_by(|&(lo, hi, _)| {
-            if u < lo {
-                Ordering::Greater
-            } else if u > hi {
-                Ordering::Less
-            } else {
-                Ordering::Equal
-            }
-        })
+        .binary_search_by(|&(lo, hi, _)| range_order(lo, hi, u))
         .ok()?;
     PUNCTUATION.get(at).map(|&(_, _, punct)| punct)
+}
+
+/// Whether `c` draws nothing: it has the `Default_Ignorable_Code_Point` property or is
+/// a format character (category `Cf`). That covers zero-width spaces and joiners, bidi
+/// controls, the soft hyphen, variation selectors and tag characters, so text carrying
+/// one does not read as what it is.
+pub(crate) fn is_hidden(c: char) -> bool {
+    let u = u32::from(c);
+    !c.is_ascii()
+        && HIDDEN
+            .binary_search_by(|&(lo, hi)| range_order(lo, hi, u))
+            .is_ok()
+}
+
+/// Where the inclusive range `lo..=hi` sits relative to `u`, for a binary search over a
+/// sorted table of ranges.
+fn range_order(lo: u32, hi: u32, u: u32) -> Ordering {
+    if u < lo {
+        Ordering::Greater
+    } else if u > hi {
+        Ordering::Less
+    } else {
+        Ordering::Equal
+    }
 }
 
 include!("link_tables.rs");
@@ -337,40 +356,81 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_non_ascii_punctuation_mark_is_classified_by_its_category() {
-        // The committed table against the vendored data, so a Unicode bump without
-        // `make tables` cannot leave it stale.
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/ucd/DerivedGeneralCategory.txt"
-        );
+    /// Every `(code point, value)` a vendored UCD data file lists, its first field being
+    /// the value: a property name or a general category.
+    fn ucd_values(file: &str) -> Vec<(char, String)> {
+        let path = format!("{}/ucd/{file}", env!("CARGO_MANIFEST_DIR"));
         let text = std::fs::read_to_string(path).unwrap();
-        let mut checked = 0;
+        let hex = |s: &str| u32::from_str_radix(s.trim(), 16).unwrap();
+        let mut out = Vec::new();
         for line in text.lines() {
             let data = line.split('#').next().unwrap().trim();
-            let Some((range, category)) = data.split_once(';') else {
+            let Some((range, value)) = data.split_once(';') else {
                 continue;
             };
-            let hex = |s: &str| u32::from_str_radix(s.trim(), 16).unwrap();
             let (lo, hi) = match range.split_once("..") {
                 Some((lo, hi)) => (hex(lo), hex(hi)),
                 None => (hex(range), hex(range)),
             };
-            for c in (lo..=hi)
-                .filter_map(char::from_u32)
-                .filter(|c| !c.is_ascii())
-            {
-                let class = classify(c);
-                match category.trim() {
-                    "Ps" | "Pe" | "Pi" | "Pf" => assert!(matches!(class, Class::Hard), "{c:?}"),
-                    "Po" => assert!(matches!(class, Class::Soft), "{c:?}"),
-                    _ => continue,
-                }
-                checked += 1;
+            let value = value.split(';').next().unwrap().trim();
+            out.extend(
+                (lo..=hi)
+                    .filter_map(char::from_u32)
+                    .map(|c| (c, value.to_string())),
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn every_non_ascii_punctuation_mark_is_classified_by_its_category() {
+        // The committed table against the vendored data, so a Unicode bump without
+        // `make tables` cannot leave it stale.
+        let mut checked = 0;
+        for (c, category) in ucd_values("DerivedGeneralCategory.txt") {
+            if c.is_ascii() {
+                continue;
             }
+            let class = classify(c);
+            match category.as_str() {
+                "Ps" | "Pe" | "Pi" | "Pf" => assert!(matches!(class, Class::Hard), "{c:?}"),
+                "Po" => assert!(matches!(class, Class::Soft), "{c:?}"),
+                _ => continue,
+            }
+            checked += 1;
         }
         assert!(checked > 500, "only {checked} marks checked");
+    }
+
+    #[test]
+    fn exactly_the_default_ignorables_and_format_characters_are_hidden() {
+        let mut hidden = std::collections::BTreeSet::new();
+        for (c, category) in ucd_values("DerivedGeneralCategory.txt") {
+            if category == "Cf" {
+                hidden.insert(c);
+            }
+        }
+        for (c, property) in ucd_values("DerivedCoreProperties.txt") {
+            if property == "Default_Ignorable_Code_Point" {
+                hidden.insert(c);
+            }
+        }
+        assert!(hidden.len() > 4000, "only {} read", hidden.len());
+        for c in (0..=0x10_FFFF).filter_map(char::from_u32) {
+            assert_eq!(is_hidden(c), hidden.contains(&c), "{c:?}");
+            if hidden.contains(&c) {
+                assert!(matches!(classify(c), Class::Url), "{c:?} cut the URL");
+            }
+        }
+    }
+
+    #[test]
+    fn a_hidden_character_does_not_end_a_url() {
+        // The URL runs on through it, so the verdict sees it and refuses the whole link.
+        assert_eq!(
+            at_needle("https://example.com/a\u{200B}b ok", "https"),
+            Some("https://example.com/a\u{200B}b".into())
+        );
     }
 
     #[test]

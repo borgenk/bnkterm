@@ -3253,6 +3253,16 @@ mod tests {
     }
 
     #[test]
+    fn a_url_hiding_a_character_hovers_as_refused_and_never_opens() {
+        let mut core = core_showing("see https://example.com/a\u{200B}b here");
+        hover_at(&mut core, 10, 0, input::Mods::NONE);
+        assert_eq!(core.hovered_link(), Some(Verdict::Refused(Refusal::Hidden)));
+        click_mods(&mut core, true, 10, 0, input::Mods::CTRL);
+        assert!(opened_url(&mut core).is_none());
+        assert!(core.drag.is_none(), "the click was consumed");
+    }
+
+    #[test]
     fn a_resize_drops_the_hover_until_the_pointer_moves() {
         // The grid reflows under a parked pointer, and the cell the pointer is over may
         // move too, so the old hover would underline cells that now hold other text.
