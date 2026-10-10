@@ -7,6 +7,8 @@
 //! on the end. A path is therefore decoded once, strictly, and refused unless every
 //! reading of it agrees.
 
+use crate::platform::bytes::percent_decoded;
+
 /// The longest path the kernel opens, and so the most a decoded path may hold.
 const PATH_MAX: usize = 4096;
 
@@ -32,17 +34,8 @@ pub fn path_is_unambiguous(url: &str) -> bool {
     };
     let mut decoded = [0u8; PATH_MAX];
     let mut len = 0;
-    let mut bytes = path.bytes();
-    while let Some(byte) = bytes.next() {
-        let byte = if byte == b'%' {
-            match (bytes.next().and_then(hex), bytes.next().and_then(hex)) {
-                (Some(high), Some(low)) => high << 4 | low,
-                _ => return false,
-            }
-        } else {
-            byte
-        };
-        let Some(slot) = decoded.get_mut(len) else {
+    for byte in percent_decoded(path) {
+        let (Some(byte), Some(slot)) = (byte, decoded.get_mut(len)) else {
             return false;
         };
         *slot = byte;
@@ -58,13 +51,6 @@ pub fn plain_path(path: &[u8]) -> Option<&str> {
     let text = std::str::from_utf8(path).ok()?;
     let plain = !path.iter().any(|&b| b < 0x20 || b == 0x7F || b == b'\\');
     (text.starts_with('/') && plain).then_some(text)
-}
-
-/// The value of one hex digit.
-fn hex(digit: u8) -> Option<u8> {
-    char::from(digit)
-        .to_digit(16)
-        .and_then(|value| u8::try_from(value).ok())
 }
 
 #[cfg(test)]

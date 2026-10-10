@@ -7,7 +7,7 @@
 //! outcome to confirm.
 
 use crate::platform::host::{self, Host, Hostname};
-use crate::platform::{browser, file_url, link};
+use crate::platform::{browser, file_url, link, mailto};
 
 /// What the rules decided about a link.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,6 +34,9 @@ pub enum Refusal {
     /// ([`file_url::path_is_unambiguous`]), so the file checked may not be the file
     /// opened.
     FilePath,
+    /// A `mailto:` target sets a header field beyond `to`, `cc`, `bcc`, `subject` and
+    /// `body` ([`mailto::fields_are_allowed`]), such as `attach=`.
+    MailField,
 }
 
 /// Judge `url` against every rule, on the machine named `hostname`.
@@ -43,6 +46,9 @@ pub fn judge(url: &str, hostname: &Hostname) -> Verdict {
     }
     if !url.is_ascii() && url.chars().any(link::is_hidden) {
         return Verdict::Refused(Refusal::Hidden);
+    }
+    if url.starts_with("mailto:") && !mailto::fields_are_allowed(url) {
+        return Verdict::Refused(Refusal::MailField);
     }
     let file = url.starts_with("file:");
     match host::read(url) {
@@ -173,5 +179,22 @@ mod tests {
             Verdict::Refused(_)
         ));
         assert_eq!(judge("file:///tmp/a%20b", &here), Verdict::Open);
+    }
+
+    #[test]
+    fn a_mailto_link_with_a_field_beyond_the_allowlist_is_refused() {
+        let here = Hostname::default();
+        for url in [
+            "mailto:a@b.com?attach=/home/u/.ssh/id_ed25519",
+            "mailto:a@b.com?%61ttach=x",
+            "mailto:a@b.com?in-reply-to=x",
+        ] {
+            assert_eq!(
+                judge(url, &here),
+                Verdict::Refused(Refusal::MailField),
+                "{url}"
+            );
+        }
+        assert_eq!(judge("mailto:a@b.com?subject=hi", &here), Verdict::Open);
     }
 }

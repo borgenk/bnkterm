@@ -11,9 +11,9 @@
 //!   font list has no answer for (`fontconfig`), and ARGB pixel math (`pixel`).
 //! - **Foundation**: the syscall FFI surface (`ffi`), the minimal error type
 //!   (`error`), branchless byte scanning (`bytes`), scroll math (`scroll`), and
-//!   finding a URL in text (`link`), reading its host (`host`) and a `file:` path
-//!   (`file_url`), judging whether it may open (`verdict`), and opening it in the
-//!   browser (`browser`).
+//!   finding a URL in text (`link`), reading its host (`host`), a `file:` path
+//!   (`file_url`) and `mailto:` fields (`mailto`), judging whether it may open
+//!   (`verdict`), and opening it in the browser (`browser`).
 
 pub(crate) mod browser;
 pub(crate) mod bytes;
@@ -29,6 +29,7 @@ pub(crate) mod geom;
 pub(crate) mod grapheme;
 pub(crate) mod host;
 pub(crate) mod link;
+pub(crate) mod mailto;
 pub(crate) mod pixel;
 pub(crate) mod protocol;
 pub(crate) mod scroll;

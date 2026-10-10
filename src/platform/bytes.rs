@@ -118,9 +118,45 @@ pub fn push_hex_nibble(out: &mut Vec<u8>, nibble: u8) {
     });
 }
 
+/// The bytes `text` percent-decodes to, strictly: a `%` not followed by two hex digits
+/// yields `None`, and the caller decides what a bad escape means. Decodes as it goes,
+/// so a check over a link allocates nothing.
+pub fn percent_decoded(text: &str) -> impl Iterator<Item = Option<u8>> + '_ {
+    let mut bytes = text.bytes();
+    std::iter::from_fn(move || {
+        let byte = bytes.next()?;
+        if byte != b'%' {
+            return Some(Some(byte));
+        }
+        let high = bytes.next().and_then(hex_value);
+        let low = bytes.next().and_then(hex_value);
+        Some(high.zip(low).map(|(high, low)| high << 4 | low))
+    })
+}
+
+/// The value of one hex digit, either case.
+fn hex_value(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        b'A'..=b'F' => Some(digit - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::bytes::*;
+
+    #[test]
+    fn percent_decoding_is_strict() {
+        let decode = |text| percent_decoded(text).collect::<Option<Vec<u8>>>();
+        assert_eq!(decode("a%20b%2fc%2F"), Some(b"a b/c/".to_vec()));
+        assert_eq!(decode("%E2%80%8B"), Some(vec![0xE2, 0x80, 0x8B]));
+        for bad in ["%", "%2", "%zz", "%g0", "a%2"] {
+            assert_eq!(decode(bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn decimal_and_hex_write_what_they_say() {

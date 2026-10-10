@@ -3593,6 +3593,17 @@ fn a_file_link_whose_path_decodes_more_than_one_way_is_refused() {
 }
 
 #[test]
+fn a_mailto_link_that_attaches_a_file_is_refused() {
+    let url = "mailto:a@b.com?subject=hi&attach=/home/u/.ssh/id_ed25519";
+    let mut s = Screen::new(80, 2);
+    feed(&mut s, format!("mail {url} now").as_bytes());
+    let mut probe = LinkProbe::default();
+    assert!(s.link_at(0, 8, &mut probe).is_some());
+    assert_eq!(probe.url(), url);
+    assert_eq!(probe.verdict(), Some(Verdict::Refused(Refusal::MailField)));
+}
+
+#[test]
 fn setting_the_hostname_judges_stored_links_again() {
     let mut s = Screen::new(40, 2);
     feed(&mut s, &anchor("file://here/a", "a"));
