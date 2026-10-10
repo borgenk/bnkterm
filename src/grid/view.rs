@@ -21,6 +21,9 @@
 // the same definitions rather than re-importing them piecemeal.
 use crate::grid::buffer::{Row, Scrolled};
 use crate::grid::*;
+use crate::platform::browser;
+use crate::platform::host::{self, Host};
+use crate::platform::verdict::Refusal;
 
 impl Screen {
     pub fn dimensions(&self) -> (usize, usize) {
@@ -558,9 +561,15 @@ impl Screen {
 
         let id = self.view_cell(row, col).link;
         if let Some(target) = self.links.get(id) {
+            let span = self.anchor_span(row, col, id);
             probe.url.push_str(&target.url);
-            probe.verdict = Some(target.verdict);
-            return Some(self.anchor_span(row, col, id));
+            probe.verdict = Some(match target.verdict {
+                Verdict::Open if !self.label_agrees(span, probe) => {
+                    Verdict::Refused(Refusal::LabelHost)
+                }
+                verdict => verdict,
+            });
+            return Some(span);
         }
         // Byte offset of the probed cell's rune, recorded as that rune is pushed.
         let mut at = None;
@@ -597,6 +606,65 @@ impl Screen {
         Some((start, end))
     }
 
+    /// Whether the text of the anchor over `span` agrees with its target, already in
+    /// `probe`'s URL: text that starts with a link scheme, in any case, must name the
+    /// target's host, and one whose host [`host::read`] refuses never agrees. Judged on
+    /// every lookup rather than when the anchor is stored, because the text is printed
+    /// after the sequence that opens it and can be overwritten.
+    ///
+    /// The text is read into `probe`'s buffer only as far as the host: past a scheme's
+    /// `//` to the first `/`, `?` or `#`, or no further than a scheme's length when it
+    /// has no `//` (`mailto:`) or is not one, so an ordinary label costs a few cells.
+    /// It reads runes straight off the row, since it needs no colour. Kept out of line,
+    /// so the lookup's other paths do not pay for its size.
+    #[inline(never)]
+    fn label_agrees(
+        &self,
+        (start, end): ((usize, usize), (usize, usize)),
+        probe: &mut LinkProbe,
+    ) -> bool {
+        const LONGEST_SCHEME: usize = 8; // "https://"
+        let (cols, _) = self.dimensions();
+        let (mut r, mut c) = start;
+        let mut line = self.view_line(r);
+        // Whether a `://` has been read, so the host has begun.
+        let mut in_authority = false;
+        loop {
+            let cell = line.and_then(|line| line.cells.get(c));
+            if let Some(cell) = cell.filter(|cell| !cell.is_wide_spacer()) {
+                let rune = cell.rune();
+                if !rune.is_whitespace() {
+                    probe.text.push(rune);
+                    if let Some(line) = line.filter(|line| line.has_marks(c)) {
+                        probe.text.extend(line.marks(c));
+                    }
+                    if in_authority && matches!(rune, '/' | '?' | '#') {
+                        break;
+                    }
+                    in_authority |= rune == '/' && probe.text.ends_with("://");
+                } else if !probe.text.is_empty() {
+                    break;
+                }
+            }
+            if (r, c) == end || (!in_authority && probe.text.len() >= LONGEST_SCHEME) {
+                break;
+            }
+            c += 1;
+            if c == cols {
+                (r, c) = (r + 1, 0);
+                line = self.view_line(r);
+            }
+        }
+        if !names_scheme(&probe.text) {
+            return true;
+        }
+        match (host::read(&probe.text), host::read(&probe.url)) {
+            (Host::Name(label), Host::Name(target)) => label.eq_ignore_ascii_case(target),
+            (Host::Absent, Host::Absent) => true,
+            _ => false,
+        }
+    }
+
     /// The extent of the OSC 8 anchor `id` around `(row, col)`: the unbroken run of
     /// cells carrying that same id, walked in reading order across the whole logical
     /// line, so an anchor that soft-wraps at the margin underlines whole.
@@ -615,6 +683,11 @@ impl Screen {
     ///          the span runs start → end in reading order, exactly the geometry
     ///          `push_hover_rule` already knows how to underline row by row.
     /// ```
+    ///
+    /// Out of line, so where its loop lands does not move with the rest of
+    /// [`Self::link_at`]: inlined, it measured up to 30% slower on the anchor lookups
+    /// after changes that never ran on them.
+    #[inline(never)]
     pub(super) fn anchor_span(
         &self,
         row: usize,
@@ -746,6 +819,15 @@ impl Screen {
         }
         out
     }
+}
+
+/// Whether `text` starts with one of [`browser::OPENABLE_SCHEMES`], in any case: text a
+/// reader takes for a link.
+fn names_scheme(text: &str) -> bool {
+    browser::OPENABLE_SCHEMES.iter().any(|scheme| {
+        text.get(..scheme.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+    })
 }
 
 /// Whether a rune bounds a double-click word selection: whitespace, or one of the

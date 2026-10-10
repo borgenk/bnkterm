@@ -1034,7 +1034,8 @@ pub enum ResizeEffect {
 #[derive(Default)]
 pub struct LinkProbe {
     /// The logical line under the pointer: its soft-wrapped display rows joined, wide
-    /// spacers dropped. Exactly the text [`crate::platform::link`] scans.
+    /// spacers dropped. Exactly the text [`crate::platform::link`] scans. Over an
+    /// anchor, the first word of its text instead, which must not name another host.
     text: String,
     /// Where each rune of `text` came from: its byte offset, and the display cell that
     /// printed it. Ascending in both, so a byte offset maps back to a cell by binary

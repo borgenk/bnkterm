@@ -3269,6 +3269,19 @@ mod tests {
     }
 
     #[test]
+    fn an_anchor_disguised_as_another_host_hovers_as_refused_and_never_opens() {
+        let mut core =
+            core_showing("\x1b]8;;https://evil.example/x\x1b\\https://github.com/x\x1b]8;;\x1b\\");
+        hover_at(&mut core, 3, 0, input::Mods::NONE);
+        assert_eq!(
+            core.hovered_link(),
+            Some(Verdict::Refused(Refusal::LabelHost))
+        );
+        click_mods(&mut core, true, 3, 0, input::Mods::CTRL);
+        assert!(opened_url(&mut core).is_none());
+    }
+
+    #[test]
     fn a_resize_drops_the_hover_until_the_pointer_moves() {
         // The grid reflows under a parked pointer, and the cell the pointer is over may
         // move too, so the old hover would underline cells that now hold other text.

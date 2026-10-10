@@ -37,6 +37,10 @@ pub enum Refusal {
     /// A `mailto:` target sets a header field beyond `to`, `cc`, `bcc`, `subject` and
     /// `body` ([`mailto::fields_are_allowed`]), such as `attach=`.
     MailField,
+    /// An anchor's text starts like a link but names a host its target does not, so
+    /// what the user reads is not where the click goes. Judged at lookup, since the text
+    /// arrives after the anchor and can be overwritten.
+    LabelHost,
 }
 
 /// Judge `url` against every rule, on the machine named `hostname`.

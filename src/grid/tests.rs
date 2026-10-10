@@ -3603,6 +3603,68 @@ fn a_mailto_link_that_attaches_a_file_is_refused() {
     assert_eq!(probe.verdict(), Some(Verdict::Refused(Refusal::MailField)));
 }
 
+/// The verdict a lookup at display `(row, col)` reports.
+fn lookup_verdict(s: &Screen, row: usize, col: usize) -> Option<Verdict> {
+    let mut probe = LinkProbe::default();
+    s.link_at(row, col, &mut probe)?;
+    probe.verdict()
+}
+
+#[test]
+fn an_anchor_whose_text_names_another_host_is_refused() {
+    let refused = Some(Verdict::Refused(Refusal::LabelHost));
+    for (target, text, verdict) in [
+        ("https://evil.example/x", "https://github.com/x", refused),
+        (
+            "https://github.com/y",
+            "https://github.com/x",
+            Some(Verdict::Open),
+        ),
+        (
+            "https://GitHub.com/y",
+            "HTTPS://github.COM/x",
+            Some(Verdict::Open),
+        ),
+        ("https://evil.example/x", "click here", Some(Verdict::Open)),
+        (
+            "https://evil.example/x",
+            "https://github.com@evil.example/",
+            refused,
+        ),
+        ("https://evil.example/x", "  https://github.com/x", refused),
+        ("mailto:a@evil.example", "https://github.com/x", refused),
+    ] {
+        let mut s = Screen::new(60, 2);
+        feed(&mut s, &anchor(target, text));
+        assert_eq!(lookup_verdict(&s, 0, 4), verdict, "{text:?} over {target}");
+    }
+}
+
+#[test]
+fn an_anchor_text_is_judged_where_it_wraps_and_after_it_is_rewritten() {
+    let mut s = Screen::new(12, 3);
+    feed(
+        &mut s,
+        &anchor("https://evil.example/x", "https://github.com/x"),
+    );
+    let refused = Some(Verdict::Refused(Refusal::LabelHost));
+    assert_eq!(lookup_verdict(&s, 1, 2), refused, "across the wrap");
+
+    // The same anchor reopened prints over its own text, which now reads as prose.
+    let mut s = Screen::new(40, 2);
+    feed(
+        &mut s,
+        &anchor("https://evil.example/x", "https://github.com/x"),
+    );
+    assert_eq!(lookup_verdict(&s, 0, 2), refused);
+    feed(&mut s, b"\r");
+    feed(
+        &mut s,
+        &anchor("https://evil.example/x", "documentation here  "),
+    );
+    assert_eq!(lookup_verdict(&s, 0, 2), Some(Verdict::Open));
+}
+
 #[test]
 fn setting_the_hostname_judges_stored_links_again() {
     let mut s = Screen::new(40, 2);
