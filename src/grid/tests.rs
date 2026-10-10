@@ -3641,6 +3641,87 @@ fn an_anchor_whose_text_names_another_host_is_refused() {
 }
 
 #[test]
+fn an_anchor_text_disguised_from_the_check_is_still_read_as_the_eye_reads_it() {
+    let refused = Some(Verdict::Refused(Refusal::LabelHost));
+    let evil = "https://evil.example/x";
+    for text in [
+        // An invisible mark inside the scheme.
+        "h\u{200B}ttps://github.com/x",
+        "h\u{034F}ttps://github.com/x",
+        "https:/\u{2060}/github.com/x",
+        "https:\u{200D}//github.com/x",
+        // A prefix that draws as a blank.
+        "\u{2800}https://github.com/x",
+        "\u{FFA0}https://github.com/x",
+        // A scheme a browser repairs, or one in fullwidth letters.
+        "https:\\github.com/x",
+        "https:/github.com/x",
+        "ｈｔｔｐｓ://github.com/x",
+    ] {
+        let mut s = Screen::new(60, 2);
+        feed(&mut s, &anchor(evil, text));
+        assert_eq!(lookup_verdict(&s, 0, 6), refused, "{text:?}");
+    }
+
+    // A concealed cell before the scheme draws as a space.
+    let mut s = Screen::new(60, 2);
+    feed(
+        &mut s,
+        &anchor(evil, "\x1b[8mX\x1b[28mhttps://github.com/x"),
+    );
+    assert_eq!(lookup_verdict(&s, 0, 6), refused, "concealed prefix");
+}
+
+#[test]
+fn an_anchor_text_is_read_as_one_word_with_the_cells_beside_it() {
+    let refused = Some(Verdict::Refused(Refusal::LabelHost));
+    let evil = "https://evil.example/x";
+
+    let mut s = Screen::new(60, 2);
+    let mut bytes = b"https://".to_vec();
+    bytes.extend(anchor(evil, "github.com/x"));
+    feed(&mut s, &bytes);
+    assert_eq!(
+        lookup_verdict(&s, 0, 10),
+        refused,
+        "a scheme printed before it"
+    );
+
+    let mut s = Screen::new(60, 2);
+    let mut bytes = anchor("https://github.com/", "https://");
+    bytes.extend(anchor(evil, "github.com/x"));
+    feed(&mut s, &bytes);
+    assert_eq!(
+        lookup_verdict(&s, 0, 10),
+        refused,
+        "a scheme in the anchor before"
+    );
+
+    let mut s = Screen::new(60, 2);
+    let mut bytes = anchor("https://github.co/", "https://github.co");
+    bytes.extend_from_slice(b"m/login");
+    feed(&mut s, &bytes);
+    assert_eq!(
+        lookup_verdict(&s, 0, 10),
+        refused,
+        "a host finished after it"
+    );
+}
+
+#[test]
+fn an_anchor_text_naming_its_own_target_opens() {
+    for (target, text) in [
+        ("file:///etc/hosts", "FILE:///etc/hosts"),
+        ("file:///home/u/src/main.rs", "file:12:fn main"),
+        ("https://github.com/x", "see https://github.com/x"),
+    ] {
+        let mut s = Screen::new(60, 2);
+        feed(&mut s, &anchor(target, text));
+        assert_eq!(lookup_verdict(&s, 0, 1), Some(Verdict::Open), "{text:?}");
+    }
+}
+
+#[test]
 fn an_anchor_text_is_judged_where_it_wraps_and_after_it_is_rewritten() {
     let mut s = Screen::new(12, 3);
     feed(

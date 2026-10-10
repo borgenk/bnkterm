@@ -21,8 +21,8 @@
 // the same definitions rather than re-importing them piecemeal.
 use crate::grid::buffer::{Row, Scrolled};
 use crate::grid::*;
-use crate::platform::browser;
 use crate::platform::host::{self, Host};
+use crate::platform::link;
 use crate::platform::verdict::Refusal;
 
 impl Screen {
@@ -607,61 +607,115 @@ impl Screen {
     }
 
     /// Whether the text of the anchor over `span` agrees with its target, already in
-    /// `probe`'s URL: text that starts with a link scheme, in any case, must name the
-    /// target's host, and one whose host [`host::read`] refuses never agrees. Judged on
-    /// every lookup rather than when the anchor is stored, because the text is printed
-    /// after the sequence that opens it and can be overwritten.
+    /// `probe`'s URL. The word the anchor's text starts with is read as a reader sees it:
+    /// across the anchor's edges, since the cells beside it read as one word with it,
+    /// with blank-looking cells ending it and invisible marks dropped. A word that reads
+    /// as a link ([`reads_as_link`]) must name the target's host, and one whose host
+    /// [`host::read`] refuses never agrees. Judged on every lookup rather than when the
+    /// anchor is stored, because the text is printed after the sequence that opens it and
+    /// can be overwritten.
     ///
-    /// The text is read into `probe`'s buffer only as far as the host: past a scheme's
-    /// `//` to the first `/`, `?` or `#`, or no further than a scheme's length when it
-    /// has no `//` (`mailto:`) or is not one, so an ordinary label costs a few cells.
-    /// It reads runes straight off the row, since it needs no colour. Kept out of line,
-    /// so the lookup's other paths do not pay for its size.
+    /// The word is read only as far as its host, past a scheme's `//` to the first `/`,
+    /// `?` or `#`, or for eight characters when it is not a link, so an ordinary label
+    /// costs a few cells. Kept out of line, so the lookup's other paths do not pay for
+    /// its size.
     #[inline(never)]
     fn label_agrees(
         &self,
         (start, end): ((usize, usize), (usize, usize)),
         probe: &mut LinkProbe,
     ) -> bool {
-        const LONGEST_SCHEME: usize = 8; // "https://"
         let (cols, _) = self.dimensions();
-        let (mut r, mut c) = start;
-        let mut line = self.view_line(r);
-        // Whether a `://` has been read, so the host has begun.
+        let next = |(r, c): (usize, usize)| {
+            if c + 1 >= cols {
+                (r + 1, 0)
+            } else {
+                (r, c + 1)
+            }
+        };
+        // The anchor's first cell that shows something; text of blanks shows no link.
+        let mut at = start;
+        while !matches!(self.ink_at(at), Ink::Rune(_)) {
+            if at == end {
+                return true;
+            }
+            at = next(at);
+        }
+        // Back to the start of its word, which may lie before the anchor.
+        let (first, last) = self.line_rows_on_screen(at.0);
+        while at != (first, 0) {
+            let before = match at.1.checked_sub(1) {
+                Some(c) => (at.0, c),
+                None => match at.0.checked_sub(1) {
+                    Some(r) => (r, cols.saturating_sub(1)),
+                    None => break,
+                },
+            };
+            if matches!(self.ink_at(before), Ink::Blank) {
+                break;
+            }
+            at = before;
+        }
+        // Forward as far as the host, which may lie past the anchor.
+        let mut scheme = ['\0'; SCHEME_READ];
+        let mut read = 0;
         let mut in_authority = false;
         loop {
-            let cell = line.and_then(|line| line.cells.get(c));
-            if let Some(cell) = cell.filter(|cell| !cell.is_wide_spacer()) {
-                let rune = cell.rune();
-                if !rune.is_whitespace() {
+            match self.ink_at(at) {
+                Ink::Blank => break,
+                Ink::Spacer => {}
+                Ink::Rune(rune) => {
+                    if let Some(slot) = scheme.get_mut(read) {
+                        *slot = fold(rune);
+                    }
+                    read += 1;
                     probe.text.push(rune);
-                    if let Some(line) = line.filter(|line| line.has_marks(c)) {
-                        probe.text.extend(line.marks(c));
+                    if let Some(line) = self.view_line(at.0).filter(|line| line.has_marks(at.1)) {
+                        probe
+                            .text
+                            .extend(line.marks(at.1).filter(|&mark| !link::is_hidden(mark)));
                     }
                     if in_authority && matches!(rune, '/' | '?' | '#') {
                         break;
                     }
                     in_authority |= rune == '/' && probe.text.ends_with("://");
-                } else if !probe.text.is_empty() {
-                    break;
                 }
             }
-            if (r, c) == end || (!in_authority && probe.text.len() >= LONGEST_SCHEME) {
+            if at == (last, cols.saturating_sub(1)) || (!in_authority && read >= SCHEME_READ) {
                 break;
             }
-            c += 1;
-            if c == cols {
-                (r, c) = (r + 1, 0);
-                line = self.view_line(r);
-            }
+            at = next(at);
         }
-        if !names_scheme(&probe.text) {
+        if !reads_as_link(scheme.get(..read.min(SCHEME_READ)).unwrap_or_default()) {
             return true;
         }
         match (host::read(&probe.text), host::read(&probe.url)) {
             (Host::Name(label), Host::Name(target)) => label.eq_ignore_ascii_case(target),
             (Host::Absent, Host::Absent) => true,
             _ => false,
+        }
+    }
+
+    /// What display cell `at` shows a reader of a link's text. A space, a character that
+    /// draws nothing, a braille blank and a concealed (SGR 8) cell all show a blank, so
+    /// each ends a word, as it does to the eye.
+    fn ink_at(&self, (r, c): (usize, usize)) -> Ink {
+        let Some(cell) = self.view_line(r).and_then(|line| line.cells.get(c)) else {
+            return Ink::Blank;
+        };
+        if cell.is_wide_spacer() {
+            return Ink::Spacer;
+        }
+        let rune = cell.rune();
+        let concealed = self
+            .styles
+            .get(cell.style_id())
+            .attrs
+            .contains(Attrs::HIDDEN);
+        if concealed || rune.is_whitespace() || rune == BRAILLE_BLANK || link::is_hidden(rune) {
+            Ink::Blank
+        } else {
+            Ink::Rune(rune)
         }
     }
 
@@ -821,13 +875,43 @@ impl Screen {
     }
 }
 
-/// Whether `text` starts with one of [`browser::OPENABLE_SCHEMES`], in any case: text a
-/// reader takes for a link.
-fn names_scheme(text: &str) -> bool {
-    browser::OPENABLE_SCHEMES.iter().any(|scheme| {
-        text.get(..scheme.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+/// What a cell shows a reader of a link's text ([`Screen::ink_at`]).
+enum Ink {
+    /// Nothing: the word ends here.
+    Blank,
+    /// The right half of a wide glyph, which its leader already shows.
+    Spacer,
+    Rune(char),
+}
+
+/// U+2800 BRAILLE PATTERN BLANK, which draws as a space in every font that has it.
+const BRAILLE_BLANK: char = '\u{2800}';
+
+/// How many characters of a word decide whether it reads as a link: `https:/` and
+/// `mailto:` are seven, and an eighth lets a `://` complete.
+const SCHEME_READ: usize = 8;
+
+/// Whether a word whose first characters, [`fold`]ed, are `scheme` reads as a link: an
+/// allowed scheme and its colon, with a slash or backslash after it for the schemes that
+/// take a host. A browser reads `https:\\host` and `https:/host` as `https://host`, so
+/// a reader may too.
+fn reads_as_link(scheme: &[char]) -> bool {
+    const LINKS: [&str; 7] = [
+        "https:/", "https:\\", "http:/", "http:\\", "file:/", "file:\\", "mailto:",
+    ];
+    LINKS.iter().any(|link| {
+        let mut read = scheme.iter();
+        link.chars().all(|want| read.next() == Some(&want))
     })
+}
+
+/// `c` as a reader takes it: fullwidth ASCII (`ｈ`) as ASCII, in lowercase.
+fn fold(c: char) -> char {
+    let ascii = match u32::from(c) {
+        u @ 0xFF01..=0xFF5E => char::from_u32(u - 0xFEE0).unwrap_or(c),
+        _ => c,
+    };
+    ascii.to_ascii_lowercase()
 }
 
 /// Whether a rune bounds a double-click word selection: whitespace, or one of the

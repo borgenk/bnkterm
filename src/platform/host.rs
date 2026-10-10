@@ -117,11 +117,12 @@ pub fn read(url: &str) -> Host<'_> {
     };
     // A `file:` URL has no port, and a browser reads `file://c:/x` as the drive letter
     // of an empty host, not as a host `c`.
-    if !port_is_plain(port) || (scheme == "file" && !port.is_empty()) {
+    let file = scheme.eq_ignore_ascii_case("file");
+    if !port_is_plain(port) || (file && !port.is_empty()) {
         return Host::Refused;
     }
     if host.is_empty() {
-        return if scheme == "file" {
+        return if file {
             Host::Name(host)
         } else {
             Host::Refused
