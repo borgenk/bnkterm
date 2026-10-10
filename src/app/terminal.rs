@@ -35,8 +35,8 @@ use crate::input;
 use crate::mouse::{self, MouseButton, MouseKind};
 use crate::platform::host::Hostname;
 use crate::platform::scroll::{self, Scrollbar};
-use crate::platform::verdict::Verdict;
-use crate::pty::{Launch, Pty, TtyMode, ZombieChild};
+use crate::platform::verdict::{self, Refusal, Verdict};
+use crate::pty::{Launch, Pty, Target, TtyMode, ZombieChild};
 use crate::render::display::DisplayList;
 use crate::term_render::{
     self, CellSpan, CursorRender, CursorShape, LinkHover, ScrollLane, Selection,
@@ -240,6 +240,10 @@ pub(super) struct TerminalCore {
     /// The child on the far side of the PTY; `None` in demo mode (and before the
     /// first configure, since the PTY is sized to the granted window).
     pty: Option<Pty>,
+    /// Where this tab's shell runs, and so where its `file:` links name files: set when
+    /// the shell spawns, and kept if the PTY goes, so a link is never judged against the
+    /// wrong filesystem.
+    shell_target: Target,
     /// Demo mode: a static grid, no shell.
     demo: bool,
     /// Reused key-encoding buffer (allocated once, not per key press).
@@ -384,6 +388,7 @@ impl TerminalCore {
             parser: Parser::new(),
             gatherer: None,
             pty: None,
+            shell_target: Target::Local,
             demo,
             key_buf: Vec::new(),
             out_buf: Vec::new(),
@@ -457,6 +462,7 @@ impl TerminalCore {
     /// label. Shared by the live path and the tests, so both bring a tab up identically.
     fn spawn_pty(&mut self, pty: Pty) -> Result<(usize, usize)> {
         let (cols, rows) = self.screen.dimensions();
+        self.shell_target = pty.target();
         let gatherer = match Gatherer::start(pty.fd(), pty.exit_fd()) {
             Ok(gatherer) => gatherer,
             Err(error) => {
@@ -989,13 +995,36 @@ impl TerminalCore {
     /// output has since invalidated. Only a link whose verdict lets it open reaches the
     /// window: the text came from the child, which can print anything. A refused link
     /// still consumes the click, so Ctrl+click on one does nothing at all.
+    ///
+    /// A local `file:` link is judged once more here against the filesystem
+    /// ([`verdict::judge_file`]), and opens as the URL of the path that was checked. If
+    /// that refuses it, the corner notice says why, and when the refusal is a fact about
+    /// the file (an executable, a launcher) rather than a check that could not run, the
+    /// anchor's verdict flips so the hover shows it from now on. A file that was missing
+    /// is checked again on the next click. A shell on the Flatpak host is judged there
+    /// instead.
     fn open_link(&mut self, row: usize, col: usize) -> bool {
         if self.screen.link_at(row, col, &mut self.probe).is_none() {
             return false;
         }
-        if self.probe.verdict() == Some(Verdict::Open) {
-            self.outbox
-                .push(ToWindow::OpenUrl(self.probe.url().to_string()));
+        if self.probe.verdict() != Some(Verdict::Open) {
+            return true;
+        }
+        let url = self.probe.url();
+        let checked = if self.shell_target == Target::Local && url.starts_with("file:") {
+            verdict::judge_file(url)
+        } else {
+            Ok(url.to_string())
+        };
+        match checked {
+            Ok(url) => self.outbox.push(ToWindow::OpenUrl(url)),
+            Err(refusal) => {
+                if refusal != Refusal::Unreachable {
+                    self.screen.refuse_anchor(row, col, refusal);
+                    self.refresh_hover();
+                }
+                self.outbox.push(ToWindow::LinkRefused(refusal));
+            }
         }
         true
     }
@@ -3279,6 +3308,124 @@ mod tests {
         );
         click_mods(&mut core, true, 3, 0, input::Mods::CTRL);
         assert!(opened_url(&mut core).is_none());
+    }
+
+    /// A fresh directory for one test's fixtures, removed when it drops, pass or fail.
+    struct FixtureDir(std::path::PathBuf);
+
+    impl FixtureDir {
+        fn new(name: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos());
+            let pid = std::process::id();
+            let dir = std::env::temp_dir().join(format!("bnkterm-{name}-{pid}-{nanos}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(std::fs::canonicalize(dir).unwrap())
+        }
+    }
+
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// An OSC 8 anchor to the file at `path`, reading `text`.
+    fn file_anchor(path: &std::path::Path, text: &str) -> String {
+        format!(
+            "\x1b]8;;file://{}\x1b\\{text}\x1b]8;;\x1b\\",
+            path.display()
+        )
+    }
+
+    #[test]
+    fn a_missing_file_is_checked_again_on_the_next_click() {
+        let fixture = FixtureDir::new("missing");
+        let report = fixture.0.join("report.txt");
+        let mut core = core_showing(&file_anchor(&report, "report"));
+
+        click_mods(&mut core, true, 2, 0, input::Mods::CTRL);
+        let out = core.take_outbox();
+        assert!(out
+            .iter()
+            .any(|m| matches!(m, ToWindow::LinkRefused(Refusal::Unreachable))));
+        hover_at(&mut core, 2, 0, input::Mods::NONE);
+        assert_eq!(
+            core.hovered_link(),
+            Some(Verdict::Open),
+            "not held against it"
+        );
+
+        std::fs::write(&report, b"x").unwrap();
+        click_mods(&mut core, true, 2, 0, input::Mods::CTRL);
+        assert!(opened_url(&mut core).is_some(), "it opens once it exists");
+    }
+
+    #[test]
+    fn a_file_link_from_a_shell_on_the_flatpak_host_is_not_judged_here() {
+        // The sandbox cannot see the host's files, so checking here would judge some
+        // other file or none.
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = FixtureDir::new("host");
+        let script = fixture.0.join("build.sh");
+        std::fs::write(&script, b"x").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut core = core_showing("");
+        let launch = Launch::new(vec!["/bin/cat".to_string()], Target::FlatpakHost);
+        if core.spawn_shell(&launch).is_err() {
+            eprintln!("pty spawn unavailable in this environment; skipping");
+            return;
+        }
+        let mut parser = Parser::new();
+        parser.advance_bytes(&mut core.screen, file_anchor(&script, "build").as_bytes());
+        click_mods(&mut core, true, 2, 0, input::Mods::CTRL);
+        assert_eq!(
+            opened_url(&mut core),
+            Some(format!("file://{}", script.display()))
+        );
+    }
+
+    #[test]
+    fn a_file_link_to_a_program_is_refused_at_the_click_and_shows_refused_after() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = FixtureDir::new("click");
+        let dir = fixture.0.as_path();
+        let script = dir.join("build.sh");
+        let notes = dir.join("notes.txt");
+        std::fs::write(&script, b"x").unwrap();
+        std::fs::write(&notes, b"x").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut core = core_showing(&format!(
+            "{} {}",
+            file_anchor(&script, "build"),
+            file_anchor(&notes, "notes")
+        ));
+
+        hover_at(&mut core, 2, 0, input::Mods::NONE);
+        assert_eq!(
+            core.hovered_link(),
+            Some(Verdict::Open),
+            "openable until clicked"
+        );
+        click_mods(&mut core, true, 2, 0, input::Mods::CTRL);
+        assert!(core.drag.is_none(), "the click was consumed");
+        let out = core.take_outbox();
+        assert!(!out.iter().any(|m| matches!(m, ToWindow::OpenUrl(_))));
+        assert!(out
+            .iter()
+            .any(|m| matches!(m, ToWindow::LinkRefused(Refusal::Executable))));
+        assert_eq!(
+            core.hovered_link(),
+            Some(Verdict::Refused(Refusal::Executable)),
+            "and refused from now on"
+        );
+
+        click_mods(&mut core, true, 7, 0, input::Mods::CTRL);
+        assert_eq!(
+            opened_url(&mut core).as_deref(),
+            Some(crate::platform::file_url::encode(notes.to_str().unwrap()).as_str())
+        );
     }
 
     #[test]

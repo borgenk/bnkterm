@@ -751,18 +751,24 @@ impl Screen {
         let (cols, _) = self.dimensions();
         let (first, last) = self.line_rows_on_screen(row);
         // Walk the logical line as one flat sequence of cells, so crossing a soft wrap
-        // needs no special case: cell `n` is at (first + n / cols, n % cols).
-        let at = |n: usize| self.view_cell(first + n / cols, n % cols);
+        // needs no special case: cell `n` is at (first + n / cols, n % cols). Only the
+        // link id is compared, read straight off the row with no style to resolve.
         let cell_of = |n: usize| (first + n / cols, n % cols);
+        let link = |n: usize| {
+            let (r, c) = cell_of(n);
+            self.view_line(r)
+                .and_then(|line| line.cells.get(c))
+                .map_or(LinkId::NONE, |cell| cell.link)
+        };
         let total = (last - first + 1) * cols;
         let here = (row - first) * cols + col;
 
         let mut start = here;
-        while start > 0 && at(start - 1).link == id {
+        while start > 0 && link(start - 1) == id {
             start -= 1;
         }
         let mut end = here;
-        while end + 1 < total && at(end + 1).link == id {
+        while end + 1 < total && link(end + 1) == id {
             end += 1;
         }
         (cell_of(start), cell_of(end))

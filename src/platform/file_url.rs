@@ -7,6 +7,8 @@
 //! on the end. A path is therefore decoded once, strictly, and refused unless every
 //! reading of it agrees.
 
+use std::fmt::Write as _;
+
 use crate::platform::bytes::percent_decoded;
 
 /// The longest path the kernel opens, and so the most a decoded path may hold.
@@ -19,22 +21,12 @@ const PATH_MAX: usize = 4096;
 /// It runs on every lookup of a `file:` link, so it decodes into a buffer on the stack
 /// rather than allocating. A path too long for it is too long to open.
 pub fn path_is_unambiguous(url: &str) -> bool {
-    if url.bytes().any(|b| matches!(b, b'?' | b'#')) {
-        return false;
-    }
-    let Some(rest) = url.strip_prefix("file://") else {
-        return false;
-    };
-    let Some(path) = rest
-        .bytes()
-        .position(|b| b == b'/')
-        .and_then(|at| rest.get(at..))
-    else {
+    let Some(bytes) = path_bytes(url) else {
         return false;
     };
     let mut decoded = [0u8; PATH_MAX];
     let mut len = 0;
-    for byte in percent_decoded(path) {
+    for byte in bytes {
         let (Some(byte), Some(slot)) = (byte, decoded.get_mut(len)) else {
             return false;
         };
@@ -42,6 +34,40 @@ pub fn path_is_unambiguous(url: &str) -> bool {
         len += 1;
     }
     decoded.get(..len).and_then(plain_path).is_some()
+}
+
+/// The path `url` names, decoded the one way [`path_is_unambiguous`] reads it, when every
+/// reader agrees on it. For the click, where the path is checked against the filesystem.
+pub fn decoded_path(url: &str) -> Option<String> {
+    let bytes = path_bytes(url)?.collect::<Option<Vec<u8>>>()?;
+    plain_path(&bytes).map(str::to_string)
+}
+
+/// A `file://` URL for `path` with every byte outside the unreserved set and `/`
+/// percent-encoded, so an opener decodes it back to exactly `path`. Safe for `xdg-open`'s
+/// `printf` decoder only because a [`plain_path`] holds no control character or `\` for
+/// it to drop or reinterpret.
+pub fn encode(path: &str) -> String {
+    let mut url = String::from("file://");
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            url.push(char::from(byte));
+        } else {
+            let _ = write!(url, "%{byte:02X}");
+        }
+    }
+    url
+}
+
+/// The bytes of `url`'s path, percent-decoded strictly as they are read (`None` for a bad
+/// escape). `None` outright when the URL has a query or fragment, or no path.
+fn path_bytes(url: &str) -> Option<impl Iterator<Item = Option<u8>> + '_> {
+    if url.bytes().any(|b| matches!(b, b'?' | b'#')) {
+        return None;
+    }
+    let rest = url.strip_prefix("file://")?;
+    let path = rest.get(rest.bytes().position(|b| b == b'/')?..)?;
+    Some(percent_decoded(path))
 }
 
 /// `path` as text when every reader agrees on it: valid UTF-8, absolute, with no
@@ -88,10 +114,28 @@ mod tests {
             assert!(path_is_unambiguous(url), "{url}");
         }
         let longest = format!("file://{}", "/a".repeat(PATH_MAX / 2));
+        assert!(decoded_path(&longest).is_some());
         assert!(path_is_unambiguous(&longest));
         assert!(
             !path_is_unambiguous(&format!("{longest}a")),
             "past PATH_MAX"
         );
+    }
+
+    #[test]
+    fn an_encoded_path_decodes_back_to_itself() {
+        for path in [
+            "/tmp/a b.txt",
+            "/tmp/report #3.md",
+            "/tmp/what?.txt",
+            "/tmp/100%.txt",
+            "/home/u/файл.txt",
+            "/home/u/日本語/ノート.md",
+        ] {
+            let url = encode(path);
+            assert!(url.is_ascii(), "{url}");
+            assert_eq!(decoded_path(&url).as_deref(), Some(path), "{url}");
+            assert!(path_is_unambiguous(&url), "{url}");
+        }
     }
 }

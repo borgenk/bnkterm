@@ -2155,6 +2155,8 @@ impl State {
                 ToWindow::OfferPrimary(bytes) => self.set_selection(Transport::Primary, bytes),
                 ToWindow::PastePrimary => self.paste_from(Transport::Primary)?,
                 ToWindow::OpenUrl(url) => self.launch_link(url),
+                // The tabs raise the corner notice for it; nothing reaches here.
+                ToWindow::LinkRefused(_) => {}
                 ToWindow::Closed => self.closed = true,
             }
         }

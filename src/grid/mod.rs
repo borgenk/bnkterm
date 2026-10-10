@@ -65,7 +65,7 @@ use crate::input::{KittyFlags, ModifyOtherKeys};
 use crate::mouse::{MouseMode, MouseProtocol};
 use crate::platform::grapheme;
 use crate::platform::host::Hostname;
-use crate::platform::verdict::{self, Verdict};
+use crate::platform::verdict::{self, Refusal, Verdict};
 use crate::vt::{Params, Perform};
 use crate::width::width;
 use std::cmp::Ordering;
@@ -480,6 +480,11 @@ impl LinkTable {
     fn get(&self, id: LinkId) -> Option<&LinkTarget> {
         let slot = usize::from(id.0).checked_sub(1)?;
         self.targets.get(slot)
+    }
+
+    fn get_mut(&mut self, id: LinkId) -> Option<&mut LinkTarget> {
+        let slot = usize::from(id.0).checked_sub(1)?;
+        self.targets.get_mut(slot)
     }
 
     /// Drop every target `live` does not mark and renumber the survivors, returning the

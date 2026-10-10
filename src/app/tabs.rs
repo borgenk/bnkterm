@@ -796,6 +796,7 @@ impl Tabs {
     /// Translate each core's outbox according to foreground/background routing.
     fn route_core_outboxes(&mut self) {
         let mut title_changed = false;
+        let mut refused = None;
         for index in 0..self.entries.len() {
             for message in self.entries[index].core.drain_outbox() {
                 match message {
@@ -811,12 +812,17 @@ impl Tabs {
                     // outbox message; the manager owns teardown, so a core never
                     // hands us `Closed` to act on here.
                     ToWindow::Closed => {}
+                    ToWindow::LinkRefused(refusal) => refused = Some(refusal),
                     other => self.outbox.push(other),
                 }
             }
         }
         if title_changed {
             self.rebuild_bar();
+        }
+        if let Some(refusal) = refused {
+            self.notice = Some(Notice::link_refused(refusal, &self.shell_startup));
+            self.mark_dirty();
         }
     }
 
@@ -1455,6 +1461,33 @@ mod tests {
             labels,
             vec!["shell", "shell"],
             "each tab paints a clean \"shell\", got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_link_refused_at_the_click_raises_the_corner_notice() {
+        let mut tabs = demo_tabs(1);
+        tabs.active_mut().feed_test_bytes(
+            b"\x1b[2J\x1b[H\x1b]8;;file:///nonexistent/bnkterm/x\x1b\\missing\x1b]8;;\x1b\\",
+        );
+        let press = PointerEvent::Button {
+            button: crate::mouse::MouseButton::Left,
+            pressed: true,
+            col: 2,
+            row: 0,
+            count: 1,
+            side: Side::Left,
+        };
+        tabs.active_mut().pointer(press, Mods::CTRL).unwrap();
+        assert!(
+            tabs.notice().is_none(),
+            "nothing until the outbox is routed"
+        );
+        let out = tabs.take_outbox();
+        assert!(!out.iter().any(|m| matches!(m, ToWindow::OpenUrl(_))));
+        assert!(
+            tabs.notice().is_some(),
+            "the refusal is stated in the corner"
         );
     }
 

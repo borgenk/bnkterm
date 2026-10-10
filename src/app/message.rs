@@ -11,6 +11,7 @@
 //! thread; gather threads publish only byte batches.
 
 use crate::mouse::MouseButton;
+use crate::platform::verdict::Refusal;
 
 /// Which half of its cell the pointer sits in, against the cell's vertical midline.
 /// A character selection reads it to round each endpoint to the nearer cell edge —
@@ -81,6 +82,9 @@ pub enum ToWindow {
     /// [`crate::platform::verdict`]); the window spawns the opener, since
     /// launching a process is a window-side concern like every other action here.
     OpenUrl(String),
+    /// A Ctrl+click landed on a link refused by the rule judged only at the click (a
+    /// `file:` link to an executable or a launcher): the corner notice says so.
+    LinkRefused(Refusal),
     /// The window should shut down: every tab is gone. A core signals its own
     /// child's exit to [`crate::app::tabs::Tabs`] through the pump's stream-end, not
     /// this message; `Tabs` removes that tab and synthesizes `Closed` only once

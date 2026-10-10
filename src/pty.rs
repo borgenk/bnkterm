@@ -251,6 +251,11 @@ impl Pty {
         })
     }
 
+    /// Where the shell on this PTY runs.
+    pub fn target(&self) -> Target {
+        self.target
+    }
+
     /// The master fd, for the event loop to `poll` alongside the Wayland socket.
     pub fn fd(&self) -> RawFd {
         self.master.as_raw_fd()
