@@ -21,8 +21,8 @@ pub enum Verdict {
 pub enum Refusal {
     /// The target does not start with a scheme in [`browser::OPENABLE_SCHEMES`].
     Scheme,
-    /// The target carries a character that draws nothing ([`link::is_hidden`]), so the
-    /// text the user reads is not the target that opens.
+    /// The target carries a character that draws nothing, a control character or one
+    /// [`link::is_hidden`] names, so the text the user reads is not the target that opens.
     Hidden,
     /// The target's host is one a browser would rewrite before resolving it
     /// ([`host::read`]), so the host the user reads is not the one reached.
@@ -87,7 +87,7 @@ pub fn judge(url: &str, hostname: &Hostname) -> Verdict {
     if !browser::can_open(url) {
         return Verdict::Refused(Refusal::Scheme);
     }
-    if !url.is_ascii() && url.chars().any(link::is_hidden) {
+    if hides_a_character(url) {
         return Verdict::Refused(Refusal::Hidden);
     }
     if url.starts_with("mailto:") && !mailto::fields_are_allowed(url) {
@@ -101,6 +101,22 @@ pub fn judge(url: &str, hostname: &Hostname) -> Verdict {
         }
         _ if file && !file_url::path_is_unambiguous(url) => Verdict::Refused(Refusal::FilePath),
         Host::Name(_) | Host::Absent => Verdict::Open,
+    }
+}
+
+/// Whether `url` holds a character that draws nothing: a control character, or one
+/// [`link::is_hidden`] names. Visible non-ASCII is not one, since `rg --hyperlink-format`
+/// prints paths unencoded. A control character reaches a target only through OSC 8, as
+/// DEL or a C1 control.
+///
+/// Out of line: inlined into [`judge`], it moved code that never runs it, and the tab
+/// bar frame measured 13% slower.
+#[inline(never)]
+fn hides_a_character(url: &str) -> bool {
+    if url.is_ascii() {
+        url.bytes().any(|b| b.is_ascii_control())
+    } else {
+        url.chars().any(|c| c.is_control() || link::is_hidden(c))
     }
 }
 
@@ -135,6 +151,29 @@ mod tests {
             judge("https://de.wikipedia.org/wiki/Grüße", &Hostname::default()),
             Verdict::Open
         );
+    }
+
+    #[test]
+    fn a_target_holding_a_control_character_is_refused() {
+        for url in [
+            "https://example.com/a\u{7F}b",
+            "https://example.com/a\u{85}b",
+            "https://example.com/\u{9B}31m",
+            "https://example.com/a\tb",
+        ] {
+            assert_eq!(
+                judge(url, &Hostname::default()),
+                Verdict::Refused(Refusal::Hidden),
+                "{url:?}"
+            );
+        }
+        for url in [
+            "https://example.com/a%7Fb",
+            "https://example.com/a%C2%85b",
+            "file:///home/u/файл.txt",
+        ] {
+            assert_eq!(judge(url, &Hostname::default()), Verdict::Open, "{url}");
+        }
     }
 
     #[test]

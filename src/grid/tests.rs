@@ -3540,6 +3540,33 @@ fn a_url_hiding_a_character_is_one_refused_link() {
 }
 
 #[test]
+fn an_anchor_whose_uri_holds_a_control_character_is_refused() {
+    // The parser drops C0 controls inside an OSC, but DEL and a C1 control in UTF-8
+    // reach the URI.
+    for (stream, url) in [
+        (
+            &b"\x1b]8;;https://example.com/a\x7fb\x1b\\docs\x1b]8;;\x1b\\"[..],
+            "https://example.com/a\u{7F}b",
+        ),
+        (
+            &b"\x1b]8;;https://example.com/a\xc2\x85b\x07docs\x1b]8;;\x07"[..],
+            "https://example.com/a\u{85}b",
+        ),
+    ] {
+        let mut s = Screen::new(40, 2);
+        feed(&mut s, stream);
+        let mut probe = LinkProbe::default();
+        assert_eq!(s.link_at(0, 1, &mut probe), Some(((0, 0), (0, 3))));
+        assert_eq!(probe.url(), url);
+        assert_eq!(probe.verdict(), Some(Verdict::Refused(Refusal::Hidden)));
+    }
+    // Visible non-ASCII is not a control: `rg --hyperlink-format` prints it unencoded.
+    let mut s = Screen::new(40, 2);
+    feed(&mut s, &anchor("file:///home/u/файл.txt", "файл.txt"));
+    assert_eq!(anchor_verdict(&s, 0, 0), Some(Verdict::Open));
+}
+
+#[test]
 fn a_link_whose_host_a_browser_would_rewrite_is_refused() {
     let url = "https://github.com@evil.com/x";
     let mut s = Screen::new(60, 2);
