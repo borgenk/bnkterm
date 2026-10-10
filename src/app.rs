@@ -63,6 +63,7 @@ use crate::platform::protocol::{
     wp_fractional_scale_manager_v1, wp_fractional_scale_v1, wp_viewporter, xdg_surface,
     xdg_toplevel, xdg_wm_base,
 };
+use crate::platform::verdict::Verdict;
 use crate::platform::wire::{self, Arg, Message, Reader};
 use crate::platform::xkb::Xkb;
 use crate::pty;
@@ -1741,9 +1742,10 @@ impl State {
     /// Every shape here is a promise about what the next gesture does, which is why
     /// both of the modifier-gated facts are read live rather than cached: the hand
     /// needs Ctrl actually held (the underline says "this is a link", the hand says
-    /// "and a click now follows it"), and the I-beam needs Shift to have taken the grid
-    /// back from a program reporting the mouse. Both can flip with the pointer parked,
-    /// so the modifiers event re-runs this, and so does the main loop — a program
+    /// "and a click now follows it", and `not_allowed` over a refused link says "and a
+    /// click does nothing"), and the I-beam needs Shift to have taken the grid back
+    /// from a program reporting the mouse. Both can flip with the pointer parked, so
+    /// the modifiers event re-runs this, and so does the main loop — a program
     /// grabbing the mouse arrives as output, not as a pointer event.
     ///
     /// Whether the Ctrl promise can be kept while the window is *unfocused* is the
@@ -1763,7 +1765,11 @@ impl State {
             on_chrome: self.pointer_in_tab_bar()
                 || self.drag_scroll
                 || self.tabs.active().on_scrollbar(px, py),
-            ctrl_link: self.xkb.ctrl_active() && self.tabs.active().hovering_link(),
+            ctrl_link: self
+                .tabs
+                .active()
+                .hovered_link()
+                .filter(|_| self.xkb.ctrl_active()),
             reporting: self.tabs.active().mouse_reporting(),
             shift: self.xkb.shift_active(),
         });
@@ -2173,8 +2179,9 @@ struct PointerFacts {
     /// The pointer is over chrome rather than the grid: the tab strip, or the
     /// scrollbar's grab band (including a thumb held anywhere).
     on_chrome: bool,
-    /// Ctrl is held over a hyperlink, so a click would follow it.
-    ctrl_link: bool,
+    /// Ctrl is held over a hyperlink, with the verdict that decides whether a click
+    /// follows it.
+    ctrl_link: Option<Verdict>,
     /// A program has grabbed the mouse with `?1000`/`?1002`/`?1003`.
     reporting: bool,
     /// Shift is held, which forces the gesture back to local selection.
@@ -2182,13 +2189,13 @@ struct PointerFacts {
 }
 
 /// Pick the pointer shape the facts call for, most specific claim first: a held tab
-/// owns the pointer outright, then chrome, then a link Ctrl would follow, then a
-/// program reporting the mouse, and failing all of those the grid is plain selectable
-/// text.
+/// owns the pointer outright, then chrome, then a link under Ctrl (the hand if it
+/// opens, `not_allowed` if it is refused), then a program reporting the mouse, and
+/// failing all of those the grid is plain selectable text.
 ///
 /// The ordering is the point. Chrome outranks `reporting` because the strip and the
 /// scrollbar are ours no matter what the child asked for, and `ctrl_link` outranks it
-/// because Ctrl+click follows a link whether or not a program is watching the mouse.
+/// because Ctrl+click acts on a link whether or not a program is watching the mouse.
 fn pointer_shape_for(f: PointerFacts) -> u32 {
     if f.tab_dragging {
         // The grabbing hand is the whole visual affordance of a tab drag, and it wins
@@ -2196,8 +2203,12 @@ fn pointer_shape_for(f: PointerFacts) -> u32 {
         wp_cursor_shape_device_v1::SHAPE_GRABBING
     } else if f.on_chrome {
         wp_cursor_shape_device_v1::SHAPE_DEFAULT
-    } else if f.ctrl_link {
+    } else if f.ctrl_link == Some(Verdict::Open) {
         wp_cursor_shape_device_v1::SHAPE_POINTER
+    } else if f.ctrl_link.is_some() {
+        // Only the terminal sets the pointer, so a program cannot draw its way past
+        // this the way it can fake an underline.
+        wp_cursor_shape_device_v1::SHAPE_NOT_ALLOWED
     } else if f.reporting && !f.shift {
         // The grid belongs to a program grabbing the mouse, so a drag is its event to
         // interpret, not a selection. Shift is the same override the terminal half
@@ -2388,12 +2399,13 @@ mod tests {
     }
 
     use crate::app::*;
+    use crate::platform::verdict::Refusal;
 
     /// The pointer resting on plain, unclaimed grid text.
     const OVER_TEXT: PointerFacts = PointerFacts {
         tab_dragging: false,
         on_chrome: false,
-        ctrl_link: false,
+        ctrl_link: None,
         reporting: false,
         shift: false,
     };
@@ -2530,18 +2542,26 @@ mod tests {
         // hand must survive reporting rather than collapse to the arrow.
         assert_eq!(
             pointer_shape_for(PointerFacts {
-                ctrl_link: true,
+                ctrl_link: Some(Verdict::Open),
                 reporting: true,
                 ..OVER_TEXT
             }),
             wp_cursor_shape_device_v1::SHAPE_POINTER
+        );
+        assert_eq!(
+            pointer_shape_for(PointerFacts {
+                ctrl_link: Some(Verdict::Refused(Refusal::Scheme)),
+                reporting: true,
+                ..OVER_TEXT
+            }),
+            wp_cursor_shape_device_v1::SHAPE_NOT_ALLOWED
         );
         // A held tab beats everything, including the strip it is travelling over.
         assert_eq!(
             pointer_shape_for(PointerFacts {
                 tab_dragging: true,
                 on_chrome: true,
-                ctrl_link: true,
+                ctrl_link: Some(Verdict::Open),
                 reporting: true,
                 shift: true,
             }),
@@ -2553,15 +2573,22 @@ mod tests {
     fn the_shape_is_never_the_unset_zero() {
         // `pointer_shape: 0` is the sentinel for "forget what was applied" on enter, so
         // no real choice may collide with it or the re-apply would be skipped.
-        for bits in 0..32u8 {
-            let facts = PointerFacts {
-                tab_dragging: bits & 1 != 0,
-                on_chrome: bits & 2 != 0,
-                ctrl_link: bits & 4 != 0,
-                reporting: bits & 8 != 0,
-                shift: bits & 16 != 0,
-            };
-            assert_ne!(pointer_shape_for(facts), 0, "{facts:?}");
+        let links = [
+            None,
+            Some(Verdict::Open),
+            Some(Verdict::Refused(Refusal::Scheme)),
+        ];
+        for bits in 0..16u8 {
+            for ctrl_link in links {
+                let facts = PointerFacts {
+                    tab_dragging: bits & 1 != 0,
+                    on_chrome: bits & 2 != 0,
+                    ctrl_link,
+                    reporting: bits & 4 != 0,
+                    shift: bits & 8 != 0,
+                };
+                assert_ne!(pointer_shape_for(facts), 0, "{facts:?}");
+            }
         }
     }
 

@@ -19,8 +19,8 @@
 // The grid's shared vocabulary: the types in `grid/mod.rs` and the imports it makes.
 // `Screen`'s operations are split across these sibling modules, so each one works on
 // the same definitions rather than re-importing them piecemeal.
-use super::buffer::{Row, Scrolled};
-use super::*;
+use crate::grid::buffer::{Row, Scrolled};
+use crate::grid::*;
 
 impl Screen {
     pub fn dimensions(&self) -> (usize, usize) {
@@ -511,8 +511,9 @@ impl Screen {
     }
 
     /// The hyperlink under display `(row, col)`: the inclusive cell range its text
-    /// occupies, in reading order, with the URL left in `probe` for
-    /// [`LinkProbe::url`] to read. `None` when that cell is not inside one.
+    /// occupies, in reading order, with the URL and the verdict on it left in `probe`
+    /// for [`LinkProbe::url`] and [`LinkProbe::verdict`] to read. `None` when that cell
+    /// is not inside one. A refused link is still a hit, so it can be shown as refused.
     ///
     /// The scan runs over the whole *logical* line (soft wraps joined, the same walk
     /// [`Self::line_at`] does), because a URL printed near the right margin routinely
@@ -526,18 +527,26 @@ impl Screen {
     /// right half of a character is the character), and a range ending on a leader is
     /// widened over its spacer, so the underline never stops half a glyph short.
     ///
-    /// An OSC 8 anchor short-circuits all of that. When the cell carries the [`LinkId`]
-    /// of an anchor that opens, the child has *told* us these cells are this link, so
-    /// there is nothing to infer: the extent is the run of cells sharing the id and the
-    /// URL is the one it interned. The text scan is the fallback for every other cell.
+    /// An OSC 8 anchor short-circuits all of that. When the cell carries a [`LinkId`],
+    /// the child has *told* us these cells are this link, so there is nothing to infer:
+    /// the extent is the run of cells sharing the id, and the URL and verdict are the
+    /// ones it interned. That holds for a refused anchor too, so a URL printed as its
+    /// label is never offered in its place. The text scan is the fallback for every
+    /// other cell, and judges what it finds by the same rules. It reads each anchored
+    /// cell as a space, so a bare URL never runs into an anchor's text.
     pub fn link_at(
         &self,
         row: usize,
         col: usize,
         probe: &mut LinkProbe,
     ) -> Option<((usize, usize), (usize, usize))> {
-        let (cols, _) = self.dimensions();
-        if col >= cols {
+        probe.text.clear();
+        probe.runes.clear();
+        probe.url.clear();
+        probe.verdict = None;
+
+        let (cols, rows) = self.dimensions();
+        if col >= cols || row >= rows {
             return None;
         }
         // The right half of a wide glyph belongs to the glyph on its left.
@@ -547,16 +556,11 @@ impl Screen {
             col
         };
 
-        probe.text.clear();
-        probe.runes.clear();
-        probe.url.clear();
-
         let id = self.view_cell(row, col).link;
         if let Some(target) = self.links.get(id) {
-            if target.verdict == Verdict::Open {
-                probe.url.push_str(&target.url);
-                return Some(self.anchor_span(row, col, id));
-            }
+            probe.url.push_str(&target.url);
+            probe.verdict = Some(target.verdict);
+            return Some(self.anchor_span(row, col, id));
         }
         // Byte offset of the probed cell's rune, recorded as that rune is pushed.
         let mut at = None;
@@ -571,6 +575,10 @@ impl Screen {
                     at = Some(probe.text.len());
                 }
                 probe.runes.push((probe.text.len(), (r, c)));
+                if cell.link.is_set() {
+                    probe.text.push(' ');
+                    continue;
+                }
                 probe.text.push(cell.rune);
                 probe.text.extend(self.view_marks(r, c));
             }
@@ -582,6 +590,7 @@ impl Screen {
         let start = probe.cell_at(found.start)?;
         let mut end = probe.cell_at(found.end.checked_sub(1)?)?;
         probe.url.push_str(probe.text.get(found)?);
+        probe.verdict = Some(verdict::judge(&probe.url));
         if self.view_cell(end.0, end.1).is_wide_leader() && end.1 + 1 < cols {
             end.1 += 1;
         }

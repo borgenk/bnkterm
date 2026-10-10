@@ -38,10 +38,9 @@
 //!   gives its `)` back to the prose.
 //!
 //! We detect exactly the schemes [`browser::OPENABLE_SCHEMES`] lists, by scanning for
-//! that same constant. A link the app decorates and then refuses to follow is a worse
-//! bug than one it never decorated, and the text being scanned may be hostile (a note
-//! can be pasted, a program can print anything), so `javascript:` and `data:` are never
-//! even candidates.
+//! that same constant. The text being scanned may be hostile (a note can be pasted, a
+//! program can print anything), so `javascript:` and `data:` in prose are never even
+//! candidates, and other `word:` text is not a link at all.
 //!
 //! [uts58]: https://www.unicode.org/reports/tr58/
 

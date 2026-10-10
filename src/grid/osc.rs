@@ -48,8 +48,8 @@ impl Screen {
     ///
     /// The URI is judged once, when it is first interned, and the verdict is kept with
     /// it ([`crate::platform::verdict`]). A refused anchor (`javascript:`, `data:`) is
-    /// stored like any other, so its cells still carry a link; the lookup does not offer
-    /// it to the pointer. An anchor with nothing to keep — bad UTF-8, an empty URI, one
+    /// stored like any other, so its cells still carry a link, and the lookup offers it
+    /// as refused. An anchor with nothing to keep — bad UTF-8, an empty URI, one
     /// over [`LINK_URL_MAX`] — closes whatever anchor was open, which is also the safe
     /// reading of a malformed sequence.
     pub(super) fn set_hyperlink(&mut self, pt: &[u8]) {

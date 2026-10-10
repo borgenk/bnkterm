@@ -1023,7 +1023,7 @@ pub enum ResizeEffect {
 
 /// The reusable working set of a hyperlink probe (see [`Screen::link_at`]): the
 /// logical line being scanned, the map back from its bytes to the cells they came
-/// from, and the URL the last hit found.
+/// from, and the URL the last hit found with its verdict.
 ///
 /// It is owned by the caller and reused because a probe is not a rare event: it runs
 /// for every cell the pointer crosses, and again whenever output scrolls the screen
@@ -1041,12 +1041,20 @@ pub struct LinkProbe {
     runes: Vec<(usize, (usize, usize))>,
     /// The URL of the most recent hit (empty after a miss).
     url: String,
+    /// The verdict on [`Self::url`] (`None` after a miss).
+    verdict: Option<Verdict>,
 }
 
 impl LinkProbe {
     /// The URL the last [`Screen::link_at`] hit found; empty after a miss.
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Whether the link the last [`Screen::link_at`] hit found opens; `None` after a
+    /// miss.
+    pub fn verdict(&self) -> Option<Verdict> {
+        self.verdict
     }
 
     /// The display cell whose rune covers byte offset `at` in [`Self::text`]: the last

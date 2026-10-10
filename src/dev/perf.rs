@@ -48,6 +48,7 @@ use crate::error::{Error, Result};
 use crate::grid::{LinkId, LinkProbe, Screen};
 use crate::platform::geom::Scale;
 use crate::platform::scroll::Scrollbar;
+use crate::platform::verdict::{Refusal, Verdict};
 use crate::vt::{Params, Parser, Perform};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -239,6 +240,7 @@ struct LinkFixture {
     url: &'static str,
     /// Whether the pointer's cell is inside an OSC 8 anchor rather than plain text.
     anchored: bool,
+    verdict: Verdict,
     /// Display rows the found link spans.
     rows: usize,
     /// Timed lookups per round, sized so each round times about a millisecond.
@@ -246,9 +248,11 @@ struct LinkFixture {
 }
 
 /// One fixture per path through [`Screen::link_at`]: a bare URL the text scan finds, an
-/// OSC 8 anchor read off its cells, and a bare URL soft-wrapped across three rows.
-fn link_fixtures() -> [LinkFixture; 3] {
+/// OSC 8 anchor read off its cells, a bare URL soft-wrapped across three rows, and a
+/// refused anchor.
+fn link_fixtures() -> [LinkFixture; 4] {
     const URL: &str = "https://example.com/docs/terminal/hyperlinks.html";
+    const EDITOR: &str = "vscode://file/home/user/src/bnkterm/src/grid/view.rs:533:12";
     [
         LinkFixture {
             name: "link_bare",
@@ -256,6 +260,7 @@ fn link_fixtures() -> [LinkFixture; 3] {
             pointer: (LINK_ROW, 30),
             url: URL,
             anchored: false,
+            verdict: Verdict::Open,
             rows: 1,
             iters: 2048,
         },
@@ -266,6 +271,7 @@ fn link_fixtures() -> [LinkFixture; 3] {
             pointer: (LINK_ROW, 30),
             url: URL,
             anchored: true,
+            verdict: Verdict::Open,
             rows: 1,
             iters: 8192,
         },
@@ -275,8 +281,22 @@ fn link_fixtures() -> [LinkFixture; 3] {
             pointer: (LINK_ROW + 1, 60),
             url: LINK_LONG_URL,
             anchored: false,
+            verdict: Verdict::Open,
             rows: 3,
             iters: 512,
+        },
+        LinkFixture {
+            name: "link_refused",
+            // An editor link, as `rg --hyperlink-format vscode` prints one.
+            line: format!(
+                "  \x1b]8;;{EDITOR}\x1b\\src/grid/view.rs:533:12\x1b]8;;\x1b\\: pub fn link_at("
+            ),
+            pointer: (LINK_ROW, 10),
+            url: EDITOR,
+            anchored: true,
+            verdict: Verdict::Refused(Refusal::Scheme),
+            rows: 1,
+            iters: 8192,
         },
     ]
 }
@@ -304,14 +324,20 @@ fn link_scenario(fixture: &LinkFixture) -> Result<Sample> {
     let rows = screen
         .link_at(row, col, &mut probe)
         .map(|((first, _), (last, _))| last - first + 1);
-    if anchored != fixture.anchored || probe.url() != fixture.url || rows != Some(fixture.rows) {
+    if anchored != fixture.anchored
+        || probe.url() != fixture.url
+        || probe.verdict() != Some(fixture.verdict)
+        || rows != Some(fixture.rows)
+    {
         return Err(Error::msg(format!(
-            "{}: expected {:?} over {} rows (anchored: {}), found {:?} over {rows:?} (anchored: {anchored})",
+            "{}: expected {:?} ({:?}) over {} rows (anchored: {}), found {:?} ({:?}) over {rows:?} (anchored: {anchored})",
             fixture.name,
             fixture.url,
+            fixture.verdict,
             fixture.rows,
             fixture.anchored,
             probe.url(),
+            probe.verdict(),
         )));
     }
     let (ns, allocs) = best_of(GATE_ROUNDS, fixture.iters, || {
@@ -1939,7 +1965,7 @@ mod tests {
         for f in link_fixtures() {
             link_scenario(&LinkFixture { iters: 1, ..f }).unwrap();
         }
-        let [bare, anchor, wrapped] = link_fixtures();
+        let [bare, anchor, wrapped, refused] = link_fixtures();
         assert!(link_scenario(&LinkFixture {
             anchored: true,
             ..bare
@@ -1951,6 +1977,11 @@ mod tests {
         })
         .is_err());
         assert!(link_scenario(&LinkFixture { rows: 2, ..wrapped }).is_err());
+        assert!(link_scenario(&LinkFixture {
+            verdict: Verdict::Open,
+            ..refused
+        })
+        .is_err());
     }
 
     #[cfg(feature = "perf-alloc")]

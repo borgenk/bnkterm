@@ -91,9 +91,10 @@ fn xdg_open(url: &str, activation_token: Option<&str>, opener: Opener) -> Comman
 }
 
 /// Whether [`open_url`] would launch `url`: it carries an [`OPENABLE_SCHEMES`]
-/// scheme and does not start with a dash `xdg-open` could read as an option. The app
-/// checks this before offering a link to the pointer, so a target we would refuse
-/// never presents itself as clickable in the first place.
+/// scheme and does not start with a dash `xdg-open` could read as an option. Every
+/// link is judged by it before the pointer is offered one
+/// ([`crate::platform::verdict::judge`]), so a target this refuses shows as refused,
+/// never as clickable.
 pub fn can_open(url: &str) -> bool {
     !url.starts_with('-')
         && OPENABLE_SCHEMES

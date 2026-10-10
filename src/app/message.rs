@@ -77,8 +77,8 @@ pub enum ToWindow {
     /// [`TerminalCore::paste`](crate::app::terminal::TerminalCore::paste).
     PastePrimary,
     /// A Ctrl+click landed on a hyperlink: hand it to the user's default handler. The
-    /// core found it in the grid and vetted its scheme (see
-    /// [`crate::platform::browser::can_open`]); the window spawns the opener, since
+    /// core found it in the grid and its verdict lets it open (see
+    /// [`crate::platform::verdict`]); the window spawns the opener, since
     /// launching a process is a window-side concern like every other action here.
     OpenUrl(String),
     /// The window should shut down: every tab is gone. A core signals its own

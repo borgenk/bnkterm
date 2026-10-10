@@ -190,6 +190,7 @@ impl Tabs {
 
         if !self.is_empty() {
             self.active_mut().focus(false)?;
+            self.active_mut().drop_hover();
         }
         let id = self.allocate_id();
         self.entries.push(TabEntry { id, core });
@@ -264,6 +265,8 @@ impl Tabs {
             return false;
         }
         let _ = self.active_mut().focus(false);
+        // The pointer stays with the window, so a background tab has nothing under it.
+        self.active_mut().drop_hover();
         self.active = index;
         let _ = self.active_mut().focus(window_focused);
         self.active_mut().dirty = true;
@@ -817,9 +820,11 @@ impl Tabs {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::app::message::{PointerEvent, Side};
+    use crate::app::tabs::*;
     use crate::input::{Key, Mods};
     use crate::platform::geom::Scale;
+    use crate::platform::verdict::Verdict;
     use crate::pty::{Launch, PollSet, Target};
     use crate::render::display::DrawCmd;
     use crate::term_render::CellMetrics;
@@ -1115,6 +1120,27 @@ mod tests {
         assert!(!tabs.shows_bar());
         assert_eq!(tabs.active_id(), None);
         assert!(tabs.gather_fds().next().is_none());
+    }
+
+    #[test]
+    fn a_tab_sent_to_the_background_drops_its_hover() {
+        // The pointer stays with the window. After a Ctrl+Tab away and back, a hover
+        // kept from before would promise a link the pointer may no longer be over.
+        let mut tabs = demo_tabs(2);
+        let ids: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
+        tabs.active_mut()
+            .feed_test_bytes(b"\x1b[2J\x1b[Hhttps://example.com/a");
+        let motion = PointerEvent::Motion {
+            col: 3,
+            row: 0,
+            side: Side::Left,
+        };
+        tabs.active_mut().pointer(motion, Mods::NONE).unwrap();
+        assert_eq!(tabs.active_mut().hovered_link(), Some(Verdict::Open));
+
+        assert!(tabs.select(ids[1], false));
+        assert!(tabs.select(ids[0], false));
+        assert_eq!(tabs.active_mut().hovered_link(), None);
     }
 
     #[test]

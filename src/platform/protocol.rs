@@ -274,11 +274,12 @@ pub mod wp_cursor_shape_device_v1 {
     /// Set the pointer's shape: the `enter` event's `serial`, then a shape enum.
     pub const SET_SHAPE: u16 = 1;
     /// Shape enums from the protocol (all present since version 1): the plain arrow
-    /// over a picture, a pointing hand over a clickable control, and the I-beam over
-    /// editable text.
+    /// over a picture, a pointing hand over a clickable control, the I-beam over
+    /// editable text, and the "not allowed" sign over a link that will not open.
     pub const SHAPE_DEFAULT: u32 = 1;
     pub const SHAPE_POINTER: u32 = 4;
     pub const SHAPE_TEXT: u32 = 9;
+    pub const SHAPE_NOT_ALLOWED: u32 = 15;
     /// The closed hand shown while a tab is being dragged along the strip; `grab` (16)
     /// is its open, not-yet-grabbing counterpart, both present since version 1.
     pub const SHAPE_GRABBING: u32 = 17;

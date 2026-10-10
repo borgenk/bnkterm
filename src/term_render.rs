@@ -53,7 +53,7 @@
 //! and an unchanged frame diffs to nothing.
 //!
 //! The two overlays the app hands in — the selection band and the hovered hyperlink's
-//! underline — are both a [`CellSpan`], and both resolve to *one inclusive column
+//! underline — both cover a [`CellSpan`], and both resolve to *one inclusive column
 //! range per row* (`span_cols`) before anything per-cell happens. That is a
 //! performance rule, not a stylistic one: `Painter::cell` runs about four times per
 //! cell, so an overlay tested there is tested a quarter of a million times a frame to
@@ -65,6 +65,7 @@ use crate::platform::freetype::{FaceKey, FontStyle, Fonts, Metrics};
 use crate::platform::geom::{Rect, Scale};
 use crate::platform::grapheme;
 use crate::platform::scroll::{self, Scrollbar};
+use crate::platform::verdict::Verdict;
 use crate::render::display::{DisplayList, DrawCmd, Fade};
 use crate::width;
 
@@ -307,6 +308,14 @@ pub struct CellSpan {
     pub end: (usize, usize),
 }
 
+/// The hyperlink under the pointer: the cells its text covers, and whether it opens.
+/// A link that opens is ruled solid, a refused one dashed and dimmed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LinkHover {
+    pub span: CellSpan,
+    pub verdict: Verdict,
+}
+
 /// The inputs a frame build reads: the grid and its theme, the fixed cell metrics,
 /// the `surface`/`origin` geometry (`origin` is the grid's top-left pixel, the window
 /// padding; the background still fills the whole `surface`, so the inset shows as a
@@ -324,7 +333,7 @@ pub struct FrameInputs<'a> {
     pub selection: Option<Selection>,
     /// The hyperlink under the pointer, which paints underlined. The app finds it
     /// (the grid holds the text); the painter only draws it.
-    pub hover: Option<CellSpan>,
+    pub hover: Option<LinkHover>,
     /// The display scale, so the scrollbar's logical pixel constants land at the right
     /// device size. [`Scale::ONE`] in a test or a headless build.
     pub scale: Scale,
@@ -605,8 +614,8 @@ struct Painter<'a> {
     /// so the whole grid rides the same rigid offset and can never drift from it.
     origin: (i32, i32),
     selection: Option<Selection>,
-    /// The hovered hyperlink's cells, underlined by [`Self::push_hover_rule`].
-    hover: Option<CellSpan>,
+    /// The hovered hyperlink, underlined by [`Self::push_hover_rule`].
+    hover: Option<LinkHover>,
     /// The display scale, so the scrollbar's logical constants land at the right size.
     scale: Scale,
     /// The overlay scrollbar's fade/expand state, drawn by [`Self::scrollbar`].
@@ -1404,9 +1413,10 @@ impl Painter<'_> {
         )
     }
 
-    /// The underline under the hovered hyperlink where it crosses `row`, drawn as one
-    /// rule over its columns. Nothing on a row the link does not reach, so an ordinary
-    /// frame pays a single `None` check per row for the whole feature.
+    /// The underline under the hovered hyperlink where it crosses `row`, drawn over its
+    /// columns: one solid rule for a link that opens, a dashed one dimmed for a refused
+    /// link. Nothing on a row the link does not reach, so an ordinary frame pays a
+    /// single `None` check per row for the whole feature.
     ///
     /// It takes the colour of the link's first cell on the row, so the rule reads as
     /// part of the text it underlines rather than as chrome laid over it.
@@ -1414,19 +1424,25 @@ impl Painter<'_> {
         let Some(hover) = self.hover else {
             return;
         };
-        let Some((first, last)) = self.span_cols(hover, row) else {
+        let Some((first, last)) = self.span_cols(hover.span, row) else {
             return;
         };
         let fg = self.cell_fg(self.cell(row, first));
-        let rect = self.underline_rect(
-            self.cell_x(first),
-            (last + 1 - first) as i32 * self.metrics.w,
-            self.baseline(row),
-        );
-        self.list.push(DrawCmd::Fill {
-            rect,
-            color: fg.to_u32(),
-        });
+        let x = self.cell_x(first);
+        let w = (last + 1 - first) as i32 * self.metrics.w;
+        let baseline = self.baseline(row);
+        match hover.verdict {
+            Verdict::Open => {
+                let rect = self.underline_rect(x, w, baseline);
+                self.list.push(DrawCmd::Fill {
+                    rect,
+                    color: fg.to_u32(),
+                });
+            }
+            Verdict::Refused(_) => {
+                self.push_underline(UnderlineStyle::Dashed, x, w, baseline, dim(fg));
+            }
+        }
     }
 
     /// Whether cell `(row, col)` has no combining marks (a blank base rune with no
@@ -1667,8 +1683,9 @@ fn dim(c: Rgb) -> Rgb {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::*;
     use crate::color::Color;
+    use crate::platform::verdict::Refusal;
+    use crate::term_render::*;
 
     /// Synthetic metrics: a 10x20 cell so column/row math reads off by eye, with a
     /// 2px line gap (ascent 14 + descent 4 < h 20), like every real font ships. The
@@ -1769,10 +1786,15 @@ mod tests {
         })
     }
 
-    /// [`list_of`] with a hovered hyperlink over it.
-    fn list_hovering(s: &Screen, hover: CellSpan) -> DisplayList {
+    /// [`list_of`] with a hovered hyperlink that opens over it.
+    fn list_hovering(s: &Screen, span: CellSpan) -> DisplayList {
+        list_hovering_verdict(s, span, Verdict::Open)
+    }
+
+    /// [`list_of`] with a hovered hyperlink over it, judged `verdict`.
+    fn list_hovering_verdict(s: &Screen, span: CellSpan, verdict: Verdict) -> DisplayList {
         build_display_list(&FrameInputs {
-            hover: Some(hover),
+            hover: Some(LinkHover { span, verdict }),
             ..inputs(s, &Theme::default())
         })
     }
@@ -2479,6 +2501,36 @@ mod tests {
         assert_eq!(rules[0].w, 3 * M.w, "and runs to the right edge");
         assert_eq!(rules[1].x, 0, "the second row starts at the left edge");
         assert_eq!(rules[1].w, 6 * M.w, "and runs to where the link ends");
+    }
+
+    #[test]
+    fn a_refused_link_is_ruled_dashed_and_dimmed() {
+        let mut s = Screen::new(10, 1);
+        feed(&mut s, b"a http://x");
+        let span = CellSpan {
+            start: (0, 2),
+            end: (0, 9),
+        };
+        let solid = rules(&list_hovering(&s, span))[0];
+        let refused = list_hovering_verdict(&s, span, Verdict::Refused(Refusal::Scheme));
+        let dashes: Vec<(Rect, u32)> = fills(&refused)
+            .into_iter()
+            .filter(|(r, _)| r.y > M.baseline)
+            .collect();
+        let fg = Color::Default.resolve(&Theme::default(), Ground::Foreground);
+        assert!(dashes.len() > 1, "dashed, not one rule: {dashes:?}");
+        assert_eq!(dashes[0].0.x, solid.x, "it starts where the link does");
+        for (rect, color) in &dashes {
+            assert_eq!(*color, dim(fg).to_u32(), "dimmed: {rect:?}");
+            assert_eq!((rect.y, rect.h), (solid.y, solid.h), "at the rule's height");
+            assert!(
+                rect.x >= solid.x && rect.x + rect.w <= solid.x + solid.w,
+                "inside the link's cells: {rect:?}"
+            );
+        }
+        let inked: i32 = dashes.iter().map(|(r, _)| r.w).sum();
+        assert!(inked < solid.w, "with gaps between the dashes");
+        assert_eq!(cells_runs(&refused), cells_runs(&list_of(&s)));
     }
 
     #[test]

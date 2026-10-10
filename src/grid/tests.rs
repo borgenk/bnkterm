@@ -1,10 +1,10 @@
 //! The grid's tests. See the `mod tests` declaration in `grid/mod.rs` for why they are one
 //! module rather than one per sibling implementation file.
 
-use super::buffer::MAX_LOGICAL_COLS;
-use super::osc::base64_decode;
-use super::*;
 use crate::color::{Ground, Rgb};
+use crate::grid::buffer::MAX_LOGICAL_COLS;
+use crate::grid::osc::base64_decode;
+use crate::grid::*;
 use crate::platform::verdict::Refusal;
 
 #[test]
@@ -3349,6 +3349,7 @@ fn link_at_finds_a_url_and_spans_exactly_its_cells() {
     let hit = s.link_at(0, 10, &mut probe).unwrap();
     assert_eq!(hit, ((0, 4), (0, 24)));
     assert_eq!(probe.url(), "https://example.com/a");
+    assert_eq!(probe.verdict(), Some(Verdict::Open));
     // Every cell of the URL resolves to the same span, so the underline does not
     // flicker as the pointer crosses it.
     for col in 4..=24 {
@@ -3358,6 +3359,7 @@ fn link_at_finds_a_url_and_spans_exactly_its_cells() {
     assert_eq!(s.link_at(0, 3, &mut probe), None, "the space before");
     assert_eq!(s.link_at(0, 25, &mut probe), None, "the space after");
     assert_eq!(probe.url(), "", "a miss leaves no stale URL behind");
+    assert_eq!(probe.verdict(), None, "nor a stale verdict");
 }
 
 #[test]
@@ -3436,6 +3438,7 @@ fn an_anchor_makes_text_that_is_not_a_url_a_link() {
     for col in 0..=7 {
         assert_eq!(s.link_at(0, col, &mut probe), Some(hit), "col {col}");
         assert_eq!(probe.url(), "https://example.com/a");
+        assert_eq!(probe.verdict(), Some(Verdict::Open));
     }
     assert_eq!(
         s.link_at(0, 8, &mut probe),
@@ -3466,10 +3469,7 @@ fn anchor_verdict(s: &Screen, row: usize, col: usize) -> Option<Verdict> {
 }
 
 #[test]
-fn a_refused_anchor_is_kept_with_its_reason_and_not_offered() {
-    // A scheme outside `OPENABLE_SCHEMES` is judged when the anchor is interned and
-    // stored refused, so its cells still say a link is there. The lookup does not
-    // offer it to the pointer.
+fn a_refused_anchor_is_offered_as_a_link_with_its_reason() {
     for uri in [
         "javascript:alert(1)",
         "data:text/html,<script>x</script>",
@@ -3479,14 +3479,60 @@ fn a_refused_anchor_is_kept_with_its_reason_and_not_offered() {
     ] {
         let mut s = Screen::new(20, 2);
         feed(&mut s, &anchor(uri, "click"));
+        let mut probe = LinkProbe::default();
+        assert_eq!(s.link_at(0, 2, &mut probe), Some(((0, 0), (0, 4))), "{uri}");
+        assert_eq!(probe.url(), uri);
         assert_eq!(
-            anchor_verdict(&s, 0, 4),
+            probe.verdict(),
             Some(Verdict::Refused(Refusal::Scheme)),
             "{uri}"
         );
-        let mut probe = LinkProbe::default();
-        assert_eq!(s.link_at(0, 2, &mut probe), None, "{uri}");
     }
+}
+
+#[test]
+fn a_refused_anchor_labelled_with_a_url_is_not_offered_the_label() {
+    // The label is text the child chose. Scanning it would open a URL the anchor never
+    // named, and hide that the anchor itself was refused.
+    let mut s = Screen::new(40, 2);
+    feed(
+        &mut s,
+        &anchor("javascript:alert(1)", "https://example.com/a"),
+    );
+    let mut probe = LinkProbe::default();
+    assert_eq!(s.link_at(0, 5, &mut probe), Some(((0, 0), (0, 20))));
+    assert_eq!(probe.url(), "javascript:alert(1)");
+    assert_eq!(probe.verdict(), Some(Verdict::Refused(Refusal::Scheme)));
+}
+
+#[test]
+fn a_bare_url_never_runs_into_an_anchor() {
+    // Probed from plain text beside an anchor, the scan must not read the anchor's label
+    // as part of a bare URL: that opens a URL built from text the anchor owns, and shows
+    // a refused anchor's cells as openable.
+    let mut probe = LinkProbe::default();
+    let mut s = Screen::new(40, 2);
+    let mut bytes = anchor("javascript:alert(1)", "https://evil");
+    bytes.extend_from_slice(b".example.com/x");
+    feed(&mut s, &bytes);
+    assert_eq!(s.link_at(0, 15, &mut probe), None, "a refused label's tail");
+
+    let mut s = Screen::new(40, 2);
+    let mut bytes = b"https://".to_vec();
+    bytes.extend(anchor("javascript:alert(1)", "evil.com"));
+    feed(&mut s, &bytes);
+    assert_eq!(s.link_at(0, 2, &mut probe), None, "a scheme before a label");
+
+    let mut s = Screen::new(40, 2);
+    let mut bytes = b"https://a.com/".to_vec();
+    bytes.extend(anchor("https://b.com/", "docs"));
+    feed(&mut s, &bytes);
+    assert_eq!(s.link_at(0, 3, &mut probe), Some(((0, 0), (0, 13))));
+    assert_eq!(
+        probe.url(),
+        "https://a.com/",
+        "an open anchor bounds it too"
+    );
 }
 
 #[test]
@@ -3520,6 +3566,14 @@ fn refused_anchors_count_against_the_link_budgets() {
     );
     assert!(s.links.targets.len() < 4000, "the budget stopped it");
     assert!(s.links.swept_dry_at.is_some());
+
+    // An anchor that opens finds no room either, and its text prints plain.
+    feed(
+        &mut s,
+        &anchor(&format!("https://e.com/late/{filler}"), "late"),
+    );
+    assert_eq!(s.cell(1, 0).link, LinkId::NONE);
+    assert_eq!(s.link_at(1, 0, &mut LinkProbe::default()), None);
 }
 
 #[test]

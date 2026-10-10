@@ -33,11 +33,13 @@ use crate::grid::{
 };
 use crate::input;
 use crate::mouse::{self, MouseButton, MouseKind};
-use crate::platform::browser;
 use crate::platform::scroll::{self, Scrollbar};
+use crate::platform::verdict::Verdict;
 use crate::pty::{Launch, Pty, TtyMode, ZombieChild};
 use crate::render::display::DisplayList;
-use crate::term_render::{self, CellSpan, CursorRender, CursorShape, ScrollLane, Selection};
+use crate::term_render::{
+    self, CellSpan, CursorRender, CursorShape, LinkHover, ScrollLane, Selection,
+};
 use crate::vt::Parser;
 
 /// The cursor blink half-period: how long each of the on/off phases lasts.
@@ -325,11 +327,12 @@ pub(super) struct TerminalCore {
     /// The left-drag in progress (the button is down), or `None`. Absolute, like the
     /// selection it pivots: output during a drag must not move the anchor.
     drag: Option<Drag>,
-    /// The hyperlink under the pointer: its cells paint underlined and Ctrl+click
-    /// follows it. `None` whenever there is nothing to follow — no URL under the
-    /// pointer, a drag in progress (the gesture is a selection), a program grabbing
-    /// the mouse (its clicks are its own), or the pointer outside the grid.
-    hover: Option<CellSpan>,
+    /// The hyperlink under the pointer: its cells paint underlined, and Ctrl+click
+    /// follows it when its verdict lets it open. `None` whenever there is no link to
+    /// show — no URL under the pointer, a drag in progress (the gesture is a
+    /// selection), a program grabbing the mouse (its clicks are its own), or the
+    /// pointer outside the grid.
+    hover: Option<LinkHover>,
     /// The cell the pointer sits in while hovering is live, or `None` when it is not.
     /// Two jobs: it makes a motion inside one cell free (the common case, since a
     /// pointer crosses many pixels per cell), and it is the position
@@ -676,6 +679,7 @@ impl TerminalCore {
         // out, so a keystroke never lands "blind" while reading history.
         if self.screen.is_scrolled() {
             self.screen.scroll_view_to_bottom();
+            self.refresh_hover();
             self.dirty = true;
         }
         self.bump_cursor(); // keep the cursor solid while typing
@@ -718,6 +722,9 @@ impl TerminalCore {
         // Prune catches the leftover cases the carry does not: a kept selection whose
         // end row a shrink dropped off the screen.
         self.prune_selection();
+        // The text moved under the pointer, and the cell the pointer is over may have
+        // too, so the hover waits for the next motion.
+        self.drop_hover();
         if ended_drag {
             self.offer_selection(true);
         }
@@ -771,6 +778,7 @@ impl TerminalCore {
         self.end_selection_on_input();
         if self.screen.is_scrolled() {
             self.screen.scroll_view_to_bottom();
+            self.refresh_hover();
             self.dirty = true;
         }
         self.send_key_buf()?;
@@ -919,8 +927,7 @@ impl TerminalCore {
     /// cell, so all but the first motion event within a cell returns here.
     fn track_hover(&mut self, row: usize, col: usize, live: bool) {
         if !live {
-            self.hover_cell = None;
-            self.set_hover(None);
+            self.drop_hover();
             return;
         }
         if self.hover_cell == Some((row, col)) {
@@ -942,12 +949,26 @@ impl TerminalCore {
             return;
         };
         let found = self.screen.link_at(row, col, &mut self.probe);
-        self.set_hover(found.map(|(start, end)| CellSpan { start, end }));
+        let hover = found
+            .zip(self.probe.verdict())
+            .map(|((start, end), verdict)| LinkHover {
+                span: CellSpan { start, end },
+                verdict,
+            });
+        self.set_hover(hover);
     }
 
-    /// Adopt a new hovered span, repainting only when it actually changed (a pointer
+    /// Forget the hovered link and the cell it was probed from until the pointer next
+    /// moves over the grid. For when this tab can no longer say what is under the
+    /// pointer: the grid was resized beneath it, or the tab went to the background.
+    pub(super) fn drop_hover(&mut self) {
+        self.hover_cell = None;
+        self.set_hover(None);
+    }
+
+    /// Adopt a new hovered link, repainting only when it actually changed (a pointer
     /// crossing cells *within* one link must not redraw the frame).
-    fn set_hover(&mut self, hover: Option<CellSpan>) {
+    fn set_hover(&mut self, hover: Option<LinkHover>) {
         if self.hover != hover {
             self.hover = hover;
             self.dirty = true;
@@ -959,18 +980,17 @@ impl TerminalCore {
     ///
     /// The URL is re-probed at the clicked cell rather than read off the hovered span,
     /// so what opens is what was clicked, with no chance of acting on a hover that
-    /// output has since invalidated. It is vetted before it is queued: the text came
-    /// from the child, which can print anything, so only a scheme
-    /// [`browser::open_url`] will actually launch ever reaches the window.
+    /// output has since invalidated. Only a link whose verdict lets it open reaches the
+    /// window: the text came from the child, which can print anything. A refused link
+    /// still consumes the click, so Ctrl+click on one does nothing at all.
     fn open_link(&mut self, row: usize, col: usize) -> bool {
         if self.screen.link_at(row, col, &mut self.probe).is_none() {
             return false;
         }
-        let url = self.probe.url();
-        if !browser::can_open(url) {
-            return false;
+        if self.probe.verdict() == Some(Verdict::Open) {
+            self.outbox
+                .push(ToWindow::OpenUrl(self.probe.url().to_string()));
         }
-        self.outbox.push(ToWindow::OpenUrl(url.to_string()));
         true
     }
 
@@ -1732,11 +1752,12 @@ impl TerminalCore {
         self.scrollbar.animating()
     }
 
-    /// Whether the pointer is resting on a hyperlink. The window reads it to offer the
-    /// hand cursor, so the pointer only promises a click will do something when
+    /// The verdict on the hyperlink the pointer rests on, or `None` off a link. The
+    /// window reads it to offer the hand over a link that opens and `not_allowed` over
+    /// a refused one, so the pointer only promises a click will do something when
     /// Ctrl+clicking actually would.
-    pub(super) fn hovering_link(&self) -> bool {
-        self.hover.is_some()
+    pub(super) fn hovered_link(&self) -> Option<Verdict> {
+        self.hover.map(|hover| hover.verdict)
     }
 
     /// Whether a program has grabbed the mouse with `?1000`/`?1002`/`?1003`. The window
@@ -2014,8 +2035,9 @@ fn demo_screen(cols: usize, rows: usize) -> Screen {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::app::terminal::*;
     use crate::platform::geom::Scale;
+    use crate::platform::verdict::Refusal;
     use crate::term_render::CellMetrics;
     use std::path::Path;
 
@@ -3015,9 +3037,13 @@ mod tests {
         // "see https://example.com/a here": the URL sits at cols 4..=24.
         let mut core = core_showing("see https://example.com/a here");
         hover_at(&mut core, 10, 0, input::Mods::NONE);
-        assert!(core.hovering_link(), "the pointer rests on the link");
         assert_eq!(
-            core.hover,
+            core.hovered_link(),
+            Some(Verdict::Open),
+            "the pointer rests on the link"
+        );
+        assert_eq!(
+            core.hover.map(|h| h.span),
             Some(CellSpan {
                 start: (0, 4),
                 end: (0, 24)
@@ -3025,12 +3051,12 @@ mod tests {
         );
         // Off the link, onto the prose after it.
         hover_at(&mut core, 27, 0, input::Mods::NONE);
-        assert!(!core.hovering_link(), "the prose is not a link");
+        assert!(core.hovered_link().is_none(), "the prose is not a link");
         // And off the grid entirely: an underline must not outlive the pointer.
         hover_at(&mut core, 10, 0, input::Mods::NONE);
-        assert!(core.hovering_link());
+        assert_eq!(core.hovered_link(), Some(Verdict::Open));
         core.pointer(PointerEvent::Left, input::Mods::NONE).unwrap();
-        assert!(!core.hovering_link(), "the pointer left the grid");
+        assert!(core.hovered_link().is_none(), "the pointer left the grid");
     }
 
     #[test]
@@ -3096,9 +3122,39 @@ mod tests {
         // hover nor the click may reach a scheme the opener refuses.
         let mut core = core_showing("javascript:alert(1) data:text/html,x");
         hover_at(&mut core, 4, 0, input::Mods::NONE);
-        assert!(!core.hovering_link(), "not even underlined");
+        assert!(core.hovered_link().is_none(), "not even underlined");
         click_mods(&mut core, true, 4, 0, input::Mods::CTRL);
         assert!(opened_url(&mut core).is_none(), "and never opened");
+    }
+
+    #[test]
+    fn a_refused_anchor_hovers_as_refused_and_its_ctrl_click_does_nothing() {
+        let mut core =
+            core_showing("\x1b]8;;javascript:alert(1)\x1b\\click me\x1b]8;;\x1b\\ after");
+        hover_at(&mut core, 3, 0, input::Mods::NONE);
+        assert_eq!(core.hovered_link(), Some(Verdict::Refused(Refusal::Scheme)));
+        assert_eq!(
+            core.hover.map(|h| h.span),
+            Some(CellSpan {
+                start: (0, 0),
+                end: (0, 7)
+            })
+        );
+
+        click_mods(&mut core, true, 3, 0, input::Mods::CTRL);
+        assert!(core.drag.is_none(), "the press began no selection");
+        click_mods(&mut core, false, 3, 0, input::Mods::CTRL);
+        let out = core.take_outbox();
+        assert!(
+            !out.iter().any(|m| matches!(m, ToWindow::OpenUrl(_))),
+            "nothing opens"
+        );
+        assert!(core.selection.is_none(), "the click selected nothing");
+        assert!(
+            !out.iter()
+                .any(|m| matches!(m, ToWindow::OfferPrimary(_) | ToWindow::OfferSelection(_))),
+            "and offered nothing to the clipboard"
+        );
     }
 
     #[test]
@@ -3110,7 +3166,10 @@ mod tests {
         assert!(core.screen.mouse_mode().reports());
 
         hover_at(&mut core, 10, 0, input::Mods::NONE);
-        assert!(!core.hovering_link(), "the program owns the pointer");
+        assert!(
+            core.hovered_link().is_none(),
+            "the program owns the pointer"
+        );
         click_mods(&mut core, true, 10, 0, input::Mods::CTRL);
         click_mods(&mut core, false, 10, 0, input::Mods::CTRL);
         assert!(
@@ -3120,7 +3179,11 @@ mod tests {
 
         // Shift frees the gesture: the link underlines, and Ctrl+Shift+click opens it.
         hover_at(&mut core, 10, 0, input::Mods::SHIFT);
-        assert!(core.hovering_link(), "Shift takes the pointer back");
+        assert_eq!(
+            core.hovered_link(),
+            Some(Verdict::Open),
+            "Shift takes the pointer back"
+        );
         click_mods(
             &mut core,
             true,
@@ -3175,7 +3238,7 @@ mod tests {
             "the drag is still reported"
         );
         assert!(
-            !core.hovering_link(),
+            core.hovered_link().is_none(),
             "the link under it is not the terminal's"
         );
         assert!(core.drag.is_none());
@@ -3186,6 +3249,45 @@ mod tests {
         assert!(
             primary_offer(&mut core).is_none(),
             "which offers no selection"
+        );
+    }
+
+    #[test]
+    fn a_resize_drops_the_hover_until_the_pointer_moves() {
+        // The grid reflows under a parked pointer, and the cell the pointer is over may
+        // move too, so the old hover would underline cells that now hold other text.
+        let mut core = core_showing("see https://example.com/a here");
+        hover_at(&mut core, 10, 0, input::Mods::NONE);
+        assert_eq!(core.hovered_link(), Some(Verdict::Open));
+        core.resize(geom(10, 24, 10 * 8, 24 * 16));
+        assert_eq!(core.hovered_link(), None);
+        hover_at(&mut core, 5, 0, input::Mods::NONE);
+        assert_eq!(
+            core.hovered_link(),
+            Some(Verdict::Open),
+            "the next move finds it"
+        );
+    }
+
+    #[test]
+    fn snapping_to_the_live_bottom_re_probes_the_hover() {
+        let mut text = String::from("https://example.com/old\r\n");
+        for _ in 0..30 {
+            text.push_str("plain\r\n");
+        }
+        let mut core = core_showing(&text);
+        core.screen.scroll_view_to_top();
+        hover_at(&mut core, 5, 0, input::Mods::NONE);
+        assert_eq!(
+            core.hovered_link(),
+            Some(Verdict::Open),
+            "the old URL in history"
+        );
+        core.paste(b"x".to_vec()).unwrap();
+        assert_eq!(
+            core.hovered_link(),
+            None,
+            "the live screen has plain text there"
         );
     }
 
@@ -3243,17 +3345,18 @@ mod tests {
         // underline must follow the text, not stay where the pointer happens to be.
         let mut core = core_showing("https://example.com/a\r\n");
         hover_at(&mut core, 5, 1, input::Mods::NONE);
-        assert!(!core.hovering_link(), "row 1 is blank");
+        assert!(core.hovered_link().is_none(), "row 1 is blank");
         // Print a link onto row 1, where the pointer already rests.
         let mut parser = Parser::new();
         parser.advance_bytes(&mut core.screen, b"https://example.com/b");
         core.after_output();
-        assert!(
-            core.hovering_link(),
+        assert_eq!(
+            core.hovered_link(),
+            Some(Verdict::Open),
             "the freshly printed link is under the pointer"
         );
         assert_eq!(
-            core.hover,
+            core.hover.map(|h| h.span),
             Some(CellSpan {
                 start: (1, 0),
                 end: (1, 20)
