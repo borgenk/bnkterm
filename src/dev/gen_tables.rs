@@ -1,5 +1,5 @@
-//! `--gen-tables`: regenerate the Unicode property tables that `width.rs` and
-//! `grapheme.rs` binary-search, from the UCD data files vendored in `ucd/`.
+//! `--gen-tables`: regenerate the Unicode property tables that `width.rs`,
+//! `grapheme.rs` and `link.rs` binary-search, from the UCD data files vendored in `ucd/`.
 //!
 //! ```text
 //!   ucd/EastAsianWidth.txt          ─┐
@@ -7,6 +7,7 @@
 //!   ucd/GraphemeBreakProperty.txt   ─┐
 //!   ucd/emoji-data.txt              ─┼─▶ src/platform/grapheme_tables.rs
 //!   ucd/DerivedCoreProperties.txt   ─┘   (GCB, EXTENDED_PICTOGRAPHIC, INCB)
+//!   ucd/DerivedGeneralCategory.txt  ───▶ src/platform/link_tables.rs (PUNCTUATION)
 //! ```
 //!
 //! The inputs are vendored and version-pinned, so a regeneration is a pure offline
@@ -23,6 +24,7 @@ use std::fmt::Write as _;
 
 const WIDTH_TABLES: &str = "src/width_tables.rs";
 const GRAPHEME_TABLES: &str = "src/platform/grapheme_tables.rs";
+const LINK_TABLES: &str = "src/platform/link_tables.rs";
 
 /// The Hangul conjoining jamo, forced zero-width so a decomposed syllable composes
 /// into one cell (a `Lo`, not a mark, so not caught by the category scan).
@@ -38,7 +40,9 @@ pub fn run(_args: &[String]) -> Result<()> {
         .map_err(|e| Error::msg(format!("write {WIDTH_TABLES}: {e}")))?;
     std::fs::write(GRAPHEME_TABLES, gen_grapheme(&version)?)
         .map_err(|e| Error::msg(format!("write {GRAPHEME_TABLES}: {e}")))?;
-    println!("wrote {WIDTH_TABLES} and {GRAPHEME_TABLES} from Unicode {version}");
+    std::fs::write(LINK_TABLES, gen_link(&version)?)
+        .map_err(|e| Error::msg(format!("write {LINK_TABLES}: {e}")))?;
+    println!("wrote {WIDTH_TABLES}, {GRAPHEME_TABLES} and {LINK_TABLES} from Unicode {version}");
     Ok(())
 }
 
@@ -310,6 +314,34 @@ fn gen_grapheme(version: &str) -> Result<String> {
         "/// Every Indic_Conjunct_Break range; the rest is `None`. For rule GB9c."
     );
     emit_tagged(&mut out, "INCB_RANGES", "Incb", &incb);
+    Ok(out)
+}
+
+/// The non-ASCII punctuation a bare URL treats as prose, by General_Category: brackets
+/// and quotation marks (`Ps`, `Pe`, `Pi`, `Pf`) end a URL, and other punctuation (`Po`)
+/// may not end one. ASCII is classified by hand in `link.rs`, so it is left out.
+fn gen_link(version: &str) -> Result<String> {
+    let dgc = read(&ucd("DerivedGeneralCategory.txt"))?;
+    let mut ranges = Vec::new();
+    for (lo, hi, f) in dgc.lines().filter_map(ucd_fields) {
+        let tag = match f.first().copied() {
+            Some("Ps" | "Pe" | "Pi" | "Pf") => "Punct::Fence",
+            Some("Po") => "Punct::Prose",
+            _ => continue,
+        };
+        let lo = lo.max(0x80);
+        if lo <= hi {
+            ranges.push((lo, hi, tag));
+        }
+    }
+
+    let mut out = String::new();
+    header(&mut out, version, &["ucd/DerivedGeneralCategory.txt"]);
+    let _ = writeln!(
+        out,
+        "/// Every non-ASCII punctuation range, tagged with what it does to a bare URL."
+    );
+    emit_tagged(&mut out, "PUNCTUATION", "Punct", &merge_tagged(ranges));
     Ok(out)
 }
 

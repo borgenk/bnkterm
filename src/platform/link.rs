@@ -30,7 +30,10 @@
 //!   legal inside a URL yet is also how prose punctuates, so it may not *end* one.
 //!   `last_safe` gets this for free: soft characters never advance it, so a run of
 //!   them at the end is simply never reached. `example.com/a.b` keeps its dot;
-//!   `see example.com/a.` gives it back to the sentence.
+//!   `see example.com/a.` gives it back to the sentence. Punctuation from other
+//!   scripts follows the same split by its Unicode category: brackets and quotation
+//!   marks (`「」`, `（）`, `“”`, `«»`) are hard, and the rest (`。`, `、`, `…`, `·`)
+//!   is soft, so `ジョン・レノン` keeps its dot and `example.jp/a。` drops its stop.
 //! - **Balanced brackets.** A closing bracket belongs to the URL only when the URL
 //!   opened it, which is why `last_safe` advances only at nesting depth zero: while
 //!   a bracket is open the link cannot end, and an unmatched closer ends it at once.
@@ -44,6 +47,7 @@
 //!
 //! [uts58]: https://www.unicode.org/reports/tr58/
 
+use std::cmp::Ordering;
 use std::ops::Range;
 
 use crate::platform::browser;
@@ -188,15 +192,49 @@ fn classify(c: char) -> Class {
         // of quoting a link — `<http://x>`, `"http://x"` — come out clean with no
         // special case for them.
         c if c.is_ascii() => Class::Hard,
-        // Non-ASCII: an IRI may carry it (an accented Wikipedia title), and it is
-        // never prose punctuation we would have to guess about.
-        _ => Class::Url,
+        // Non-ASCII punctuation is the prose around a link in another script, and is
+        // split the way the ASCII above is.
+        c => match punctuation(c) {
+            Some(Punct::Fence) => Class::Hard,
+            Some(Punct::Prose) => Class::Soft,
+            // Anything else an IRI may carry: an accented title, an en dash.
+            None => Class::Url,
+        },
     }
 }
 
+/// What a non-ASCII punctuation mark does to a URL, by its General_Category.
+#[derive(Clone, Copy)]
+enum Punct {
+    /// `Ps`, `Pe`, `Pi`, `Pf`: a bracket or quotation mark, which ends a URL. A URL
+    /// opens no bracket outside ASCII, so none can be its own to close.
+    Fence,
+    /// `Po`: sentence and clause punctuation, which may not end a URL.
+    Prose,
+}
+
+/// The [`Punct`] of `c`, or `None` when it is not non-ASCII punctuation.
+fn punctuation(c: char) -> Option<Punct> {
+    let u = u32::from(c);
+    let at = PUNCTUATION
+        .binary_search_by(|&(lo, hi, _)| {
+            if u < lo {
+                Ordering::Greater
+            } else if u > hi {
+                Ordering::Less
+            } else {
+                Ordering::Equal
+            }
+        })
+        .ok()?;
+    PUNCTUATION.get(at).map(|&(_, _, punct)| punct)
+}
+
+include!("link_tables.rs");
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::link::*;
 
     /// The URL covering the first byte of `needle` in `text`, as [`find_at`] sees it.
     /// Panics when `needle` is absent, so a typo in a case reads as a test bug.
@@ -268,6 +306,71 @@ mod tests {
             at_needle("https://example.com/a...", "https"),
             Some("https://example.com/a".into())
         );
+    }
+
+    #[test]
+    fn closing_punctuation_from_any_script_is_left_to_the_prose() {
+        for (text, url) in [
+            ("see https://example.com/a” next", "https://example.com/a"),
+            ("«https://example.fr/a» ok", "https://example.fr/a"),
+            ("「https://example.jp/a」を参照", "https://example.jp/a"),
+            ("（https://example.jp/a）", "https://example.jp/a"),
+            ("https://example.jp/a（注）", "https://example.jp/a"),
+            ("詳細: https://example.jp/a。", "https://example.jp/a"),
+            ("https://example.com/a…", "https://example.com/a"),
+            ("انظر https://example.com/a؟", "https://example.com/a"),
+            ("देखें https://example.in/a।", "https://example.in/a"),
+        ] {
+            assert_eq!(at_needle(text, "https").as_deref(), Some(url), "{text}");
+        }
+    }
+
+    #[test]
+    fn punctuation_from_another_script_inside_a_url_is_kept() {
+        for url in [
+            "https://ja.wikipedia.org/wiki/ジョン・レノン",
+            "https://ca.wikipedia.org/wiki/Paral·lel",
+            "https://en.wikipedia.org/wiki/Spanish–American_War",
+        ] {
+            let text = format!("{url} ok");
+            assert_eq!(at_needle(&text, "https").as_deref(), Some(url));
+        }
+    }
+
+    #[test]
+    fn every_non_ascii_punctuation_mark_is_classified_by_its_category() {
+        // The committed table against the vendored data, so a Unicode bump without
+        // `make tables` cannot leave it stale.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/ucd/DerivedGeneralCategory.txt"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut checked = 0;
+        for line in text.lines() {
+            let data = line.split('#').next().unwrap().trim();
+            let Some((range, category)) = data.split_once(';') else {
+                continue;
+            };
+            let hex = |s: &str| u32::from_str_radix(s.trim(), 16).unwrap();
+            let (lo, hi) = match range.split_once("..") {
+                Some((lo, hi)) => (hex(lo), hex(hi)),
+                None => (hex(range), hex(range)),
+            };
+            for c in (lo..=hi)
+                .filter_map(char::from_u32)
+                .filter(|c| !c.is_ascii())
+            {
+                let class = classify(c);
+                match category.trim() {
+                    "Ps" | "Pe" | "Pi" | "Pf" => assert!(matches!(class, Class::Hard), "{c:?}"),
+                    "Po" => assert!(matches!(class, Class::Soft), "{c:?}"),
+                    _ => continue,
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 500, "only {checked} marks checked");
     }
 
     #[test]
