@@ -314,9 +314,10 @@ mod tests {
             return;
         };
         let text = String::from_utf8(out.stdout).unwrap();
+        // GNU ls ends the sequence with BEL or with ST, depending on its version.
         let uri = text
             .strip_prefix("\x1b]8;;")
-            .and_then(|rest| rest.split_once('\x1b'))
+            .and_then(|rest| rest.split_once(['\x07', '\x1b']))
             .map(|(uri, _)| uri)
             .unwrap();
         assert!(uri.starts_with("file://"), "{uri}");
