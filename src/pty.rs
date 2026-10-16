@@ -124,8 +124,8 @@ pub enum TtyMode {
 }
 
 /// A spawned child on the far side of a pseudoterminal, owning the master fd and
-/// the child's pid. Dropping it closes the master (which sends the child SIGHUP)
-/// and reaps the child if it has exited.
+/// the child's pid. Dropping it closes the master, which sends the child SIGHUP;
+/// reaping it is the owner's job, through [`Pty::into_zombie`].
 pub struct Pty {
     master: OwnedFd,
     pid: i32,
@@ -390,28 +390,10 @@ impl Pty {
         );
     }
 
-    /// Reap the child if it has exited, returning its exit status, else `None`
-    /// (still running). Non-blocking.
-    pub fn reap(&self) -> Option<c_int> {
-        let mut status: c_int = 0;
-        // SAFETY: status is a live local; WNOHANG makes this non-blocking.
-        let r = unsafe { waitpid(self.pid, &mut status, WNOHANG) };
-        (r == self.pid).then_some(status)
-    }
-
     /// Close the master (hanging up the child's terminal session) and retain only
     /// the pid for later nonblocking reaping.
     pub fn into_zombie(self) -> ZombieChild {
-        // `Pty` implements Drop, so its fields cannot be moved out directly. Keep
-        // the allocation inert, explicitly drop the master exactly once, and copy
-        // the plain pid into the lightweight handoff object.
-        let mut this = std::mem::ManuallyDrop::new(self);
-        let pid = this.pid;
-        drop(this.exited.take());
-        // SAFETY: `ManuallyDrop` suppresses `Pty::drop`; `master` is initialized
-        // and is dropped exactly here. The other fields are Copy or already taken.
-        unsafe { std::ptr::drop_in_place(&mut this.master) };
-        ZombieChild { pid }
+        ZombieChild { pid: self.pid }
     }
 }
 
@@ -459,24 +441,6 @@ fn resolve_program(program: &str) -> String {
         .map(|dir| dir.join(program))
         .find(|candidate| candidate.is_file())
         .map_or_else(|| program.to_string(), |p| p.to_string_lossy().into_owned())
-}
-
-impl Drop for Pty {
-    fn drop(&mut self) {
-        // The comment that used to sit here described the opposite of what runs. `reap`
-        // is called *before* the `OwnedFd` closes, so the hangup that would make the
-        // child exitable has not happened yet, and a nonblocking `waitpid` can only
-        // succeed for a child that had already exited on its own.
-        //
-        // Left as it is rather than reordered, because the honest fix is not to close and
-        // then spin: a `waitpid` that actually waited would block app teardown on a shell
-        // that ignores `SIGHUP`. This path is only reachable at teardown — closing a tab
-        // goes through [`Pty::into_zombie`], which hands the pid to the reaper that does
-        // poll it — and at teardown the process is exiting, so `init` inherits whatever
-        // is left. So: an opportunistic reap of a child that has already gone, and the
-        // fd close below is what tells the rest.
-        let _ = self.reap();
-    }
 }
 
 /// A reusable set of file descriptors waited on with `poll(2)`.

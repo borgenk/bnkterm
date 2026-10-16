@@ -121,7 +121,8 @@ fn capture(cols: usize, rows: usize, command: &[&str]) -> Result<Capture> {
             ReadOutcome::Eof => break,
         }
     }
-    // `pty` drops here: it closes the master and reaps the (already-exited) child.
+    // `pty` drops here and closes the master. The child is not reaped: this process
+    // exits right after the capture is written.
     Ok(Capture { bytes: out, chunks })
 }
 
