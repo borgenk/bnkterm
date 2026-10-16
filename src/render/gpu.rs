@@ -641,16 +641,17 @@ impl Batcher<'_> {
         }
     }
 
-    /// Emit one axis-aligned quad (two triangles), with uv running from
-    /// `[u0, v0]` at the top-left to `[u1, v1]` at the bottom-right (`uv` is
-    /// `[u0, v0, u1, v1]`). The atlases and fills pass texel coordinates (uv
-    /// advancing 1:1 with pixels).
-    fn quad_uv(&mut self, rect: Rect, mode: u32, color: u32, uv: [f32; 4], extra: [f32; 4]) {
+    /// Emit one axis-aligned quad (two triangles) with texel UVs: `uv0` is the
+    /// coordinate at the quad's top-left and uv advances 1:1 with pixels. Fills,
+    /// glyphs, emoji and rounded corners all go through here.
+    fn quad(&mut self, rect: Rect, mode: u32, color: u32, uv0: [f32; 2], extra: [f32; 4]) {
         if rect.w <= 0 || rect.h <= 0 {
             return;
         }
         let (x0, y0) = (rect.x as f32, rect.y as f32);
         let (x1, y1) = ((rect.x + rect.w) as f32, (rect.y + rect.h) as f32);
+        let [u0, v0] = uv0;
+        let (u1, v1) = (u0 + rect.w as f32, v0 + rect.h as f32);
         let c = color_f32(color);
         let v = |x: f32, y: f32, u: f32, vv: f32| Vertex {
             pos: [x, y],
@@ -659,7 +660,6 @@ impl Batcher<'_> {
             extra,
             mode,
         };
-        let [u0, v0, u1, v1] = uv;
         self.vertices.extend_from_slice(&[
             v(x0, y0, u0, v0),
             v(x1, y0, u1, v0),
@@ -669,19 +669,6 @@ impl Batcher<'_> {
             v(x0, y1, u0, v1),
         ]);
         self.extend_batch(6);
-    }
-
-    /// Emit one axis-aligned quad with texel UVs: `uv0` is the coordinate at the
-    /// quad's top-left and uv advances 1:1 with pixels. The atlas-bound path (no
-    /// per-image texture), for fills, glyphs, emoji, and rounded corners.
-    fn quad(&mut self, rect: Rect, mode: u32, color: u32, uv0: [f32; 2], extra: [f32; 4]) {
-        let uv = [
-            uv0[0],
-            uv0[1],
-            uv0[0] + rect.w as f32,
-            uv0[1] + rect.h as f32,
-        ];
-        self.quad_uv(rect, mode, color, uv, extra);
     }
 
     /// Append `count` vertices to the frame's single batch (every quad binds the

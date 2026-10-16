@@ -304,11 +304,6 @@ impl Params {
         }
     }
 
-    /// Each parameter in order, as a slice of its sub-parameters.
-    pub fn iter(&self) -> impl Iterator<Item = &[u16]> {
-        (0..self.num).filter_map(|i| self.get(i))
-    }
-
     fn clear(&mut self) {
         self.num = 0;
         self.total = 0;
@@ -1106,7 +1101,7 @@ mod tests {
         }
         fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], private: u8, action: u8) {
             self.actions.push(Action::Csi {
-                params: params.iter().map(|p| p.to_vec()).collect(),
+                params: param_lists(params),
                 intermediates: intermediates.to_vec(),
                 private,
                 action,
@@ -1124,12 +1119,20 @@ mod tests {
         }
         fn dcs_dispatch(&mut self, params: &Params, intermediates: &[u8], action: u8, data: &[u8]) {
             self.actions.push(Action::Dcs {
-                params: params.iter().map(|p| p.to_vec()).collect(),
+                params: param_lists(params),
                 intermediates: intermediates.to_vec(),
                 action,
                 data: data.to_vec(),
             });
         }
+    }
+
+    /// Each parameter in order, as its list of sub-parameters.
+    fn param_lists(params: &Params) -> Vec<Vec<u16>> {
+        (0..params.len())
+            .filter_map(|i| params.get(i))
+            .map(<[u16]>::to_vec)
+            .collect()
     }
 
     fn run(bytes: &[u8]) -> Vec<Action> {
