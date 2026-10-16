@@ -1,64 +1,6 @@
-//! `getrusage(2)` for CPU time, `/proc/self/smaps_rollup` for resident, swapped and
-//! referenced bytes. Linux-only; std already links libc, so the symbols resolve without
-//! a `#[link]`.
+//! `/proc/self/smaps_rollup` for resident and swapped bytes. Linux-only.
 //!
 //! The rollup is a page-table walk. Sample it outside timed regions.
-
-use core::ffi::{c_int, c_long};
-use std::time::Duration;
-
-/// `getrusage` target: this process (self), not its children.
-const RUSAGE_SELF: c_int = 0;
-
-#[repr(C)]
-struct Timeval {
-    tv_sec: c_long,
-    tv_usec: c_long,
-}
-
-/// `struct rusage`, Linux x86_64/arm64 ABI: two timevals then sixteen longs. Only
-/// the times are read; the rest is padding kept so the struct has the size the
-/// kernel writes.
-#[repr(C)]
-#[allow(dead_code)]
-struct Rusage {
-    ru_utime: Timeval,
-    ru_stime: Timeval,
-    ru_maxrss: c_long,
-    rest: [c_long; 15],
-}
-
-extern "C" {
-    fn getrusage(who: c_int, usage: *mut Rusage) -> c_int;
-}
-
-fn rusage() -> Option<Rusage> {
-    // SAFETY: `getrusage` fills a fully owned, correctly sized `Rusage`; a zeroed
-    // start is valid for every field. A nonzero return means it wrote nothing.
-    let mut u = std::mem::MaybeUninit::<Rusage>::zeroed();
-    let rc = unsafe { getrusage(RUSAGE_SELF, u.as_mut_ptr()) };
-    if rc != 0 {
-        return None;
-    }
-    Some(unsafe { u.assume_init() })
-}
-
-/// Total CPU time (user + system) this process has consumed so far. Take a delta
-/// across a workload for its CPU cost; monotonic, so a delta is always >= 0.
-pub fn cpu_time() -> Duration {
-    match rusage() {
-        Some(u) => dur(&u.ru_utime) + dur(&u.ru_stime),
-        None => Duration::ZERO,
-    }
-}
-
-fn dur(t: &Timeval) -> Duration {
-    // tv_usec is microseconds in [0, 1e6); *1000 stays under a second in nanos.
-    Duration::new(
-        t.tv_sec.max(0) as u64,
-        (t.tv_usec.max(0) as u32).wrapping_mul(1000),
-    )
-}
 
 /// Where this process's pages are right now, in bytes, summed across every mapping
 /// by `/proc/self/smaps_rollup`. Unlike a lifetime high-water mark this falls when
@@ -74,11 +16,6 @@ pub struct Memory {
     pub rss: u64,
     /// Pushed out to swap and still owned.
     pub swap: u64,
-    /// Pages the kernel has seen touched since the reference bits were last
-    /// cleared. The one field that reports an *advice* rather than an outcome:
-    /// `MADV_COLD` clears the referenced bits of the range it covers, so advice is
-    /// measurable here before any memory pressure exists to act on it.
-    pub referenced: u64,
 }
 
 /// Read [`Memory`] for this process. All zeroes when `/proc` is unreadable, which
@@ -90,7 +27,7 @@ pub fn memory() -> Memory {
     }
 }
 
-/// Pull the three fields out of a rollup. Every line past the header is
+/// Pull the two fields out of a rollup. Every line past the header is
 /// `Name:<whitespace><n> kB`, so the name is what precedes the first colon; the
 /// header line's own colons sit inside its device number and match nothing.
 fn parse_smaps_rollup(text: &str) -> Memory {
@@ -104,7 +41,6 @@ fn parse_smaps_rollup(text: &str) -> Memory {
         let field = match name {
             "Rss" => &mut m.rss,
             "Swap" => &mut m.swap,
-            "Referenced" => &mut m.referenced,
             _ => continue,
         };
         *field = parse_kb(value);
@@ -127,7 +63,7 @@ mod tests {
     use super::*;
 
     /// A verbatim rollup from the development kernel (7.1.5), kept whole rather
-    /// than trimmed to the three interesting lines: the near-miss names
+    /// than trimmed to the two interesting lines: the near-miss names
     /// (`Pss_Shmem`, `SwapPss`) are the entire reason the match is exact, and a
     /// fixture without them could not catch a prefix match sneaking back in.
     const ROLLUP: &str = "\
@@ -157,10 +93,9 @@ Locked:                0 kB
 ";
 
     #[test]
-    fn rollup_reports_the_three_fields_in_bytes() {
+    fn rollup_reports_the_two_fields_in_bytes() {
         let m = parse_smaps_rollup(ROLLUP);
         assert_eq!(m.rss, 5892 * 1024);
-        assert_eq!(m.referenced, 5892 * 1024);
         // Not SwapPss's 12, which is the prefix an inexact match would take.
         assert_eq!(m.swap, 44 * 1024);
     }
@@ -178,9 +113,8 @@ Locked:                0 kB
 
     #[test]
     fn the_live_process_is_resident_somewhere() {
-        // The one check that the path and the format are still real on this kernel;
-        // a running process always has resident pages, and Referenced is a superset
-        // of nothing but always reported beside it.
+        // The one check that the path and the format are still real on this kernel:
+        // a running process always has resident pages.
         let m = memory();
         assert!(m.rss > 0, "smaps_rollup reported no resident memory");
     }

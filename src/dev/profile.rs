@@ -11,12 +11,11 @@
 //! ```
 
 use crate::error::{Error, Result};
+use crate::gather::BUF_CAP;
 use crate::vt::{Params, Parser, Perform};
 use crate::width::width;
 use std::fmt;
 use std::path::{Path, PathBuf};
-
-const NORMALIZED_CHUNK: usize = 64 * 1024;
 
 struct Recording {
     name: &'static str,
@@ -95,10 +94,7 @@ pub fn load_recording(
     }
     let (chunks, delivery) = match sidecar {
         Some(source) => (repeat_chunks(&source, bytes.len()), "recorded"),
-        None => (
-            fixed_chunk_lengths(bytes.len(), NORMALIZED_CHUNK),
-            "normalized-64k",
-        ),
+        None => (fixed_chunk_lengths(bytes.len()), "normalized-64k"),
     };
     Ok(Some(LabRecording {
         bytes,
@@ -109,18 +105,33 @@ pub fn load_recording(
     }))
 }
 
-/// Fixed parser-call lengths spanning `bytes`.
-pub fn fixed_chunk_lengths(bytes: usize, chunk: usize) -> Vec<usize> {
-    if chunk == 0 {
-        return vec![bytes];
-    }
-    let full = bytes / chunk;
-    let tail = bytes % chunk;
-    let mut lengths = vec![chunk; full];
+/// Parser-call lengths spanning `bytes` at the live read size, [`BUF_CAP`].
+pub fn fixed_chunk_lengths(bytes: usize) -> Vec<usize> {
+    let mut lengths = vec![BUF_CAP; bytes / BUF_CAP];
+    let tail = bytes % BUF_CAP;
     if tail > 0 {
         lengths.push(tail);
     }
     lengths
+}
+
+/// Hand `bytes` to `deliver` at the parser-call boundaries `lengths` describes,
+/// skipping empty calls. Lengths that fall short cannot drop data: the remaining
+/// suffix is delivered as one final call.
+pub fn for_each_chunk(bytes: &[u8], lengths: &[usize], mut deliver: impl FnMut(&[u8])) {
+    let mut rest = bytes;
+    for &length in lengths {
+        let Some((chunk, tail)) = rest.split_at_checked(length.min(rest.len())) else {
+            break;
+        };
+        if !chunk.is_empty() {
+            deliver(chunk);
+        }
+        rest = tail;
+    }
+    if !rest.is_empty() {
+        deliver(rest);
+    }
 }
 
 fn read_chunks(path: &Path, expected_bytes: usize) -> Result<Option<Vec<usize>>> {
@@ -152,7 +163,7 @@ fn read_chunks(path: &Path, expected_bytes: usize) -> Result<Option<Vec<usize>>>
 
 fn repeat_chunks(source: &[usize], target: usize) -> Vec<usize> {
     if source.is_empty() {
-        return fixed_chunk_lengths(target, NORMALIZED_CHUNK);
+        return fixed_chunk_lengths(target);
     }
     let mut chunks = Vec::new();
     let mut total = 0usize;
@@ -192,28 +203,11 @@ impl StreamProfile {
     pub fn analyze(bytes: &[u8], chunks: &[usize]) -> Self {
         let mut parser = Parser::new();
         let mut observer = Observer::default();
-        let mut offset = 0usize;
         let mut delivered = Vec::new();
-
-        for &length in chunks {
-            if offset >= bytes.len() {
-                break;
-            }
-            let end = offset.saturating_add(length).min(bytes.len());
-            if let Some(chunk) = bytes.get(offset..end) {
-                if !chunk.is_empty() {
-                    parser.advance_bytes(&mut observer, chunk);
-                    delivered.push(chunk.len());
-                }
-            }
-            offset = end;
-        }
-        if let Some(tail) = bytes.get(offset..) {
-            if !tail.is_empty() {
-                parser.advance_bytes(&mut observer, tail);
-                delivered.push(tail.len());
-            }
-        }
+        for_each_chunk(bytes, chunks, |chunk| {
+            parser.advance_bytes(&mut observer, chunk);
+            delivered.push(chunk.len());
+        });
         parser.finish(&mut observer);
         observer.finish_run();
 

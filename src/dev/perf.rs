@@ -45,6 +45,7 @@
 
 use crate::dev::{alloc, profile, stream, sys};
 use crate::error::{Error, Result};
+use crate::gather::BUF_CAP;
 use crate::grid::{LinkId, LinkProbe, Screen};
 use crate::platform::geom::Scale;
 use crate::platform::scroll::Scrollbar;
@@ -96,12 +97,6 @@ const LAB_MAX_MIB: usize = 512;
 /// Timed reps per `--cat-bench` run; the min is the least-noisy estimate, the median
 /// the typical.
 const CAT_REPS: usize = 10;
-
-/// The chunk `--cat-bench` feeds the parser in. It matches `app.rs`'s live PTY read
-/// (`PTY_READ_CHUNK`, 64 KiB) so the parser sees the same chunk boundaries a real
-/// shell produces. The parser carries UTF-8 and escape state across calls, so
-/// where a boundary falls never changes the resulting grid, only the realism.
-const CAT_READ_CHUNK: usize = 64 * 1024;
 
 /// One measured gate scenario: its best per-op time and, when measured, the
 /// allocations one op costs (0 with the counting allocator absent).
@@ -1076,7 +1071,7 @@ fn load_footprints(path: &str) -> Result<Option<HashMap<String, u64>>> {
 // ---------------------------------------------------------------------------
 
 /// Throughput over `FILE`: warm the parser, then time [`CAT_REPS`] passes of
-/// decode -> parse -> grid (fed in [`CAT_READ_CHUNK`] slices, as a live PTY delivers),
+/// decode -> parse -> grid (fed in [`BUF_CAP`] slices, as a live PTY delivers),
 /// reporting min and median wall time and MB/s with rendering excluded. The file is
 /// read once, outside the timed loop, so the number is parse and grid, not disk IO.
 pub fn cat_bench(args: &[String]) -> Result<()> {
@@ -1124,10 +1119,12 @@ pub fn cat_bench(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Feed `bytes` to the parser in [`CAT_READ_CHUNK`] slices, exactly as the live PTY
-/// drain does, so cross-chunk parser state stays on the measured path.
+/// Feed `bytes` to the parser in [`BUF_CAP`] slices, exactly as the live PTY
+/// drain does, so cross-chunk parser state stays on the measured path. The parser
+/// carries UTF-8 and escape state across calls, so where a boundary falls never
+/// changes the resulting grid, only the realism.
 fn feed_in_chunks(parser: &mut Parser, screen: &mut Screen, bytes: &[u8]) {
-    for chunk in bytes.chunks(CAT_READ_CHUNK) {
+    for chunk in bytes.chunks(BUF_CAP) {
         parser.advance_bytes(screen, chunk);
     }
 }
@@ -1730,11 +1727,11 @@ impl Perform for GridActions {
 fn measure_parser_stage(input: &LabInput) -> u64 {
     let mut parser = Parser::new();
     let mut counter = ParseCounter::default();
-    feed_performer_at_boundaries(&mut parser, &mut counter, &input.bytes, &input.chunks);
+    feed_lab_input(&mut parser, &mut counter, input);
     let mut best = u64::MAX;
     for _ in 0..LAB_REPS {
         let start = Instant::now();
-        feed_performer_at_boundaries(&mut parser, &mut counter, &input.bytes, &input.chunks);
+        feed_lab_input(&mut parser, &mut counter, input);
         black_box((counter.scalars, counter.actions));
         best = best.min(duration_ns(start.elapsed()));
     }
@@ -1744,7 +1741,7 @@ fn measure_parser_stage(input: &LabInput) -> u64 {
 fn measure_grid_stage(input: &LabInput) -> (u64, usize) {
     let mut parser = Parser::new();
     let mut decoded = GridActions::with_capacity(input.bytes.len());
-    feed_performer_at_boundaries(&mut parser, &mut decoded, &input.bytes, &input.chunks);
+    feed_lab_input(&mut parser, &mut decoded, input);
     if decoded.non_text_actions > 0 {
         return (0, decoded.non_text_actions);
     }
@@ -1763,11 +1760,11 @@ fn measure_grid_stage(input: &LabInput) -> (u64, usize) {
 fn measure_full_stage(input: &LabInput) -> u64 {
     let mut parser = Parser::new();
     let mut screen = Screen::new(input.cols, input.rows);
-    feed_at_boundaries(&mut parser, &mut screen, &input.bytes, &input.chunks);
+    feed_lab_input(&mut parser, &mut screen, input);
     let mut best = u64::MAX;
     for _ in 0..LAB_REPS {
         let start = Instant::now();
-        feed_at_boundaries(&mut parser, &mut screen, &input.bytes, &input.chunks);
+        feed_lab_input(&mut parser, &mut screen, input);
         black_box(&screen);
         best = best.min(duration_ns(start.elapsed()));
     }
@@ -1855,16 +1852,16 @@ pub fn run_lab(args: &[String]) -> Result<()> {
         }
         let mut screen = Screen::new(input.cols, input.rows);
         let mut parser = Parser::new();
-        feed_at_boundaries(&mut parser, &mut screen, &input.bytes, &input.chunks); // warm
+        feed_lab_input(&mut parser, &mut screen, &input); // warm
 
         alloc::reset();
-        feed_at_boundaries(&mut parser, &mut screen, &input.bytes, &input.chunks);
+        feed_lab_input(&mut parser, &mut screen, &input);
         let allocs = alloc::snapshot().allocs;
 
         let mut best = u64::MAX;
         for _ in 0..LAB_REPS {
             let start = Instant::now();
-            feed_at_boundaries(&mut parser, &mut screen, &input.bytes, &input.chunks);
+            feed_lab_input(&mut parser, &mut screen, &input);
             black_box(&screen);
             best = best.min(start.elapsed().as_nanos() as u64);
         }
@@ -1929,7 +1926,7 @@ fn load_lab_input(
     requested_delivery: profile::Delivery,
 ) -> Result<LabInput> {
     if let Some(bytes) = stream::generate(name, target) {
-        let chunks = profile::fixed_chunk_lengths(bytes.len(), CAT_READ_CHUNK);
+        let chunks = profile::fixed_chunk_lengths(bytes.len());
         return Ok(LabInput {
             bytes,
             chunks,
@@ -1962,34 +1959,11 @@ fn parse_delivery(args: &[String]) -> Result<profile::Delivery> {
     }
 }
 
-/// Feed one corpus at explicit parser-call boundaries. Missing lengths cannot
-/// drop data: any remaining suffix is delivered as one final call.
-fn feed_at_boundaries(parser: &mut Parser, screen: &mut Screen, bytes: &[u8], chunks: &[usize]) {
-    feed_performer_at_boundaries(parser, screen, bytes, chunks);
-}
-
-fn feed_performer_at_boundaries<P: Perform>(
-    parser: &mut Parser,
-    performer: &mut P,
-    bytes: &[u8],
-    chunks: &[usize],
-) {
-    let mut offset = 0usize;
-    for &length in chunks {
-        if offset >= bytes.len() {
-            break;
-        }
-        let end = offset.saturating_add(length).min(bytes.len());
-        if let Some(chunk) = bytes.get(offset..end) {
-            parser.advance_bytes(performer, chunk);
-        }
-        offset = end;
-    }
-    if let Some(tail) = bytes.get(offset..) {
-        if !tail.is_empty() {
-            parser.advance_bytes(performer, tail);
-        }
-    }
+/// Feed `input` to `performer` at its recorded parser-call boundaries.
+fn feed_lab_input<P: Perform>(parser: &mut Parser, performer: &mut P, input: &LabInput) {
+    profile::for_each_chunk(&input.bytes, &input.chunks, |chunk| {
+        parser.advance_bytes(performer, chunk);
+    });
 }
 
 /// The `--size N` argument (MiB), if present and parseable.
@@ -2130,11 +2104,11 @@ mod tests {
 
     #[test]
     fn cat_bench_streams_a_multi_chunk_file() {
-        // Larger than one CAT_READ_CHUNK so the chunk loop iterates and the parser
+        // Larger than one BUF_CAP so the chunk loop iterates and the parser
         // resumes across boundaries; mixed ASCII / UTF-8 / escape so every arm of
         // the parser is exercised. Success means all reps ran without error.
         let mut bytes = Vec::new();
-        while bytes.len() < CAT_READ_CHUNK * 2 + 123 {
+        while bytes.len() < BUF_CAP * 2 + 123 {
             bytes.extend_from_slice("héllo \x1b[31mworld\x1b[0m 日本語\n".as_bytes());
         }
         let f = TempFile::write("multi", &bytes);

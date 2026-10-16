@@ -67,8 +67,8 @@ use core::ffi::{c_int, c_ulong, c_void};
 use crate::error::{Error, Result};
 use crate::platform::ffi;
 
-/// Capacity of each pool buffer, matching bnkterm's live PTY read chunk so the
-/// parser sees the same batch boundaries a real shell produces.
+/// Capacity of each pool buffer, and so the most one parser call receives from a live
+/// PTY. The dev harnesses feed at this size to see the boundaries a real shell produces.
 pub const BUF_CAP: usize = 64 * 1024;
 
 /// Default pool depth: 64 × 64 KiB = 4 MiB of runway. The Stage 0 probe showed

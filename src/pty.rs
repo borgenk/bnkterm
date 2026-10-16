@@ -183,7 +183,7 @@ impl Pty {
         // the fd before the flag is set.
         // SAFETY: posix_openpt with O_RDWR|O_NOCTTY|O_CLOEXEC returns a fresh master
         // fd or -1; we take ownership of a valid fd or map the error.
-        let master_raw = unsafe { posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC) };
+        let master_raw = unsafe { posix_openpt(O_RDWR | O_NOCTTY | ffi::O_CLOEXEC) };
         if master_raw < 0 {
             return Err(errno_error("posix_openpt"));
         }
@@ -499,7 +499,7 @@ impl PollSet {
             // exclusively borrowed for the duration of the call.
             let r = unsafe { ffi::poll(self.fds.as_mut_ptr(), self.fds.len() as c_ulong, millis) };
             if r < 0 {
-                if ffi::errno() == EINTR {
+                if ffi::errno() == ffi::EINTR {
                     continue;
                 }
                 return Err(errno_error("poll"));
@@ -524,13 +524,13 @@ impl Default for PollSet {
 }
 
 // ---------------------------------------------------------------------------
-// FFI. The generic fd calls (read, write, poll, errno) are `platform::ffi`'s.
+// FFI. The generic fd calls (read, write, poll, ioctl, errno) and their shared
+// constants are `platform::ffi`'s.
 // ---------------------------------------------------------------------------
 
 // open(2) / posix_openpt(3) flags (Linux generic ABI).
 const O_RDWR: c_int = 0o2;
 const O_NOCTTY: c_int = 0o400;
-const O_CLOEXEC: c_int = 0o2000000;
 // tty ioctls (Linux).
 const TIOCSCTTY: c_ulong = 0x540E;
 const TIOCSWINSZ: c_ulong = 0x5414;
@@ -557,9 +557,8 @@ const ICANON: u32 = 0o2;
 const ECHO: u32 = 0o10;
 // waitpid options.
 const WNOHANG: c_int = 1;
-// The errno the PTY branches on itself; the fd layer owns poll's events and the
-// read/write errnos.
-const EINTR: c_int = 4;
+// The errno the PTY branches on itself; the fd layer owns EINTR, poll's events and
+// the read/write errnos.
 const ECHILD: c_int = 10;
 
 /// `struct winsize` (`sys/ioctl.h`): the cell dimensions a `TIOCSWINSZ` carries.
@@ -618,7 +617,6 @@ extern "C" {
     /// `flags` carries `O_CREAT` or `O_TMPFILE`. Declaring the two-argument form
     /// would be a different ABI than the `open` the C library exports.
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
-    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     #[cfg(test)]
     fn pipe(pipefd: *mut c_int) -> c_int;
@@ -704,7 +702,7 @@ fn set_winsize(master: RawFd, cols: usize, rows: usize) -> Result<()> {
     };
     // SAFETY: TIOCSWINSZ reads a `struct winsize` through the pointer; ws is a
     // live, correctly-typed local for the duration of the call.
-    if unsafe { ioctl(master, TIOCSWINSZ, &ws as *const Winsize) } < 0 {
+    if unsafe { ffi::ioctl(master, TIOCSWINSZ, &ws as *const Winsize) } < 0 {
         return Err(errno_error("ioctl(TIOCSWINSZ)"));
     }
     Ok(())
@@ -766,7 +764,7 @@ unsafe fn fork_child_in_pty(
     // controlling terminal, so job control does not work, `Ctrl+C` reaches nothing, and
     // no error is ever printed. Failing to `_exit(127)` here is the difference between a
     // tab that visibly refuses to open and one that opens subtly broken.
-    if claim_tty && ioctl(slave, TIOCSCTTY, 0 as c_ulong) < 0 {
+    if claim_tty && ffi::ioctl(slave, TIOCSCTTY, 0 as c_ulong) < 0 {
         _exit(127);
     }
     for fd in [0, 1, 2] {

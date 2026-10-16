@@ -42,8 +42,8 @@ const MSG_CMSG_CLOEXEC: c_int = 0x4000_0000;
 /// all the ancillary data, so some passed fds were dropped.
 const MSG_CTRUNC: c_int = 0x8;
 
-/// Open the pipe with both ends close-on-exec.
-const O_CLOEXEC: c_int = 0x8_0000;
+/// Close the fd across `exec`, set atomically at creation (`pipe2`, `posix_openpt`).
+pub(crate) const O_CLOEXEC: c_int = 0x8_0000;
 
 pub(crate) const EINTR: c_int = 4;
 /// A timed-out or would-block read (EAGAIN == EWOULDBLOCK on Linux).
@@ -175,7 +175,7 @@ extern "C" {
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlclose(handle: *mut c_void) -> c_int;
-    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    pub(crate) fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     fn syscall(number: c_long, ...) -> c_long;
 }
 
