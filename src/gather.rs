@@ -544,7 +544,7 @@ extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CString;
+    use crate::pty::Pty;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
@@ -696,97 +696,14 @@ mod tests {
 
     // -- Real-PTY integration ----------------------------------------------
 
-    const O_RDWR: c_int = 0o2;
-    const O_NOCTTY: c_int = 0o400;
-    const TIOCSCTTY: c_ulong = 0x540E;
-
-    extern "C" {
-        fn posix_openpt(flags: c_int) -> c_int;
-        fn grantpt(fd: c_int) -> c_int;
-        fn unlockpt(fd: c_int) -> c_int;
-        fn ptsname_r(fd: c_int, buf: *mut core::ffi::c_char, buflen: usize) -> c_int;
-        fn fork() -> c_int;
-        fn setsid() -> c_int;
-        fn execvp(file: *const core::ffi::c_char, argv: *const *const core::ffi::c_char) -> c_int;
-        fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
-        fn open(path: *const core::ffi::c_char, flags: c_int, ...) -> c_int;
-        fn close(fd: c_int) -> c_int;
-        fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
-        fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
-        fn _exit(code: c_int) -> !;
-    }
-
-    /// A spawned PTY child, closing the master and reaping on drop. `None` when
-    /// fork/exec is unavailable (a locked-down sandbox), so tests can skip cleanly.
-    struct PtyChild {
-        master: c_int,
-        pid: c_int,
-    }
-
-    impl Drop for PtyChild {
-        fn drop(&mut self) {
-            unsafe {
-                close(self.master);
-                let mut status = 0;
-                waitpid(self.pid, &mut status, 0);
-            }
-        }
-    }
-
-    /// Fork `argv` on a fresh nonblocking cooked PTY (OPOST/ONLCR untouched).
-    fn spawn_on_pty(argv: &[&str]) -> Option<PtyChild> {
-        unsafe {
-            let master = posix_openpt(O_RDWR | O_NOCTTY);
-            if master < 0 {
-                return None;
-            }
-            if grantpt(master) != 0 || unlockpt(master) != 0 {
-                close(master);
-                return None;
-            }
-            let mut namebuf = [0u8; 128];
-            if ptsname_r(
-                master,
-                namebuf.as_mut_ptr() as *mut core::ffi::c_char,
-                namebuf.len(),
-            ) != 0
-            {
-                close(master);
-                return None;
-            }
-            if ffi::set_nonblocking(master).is_err() {
-                close(master);
-                return None;
-            }
-
-            let cargv: Vec<CString> = argv.iter().map(|a| CString::new(*a).unwrap()).collect();
-            let mut ptrs: Vec<*const core::ffi::c_char> =
-                cargv.iter().map(|c| c.as_ptr()).collect();
-            ptrs.push(core::ptr::null());
-
-            let pid = fork();
-            if pid < 0 {
-                close(master);
-                return None;
-            }
-            if pid == 0 {
-                setsid();
-                let slave = open(namebuf.as_ptr() as *const core::ffi::c_char, O_RDWR);
-                if slave < 0 {
-                    _exit(127);
-                }
-                ioctl(slave, TIOCSCTTY, 0 as c_ulong);
-                dup2(slave, 0);
-                dup2(slave, 1);
-                dup2(slave, 2);
-                if slave > 2 {
-                    close(slave);
-                }
-                close(master);
-                execvp(ptrs[0], ptrs.as_ptr());
-                _exit(127);
-            }
-            Some(PtyChild { master, pid })
+    /// Hang up `pty` and wait for its child to go. Closing the master SIGHUPs the
+    /// child, a session leader, so even `sleep 30` exits at once.
+    fn hang_up_and_reap(pty: Pty) {
+        let child = pty.into_zombie();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !child.try_reap() {
+            assert!(Instant::now() < deadline, "the child outlived its hangup");
+            thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -875,12 +792,12 @@ mod tests {
     #[test]
     fn gather_delivers_exact_stream_over_many_turnovers() {
         let (path, data) = temp_payload("turnovers", 3 * 1024 * 1024);
-        let Some(child) = spawn_on_pty(&["/bin/cat", path.to_str().unwrap()]) else {
+        let Ok(pty) = Pty::spawn_command(80, 24, &["/bin/cat", path.to_str().unwrap()]) else {
             eprintln!("pty unavailable; skipping");
             let _ = std::fs::remove_file(&path);
             return;
         };
-        let g = Gatherer::start(child.master, None).unwrap();
+        let g = Gatherer::start(pty.fd(), None).unwrap();
         let (want_hash, want_len) = expected_fnv(&data);
         let hash = AtomicU64::new(0xcbf29ce484222325u64);
         let got = AtomicU64::new(0);
@@ -895,6 +812,8 @@ mod tests {
         assert_eq!(end, GatherEnd::Eof);
         assert_eq!(got.load(Ordering::Relaxed), want_len, "byte count");
         assert_eq!(hash.load(Ordering::Relaxed), want_hash, "stream checksum");
+        drop(g);
+        hang_up_and_reap(pty);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -902,11 +821,11 @@ mod tests {
     #[test]
     fn gather_publishes_final_partial_then_eof() {
         let (path, data) = temp_payload("small", 200);
-        let Some(child) = spawn_on_pty(&["/bin/cat", path.to_str().unwrap()]) else {
+        let Ok(pty) = Pty::spawn_command(80, 24, &["/bin/cat", path.to_str().unwrap()]) else {
             let _ = std::fs::remove_file(&path);
             return;
         };
-        let g = Gatherer::start(child.master, None).unwrap();
+        let g = Gatherer::start(pty.fd(), None).unwrap();
         let (want_hash, want_len) = expected_fnv(&data);
         let hash = AtomicU64::new(0xcbf29ce484222325u64);
         let got = AtomicU64::new(0);
@@ -921,6 +840,8 @@ mod tests {
         assert_eq!(end, GatherEnd::Eof);
         assert_eq!(got.load(Ordering::Relaxed), want_len);
         assert_eq!(hash.load(Ordering::Relaxed), want_hash);
+        drop(g);
+        hang_up_and_reap(pty);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -929,11 +850,11 @@ mod tests {
     #[test]
     fn pool_exhaustion_and_recovery() {
         let (path, data) = temp_payload("exhaust", 1024 * 1024);
-        let Some(child) = spawn_on_pty(&["/bin/cat", path.to_str().unwrap()]) else {
+        let Ok(pty) = Pty::spawn_command(80, 24, &["/bin/cat", path.to_str().unwrap()]) else {
             let _ = std::fs::remove_file(&path);
             return;
         };
-        let g = Gatherer::start_with_pool(child.master, None, 2).unwrap();
+        let g = Gatherer::start_with_pool(pty.fd(), None, 2).unwrap();
         let (want_hash, want_len) = expected_fnv(&data);
         let hash = AtomicU64::new(0xcbf29ce484222325u64);
         let got = AtomicU64::new(0);
@@ -954,6 +875,8 @@ mod tests {
         assert_eq!(end, GatherEnd::Eof);
         assert_eq!(got.load(Ordering::Relaxed), want_len);
         assert_eq!(hash.load(Ordering::Relaxed), want_hash);
+        drop(g);
+        hang_up_and_reap(pty);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -962,11 +885,11 @@ mod tests {
     #[test]
     fn consumer_stall_longer_than_runway() {
         let (path, data) = temp_payload("stall", 2 * 1024 * 1024);
-        let Some(child) = spawn_on_pty(&["/bin/cat", path.to_str().unwrap()]) else {
+        let Ok(pty) = Pty::spawn_command(80, 24, &["/bin/cat", path.to_str().unwrap()]) else {
             let _ = std::fs::remove_file(&path);
             return;
         };
-        let g = Gatherer::start_with_pool(child.master, None, 4).unwrap();
+        let g = Gatherer::start_with_pool(pty.fd(), None, 4).unwrap();
         let (want_hash, want_len) = expected_fnv(&data);
         let hash = AtomicU64::new(0xcbf29ce484222325u64);
         let got = AtomicU64::new(0);
@@ -986,6 +909,8 @@ mod tests {
         assert_eq!(end, GatherEnd::Eof);
         assert_eq!(got.load(Ordering::Relaxed), want_len);
         assert_eq!(hash.load(Ordering::Relaxed), want_hash);
+        drop(g);
+        hang_up_and_reap(pty);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -998,10 +923,10 @@ mod tests {
     #[test]
     fn stop_while_polling() {
         // `sleep` produces nothing, so the gather thread parks in poll.
-        let Some(child) = spawn_on_pty(&["/bin/sleep", "30"]) else {
+        let Ok(pty) = Pty::spawn_command(80, 24, &["/bin/sleep", "30"]) else {
             return;
         };
-        let g = Gatherer::start(child.master, None).unwrap();
+        let g = Gatherer::start(pty.fd(), None).unwrap();
         thread::sleep(Duration::from_millis(30)); // ensure it is parked in poll
         let start = Instant::now();
         drop(g); // must wake via the stop eventfd and join
@@ -1009,6 +934,7 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "join hung on shutdown"
         );
+        hang_up_and_reap(pty);
     }
 
     /// Stop while the gather thread is blocked waiting for a free buffer: a tiny
@@ -1017,11 +943,11 @@ mod tests {
     #[test]
     fn stop_while_waiting_for_free() {
         let (path, _data) = temp_payload("waitfree", 4 * 1024 * 1024);
-        let Some(child) = spawn_on_pty(&["/bin/cat", path.to_str().unwrap()]) else {
+        let Ok(pty) = Pty::spawn_command(80, 24, &["/bin/cat", path.to_str().unwrap()]) else {
             let _ = std::fs::remove_file(&path);
             return;
         };
-        let g = Gatherer::start_with_pool(child.master, None, 1).unwrap();
+        let g = Gatherer::start_with_pool(pty.fd(), None, 1).unwrap();
         // Never call next_batch: the one buffer fills, publishes, and the thread
         // blocks in take_free waiting for the free queue.
         thread::sleep(Duration::from_millis(50));
@@ -1031,6 +957,7 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "join hung waiting for free"
         );
+        hang_up_and_reap(pty);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1039,11 +966,11 @@ mod tests {
     #[test]
     fn child_exit_while_buffers_queued() {
         let (path, data) = temp_payload("queued", 512 * 1024);
-        let Some(child) = spawn_on_pty(&["/bin/cat", path.to_str().unwrap()]) else {
+        let Ok(pty) = Pty::spawn_command(80, 24, &["/bin/cat", path.to_str().unwrap()]) else {
             let _ = std::fs::remove_file(&path);
             return;
         };
-        let g = Gatherer::start(child.master, None).unwrap();
+        let g = Gatherer::start(pty.fd(), None).unwrap();
         // Let the child finish and exit before we start draining, so batches and
         // the EOF marker are all queued when we begin.
         thread::sleep(Duration::from_millis(100));
@@ -1061,6 +988,8 @@ mod tests {
         assert_eq!(end, GatherEnd::Eof);
         assert_eq!(got.load(Ordering::Relaxed), want_len);
         assert_eq!(hash.load(Ordering::Relaxed), want_hash);
+        drop(g);
+        hang_up_and_reap(pty);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1091,11 +1020,11 @@ mod tests {
     #[test]
     fn no_steady_state_buffer_allocation() {
         let (path, _data) = temp_payload("noalloc", 1024 * 1024);
-        let Some(child) = spawn_on_pty(&["/bin/cat", path.to_str().unwrap()]) else {
+        let Ok(pty) = Pty::spawn_command(80, 24, &["/bin/cat", path.to_str().unwrap()]) else {
             let _ = std::fs::remove_file(&path);
             return;
         };
-        let g = Gatherer::start_with_pool(child.master, None, 8).unwrap();
+        let g = Gatherer::start_with_pool(pty.fd(), None, 8).unwrap();
         let original: std::collections::HashSet<*const u8> = {
             let inner = g.pool.lock();
             inner.free.iter().map(|b| b.as_ptr()).collect()
@@ -1126,6 +1055,8 @@ mod tests {
             assert!(start.elapsed() < deadline, "no-alloc drain hung");
         };
         assert_eq!(end, GatherEnd::Eof);
+        drop(g);
+        hang_up_and_reap(pty);
         let _ = std::fs::remove_file(&path);
     }
 }
