@@ -7,6 +7,24 @@ use crate::render::vulkan::abi::*;
 /// The atlas set's bindings: the glyph atlas at 0, the emoji atlas at 1.
 const ATLAS_BINDINGS: u32 = 2;
 
+/// Which of the two font atlases a sync/upload targets. The glyph atlas is a
+/// single-channel coverage mask; the emoji atlas is full-colour, so they differ
+/// only in their texture format (and which `Renderer` slot holds them).
+#[derive(Clone, Copy)]
+pub(super) enum AtlasSlot {
+    Glyph,
+    Emoji,
+}
+
+impl AtlasSlot {
+    pub(super) fn format(self) -> u32 {
+        match self {
+            AtlasSlot::Glyph => VK_FORMAT_R8_UNORM,
+            AtlasSlot::Emoji => VK_FORMAT_B8G8R8A8_UNORM,
+        }
+    }
+}
+
 /// One sampled atlas texture: its image, backing memory and view.
 pub(super) struct Texture {
     pub(super) image: VkImage,
@@ -94,6 +112,15 @@ pub(super) fn destroy_texture(fns: &DeviceFns, device: VkDevice, t: Texture) {
 }
 
 impl Renderer {
+    /// The texture slot for `slot`'s atlas, tagged with the generation of the CPU
+    /// mirror it was created for.
+    pub(super) fn atlas_mut(&mut self, slot: AtlasSlot) -> &mut Option<(Texture, u32)> {
+        match slot {
+            AtlasSlot::Glyph => &mut self.glyph_tex,
+            AtlasSlot::Emoji => &mut self.emoji_tex,
+        }
+    }
+
     /// Destroy everything this renderer owns, in reverse creation order.
     /// Zeroed handles (a partial build) are skipped. The caller drained the
     /// queue.

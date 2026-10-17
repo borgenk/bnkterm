@@ -5,31 +5,13 @@ use crate::platform::error::{Error, Result};
 use crate::render::gpu::{AtlasInfo, AtlasUpload, FrameData};
 use crate::render::vulkan::abi::*;
 use crate::render::vulkan::renderer::{
-    color_range, destroy_texture, write_image_set, HostBuffer, Texture,
+    color_range, destroy_texture, write_image_set, AtlasSlot, HostBuffer, Texture,
 };
 use crate::render::vulkan::{pick_memory_type, Gpu};
 
 // ---------------------------------------------------------------------------
 // Render targets.
 // ---------------------------------------------------------------------------
-
-/// Which of the two font atlases a sync/upload targets. The glyph atlas is a
-/// single-channel coverage mask; the emoji atlas is full-colour, so they differ
-/// only in their texture format (and which `Renderer` slot holds them).
-#[derive(Clone, Copy)]
-enum AtlasSlot {
-    Glyph,
-    Emoji,
-}
-
-impl AtlasSlot {
-    fn format(self) -> u32 {
-        match self {
-            AtlasSlot::Glyph => VK_FORMAT_R8_UNORM,
-            AtlasSlot::Emoji => VK_FORMAT_B8G8R8A8_UNORM,
-        }
-    }
-}
 
 /// One presentable render target: a device-local image whose memory is
 /// exported as the dmabuf behind a `wl_buffer`, plus the per-image submission
@@ -1243,10 +1225,7 @@ impl Gpu {
         info: &AtlasInfo,
         uploads: &mut Vec<PendingUpload>,
     ) -> Result<bool> {
-        let tex = match slot {
-            AtlasSlot::Glyph => &mut self.renderer.glyph_tex,
-            AtlasSlot::Emoji => &mut self.renderer.emoji_tex,
-        };
+        let tex = self.renderer.atlas_mut(slot);
         if tex.as_ref().is_some_and(|(_, g)| *g == info.generation) {
             return Ok(false);
         }
@@ -1264,10 +1243,7 @@ impl Gpu {
             w: 0,
             h: 0,
         });
-        match slot {
-            AtlasSlot::Glyph => self.renderer.glyph_tex = Some((tex, info.generation)),
-            AtlasSlot::Emoji => self.renderer.emoji_tex = Some((tex, info.generation)),
-        }
+        *self.renderer.atlas_mut(slot) = Some((tex, info.generation));
         Ok(true)
     }
 
@@ -1275,7 +1251,7 @@ impl Gpu {
     /// the bytes to `staging`. A no-op when the frame carried no change for that
     /// slot.
     fn stage_atlas_upload(
-        &self,
+        &mut self,
         slot: AtlasSlot,
         upload: &Option<AtlasUpload>,
         staging: &mut Vec<u8>,
@@ -1284,11 +1260,7 @@ impl Gpu {
         let Some(up) = upload else {
             return;
         };
-        let tex = match slot {
-            AtlasSlot::Glyph => self.renderer.glyph_tex.as_ref(),
-            AtlasSlot::Emoji => self.renderer.emoji_tex.as_ref(),
-        };
-        if let Some((tex, _)) = tex {
+        if let Some((tex, _)) = self.renderer.atlas_mut(slot) {
             uploads.push(PendingUpload {
                 image: tex.image,
                 was_initialized: true,

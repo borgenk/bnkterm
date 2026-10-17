@@ -102,19 +102,6 @@ impl EmojiFont {
         })
     }
 
-    /// Run `f` over the color glyph for `cluster` at `target` pixels, rasterizing
-    /// it (shape, decode strikes, composite, resample) on the spot. `None` means
-    /// the font cannot form this cluster. The GPU batcher caches the atlas
-    /// placement, so it calls this only on the first sight of a cluster.
-    pub(crate) fn with_glyph<R>(
-        &self,
-        cluster: &str,
-        target: u32,
-        f: impl FnOnce(&ColorGlyph) -> R,
-    ) -> Option<R> {
-        Some(f(&self.raster(cluster, target)?))
-    }
-
     /// Record that the GPU batcher served a color cluster from its atlas cache.
     /// Pure instrumentation.
     pub(crate) fn record_hit(&self) {
@@ -151,16 +138,18 @@ impl EmojiFont {
         target as f32 / self.strike
     }
 
-    /// Rasterize `cluster` at `target` pixels: decode each shaped glyph's color
-    /// strike, composite them along the pen into one strike-sized image, then
-    /// resample once to the target size. Emoji clusters almost always shape to
-    /// a single glyph, so the composite loop usually runs once.
+    /// Rasterize `cluster` at `target` pixels, or `None` when the font cannot form
+    /// it: decode each shaped glyph's color strike, composite them along the pen
+    /// into one strike-sized image, then resample once to the target size. Emoji
+    /// clusters almost always shape to a single glyph, so the composite loop usually
+    /// runs once. The GPU batcher caches the atlas placement, so it asks only on the
+    /// first sight of a cluster.
     ///
     /// The pipeline stays *premultiplied* (as FreeType decodes it) through
     /// compositing and resampling, and un-premultiplies only the final
     /// display-size pixels. Filtering straight alpha would mix the black of
     /// transparent texels into edge colors and fringe the glyph outline dark.
-    fn raster(&self, cluster: &str, target: u32) -> Option<ColorGlyph> {
+    pub(crate) fn raster(&self, cluster: &str, target: u32) -> Option<ColorGlyph> {
         let shaped = self.shaped(cluster)?;
         let scale = self.scale(target);
         let (placed, pen) = self.place_strikes(&shaped);
@@ -383,25 +372,24 @@ mod tests {
     #[test]
     fn emoji_font_rasters_a_smiley() {
         let font = emoji();
-        let (width, rows, has_ink, advance) = font
-            .with_glyph("😀", 32, |g| {
-                let ink = g.argb.iter().any(|&p| p >> 24 != 0);
-                (g.width, g.rows, ink, g.advance)
-            })
-            .expect("the smiley should raster");
-        assert!(width > 0 && rows > 0, "the smiley has pixels");
-        assert!(has_ink, "the smiley has visible ink");
+        let g = font.raster("😀", 32).expect("the smiley should raster");
+        assert!(g.width > 0 && g.rows > 0, "the smiley has pixels");
         assert!(
-            rows <= 40,
-            "scaled to the 32px em square, not the strike ({rows} rows)"
+            g.argb.iter().any(|&p| p >> 24 != 0),
+            "the smiley has visible ink"
         );
-        assert!(advance > 0.0);
+        assert!(
+            g.rows <= 40,
+            "scaled to the 32px em square, not the strike ({} rows)",
+            g.rows
+        );
+        assert!(g.advance > 0.0);
     }
 
     #[test]
     fn zwj_and_flag_clusters_ligate_to_one_glyph() {
         let font = emoji();
-        let advance = |cluster| font.with_glyph(cluster, 32, |g| g.advance);
+        let advance = |cluster| font.raster(cluster, 32).map(|g| g.advance);
         let single = advance("👨").expect("the man emoji shapes");
         let family = advance("👨\u{200d}👩\u{200d}👧").expect("the family should ligate");
         assert!(
@@ -418,10 +406,10 @@ mod tests {
     #[test]
     fn cluster_stats_count_reported_hits_and_misses() {
         let font = emoji();
-        // with_glyph rasterizes on demand (the GPU atlas holds the result); the
-        // hit and miss tallies are reported by the batcher, and both roll up
-        // through cache_stats.
-        font.with_glyph("🎉", 32, |_| ()).expect("party popper");
+        // raster works on demand (the GPU atlas holds the result); the hit and
+        // miss tallies are reported by the batcher, and both roll up through
+        // cache_stats.
+        font.raster("🎉", 32).expect("party popper");
         font.record_miss();
         font.record_hit();
         let stats = font.cache_stats();
@@ -434,6 +422,6 @@ mod tests {
         // A letter with a combining mark is no emoji ligature; the emoji font
         // has no glyphs for it and must say so rather than render garbage.
         // (Routing filters this out anyway; the font still answers safely.)
-        assert!(font.with_glyph("e\u{301}", 32, |_| ()).is_none());
+        assert!(font.raster("e\u{301}", 32).is_none());
     }
 }

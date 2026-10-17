@@ -650,10 +650,8 @@ impl Face {
     }
 
     /// Rasterize a character at the current pixel size, copying the coverage
-    /// out. A load failure or glyphless character yields an empty glyph. The
-    /// render path goes through [`Face::with_cluster_glyph`](Self::with_cluster_glyph), which
-    /// caches the result;
-    /// this is the uncached primitive behind it.
+    /// out. A load failure or glyphless character yields an empty glyph. Nothing is
+    /// cached here; the GPU batcher keeps the packed result per `(FaceKey, char)`.
     pub fn rasterize(&self, ch: char) -> Glyph {
         // SAFETY: face is valid; FT_Load_Char renders into the face's shared
         // glyph slot. No reference into that slot is held across this call.
@@ -726,27 +724,21 @@ impl Face {
         unsafe { slot.as_ref().advance.x as f32 / 64.0 }
     }
 
-    /// Run `f` over the color glyph for an emoji cluster rasterized at `target`
-    /// pixels, or return `None` when the cluster renders through the ordinary
-    /// per-character path (not an emoji, no emoji font installed, or the emoji
-    /// font cannot form it). `None` tells the caller to draw the cluster's
-    /// characters instead.
+    /// The color glyph for an emoji cluster rasterized at `target` pixels, or `None`
+    /// when the cluster renders through the ordinary per-character path (not an
+    /// emoji, no emoji font installed, or the emoji font cannot form it). `None`
+    /// tells the caller to draw the cluster's characters instead.
     ///
     /// The caller passes `target` because the fit differs by path: a wide
     /// cluster (two grid cells) is drawn at the em (its natural ~square size
     /// filling both cells), but a single-width emoji is scaled down to one cell
     /// so it does not spill into the next column.
-    pub fn with_cluster_glyph<R>(
-        &self,
-        cluster: &str,
-        target: u32,
-        f: impl FnOnce(&ColorGlyph) -> R,
-    ) -> Option<R> {
+    pub fn cluster_glyph(&self, cluster: &str, target: u32) -> Option<ColorGlyph> {
         let emoji = self.emoji.as_ref()?;
         if !wants_emoji(cluster, |c| self.has_scalar(c)) {
             return None;
         }
-        emoji.with_glyph(cluster, target, f)
+        emoji.raster(cluster, target)
     }
 
     /// Whether this face's character map has a real glyph for `ch` (a missing
@@ -783,34 +775,6 @@ impl Face {
         (ppem > 0).then(|| f32::from(ppem))
     }
 
-    /// Ascent and descent at the current pixel size, in pixels. Descent is
-    /// negative, matching FreeType.
-    pub fn line_metrics(&self) -> (f32, f32) {
-        // SAFETY: face is valid; face->size is non-null once a size is set,
-        // which open_default always does. The metrics are copied out.
-        let size = unsafe { (*self.face.as_ptr()).size };
-        let Some(size) = NonNull::new(size) else {
-            return (0.0, 0.0);
-        };
-        let metrics = unsafe { &size.as_ref().metrics };
-        (
-            metrics.ascender as f32 / 64.0,
-            metrics.descender as f32 / 64.0,
-        )
-    }
-
-    /// The recommended baseline-to-baseline distance at the current pixel size,
-    /// in pixels: FreeType's line height, which includes any line gap the font
-    /// asks for. Zero if no size is set.
-    pub fn line_height(&self) -> f32 {
-        // SAFETY: face is valid; face->size is non-null once a size is set.
-        let size = unsafe { (*self.face.as_ptr()).size };
-        let Some(size) = NonNull::new(size) else {
-            return 0.0;
-        };
-        unsafe { size.as_ref().metrics.height as f32 / 64.0 }
-    }
-
     /// Render-ready [`Metrics`] at the current pixel size: ascent and descent
     /// rounded up to whole pixels, and the baseline-to-baseline line height,
     /// held to at least the ink height so stacked lines never overlap.
@@ -823,10 +787,16 @@ impl Face {
     /// The baseline seats the descent on the line box's bottom edge, which puts
     /// the font's line gap above the ascent where it belongs; see [`Metrics`].
     pub fn metrics(&self) -> Metrics {
-        let (ascent, descent) = self.line_metrics();
-        let ascent = ascent.ceil() as i32;
-        let descent = (-descent).ceil() as i32;
-        let line_height = (self.line_height().ceil() as i32).max(ascent + descent);
+        // SAFETY: face is valid; face->size is non-null once a size is set. The three
+        // 26.6 values are copied out, and read as zero when no size is set.
+        let size = NonNull::new(unsafe { (*self.face.as_ptr()).size });
+        let (ascender, descender, height) = size.map_or((0, 0, 0), |size| {
+            let m = unsafe { &size.as_ref().metrics };
+            (m.ascender, m.descender, m.height)
+        });
+        let ascent = (ascender as f32 / 64.0).ceil() as i32;
+        let descent = (-(descender as f32 / 64.0)).ceil() as i32;
+        let line_height = ((height as f32 / 64.0).ceil() as i32).max(ascent + descent);
         Metrics {
             ascent,
             descent,
@@ -1580,11 +1550,11 @@ mod tests {
     }
 
     #[test]
-    fn line_metrics_have_expected_signs() {
-        let face = open();
-        let (ascent, descent) = face.line_metrics();
-        assert!(ascent > 0.0);
-        assert!(descent < 0.0);
+    fn metrics_read_the_descender_as_a_positive_depth() {
+        let m = open().metrics();
+        assert!(m.ascent > 0);
+        // FreeType's descender is negative; the line box measures it downward.
+        assert!(m.descent > 0);
     }
 
     #[test]
@@ -1723,12 +1693,12 @@ mod tests {
             style: FontStyle::Regular,
         });
         assert!(
-            face.with_cluster_glyph("😀", 32, |g| g.advance)
-                .is_some_and(|advance| advance > 0.0),
+            face.cluster_glyph("😀", 32)
+                .is_some_and(|g| g.advance > 0.0),
             "a smiley routes to the emoji path"
         );
         assert!(
-            face.with_cluster_glyph("a", 32, |_| ()).is_none(),
+            face.cluster_glyph("a", 32).is_none(),
             "ASCII never routes to the emoji path"
         );
     }
