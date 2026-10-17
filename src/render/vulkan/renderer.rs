@@ -4,6 +4,9 @@ use crate::platform::error::{Error, Result};
 use crate::render::gpu::Vertex;
 use crate::render::vulkan::abi::*;
 
+/// The atlas set's bindings: the glyph atlas at 0, the emoji atlas at 1.
+const ATLAS_BINDINGS: u32 = 2;
+
 /// One sampled atlas texture: its image, backing memory and view.
 pub(super) struct Texture {
     pub(super) image: VkImage,
@@ -227,8 +230,8 @@ pub(super) fn allocate_set(
 }
 
 /// Build the frame renderer: the render pass, descriptor layouts, pipeline
-/// (from the committed SPIR-V), sampler, and descriptor pool with the two
-/// standing sets. On error, everything built so far is destroyed.
+/// (from the committed SPIR-V), sampler, and the descriptor pool with its one
+/// atlas set. On error, everything built so far is destroyed.
 pub(super) fn create_renderer(fns: &DeviceFns, device: VkDevice) -> Result<Renderer> {
     let mut r = Renderer::default();
     match fill_renderer(&mut r, fns, device) {
@@ -291,11 +294,11 @@ fn fill_renderer(r: &mut Renderer, fns: &DeviceFns, device: VkDevice) -> Result<
         "vkCreateRenderPass",
     )?;
 
-    // Descriptor layout: set 0 the two atlases (the image set is excised).
+    // Descriptor layout: set 0 holds the two atlases.
     sampler_set_layout(
         fns,
         device,
-        2,
+        ATLAS_BINDINGS,
         "vkCreateDescriptorSetLayout (atlas)",
         &mut r.set_layout_atlas,
     )?;
@@ -393,16 +396,17 @@ fn fill_renderer(r: &mut Renderer, fns: &DeviceFns, device: VkDevice) -> Result<
         "vkCreateSampler",
     )?;
 
-    // The descriptor pool and the two standing sets.
+    // The descriptor pool holds exactly the atlas set, which lives as long as the
+    // renderer and is never freed on its own.
     let pool_size = VkDescriptorPoolSize {
         descriptor_type: VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        descriptor_count: DESCRIPTOR_MAX_SETS * 2,
+        descriptor_count: ATLAS_BINDINGS,
     };
     let pool_info = VkDescriptorPoolCreateInfo {
         s_type: VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         p_next: core::ptr::null(),
-        flags: VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-        max_sets: DESCRIPTOR_MAX_SETS,
+        flags: 0,
+        max_sets: 1,
         pool_size_count: 1,
         p_pool_sizes: &pool_size,
     };

@@ -182,10 +182,6 @@ pub(super) const VK_FILTER_LINEAR: u32 = 1;
 pub(super) const VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE: u32 = 2;
 pub(super) const VK_VERTEX_INPUT_RATE_VERTEX: u32 = 0;
 pub(super) const VK_SUBPASS_CONTENTS_INLINE: u32 = 0;
-pub(super) const VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT: u32 = 0x1;
-/// Room for the atlas set, the dummy set, and a generous number of distinct
-/// visible images; a notes document with more is out of scope.
-pub(super) const DESCRIPTOR_MAX_SETS: u32 = 256;
 
 pub(super) const VK_IMAGE_ASPECT_COLOR_BIT: u32 = 0x1;
 /// The dmabuf plane aspect for layout queries under modifier tiling.
