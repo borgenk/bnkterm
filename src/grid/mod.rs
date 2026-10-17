@@ -979,7 +979,7 @@ impl RowRemap {
             return None;
         }
         let off = base + col;
-        let (start, end) = (self.line_first[line], self.line_first[line + 1]);
+        let (start, end) = (*self.line_first.get(line)?, *self.line_first.get(line + 1)?);
         // A line's rows carry contiguous offset ranges, so the last row whose start is not
         // past `off` is the one holding it; an offset beyond the content clamps to the last.
         let mut chosen = start;

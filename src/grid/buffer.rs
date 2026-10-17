@@ -1076,9 +1076,8 @@ impl Buffer {
             let line = line_first.len();
             let start = idx;
             let mut len = 0;
-            loop {
+            while let Some(row) = old_rows.get(idx) {
                 old.push((line, len));
-                let row = &old_rows[idx];
                 len += row.cells.len();
                 // A soft-wrapped row whose continuation begins with a wide glyph left its last
                 // column blank because the pair could not fit there (the printer's last-column
@@ -1087,12 +1086,12 @@ impl Buffer {
                 if wrap_padding_at(&old_rows, idx) {
                     len -= 1;
                 }
-                let wrapped = row.wrapped;
                 idx += 1;
                 // Close on a hard newline, or when the run reaches the cap (a forced seam). A
                 // trailing wrapped run with no terminator cannot arise (the bottom live row is
-                // never wrapped past the screen), but close any remainder rather than lose it.
-                if !wrapped || len >= MAX_LOGICAL_COLS || idx >= old_rows.len() {
+                // never wrapped past the screen), but the end of the stream closes any
+                // remainder rather than lose it.
+                if !row.wrapped || len >= MAX_LOGICAL_COLS {
                     break;
                 }
             }
@@ -1102,27 +1101,26 @@ impl Buffer {
             // at both widths: keep the row and adjust only its width. Trimming and re-laying
             // it out would pad the same text back into the same single row, so the cells
             // never need to move, and this is the shape of nearly every scrollback row.
-            if idx == start + 1
-                && !old_rows[start].wrapped
-                && old_rows[start].is_blank_from(new_cols)
-            {
-                let empty = old_rows[start].is_blank_from(0);
-                let mut row = std::mem::replace(&mut old_rows[start], Row::empty());
-                row.resize_cols(new_cols);
-                new_start.push(0);
-                new_stream.push(row);
-                empty_tail = if empty { empty_tail + 1 } else { 0 };
-                continue;
+            if let Some([row]) = old_rows.get_mut(start..idx) {
+                if !row.wrapped && row.is_blank_from(new_cols) {
+                    let empty = row.is_blank_from(0);
+                    let mut row = std::mem::replace(row, Row::empty());
+                    row.resize_cols(new_cols);
+                    new_start.push(0);
+                    new_stream.push(row);
+                    empty_tail = if empty { empty_tail + 1 } else { 0 };
+                    continue;
+                }
             }
 
             // Unwrap the run into the reused buffer: one flat cell sequence with the marks
             // re-keyed from per-row columns to the logical column.
             logical.cells.clear();
             logical.combining.clear();
-            for i in start..idx {
+            for (i, row) in old_rows.iter().enumerate().take(idx).skip(start) {
                 let base = logical.cells.len();
-                logical.cells.extend_from_slice(&old_rows[i].cells);
-                for m in &old_rows[i].combining {
+                logical.cells.extend_from_slice(&row.cells);
+                for m in &row.combining {
                     logical.combining.push(CombiningMark {
                         col: base + m.col,
                         ch: m.ch,
@@ -1158,7 +1156,7 @@ impl Buffer {
                 // Never split a wide glyph from its spacer at the wrap: if a leader would be
                 // this row's last column with its spacer on the next, push the whole pair
                 // down (the printer's own last-column rule).
-                if end < cells.len() && cells[end - 1].is_wide_leader() {
+                if end < cells.len() && cells.get(end - 1).is_some_and(|c| c.is_wide_leader()) {
                     end -= 1;
                 }
                 // Degenerate new_cols == 1 against a wide glyph: place it alone rather than
@@ -1166,28 +1164,31 @@ impl Buffer {
                 if end <= i {
                     end = i + 1;
                 }
+                let Some(chunk) = cells.get(i..end) else {
+                    break;
+                };
                 // A wide glyph whose spacer cannot share its row (only at new_cols == 1) is
                 // stored clipped: the leader alone with its WIDE_LEADER attr stripped, and its
                 // spacer dropped, exactly as the printer records a wide glyph at a single
                 // column. Leaving the leader marked would strand it without the spacer the
                 // grid's invariant demands, and copying the spacer would orphan it onto the
                 // next row.
-                let clip_wide = cells[i].is_wide_leader() && end == i + 1;
-                let next_i = if clip_wide && cells.get(i + 1).is_some_and(|c| c.is_wide_spacer()) {
-                    i + 2
-                } else {
-                    end
+                let clipped = match chunk {
+                    [leader] if leader.is_wide_leader() => {
+                        Some(leader.with_width(CellWidth::Narrow))
+                    }
+                    _ => None,
                 };
+                let next_i =
+                    if clipped.is_some() && cells.get(end).is_some_and(|c| c.is_wide_spacer()) {
+                        end + 1
+                    } else {
+                        end
+                    };
                 let wrapped = next_i < cells.len();
-                let mut row = if clip_wide {
-                    take_row(
-                        &mut pool,
-                        new_cols,
-                        &[cells[i].with_width(CellWidth::Narrow)],
-                        wrapped,
-                    )
-                } else {
-                    take_row(&mut pool, new_cols, &cells[i..end], wrapped)
+                let mut row = match clipped {
+                    Some(leader) => take_row(&mut pool, new_cols, &[leader], wrapped),
+                    None => take_row(&mut pool, new_cols, chunk, wrapped),
                 };
                 for m in &logical.combining {
                     if m.col >= i && m.col < end {
