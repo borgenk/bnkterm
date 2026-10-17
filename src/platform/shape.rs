@@ -28,8 +28,8 @@ pub struct ShapedGlyph {
 }
 
 // ---------------------------------------------------------------------------
-// FFI surface. Mirrors of hb_glyph_info_t / hb_glyph_position_t; both structs
-// have been ABI-stable since HarfBuzz 1.0.
+// FFI surface. Mirrors of hb_glyph_info_t / hb_glyph_position_t, pinned in the
+// tests against the C headers.
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
@@ -155,5 +155,24 @@ impl Drop for Shaper {
         // SAFETY: the handle came from hb_ft_font_create_referenced and is
         // destroyed exactly once.
         unsafe { hb_font_destroy(self.font.as_ptr()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::platform::shape::*;
+    use core::mem::offset_of;
+
+    /// HarfBuzz hands back arrays of these that `shape` walks by index, so the sizes
+    /// matter as much as the offsets read. Values are `offsetof`/`sizeof` over `hb.h`,
+    /// from a C compiler on x86_64 (LP64).
+    #[test]
+    fn glyph_records_match_the_c_abi() {
+        assert_eq!(size_of::<HbGlyphInfo>(), 20);
+        assert_eq!(offset_of!(HbGlyphInfo, codepoint), 0);
+        assert_eq!(size_of::<HbGlyphPosition>(), 20);
+        assert_eq!(offset_of!(HbGlyphPosition, x_advance), 0);
+        assert_eq!(offset_of!(HbGlyphPosition, x_offset), 8);
+        assert_eq!(offset_of!(HbGlyphPosition, y_offset), 12);
     }
 }

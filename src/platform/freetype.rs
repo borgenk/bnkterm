@@ -9,10 +9,8 @@
 //! FreeType exposes glyph data as struct fields reached from the Face pointer
 //! (face->glyph->bitmap, face->size->metrics), not accessors. The repr(C)
 //! structs below mirror those layouts up to the last field this module reads;
-//! FreeType allocates the full structs, we only read a prefix, so declaring it
-//! with matching primitive types plus repr(C) padding is enough. The touched
-//! fields are old and load-bearing for every FreeType consumer, so their
-//! offsets have been ABI-stable for years.
+//! FreeType allocates the full structs, we only read a prefix. The offset of
+//! every field read is pinned in the tests against the C headers.
 
 use core::ffi::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_ushort, c_void};
 use core::ptr::{self, NonNull};
@@ -1283,6 +1281,33 @@ fn copy_coverage(bitmap: &FtBitmap) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use crate::platform::freetype::*;
+    use core::mem::offset_of;
+
+    /// Every field this module reads through a FreeType pointer, and the size of
+    /// each embedded struct. Values are `offsetof`/`sizeof` over `freetype.h`, from
+    /// a C compiler on x86_64 (LP64).
+    #[test]
+    fn struct_layouts_match_the_c_abi() {
+        assert_eq!(offset_of!(FtFaceRec, num_fixed_sizes), 56);
+        assert_eq!(offset_of!(FtFaceRec, glyph), 152);
+        assert_eq!(offset_of!(FtFaceRec, size), 160);
+        assert_eq!(offset_of!(FtGlyphSlotRec, advance), 128);
+        assert_eq!(offset_of!(FtGlyphSlotRec, bitmap), 152);
+        assert_eq!(offset_of!(FtGlyphSlotRec, bitmap_left), 192);
+        assert_eq!(offset_of!(FtGlyphSlotRec, bitmap_top), 196);
+        assert_eq!(size_of::<FtBitmap>(), 40);
+        assert_eq!(offset_of!(FtBitmap, rows), 0);
+        assert_eq!(offset_of!(FtBitmap, width), 4);
+        assert_eq!(offset_of!(FtBitmap, pitch), 8);
+        assert_eq!(offset_of!(FtBitmap, buffer), 16);
+        assert_eq!(offset_of!(FtBitmap, pixel_mode), 26);
+        assert_eq!(offset_of!(FtSizeRec, metrics), 24);
+        assert_eq!(size_of::<FtSizeMetrics>(), 56);
+        assert_eq!(offset_of!(FtSizeMetrics, y_ppem), 2);
+        assert_eq!(offset_of!(FtSizeMetrics, ascender), 24);
+        assert_eq!(offset_of!(FtSizeMetrics, descender), 32);
+        assert_eq!(offset_of!(FtSizeMetrics, height), 40);
+    }
 
     fn open() -> Face {
         Face::open_default(16).expect("a default font should be available")
