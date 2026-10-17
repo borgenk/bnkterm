@@ -4,14 +4,11 @@ use crate::platform::error::{Error, Result};
 use crate::render::gpu::Vertex;
 use crate::render::vulkan::abi::*;
 
-/// One sampled texture (an atlas or the 1x1 dummy) and whether its contents have
-/// ever been defined (governs the upload barrier's old layout).
-#[derive(Default)]
+/// One sampled atlas texture: its image, backing memory and view.
 pub(super) struct Texture {
     pub(super) image: VkImage,
     pub(super) memory: VkDeviceMemory,
     pub(super) view: VkImageView,
-    pub(super) initialized: bool,
 }
 
 /// A host-visible, persistently mapped buffer (vertices or staging), grown by
@@ -25,8 +22,7 @@ pub(super) struct HostBuffer {
 }
 
 /// The draw machinery shared by every frame: the one pipeline over the one
-/// render pass, the descriptor plumbing, and the sampled textures (the two
-/// atlases, and the 1x1 dummy that stands in for an atlas not yet created).
+/// render pass, the descriptor plumbing, and the two sampled atlas textures.
 #[derive(Default)]
 pub(super) struct Renderer {
     pub(super) render_pass: VkRenderPass,
@@ -36,7 +32,6 @@ pub(super) struct Renderer {
     pub(super) sampler: VkSampler,
     pub(super) descriptor_pool: VkDescriptorPool,
     pub(super) set_atlas: VkDescriptorSet,
-    pub(super) dummy: Texture,
     /// The R8 glyph atlas and BGRA emoji atlas textures, each tagged with the
     /// CPU mirror generation they were created for.
     pub(super) glyph_tex: Option<(Texture, u32)>,
@@ -84,11 +79,8 @@ pub(super) fn write_image_set(
     unsafe { (fns.update_descriptor_sets)(device, 1, &write, 0, core::ptr::null()) };
 }
 
-/// Destroy a texture's view, memory, and image (a zeroed default is a no-op).
+/// Destroy a texture's view, memory, and image.
 pub(super) fn destroy_texture(fns: &DeviceFns, device: VkDevice, t: Texture) {
-    if t.image == 0 {
-        return;
-    }
     // SAFETY: all three were created together on this device and nothing in
     // flight references them (callers drain the queue where needed).
     unsafe {
@@ -109,7 +101,6 @@ impl Renderer {
         if let Some((tex, _)) = self.emoji_tex {
             destroy_texture(fns, device, tex);
         }
-        destroy_texture(fns, device, self.dummy);
         // SAFETY: every non-zero handle below came from this device and is
         // destroyed exactly once; destroying the pool frees its sets.
         unsafe {

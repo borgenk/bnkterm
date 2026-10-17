@@ -1093,8 +1093,8 @@ impl Gpu {
         }
     }
 
-    /// Record one texture upload (or a bare initialization barrier when the
-    /// upload carries no bytes, the dummy texture's case).
+    /// Record one texture upload, or the bare initialization barrier a texture
+    /// created this frame gets (an upload that carries no bytes).
     fn record_upload(&self, img: &GpuImage, up: &PendingUpload) {
         let f = &self.fns;
         let range = color_range();
@@ -1195,35 +1195,23 @@ impl Gpu {
         }
     }
 
-    /// Reconcile the renderer's textures with this frame's data: (re)create
-    /// atlas textures on generation changes, create textures and descriptor
-    /// sets for new images, and assemble the staging bytes plus copy list.
+    /// Reconcile the renderer's textures with this frame's data: (re)create atlas
+    /// textures on generation changes, repoint the descriptor set at them, and
+    /// assemble the staging bytes plus copy list.
     fn sync_frame_textures(&mut self, frame: &FrameData) -> Result<(Vec<u8>, Vec<PendingUpload>)> {
         let mut staging = Vec::new();
         let mut uploads = Vec::new();
 
-        // The dummy texture: 1x1, never written, stands in for an atlas binding
-        // in set 0 before that atlas texture exists (see `update_atlas_set`).
-        // Contents are irrelevant, only the layout must be right, so its
-        // "upload" is a bare barrier.
-        if self.renderer.dummy.image == 0 {
-            let dummy = self.create_texture(VK_FORMAT_B8G8R8A8_UNORM, 1, 1)?;
-            uploads.push(PendingUpload {
-                image: dummy.image,
-                was_initialized: false,
-                staging_offset: 0,
-                x: 0,
-                y: 0,
-                w: 0,
-                h: 0,
-            });
-            self.renderer.dummy = dummy;
-        }
-
         // Atlas textures follow the CPU mirrors' generations, then take any
-        // dirty-region upload for the frame.
-        self.sync_atlas(AtlasSlot::Glyph, &frame.glyph_atlas)?;
-        self.sync_atlas(AtlasSlot::Emoji, &frame.emoji_atlas)?;
+        // dirty-region upload for the frame. The shared set is repointed once, after
+        // both exist; a create that fails ends the frame before anything draws. The
+        // syncs come first because the data uploads start from SHADER_READ_ONLY, which
+        // a texture created this frame reaches only through its initialization entry.
+        let glyph_changed = self.sync_atlas(AtlasSlot::Glyph, &frame.glyph_atlas, &mut uploads)?;
+        let emoji_changed = self.sync_atlas(AtlasSlot::Emoji, &frame.emoji_atlas, &mut uploads)?;
+        if glyph_changed || emoji_changed {
+            self.update_atlas_set()?;
+        }
         self.stage_atlas_upload(
             AtlasSlot::Glyph,
             &frame.glyph_upload,
@@ -1243,36 +1231,51 @@ impl Gpu {
     }
 
     /// Rebuild an atlas texture when its CPU mirror's generation moved (or it
-    /// does not exist yet). A replacement may still be sampled by the other
-    /// slot's in-flight frame, so the queue is drained before the old texture is
-    /// destroyed, and the shared atlas descriptor set is repointed after the new
-    /// one exists. Shared by the glyph and emoji slots so that ordering lives in
-    /// one place.
-    fn sync_atlas(&mut self, slot: AtlasSlot, info: &AtlasInfo) -> Result<()> {
+    /// does not exist yet), returning whether it did. The other frame in flight may
+    /// still sample the texture being replaced, so the queue is drained before it is
+    /// destroyed; the caller repoints the shared descriptor set.
+    /// The new texture's bare initialization barrier is queued on `uploads`, so it
+    /// is in the layout its descriptor names before any draw samples it, uploaded
+    /// or not.
+    fn sync_atlas(
+        &mut self,
+        slot: AtlasSlot,
+        info: &AtlasInfo,
+        uploads: &mut Vec<PendingUpload>,
+    ) -> Result<bool> {
         let tex = match slot {
             AtlasSlot::Glyph => &mut self.renderer.glyph_tex,
             AtlasSlot::Emoji => &mut self.renderer.emoji_tex,
         };
         if tex.as_ref().is_some_and(|(_, g)| *g == info.generation) {
-            return Ok(());
+            return Ok(false);
         }
         if let Some((old, _)) = tex.take() {
             self.wait_idle();
             destroy_texture(&self.fns, self.device.raw, old);
         }
         let tex = self.create_texture(slot.format(), info.width, info.height)?;
+        uploads.push(PendingUpload {
+            image: tex.image,
+            was_initialized: false,
+            staging_offset: 0,
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        });
         match slot {
             AtlasSlot::Glyph => self.renderer.glyph_tex = Some((tex, info.generation)),
             AtlasSlot::Emoji => self.renderer.emoji_tex = Some((tex, info.generation)),
         }
-        self.update_atlas_set()
+        Ok(true)
     }
 
     /// Queue an atlas's dirty region for upload into its live texture, appending
     /// the bytes to `staging`. A no-op when the frame carried no change for that
-    /// slot or the texture does not exist yet.
+    /// slot.
     fn stage_atlas_upload(
-        &mut self,
+        &self,
         slot: AtlasSlot,
         upload: &Option<AtlasUpload>,
         staging: &mut Vec<u8>,
@@ -1282,13 +1285,13 @@ impl Gpu {
             return;
         };
         let tex = match slot {
-            AtlasSlot::Glyph => self.renderer.glyph_tex.as_mut(),
-            AtlasSlot::Emoji => self.renderer.emoji_tex.as_mut(),
+            AtlasSlot::Glyph => self.renderer.glyph_tex.as_ref(),
+            AtlasSlot::Emoji => self.renderer.emoji_tex.as_ref(),
         };
         if let Some((tex, _)) = tex {
             uploads.push(PendingUpload {
                 image: tex.image,
-                was_initialized: tex.initialized,
+                was_initialized: true,
                 staging_offset: staging.len(),
                 x: up.x,
                 y: up.y,
@@ -1296,35 +1299,23 @@ impl Gpu {
                 h: up.h,
             });
             staging.extend_from_slice(&up.bytes);
-            tex.initialized = true;
         }
     }
 
-    /// Point the shared atlas descriptor set at the current atlas textures
-    /// (both bindings, using the dummy for one that does not exist yet).
+    /// Point the shared atlas descriptor set at both atlas textures.
     fn update_atlas_set(&self) -> Result<()> {
-        let glyph_view = self
-            .renderer
-            .glyph_tex
-            .as_ref()
-            .map(|(t, _)| t.view)
-            .unwrap_or(self.renderer.dummy.view);
-        let emoji_view = self
-            .renderer
-            .emoji_tex
-            .as_ref()
-            .map(|(t, _)| t.view)
-            .unwrap_or(self.renderer.dummy.view);
-        if glyph_view == 0 || emoji_view == 0 {
-            return Err(Error::msg("atlas descriptor update before any texture"));
-        }
+        let (Some((glyph, _)), Some((emoji, _))) =
+            (&self.renderer.glyph_tex, &self.renderer.emoji_tex)
+        else {
+            return Err(Error::msg("atlas descriptor update before both textures"));
+        };
         write_image_set(
             &self.fns,
             self.device.raw,
             self.renderer.set_atlas,
             0,
             self.renderer.sampler,
-            glyph_view,
+            glyph.view,
         );
         write_image_set(
             &self.fns,
@@ -1332,12 +1323,12 @@ impl Gpu {
             self.renderer.set_atlas,
             1,
             self.renderer.sampler,
-            emoji_view,
+            emoji.view,
         );
         Ok(())
     }
 
-    /// A sampled, transfer-destination 2D texture (an atlas or the dummy).
+    /// A sampled, transfer-destination 2D atlas texture, created in `UNDEFINED`.
     fn create_texture(&self, format: u32, width: u32, height: u32) -> Result<Texture> {
         let d = self.device.raw;
         let f = &self.fns;
@@ -1405,7 +1396,6 @@ impl Gpu {
             image: pending.image,
             memory: pending.memory,
             view: pending.view,
-            initialized: false,
         };
         core::mem::forget(pending);
         Ok(texture)
@@ -1541,6 +1531,8 @@ impl Gpu {
 /// A zero-sized region is a bare layout-initialization barrier.
 struct PendingUpload {
     image: VkImage,
+    /// False only for the initialization barrier of a texture created this frame,
+    /// the one transition that starts from `UNDEFINED`.
     was_initialized: bool,
     staging_offset: usize,
     x: u32,
