@@ -1087,50 +1087,16 @@ impl Fonts {
             .unwrap_or(&self.sized[0])
     }
 
-    /// The face for `size` in `style`, falling back to the regular face when the
-    /// family lacks that variant and to the first opened size when `size` was not
-    /// opened. Never fails, never panics.
-    pub fn face(&self, size: u32, style: FontStyle) -> &Face {
-        let entry = self.entry(size);
-        match style {
-            // The prose family ships no medium weight, so it reads as regular.
-            FontStyle::Regular | FontStyle::Medium => &entry.regular,
-            FontStyle::Bold => entry.bold.as_ref().unwrap_or(&entry.regular),
-            FontStyle::Italic => entry.italic.as_ref().unwrap_or(&entry.regular),
-            FontStyle::BoldItalic => entry.bold_italic.as_ref().unwrap_or(&entry.regular),
-        }
-    }
-
-    /// The interface face for `size` and weight: the proportional UI family's
-    /// medium or bold when asked and available, else its regular (italic styles
-    /// resolve to their upright weight, since UI text never slants). A missing
-    /// medium or bold falls back to `ui_regular`, as does an unopened `size`. Never
-    /// panics.
-    pub fn ui_face(&self, size: u32, style: FontStyle) -> &Face {
-        let entry = self.entry(size);
-        match style {
-            FontStyle::Medium => entry.ui_medium.as_ref().unwrap_or(&entry.ui_regular),
-            FontStyle::Bold | FontStyle::BoldItalic => {
-                entry.ui_bold.as_ref().unwrap_or(&entry.ui_regular)
-            }
-            FontStyle::Regular | FontStyle::Italic => &entry.ui_regular,
-        }
-    }
-
     /// The interface family's vertical metrics for `size` (its own ascent/descent),
     /// so a UI baseline centers on the sans ink box, not the monospace one.
     pub fn ui_metrics(&self, size: u32) -> Metrics {
         self.entry(size).ui_metrics
     }
 
-    /// Resolve a [`FaceKey`] to its face, the inverse of the key a run records.
-    /// Routes to [`Self::face`] or [`Self::ui_face`], so it inherits their
-    /// fallbacks and never panics.
+    /// Resolve a [`FaceKey`] to its face, the inverse of the key a run records. Falls
+    /// back as [`face_rc`](Self::face_rc) describes, so it never fails and never panics.
     pub fn face_for(&self, key: FaceKey) -> &Face {
-        match key {
-            FaceKey::Prose { size, style } => self.face(size, style),
-            FaceKey::Ui { size, style } => self.ui_face(size, style),
-        }
+        self.face_rc(key)
     }
 
     /// The physical face to rasterize `ch` in for `key`, resolved in three steps:
@@ -1177,10 +1143,16 @@ impl Fonts {
 
     /// The keyed face as the shared handle the caches hold, so [`glyph_face`](Self::glyph_face)
     /// can hand back either it or a discovered face without the two having different types.
+    ///
+    /// An unopened size resolves to the first opened one. A prose style the family lacks
+    /// falls back to its regular face. The interface family gives medium or bold when
+    /// asked and available, else its regular; italic styles resolve to their upright
+    /// weight, since UI text never slants.
     fn face_rc(&self, key: FaceKey) -> &Rc<Face> {
         let entry = self.entry(key.size());
         match key {
             FaceKey::Prose { style, .. } => match style {
+                // The prose family ships no medium weight, so it reads as regular.
                 FontStyle::Regular | FontStyle::Medium => &entry.regular,
                 FontStyle::Bold => entry.bold.as_ref().unwrap_or(&entry.regular),
                 FontStyle::Italic => entry.italic.as_ref().unwrap_or(&entry.regular),
@@ -1573,9 +1545,13 @@ mod tests {
         assert_eq!(fonts.cache_stats().lookups(), 0);
         // Report through two different sizes (hence different faces); the rolled-up
         // tally must see both faces' counts.
-        fonts.face(16, FontStyle::Regular).record_glyph_miss();
-        fonts.face(24, FontStyle::Regular).record_glyph_miss();
-        fonts.face(16, FontStyle::Regular).record_glyph_hit();
+        let regular = |size| FaceKey::Prose {
+            size,
+            style: FontStyle::Regular,
+        };
+        fonts.face_for(regular(16)).record_glyph_miss();
+        fonts.face_for(regular(24)).record_glyph_miss();
+        fonts.face_for(regular(16)).record_glyph_hit();
         let stats = fonts.cache_stats();
         assert_eq!(stats.misses, 2);
         assert_eq!(stats.hits, 1);
@@ -1686,7 +1662,7 @@ mod tests {
                 FontStyle::BoldItalic,
             ] {
                 assert!(
-                    fonts.face(size, style).advance('m') > 0.0,
+                    fonts.face_for(FaceKey::Prose { size, style }).advance('m') > 0.0,
                     "{style:?} at {size}px advances"
                 );
             }
@@ -1714,20 +1690,10 @@ mod tests {
                 FontStyle::BoldItalic,
             ] {
                 assert!(
-                    fonts.ui_face(size, style).advance('n') > 0.0,
+                    fonts.face_for(FaceKey::Ui { size, style }).advance('n') > 0.0,
                     "ui face {style:?} at {size}px advances"
                 );
             }
-            // A `FaceKey::Ui` routes through `face_for` to the same face `ui_face`
-            // returns, so a display-list run and a direct lookup agree.
-            let key = FaceKey::Ui {
-                size,
-                style: FontStyle::Bold,
-            };
-            assert!(std::ptr::eq(
-                fonts.face_for(key),
-                fonts.ui_face(size, FontStyle::Bold)
-            ));
             // Its vertical metrics are a sane, positive box (used for the tab-bar
             // baseline). Bold is never lighter than regular (equal only when the
             // installed family ships no distinct bold).
@@ -1735,7 +1701,7 @@ mod tests {
             assert!(m.ascent > 0 && m.descent > 0 && m.line_height >= m.ascent + m.descent);
             let ink = |style| {
                 fonts
-                    .ui_face(size, style)
+                    .face_for(FaceKey::Ui { size, style })
                     .rasterize('B')
                     .coverage
                     .iter()
@@ -1752,7 +1718,10 @@ mod tests {
     #[test]
     fn faces_route_emoji_clusters_and_keep_ascii_on_the_char_path() {
         let fonts = Fonts::new(&[32]).expect("a default font");
-        let face = fonts.face(32, FontStyle::Regular);
+        let face = fonts.face_for(FaceKey::Prose {
+            size: 32,
+            style: FontStyle::Regular,
+        });
         assert!(
             face.with_cluster_glyph("😀", 32, |g| g.advance)
                 .is_some_and(|advance| advance > 0.0),

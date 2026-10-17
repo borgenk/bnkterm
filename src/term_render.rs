@@ -171,16 +171,12 @@ impl CellMetrics {
     /// Measure the cell box from the opened fonts at `size`: the line height for the row
     /// pitch and the regular face's reference-glyph advance for the column pitch.
     pub fn from_fonts(fonts: &Fonts, size: u32) -> Self {
-        let advance = fonts
-            .face(size, FontStyle::Regular)
-            .advance(REFERENCE_GLYPH);
-        let lock_glyph = fonts.covers(
-            FaceKey::Prose {
-                size,
-                style: FontStyle::Regular,
-            },
-            LOCK_GLYPH,
-        );
+        let key = FaceKey::Prose {
+            size,
+            style: FontStyle::Regular,
+        };
+        let advance = fonts.face_for(key).advance(REFERENCE_GLYPH);
+        let lock_glyph = fonts.covers(key, LOCK_GLYPH);
         Self::measure(size, fonts.metrics(size), advance, lock_glyph)
     }
 
@@ -190,17 +186,15 @@ impl CellMetrics {
     /// but proportional UI text is placed by each glyph's real advance, not this
     /// pitch, so it is not a cell width.
     pub fn from_ui(fonts: &Fonts, size: u32) -> Self {
-        let advance = fonts.ui_face(size, FontStyle::Regular).advance('n');
+        let key = FaceKey::Ui {
+            size,
+            style: FontStyle::Regular,
+        };
+        let advance = fonts.face_for(key).advance('n');
         // The chrome never draws a cursor, and lock coverage comes from the fallback
         // chain, not this face, so it resolves the same either way. Measuring it rather
         // than hardcoding `false` keeps the two constructors from disagreeing.
-        let lock_glyph = fonts.covers(
-            FaceKey::Ui {
-                size,
-                style: FontStyle::Regular,
-            },
-            LOCK_GLYPH,
-        );
+        let lock_glyph = fonts.covers(key, LOCK_GLYPH);
         Self::measure(size, fonts.ui_metrics(size), advance, lock_glyph)
     }
 
