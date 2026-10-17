@@ -694,13 +694,7 @@ impl TerminalCore {
         if event != input::KeyEvent::Release {
             self.end_selection_on_input();
         }
-        // Typing snaps the view back to the live bottom before the bytes go
-        // out, so a keystroke never lands "blind" while reading history.
-        if self.screen.is_scrolled() {
-            self.screen.scroll_view_to_bottom();
-            self.refresh_hover();
-            self.dirty = true;
-        }
+        self.snap_to_bottom();
         self.bump_cursor(); // keep the cursor solid while typing
         self.send_key_buf()?;
         Ok(true)
@@ -795,11 +789,7 @@ impl TerminalCore {
         // handed to the window when the drag ended and stands on its own, so the
         // highlight going away does not retract what middle-click pastes.
         self.end_selection_on_input();
-        if self.screen.is_scrolled() {
-            self.screen.scroll_view_to_bottom();
-            self.refresh_hover();
-            self.dirty = true;
-        }
+        self.snap_to_bottom();
         self.send_key_buf()?;
         Ok(())
     }
@@ -1189,6 +1179,16 @@ impl TerminalCore {
         }
     }
 
+    /// Return a scrolled-back view to the live bottom before input goes out, so a
+    /// keystroke or paste never lands "blind" while the user is reading history.
+    fn snap_to_bottom(&mut self) {
+        if self.screen.is_scrolled() {
+            self.screen.scroll_view_to_bottom();
+            self.refresh_hover();
+            self.dirty = true;
+        }
+    }
+
     /// Begin a selection at display `(row, col)` with the granularity the click
     /// `count` picks: one click a character, two the word, three the whole
     /// (soft-wrapped) line. The clicked unit is the anchor a drag pivots around. A
@@ -1290,13 +1290,13 @@ impl TerminalCore {
     /// across the final read is flushed to U+FFFD (see [`Parser::finish`](crate::vt::Parser::finish)),
     /// since no further read can complete it. A no-op before a shell is spawned.
     pub(super) fn pump(&mut self, max_bytes: usize, deadline: Instant) -> Result<PumpOutcome> {
-        if self.gatherer.is_none() {
+        let Some(gatherer) = &self.gatherer else {
             return Ok(PumpOutcome {
                 bytes: 0,
                 more: false,
                 end: None,
             });
-        }
+        };
         // Drain the wake eventfd once per pump; a publish that races this still
         // re-arms it (empty→nonempty), so the next poll returns and we catch it.
         //
@@ -1305,9 +1305,7 @@ impl TerminalCore {
         // skipping it when no batch is ready inverts the race — a turn woken *by* the
         // eventfd that then finds the batch already consumed would leave it armed and
         // spin. The syscall is the cheap side of that trade.
-        if let Some(g) = &self.gatherer {
-            g.clear_wakeup();
-        }
+        gatherer.clear_wakeup();
 
         let mut consumed_bytes = 0usize;
         let mut consumed_any = false;
@@ -1660,12 +1658,8 @@ impl TerminalCore {
         }
         self.last_title.clear();
         self.last_title.push_str(self.screen.title());
-        let shown = if self.last_title.is_empty() {
-            "bnkterm"
-        } else {
-            &self.last_title
-        };
-        self.outbox.push(ToWindow::Title(shown.to_string()));
+        let shown = self.title().to_string();
+        self.outbox.push(ToWindow::Title(shown));
     }
 
     /// Compose the window's display list: the visible grid painted at the current
