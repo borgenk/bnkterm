@@ -591,8 +591,7 @@ impl State {
         let font_size = config_font_px(SCALE_120_UNITY, config.font_size);
         let tab_bar_config = config.tab_bar.clone();
         let label_size = label_font_px(font_size, tab_bar_config.label_scale_pct);
-        let fonts =
-            Fonts::with_selection(&font_selection, &font_sizes(font_size, label_size), 1.0)?;
+        let fonts = Fonts::with_selection(&font_selection, &font_sizes(font_size, label_size))?;
         let metrics = CellMetrics::from_fonts(&fonts, font_size);
         let label_metrics = CellMetrics::from_ui(&fonts, label_size);
         let (cols, rows) = (DEFAULT_COLS, DEFAULT_ROWS);
@@ -1094,7 +1093,7 @@ impl State {
         // window); the next scale event may recover.
         let label_size = label_font_px(size, self.tab_bar_config.label_scale_pct);
         let sizes = font_sizes(size, label_size);
-        if let Ok(fonts) = Fonts::with_selection(&self.font_selection, &sizes, 1.0) {
+        if let Ok(fonts) = Fonts::with_selection(&self.font_selection, &sizes) {
             self.layout.terminal.metrics = CellMetrics::from_fonts(&fonts, size);
             self.layout.label_metrics = CellMetrics::from_ui(&fonts, label_size);
             self.fonts = fonts;

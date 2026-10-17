@@ -431,9 +431,9 @@ impl Glyph {
 /// gap, so this is a visible 2-3px, not a rounding curiosity. wezterm and Alacritty
 /// seat the baseline the same way.
 ///
-/// Leading a *caller* adds on top of the font's own line height (see
-/// [`Fonts::with_selection`]) is a different thing: that one is split evenly, so text
-/// stays centered in the taller line box rather than sinking to its floor.
+/// Leading added on top of the font's own line height (see [`Fonts::with_selection`])
+/// is a different thing: that one is split evenly, so text stays centered in the
+/// taller line box rather than sinking to its floor.
 #[derive(Clone, Copy, Debug)]
 pub struct Metrics {
     pub ascent: i32,
@@ -949,24 +949,19 @@ pub struct Fonts {
 }
 
 impl Fonts {
-    /// Open the default font selection at each of `sizes`, with the font's own
-    /// line height (a scale of 1.0, no extra leading). For tests; the app resolves
-    /// its configured selection once and opens it through [`Self::with_selection`].
+    /// Open the default font selection at each of `sizes`. Tests and the perf
+    /// harness use this; the app resolves its configured selection once and opens it
+    /// through [`Self::with_selection`].
     pub fn new(sizes: &[u32]) -> Result<Self> {
-        Self::with_selection(&FontSelection::resolve(&FontConfig::default())?, sizes, 1.0)
+        Self::with_selection(&FontSelection::resolve(&FontConfig::default())?, sizes)
     }
 
     /// Open an already-resolved [`FontSelection`] at each of `sizes` (zeros and
     /// duplicates skipped), loading every available style per size. Each size's
-    /// line box is grown to at least `line_height_scale` times the size (the CSS
-    /// line-height model), never below the font's own line height, so lines can
-    /// be spaced out without overlapping. At least one nonzero size is required;
-    /// the first opened becomes the fallback.
-    pub fn with_selection(
-        selection: &FontSelection,
-        sizes: &[u32],
-        line_height_scale: f32,
-    ) -> Result<Self> {
+    /// line box is the font's own line height, or the pixel size when that is
+    /// taller. At least one nonzero size is required; the first opened becomes the
+    /// fallback.
+    pub fn with_selection(selection: &FontSelection, sizes: &[u32]) -> Result<Self> {
         let family = &selection.prose;
         let ui_family = &selection.ui;
         let emoji = selection
@@ -980,13 +975,12 @@ impl Fonts {
                 continue;
             }
             let regular = open_face(&family.regular, size, emoji.as_ref())?;
-            // Grow the line box to the requested multiple of the size, keeping
-            // the font's own line height as the floor so lines never overlap.
-            // Ascent and descent stay the glyph metrics; the extra is leading the
-            // caller asked for, so it splits evenly and the baseline moves down
-            // half of it (see `Metrics`).
-            let target = (line_height_scale * size as f32).round() as i32;
-            let metrics = regular.metrics().grown_to(target);
+            // A font spaced tighter than its pixel size has its line box grown to
+            // the size, so a row is never shorter than an em. Ascent and descent
+            // stay the glyph metrics; the extra is leading, so it splits evenly and
+            // the baseline moves down half of it (see `Metrics`).
+            let em = i32::try_from(size).map_err(|_| Error::msg("font size out of range"))?;
+            let metrics = regular.metrics().grown_to(em);
             // Fallback faces draw only scalars the primary lacks and never route
             // emoji clusters themselves, so they carry no emoji font.
             //
@@ -1336,7 +1330,7 @@ mod tests {
         }
         let selection = FontSelection::resolve(&config_of(&["NoSuchFamilyAtAll", "monospace"]))
             .expect("the alias resolves");
-        let fonts = Fonts::with_selection(&selection, &[16], 1.0).expect("fonts open");
+        let fonts = Fonts::with_selection(&selection, &[16]).expect("fonts open");
         let face = fonts.face_for(FaceKey::Prose {
             size: 16,
             style: FontStyle::Regular,
@@ -1447,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn caller_leading_splits_evenly_around_the_text() {
+    fn added_leading_splits_evenly_and_keeps_the_glyph_metrics() {
         let face = Face::open_default(16).expect("a default font");
         let m = face.metrics();
         let taller = m.grown_to(m.line_height + 4);
@@ -1455,8 +1449,10 @@ mod tests {
         assert_eq!(
             taller.baseline,
             m.baseline + 2,
-            "leading a caller asks for is split above and below, not stacked on one side"
+            "added leading is split above and below, not stacked on one side"
         );
+        assert_eq!(taller.ascent, m.ascent, "ascent stays the glyph metric");
+        assert_eq!(taller.descent, m.descent, "descent stays the glyph metric");
         assert_eq!(
             m.grown_to(m.line_height - 1).line_height,
             m.line_height,
@@ -1580,36 +1576,6 @@ mod tests {
         let small = fonts.metrics(16);
         let large = fonts.metrics(32);
         assert!(large.line_height > small.line_height, "32px is taller");
-    }
-
-    #[test]
-    fn line_height_scale_grows_the_box_and_keeps_glyph_metrics() {
-        let base = Fonts::new(&[14]).expect("a default font").metrics(14);
-        // A scale well above any 14px font's own line height forces the box to
-        // the scaled target; 3.0 gives 42px, past ascent + descent.
-        let selection = FontSelection::resolve(&FontConfig::default()).expect("a default font");
-        let big = Fonts::with_selection(&selection, &[14], 3.0)
-            .expect("a default font")
-            .metrics(14);
-        assert_eq!(big.ascent, base.ascent, "ascent stays the glyph metric");
-        assert_eq!(big.descent, base.descent, "descent stays the glyph metric");
-        assert_eq!(big.line_height, 42, "line box is round(3.0 * 14)");
-        assert!(
-            big.line_height > big.ascent + big.descent,
-            "the surplus is leading below the line"
-        );
-    }
-
-    #[test]
-    fn line_height_scale_floors_at_the_font_line_height() {
-        // A scale too small to matter leaves the font's own line height, so
-        // lines never overlap.
-        let base = Fonts::new(&[14]).expect("a default font").metrics(14);
-        let selection = FontSelection::resolve(&FontConfig::default()).expect("a default font");
-        let tiny = Fonts::with_selection(&selection, &[14], 0.1)
-            .expect("a default font")
-            .metrics(14);
-        assert_eq!(tiny.line_height, base.line_height);
     }
 
     #[test]
