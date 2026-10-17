@@ -7,7 +7,7 @@ use crate::render::vulkan::abi::*;
 use crate::render::vulkan::renderer::{
     color_range, destroy_texture, write_image_set, HostBuffer, Texture,
 };
-use crate::render::vulkan::Gpu;
+use crate::render::vulkan::{pick_memory_type, Gpu};
 
 // ---------------------------------------------------------------------------
 // Render targets.
@@ -294,8 +294,7 @@ impl Gpu {
         };
         // SAFETY: image is live; reqs is a valid out-parameter.
         unsafe { (f.get_image_memory_requirements)(d, pending.image, &mut reqs) };
-        let memory_type = self
-            .pick_memory_type(reqs.memory_type_bits, 0)
+        let memory_type = pick_memory_type(&self.memory_type_flags, reqs.memory_type_bits, 0)
             .ok_or_else(|| Error::msg("no memory type fits the exported image"))?;
         let dedicated = VkMemoryDedicatedAllocateInfo {
             s_type: VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
@@ -1382,8 +1381,7 @@ impl Gpu {
         };
         // SAFETY: image is live.
         unsafe { (f.get_image_memory_requirements)(d, pending.image, &mut reqs) };
-        let memory_type = self
-            .pick_memory_type(reqs.memory_type_bits, 0)
+        let memory_type = pick_memory_type(&self.memory_type_flags, reqs.memory_type_bits, 0)
             .ok_or_else(|| Error::msg("no memory type fits a texture"))?;
         let alloc = VkMemoryAllocateInfo {
             s_type: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -1474,9 +1472,9 @@ impl Gpu {
         // SAFETY: buf is live.
         unsafe { (f.get_buffer_memory_requirements)(d, pending.buf, &mut reqs) };
         let required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        let memory_type = self
-            .pick_memory_type(reqs.memory_type_bits, required)
-            .ok_or_else(|| Error::msg("no host-visible memory type for a buffer"))?;
+        let memory_type =
+            pick_memory_type(&self.memory_type_flags, reqs.memory_type_bits, required)
+                .ok_or_else(|| Error::msg("no host-visible memory type for a buffer"))?;
         let alloc = VkMemoryAllocateInfo {
             s_type: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
             p_next: core::ptr::null(),
@@ -1535,26 +1533,6 @@ impl Gpu {
         let old = std::mem::replace(b, fresh);
         self.destroy_host_buffer(old);
         Ok(())
-    }
-
-    /// The first allowed memory type carrying every `required` property flag;
-    /// with no requirement, prefer device-local and fall back to any allowed.
-    fn pick_memory_type(&self, allowed_bits: u32, required: u32) -> Option<u32> {
-        let allowed = |i: usize| allowed_bits & (1u32 << i) != 0;
-        if required != 0 {
-            return self
-                .memory_type_flags
-                .iter()
-                .enumerate()
-                .position(|(i, &flags)| allowed(i) && flags & required == required)
-                .map(|i| i as u32);
-        }
-        self.memory_type_flags
-            .iter()
-            .enumerate()
-            .position(|(i, &flags)| allowed(i) && flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT != 0)
-            .or_else(|| (0..self.memory_type_flags.len()).find(|&i| allowed(i)))
-            .map(|i| i as u32)
     }
 }
 
