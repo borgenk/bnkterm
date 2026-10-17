@@ -4,9 +4,10 @@
 //! strike, and scales it to the surrounding text size. Sits above the FFI layer in `freetype.rs` (whose faces and
 //! glyph-slot mirror it reads) and the pure pixel math in `pixel.rs`.
 
-use core::ffi::{c_uint, c_void};
+use core::ffi::c_uint;
 use core::ptr::NonNull;
 use std::cell::Cell;
+use std::rc::Rc;
 
 use crate::platform::fontconfig::FontFile;
 use crate::platform::freetype::{
@@ -70,12 +71,9 @@ pub struct ColorGlyph {
 /// font, or a cluster the font cannot form all yield `None`, and the caller
 /// falls back to per-character rendering.
 pub struct EmojiFont {
-    /// Declared before `face` deliberately: fields drop in declaration order,
-    /// and the shaper's HarfBuzz font holds a reference to the FreeType face
-    /// that it releases with `FT_Done_Face` on destroy. The face's own `Drop`
-    /// tears down its whole FreeType library, so HarfBuzz must let go first.
+    /// Shared with `shaper`, which keeps it alive for as long as HarfBuzz uses it.
+    face: Rc<Face>,
     shaper: Shaper,
-    face: Face,
     /// The strike's nominal pixel size; glyph bitmaps and shaped positions are
     /// scaled by `target / strike` to land on the text's em square.
     strike: f32,
@@ -91,12 +89,10 @@ impl EmojiFont {
     /// font has no bitmap strikes (an outline-only build), or the shaper cannot
     /// bind to it.
     pub fn open(file: &FontFile) -> Option<Self> {
-        let face = Face::from_file(file).ok()?;
+        let face = Rc::new(Face::from_file(file).ok()?);
         // Reject a text face returned for an emoji alias.
         let strike = face.select_first_strike()?;
-        // SAFETY: the face handle is valid and has a size selected; the shaper
-        // takes its own FreeType reference, so drop order does not matter.
-        let shaper = unsafe { Shaper::from_ft_face(face.ft_face_ptr() as *mut c_void) }?;
+        let shaper = Shaper::new(Rc::clone(&face))?;
         Some(Self {
             face,
             shaper,

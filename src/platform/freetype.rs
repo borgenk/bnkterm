@@ -756,8 +756,8 @@ impl Face {
         unsafe { FT_Get_Char_Index(self.face.as_ptr(), ch as u32 as c_ulong) != 0 }
     }
 
-    /// The raw FreeType face handle, for the emoji module to shape and decode
-    /// color strikes through the same face (it reads the glyph slot after a
+    /// The raw FreeType face handle, for binding a HarfBuzz font to this face and
+    /// for the emoji module to decode color strikes (it reads the glyph slot after a
     /// load). Confined to `pub(crate)`; the pointer is valid for the face's life.
     pub(crate) fn ft_face_ptr(&self) -> *mut FtFaceRec {
         self.face.as_ptr()

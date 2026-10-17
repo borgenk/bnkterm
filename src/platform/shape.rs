@@ -17,6 +17,9 @@
 
 use core::ffi::{c_char, c_int, c_uint, c_void};
 use core::ptr::{self, NonNull};
+use std::rc::Rc;
+
+use crate::platform::freetype::Face;
 
 /// One glyph of a shaped cluster: the font glyph id and its pen placement in
 /// pixels at the face's selected size (already divided down from 26.6).
@@ -79,24 +82,27 @@ extern "C" {
     ) -> *const HbGlyphPosition;
 }
 
-/// A HarfBuzz font handle over a FreeType face, used to shape one cluster at a
-/// time. Dropping it releases only HarfBuzz's own reference; the FreeType face
-/// is independently referenced (`_referenced`), so drop order with the owning
-/// face does not matter.
+/// A HarfBuzz font over a FreeType face, used to shape one cluster at a time.
+///
+/// HarfBuzz takes its own FreeType reference on the face, but that reference does
+/// not survive the face's library: dropping the [`Face`] frees its library and every
+/// face in it. So the shaper holds the face too, and its other owners can drop in
+/// any order.
 pub struct Shaper {
     font: NonNull<c_void>,
+    _face: Rc<Face>,
 }
 
 impl Shaper {
-    /// Bind a shaper to a FreeType face handle.
-    ///
-    /// # Safety
-    /// `ft_face` must be a valid `FT_Face` with a size selected. HarfBuzz takes
-    /// its own reference, so the face may be freed before or after the shaper.
-    pub unsafe fn from_ft_face(ft_face: *mut c_void) -> Option<Self> {
-        let font = hb_ft_font_create_referenced(ft_face);
+    /// Bind a shaper to `face`. Select the face's size first: HarfBuzz reads the
+    /// scale when the font is created.
+    pub fn new(face: Rc<Face>) -> Option<Self> {
+        // SAFETY: the face handle is live, and stays live for the shaper's whole life
+        // through the `Rc` stored beside the font.
+        let font = unsafe { hb_ft_font_create_referenced(face.ft_face_ptr().cast()) };
         Some(Self {
             font: NonNull::new(font)?,
+            _face: face,
         })
     }
 
@@ -153,7 +159,8 @@ impl Shaper {
 impl Drop for Shaper {
     fn drop(&mut self) {
         // SAFETY: the handle came from hb_ft_font_create_referenced and is
-        // destroyed exactly once.
+        // destroyed exactly once, here, while `_face` (dropped after this, with the
+        // other fields) still keeps the FreeType face alive.
         unsafe { hb_font_destroy(self.font.as_ptr()) };
     }
 }
