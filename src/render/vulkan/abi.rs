@@ -1601,9 +1601,9 @@ pub(super) unsafe fn load_device<T>(
 mod tests {
     use crate::render::vulkan::abi::*;
 
-    /// The transcription's one real hazard is a struct size drifting from the
-    /// C ABI: the driver writes past what we allocated. These sizes are from
-    /// vulkan_core.h on x86_64/arm64 (LP64).
+    /// Every `#[repr(C)]` struct here, sized against the C ABI. A size that drifts
+    /// has the driver write past what we allocated, or read past what we handed it.
+    /// Values are `sizeof` over `vulkan_core.h`, from a C compiler on x86_64 (LP64).
     #[test]
     fn struct_sizes_match_the_c_abi() {
         assert_eq!(size_of::<VkPhysicalDeviceLimits>(), 504);
@@ -1637,6 +1637,60 @@ mod tests {
         assert_eq!(size_of::<VkSubmitInfo>(), 72);
         assert_eq!(size_of::<VkSemaphoreGetFdInfoKHR>(), 32);
         assert_eq!(size_of::<VkImportSemaphoreFdInfoKHR>(), 40);
+        assert_eq!(size_of::<VkExtent3D>(), 12);
+        assert_eq!(size_of::<VkMemoryType>(), 8);
+        assert_eq!(size_of::<VkMemoryHeap>(), 16);
+        assert_eq!(size_of::<VkFormatProperties>(), 12);
+        assert_eq!(size_of::<VkExportMemoryAllocateInfo>(), 24);
+        assert_eq!(size_of::<VkImageSubresource>(), 12);
+        assert_eq!(size_of::<VkCommandPoolCreateInfo>(), 24);
+        assert_eq!(size_of::<VkCommandBufferBeginInfo>(), 32);
+        assert_eq!(size_of::<VkImageSubresourceRange>(), 20);
+        assert_eq!(size_of::<VkFenceCreateInfo>(), 24);
+        assert_eq!(size_of::<VkSemaphoreCreateInfo>(), 24);
+        assert_eq!(size_of::<VkExportSemaphoreCreateInfo>(), 24);
+        assert_eq!(size_of::<VkClearColorValue>(), 16);
+        assert_eq!(size_of::<VkBufferCreateInfo>(), 56);
+        assert_eq!(size_of::<VkComponentMapping>(), 16);
+        assert_eq!(size_of::<VkImageViewCreateInfo>(), 80);
+        assert_eq!(size_of::<VkShaderModuleCreateInfo>(), 40);
+        assert_eq!(size_of::<VkPipelineShaderStageCreateInfo>(), 48);
+        assert_eq!(size_of::<VkVertexInputBindingDescription>(), 12);
+        assert_eq!(size_of::<VkVertexInputAttributeDescription>(), 16);
+        assert_eq!(size_of::<VkPipelineVertexInputStateCreateInfo>(), 48);
+        assert_eq!(size_of::<VkPipelineInputAssemblyStateCreateInfo>(), 32);
+        assert_eq!(size_of::<VkViewport>(), 24);
+        assert_eq!(size_of::<VkOffset2D>(), 8);
+        assert_eq!(size_of::<VkExtent2D>(), 8);
+        assert_eq!(size_of::<VkRect2D>(), 16);
+        assert_eq!(size_of::<VkPipelineViewportStateCreateInfo>(), 48);
+        assert_eq!(size_of::<VkPipelineRasterizationStateCreateInfo>(), 64);
+        assert_eq!(size_of::<VkPipelineMultisampleStateCreateInfo>(), 48);
+        assert_eq!(size_of::<VkPipelineColorBlendAttachmentState>(), 32);
+        assert_eq!(size_of::<VkPipelineColorBlendStateCreateInfo>(), 56);
+        assert_eq!(size_of::<VkPipelineDynamicStateCreateInfo>(), 32);
+        assert_eq!(size_of::<VkPushConstantRange>(), 12);
+        assert_eq!(size_of::<VkPipelineLayoutCreateInfo>(), 48);
+        assert_eq!(size_of::<VkGraphicsPipelineCreateInfo>(), 144);
+        assert_eq!(size_of::<VkSamplerCreateInfo>(), 80);
+        assert_eq!(size_of::<VkDescriptorSetLayoutBinding>(), 24);
+        assert_eq!(size_of::<VkDescriptorSetLayoutCreateInfo>(), 32);
+        assert_eq!(size_of::<VkDescriptorPoolSize>(), 8);
+        assert_eq!(size_of::<VkDescriptorPoolCreateInfo>(), 40);
+        assert_eq!(size_of::<VkDescriptorSetAllocateInfo>(), 40);
+        assert_eq!(size_of::<VkDescriptorImageInfo>(), 24);
+        assert_eq!(size_of::<VkWriteDescriptorSet>(), 64);
+        assert_eq!(size_of::<VkAttachmentDescription>(), 36);
+        assert_eq!(size_of::<VkAttachmentReference>(), 8);
+        assert_eq!(size_of::<VkSubpassDescription>(), 72);
+        assert_eq!(size_of::<VkRenderPassCreateInfo>(), 64);
+        assert_eq!(size_of::<VkFramebufferCreateInfo>(), 64);
+        assert_eq!(size_of::<VkRenderPassBeginInfo>(), 64);
+        assert_eq!(size_of::<VkImageSubresourceLayers>(), 16);
+        assert_eq!(size_of::<VkOffset3D>(), 12);
+        assert_eq!(size_of::<VkBufferImageCopy>(), 56);
+        // Read back by index from the driver-filled `memory_types` array.
+        assert_eq!(std::mem::offset_of!(VkMemoryType, property_flags), 0);
     }
 
     /// Offsets and enum values emitted by a C compiler against vulkan_core.h (LP64).
