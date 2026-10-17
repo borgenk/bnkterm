@@ -29,7 +29,7 @@ use crate::config::{ShellStartupConfig, TabBarConfig};
 use crate::error::Result;
 use crate::gather::GatherEnd;
 use crate::keymode::Dir;
-use crate::notice::Notice;
+use crate::notice::{Notice, Phase};
 use crate::platform::freetype::Fonts;
 use crate::platform::host::Hostname;
 use crate::platform::verdict::Refusal;
@@ -569,15 +569,13 @@ impl Tabs {
     /// only the fade and its end mark the frame dirty. Without that, the hold would
     /// repaint every loop turn for no visible difference.
     fn tick_notice_if_due(&mut self, now: Instant) {
-        let Some(notice) = self.notice.as_ref() else {
+        let Some(phase) = self.notice.as_ref().map(|notice| notice.phase(now)) else {
             return;
         };
-        let (fading, expired) = (notice.fading(now), notice.expired(now));
-        if !fading && !expired {
-            return;
-        }
-        if expired {
-            self.notice = None;
+        match phase {
+            Phase::Holding => return,
+            Phase::Fading(_) => {}
+            Phase::Gone => self.notice = None,
         }
         self.mark_dirty();
     }
@@ -959,7 +957,7 @@ mod tests {
         assert!(
             tabs.notice
                 .as_ref()
-                .is_some_and(|notice| notice.fading(now)),
+                .is_some_and(|notice| matches!(notice.phase(now), Phase::Fading(_))),
             "a zero hold raises it straight into its fade"
         );
         assert!(

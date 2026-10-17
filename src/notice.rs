@@ -53,6 +53,18 @@ const FADE_FRAME: Duration = Duration::from_millis(16);
 /// anything that reaches the screen.
 const FULL: u16 = 255;
 
+/// Where a notice is in its life at a given moment.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Phase {
+    /// Standing at full ink. It looks identical frame to frame, so it needs no repaint.
+    Holding,
+    /// Mid-fade, drawing with this much ink in parts of [`FULL`]; each frame's colours
+    /// differ from the last one's.
+    Fading(u16),
+    /// The fade has finished and the notice can be dropped.
+    Gone,
+}
+
 /// A raised notice: what it says, and when it was raised. The timings are copied from
 /// the config at raise time rather than borrowed, so a notice is self-contained and the
 /// painter needs nothing but this and a surface.
@@ -95,47 +107,31 @@ impl Notice {
         }
     }
 
-    /// Whether the fade has finished and the notice can be dropped.
-    pub(crate) fn expired(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.raised) >= self.hold + self.fade
-    }
-
-    /// Whether the notice is mid-fade, so this frame's colours differ from the last
-    /// one's. A notice that merely stands looks identical frame to frame, and saying so
-    /// is what keeps the hold from repainting for nothing.
-    pub(crate) fn fading(&self, now: Instant) -> bool {
+    /// The notice's phase at `now`: solid through the hold, then its ink falling
+    /// linearly to nothing across the fade, then gone.
+    pub(crate) fn phase(&self, now: Instant) -> Phase {
         let elapsed = now.saturating_duration_since(self.raised);
-        elapsed >= self.hold && elapsed < self.hold + self.fade
+        let Some(into_fade) = elapsed.checked_sub(self.hold) else {
+            return Phase::Holding;
+        };
+        if into_fade >= self.fade {
+            return Phase::Gone;
+        }
+        // Integer arithmetic on millis, so the ratio is exact at both ends. `into_fade`
+        // is short of the fade, so `gone` never exceeds FULL.
+        let gone = (into_fade.as_millis() * u128::from(FULL)) / self.fade.as_millis().max(1);
+        Phase::Fading(u16::try_from(gone).map_or(0, |gone| FULL.saturating_sub(gone)))
     }
 
     /// When the window should next repaint for this notice: the end of the hold while it
     /// still stands, then one frame at a time through the fade, then never. `None` once
-    /// it has expired, so a spent notice stops waking the loop.
+    /// it is gone, so a spent notice stops waking the loop.
     pub(crate) fn retry_at(&self, now: Instant) -> Option<Instant> {
-        let elapsed = now.saturating_duration_since(self.raised);
-        if elapsed < self.hold {
-            Some(self.raised + self.hold)
-        } else if elapsed < self.hold + self.fade {
-            Some(now + FADE_FRAME)
-        } else {
-            None
+        match self.phase(now) {
+            Phase::Holding => Some(self.raised + self.hold),
+            Phase::Fading(_) => Some(now + FADE_FRAME),
+            Phase::Gone => None,
         }
-    }
-
-    /// How much ink the notice draws with right now, in parts of [`FULL`]: solid through
-    /// the hold, then falling linearly to nothing across the fade.
-    fn strength(&self, now: Instant) -> u16 {
-        let elapsed = now.saturating_duration_since(self.raised);
-        let Some(into_fade) = elapsed.checked_sub(self.hold) else {
-            return FULL;
-        };
-        if self.fade.is_zero() || into_fade >= self.fade {
-            return 0;
-        }
-        // Integer arithmetic on millis: the fade is bounded well under a second, so this
-        // cannot overflow u32, and the ratio is exact at both ends.
-        let gone = (into_fade.as_millis() * u128::from(FULL)) / self.fade.as_millis().max(1);
-        FULL.saturating_sub(gone as u16)
     }
 }
 
@@ -161,10 +157,11 @@ pub(crate) fn paint(
     if metrics.w <= 0 || metrics.h <= 0 {
         return;
     }
-    let strength = notice.strength(Instant::now());
-    if strength == 0 {
-        return;
-    }
+    let strength = match notice.phase(Instant::now()) {
+        Phase::Holding => FULL,
+        Phase::Fading(0) | Phase::Gone => return,
+        Phase::Fading(strength) => strength,
+    };
 
     let content_cols = width::text_cells(&notice.text) as i32;
     let pad_x = metrics.w;
@@ -275,19 +272,28 @@ mod tests {
     }
 
     #[test]
-    fn strength_holds_solid_then_ramps_to_nothing() {
+    fn the_phase_holds_solid_then_ramps_to_nothing() {
         let notice = raised("x", 100, 100);
-        let at = |ms| notice.strength(notice.raised + Duration::from_millis(ms));
-        assert_eq!(at(0), FULL, "solid when raised");
-        assert_eq!(at(99), FULL, "solid until the hold ends");
+        let at = |ms| notice.phase(notice.raised + Duration::from_millis(ms));
+        assert_eq!(at(0), Phase::Holding, "solid when raised");
+        assert_eq!(at(99), Phase::Holding, "solid until the hold ends");
+        assert_eq!(at(100), Phase::Fading(FULL), "the fade starts at full ink");
         // Half way through the fade, within the one step integer division costs.
+        let Phase::Fading(half) = at(150) else {
+            panic!("mid-fade: {:?}", at(150));
+        };
         assert!(
-            at(150).abs_diff(FULL / 2) <= 1,
-            "half way through the fade: {}",
-            at(150)
+            half.abs_diff(FULL / 2) <= 1,
+            "half way through the fade: {half}"
         );
-        assert_eq!(at(200), 0, "gone when the fade ends");
-        assert_eq!(at(10_000), 0, "and stays gone");
+        assert_eq!(at(200), Phase::Gone, "gone when the fade ends");
+        assert_eq!(at(10_000), Phase::Gone, "and stays gone");
+        let unfaded = raised("x", 100, 0);
+        assert_eq!(
+            unfaded.phase(unfaded.raised + Duration::from_millis(100)),
+            Phase::Gone,
+            "a zero fade goes straight from the hold to gone"
+        );
     }
 
     #[test]
@@ -306,8 +312,8 @@ mod tests {
         );
         // Spent: no deadline, so an idle terminal goes back to blocking indefinitely.
         assert_eq!(notice.retry_at(base + Duration::from_millis(200)), None);
-        assert!(notice.expired(base + Duration::from_millis(200)));
-        assert!(!notice.expired(base + Duration::from_millis(199)));
+        assert_eq!(notice.phase(base + Duration::from_millis(200)), Phase::Gone);
+        assert_ne!(notice.phase(base + Duration::from_millis(199)), Phase::Gone);
     }
 
     #[test]
