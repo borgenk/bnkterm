@@ -1048,7 +1048,7 @@ fn is_c0(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::vt::*;
 
     /// A recording [`Perform`]: a real implementation that logs the callbacks,
     /// so a test can assert the exact action sequence a byte stream produces.

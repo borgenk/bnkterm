@@ -339,7 +339,7 @@ impl Default for Theme {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::color::*;
 
     #[test]
     fn mix_blends_each_channel_between_the_endpoints() {

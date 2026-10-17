@@ -212,7 +212,7 @@ pub(crate) fn paint(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::notice::*;
 
     const METRICS: CellMetrics = CellMetrics {
         size: 16,

@@ -543,7 +543,7 @@ extern "C" {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::gather::*;
     use crate::pty::Pty;
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};

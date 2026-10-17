@@ -124,7 +124,7 @@ pub(super) fn surface_for_cells(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::app::layout::*;
 
     const METRICS: CellMetrics = CellMetrics {
         size: 16,

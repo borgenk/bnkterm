@@ -1036,7 +1036,7 @@ fn parse_cmsgs(cbuf: &CmsgBuf, controllen: usize, out: &mut Vec<OwnedFd>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::ffi::*;
     use std::os::fd::AsRawFd;
 
     #[test]

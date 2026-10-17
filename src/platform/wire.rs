@@ -178,7 +178,7 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::wire::*;
 
     #[test]
     fn header_carries_size_and_opcode() {

@@ -496,7 +496,7 @@ const _: Option<&FcConfig> = None;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::fontconfig::*;
 
     /// Symbols used to exercise system fallback discovery.
     const HOMELESS: [char; 6] = ['⏺', '⎿', '✓', '✗', '✻', '⠁'];

@@ -271,7 +271,7 @@ fn intersection(a: Rect, b: Rect) -> Option<Rect> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::render::display::*;
 
     fn fill(x: i32, y: i32, w: i32, h: i32, color: u32) -> DrawCmd {
         DrawCmd::Fill {

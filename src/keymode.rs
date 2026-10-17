@@ -256,7 +256,7 @@ pub(crate) fn paint_overlay(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::keymode::*;
     use crate::platform::grapheme;
 
     const METRICS: CellMetrics = CellMetrics {

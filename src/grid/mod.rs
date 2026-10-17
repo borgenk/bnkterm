@@ -56,7 +56,7 @@ mod view;
 #[cfg(test)]
 mod tests;
 
-// The sibling modules reach these through `use super::*`, so this is the one list of what
+// The sibling modules reach these through `use crate::grid::*`, so this is the one list of what
 // the whole grid speaks — including the two `buffer` types `Screen`'s own fields name.
 use buffer::{Buffer, Charsets, Pen};
 

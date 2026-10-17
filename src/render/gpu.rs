@@ -1142,7 +1142,7 @@ fn luma(color: u32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::render::gpu::*;
 
     /// Both dials at 2.0 in tests, so an assertion reads as a plain power and a
     /// change to the shipping values in `app` cannot quietly move these numbers.

@@ -165,7 +165,7 @@ fn filename_of(line: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dev::capture::*;
 
     #[test]
     fn filename_is_the_text_past_the_two_space_separator() {

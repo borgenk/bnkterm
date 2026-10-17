@@ -402,7 +402,7 @@ fn percent(part: usize, whole: usize) -> Percent {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dev::profile::*;
 
     #[test]
     fn profile_uses_semantic_runs_not_escape_payload_bytes() {

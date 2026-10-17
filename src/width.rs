@@ -119,7 +119,7 @@ include!("width_tables.rs");
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::width::*;
 
     #[test]
     fn ascii_is_one_column() {

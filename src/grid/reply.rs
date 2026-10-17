@@ -25,7 +25,7 @@ use crate::platform::bytes::{push_decimal, push_hex_nibble};
 // The grid's shared vocabulary: the types in `grid/mod.rs` and the imports it makes.
 // `Screen`'s operations are split across these sibling modules, so each one works on
 // the same definitions rather than re-importing them piecemeal.
-use super::*;
+use crate::grid::*;
 
 impl Screen {
     /// The bytes queued to write back to the child (DA/DSR answers). Empty in the

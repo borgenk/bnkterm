@@ -60,7 +60,7 @@ fn parse_kb(value: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dev::sys::*;
 
     /// A verbatim rollup from the development kernel (7.1.5), kept whole rather
     /// than trimmed to the two interesting lines: the near-miss names

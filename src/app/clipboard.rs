@@ -14,7 +14,7 @@
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
-use super::State;
+use crate::app::State;
 use crate::error::{Error, Result};
 use crate::platform::ffi;
 use crate::platform::protocol::{

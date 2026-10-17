@@ -357,7 +357,7 @@ include!("grapheme_tables.rs");
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::grapheme::*;
 
     /// The fast-path threshold in [`joins_across_cells`] is a claim about the tables, so
     /// it is checked against them rather than believed. Sweeps every scalar below the

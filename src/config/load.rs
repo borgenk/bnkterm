@@ -250,7 +250,7 @@ fn number(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::config::load::*;
 
     fn clean(text: &str) -> Config {
         let (config, problems) = parse(text);

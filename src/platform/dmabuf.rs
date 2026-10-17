@@ -194,7 +194,7 @@ pub fn dev_minor(dev: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::dmabuf::*;
 
     /// The linear (no tiling) layout modifier, `DRM_FORMAT_MOD_LINEAR`.
     const MOD_LINEAR: u64 = 0;

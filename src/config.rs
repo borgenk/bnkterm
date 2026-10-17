@@ -173,7 +173,7 @@ impl Default for TabBarConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::config::*;
     use crate::platform::freetype::FontSelection;
 
     #[test]

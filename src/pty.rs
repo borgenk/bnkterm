@@ -789,7 +789,7 @@ unsafe fn fork_child_in_pty(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::pty::*;
 
     #[test]
     fn a_bare_program_name_resolves_against_path_before_the_fork() {

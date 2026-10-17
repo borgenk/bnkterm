@@ -172,7 +172,7 @@ fn modifier_bits(mods: Mods) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::mouse::*;
 
     /// Encode into a fresh buffer, or `None` when nothing is reported.
     fn encoded(

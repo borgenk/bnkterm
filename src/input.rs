@@ -934,7 +934,7 @@ mod keycode {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::input::*;
 
     /// Encode into a fresh buffer.
     fn encoded(key: Key, mods: Mods, modes: Modes) -> Vec<u8> {

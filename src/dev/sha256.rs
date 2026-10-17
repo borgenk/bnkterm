@@ -95,7 +95,7 @@ fn digest(data: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dev::sha256::*;
 
     #[test]
     fn matches_the_nist_vectors() {

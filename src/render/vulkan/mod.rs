@@ -579,7 +579,7 @@ fn create_logical_device(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::render::vulkan::*;
 
     #[test]
     fn memory_type_picking_prefers_device_local() {

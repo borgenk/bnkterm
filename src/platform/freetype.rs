@@ -1282,7 +1282,7 @@ fn copy_coverage(bitmap: &FtBitmap) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::freetype::*;
 
     fn open() -> Face {
         Face::open_default(16).expect("a default font should be available")

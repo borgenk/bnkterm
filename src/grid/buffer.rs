@@ -25,7 +25,7 @@
 // The grid's shared vocabulary: the types in `grid/mod.rs` and the imports it makes.
 // `Screen`'s operations are split across these sibling modules, so each one works on
 // the same definitions rather than re-importing them piecemeal.
-use super::*;
+use crate::grid::*;
 
 /// Columns between default tab stops.
 pub(super) const TAB_WIDTH: usize = 8;

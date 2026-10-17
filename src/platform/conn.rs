@@ -234,7 +234,7 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::conn::*;
 
     /// Encode a wire message: `object`, the `size | opcode` header word, then `body`.
     fn framed(object: u32, opcode: u16, body: &[u8]) -> Vec<u8> {

@@ -518,7 +518,7 @@ fn emit_tagged(out: &mut String, name: &str, ty: &str, ranges: &[(u32, u32, &'st
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dev::gen_tables::*;
 
     #[test]
     fn parses_the_version_from_a_ucd_header() {

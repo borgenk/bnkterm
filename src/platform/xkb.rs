@@ -455,7 +455,7 @@ impl Drop for Xkb {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::xkb::*;
 
     #[test]
     fn queries_are_inert_without_a_keymap() {

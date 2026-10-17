@@ -141,7 +141,7 @@ fn sample_bilinear(src: &[u32], w: i32, h: i32, fx: f32, fy: f32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::pixel::*;
 
     #[test]
     fn premultiplied_edges_resample_without_dark_fringe() {

@@ -350,7 +350,7 @@ fn copy_bgra(bitmap: &FtBitmap) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::emoji::*;
 
     fn emoji() -> EmojiFont {
         let file = crate::platform::fontconfig::font_for_family(

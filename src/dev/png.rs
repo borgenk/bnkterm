@@ -260,7 +260,7 @@ fn adler32(data: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dev::png::*;
 
     /// A little-endian bit reader over the deflate stream.
     struct Bits<'a> {

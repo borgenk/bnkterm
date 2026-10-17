@@ -99,7 +99,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dev::gen_stream::*;
 
     #[test]
     fn strips_only_the_first_header_line() {

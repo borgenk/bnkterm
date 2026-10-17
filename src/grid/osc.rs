@@ -21,8 +21,8 @@
 // The grid's shared vocabulary: the types in `grid/mod.rs` and the imports it makes.
 // `Screen`'s operations are split across these sibling modules, so each one works on
 // the same definitions rather than re-importing them piecemeal.
-use super::*;
 use crate::grid::reply::push_osc_end;
+use crate::grid::*;
 use crate::platform::bytes::push_decimal;
 
 impl Screen {
@@ -554,7 +554,7 @@ pub(super) fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::grid::osc::*;
 
     #[test]
     fn a_palette_index_is_one_to_three_digits_in_range() {

@@ -366,7 +366,7 @@ fn invalid_utf8(target: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dev::stream::*;
 
     #[test]
     fn every_named_stream_meets_its_target() {

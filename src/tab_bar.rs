@@ -472,7 +472,7 @@ fn sanitize_title(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::tab_bar::*;
 
     const METRICS: CellMetrics = CellMetrics {
         size: 16,

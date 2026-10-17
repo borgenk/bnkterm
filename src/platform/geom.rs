@@ -63,7 +63,7 @@ impl Scale {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::geom::*;
 
     #[test]
     fn pxf_keeps_the_fraction_px_rounds_away() {

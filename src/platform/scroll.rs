@@ -228,7 +228,7 @@ impl Scrollbar {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::platform::scroll::*;
 
     #[test]
     fn max_scroll_is_zero_when_content_fits() {
