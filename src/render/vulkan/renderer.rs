@@ -1,3 +1,5 @@
+use core::mem::offset_of;
+
 use crate::platform::error::{Error, Result};
 use crate::render::gpu::Vertex;
 use crate::render::vulkan::abi::*;
@@ -462,38 +464,19 @@ fn create_pipeline(
         stride: size_of::<Vertex>() as u32,
         input_rate: VK_VERTEX_INPUT_RATE_VERTEX,
     };
-    // Locations mirror shaders/quad.vert; offsets mirror gpu::Vertex.
+    // Locations mirror shaders/quad.vert; offsets come from `gpu::Vertex` itself.
+    let attr = |location: u32, format: u32, offset: usize| VkVertexInputAttributeDescription {
+        location,
+        binding: 0,
+        format,
+        offset: offset as u32,
+    };
     let attrs = [
-        VkVertexInputAttributeDescription {
-            location: 0,
-            binding: 0,
-            format: VK_FORMAT_R32G32_SFLOAT,
-            offset: 0,
-        },
-        VkVertexInputAttributeDescription {
-            location: 1,
-            binding: 0,
-            format: VK_FORMAT_R32G32_SFLOAT,
-            offset: 8,
-        },
-        VkVertexInputAttributeDescription {
-            location: 2,
-            binding: 0,
-            format: VK_FORMAT_R32G32B32A32_SFLOAT,
-            offset: 16,
-        },
-        VkVertexInputAttributeDescription {
-            location: 3,
-            binding: 0,
-            format: VK_FORMAT_R32G32B32A32_SFLOAT,
-            offset: 32,
-        },
-        VkVertexInputAttributeDescription {
-            location: 4,
-            binding: 0,
-            format: VK_FORMAT_R32_UINT,
-            offset: 48,
-        },
+        attr(0, VK_FORMAT_R32G32_SFLOAT, offset_of!(Vertex, pos)),
+        attr(1, VK_FORMAT_R32G32_SFLOAT, offset_of!(Vertex, uv)),
+        attr(2, VK_FORMAT_R32G32B32A32_SFLOAT, offset_of!(Vertex, color)),
+        attr(3, VK_FORMAT_R32G32B32A32_SFLOAT, offset_of!(Vertex, extra)),
+        attr(4, VK_FORMAT_R32_UINT, offset_of!(Vertex, mode)),
     ];
     let vertex_input = VkPipelineVertexInputStateCreateInfo {
         s_type: VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
