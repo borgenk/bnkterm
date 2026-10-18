@@ -134,8 +134,9 @@ screenshot:
 perf:
 	cargo run --release --features perf-alloc --bin bnkterm-dev -- --perf
 
-# Accept the current numbers as the new baseline. Every byte of footprint growth has
-# to be explained before it is saved: that gate holds at equality, not a ratio.
+# Accept the current numbers as the new baseline. Every new allocation and every byte
+# of footprint growth has to be explained before it is saved: those gates hold at
+# equality, not a ratio.
 perf-save:
 	cargo run --release --features perf-alloc --bin bnkterm-dev -- --perf --save
 

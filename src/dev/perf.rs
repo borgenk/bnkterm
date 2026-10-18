@@ -7,8 +7,10 @@
 //! hyperlink lookup) timed against `stats/baseline.txt`. It writes `data/latest.txt` and exits nonzero
 //! when a scenario is slower than the baseline by [`REGRESSION_RATIO`]. `--save`
 //! accepts the current numbers as the new baseline. Built with `perf-alloc` it also
-//! reports allocations per operation: the steady-state parse and print scenarios must
-//! show zero, and the baseline records that.
+//! counts allocations per operation and fails on any increase: a count is exact and
+//! repeats run to run, so a ratio would only let a scenario's first allocation through.
+//! `--save` needs `perf-alloc`, because a baseline without counts would leave them
+//! ungated.
 //!
 //! The same run gates the grid's footprint against `stats/footprint.txt`, in its own
 //! table because it is a different kind of number. A time is sampled and noisy, so it
@@ -51,6 +53,7 @@ use crate::platform::geom::Scale;
 use crate::platform::scroll::Scrollbar;
 use crate::platform::verdict::{Refusal, Verdict};
 use crate::vt::{Params, Parser, Perform};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -61,9 +64,9 @@ const LATEST_PATH: &str = "data/latest.txt";
 const HISTORY_PATH: &str = "data/history.jsonl";
 const FOOTPRINT_PATH: &str = "stats/footprint.txt";
 
-/// A scenario counts as a regression when it is at least this much slower (or, for
-/// allocations, this much larger) than the baseline. Wide enough to absorb timing
-/// noise, tight enough to catch the order-of-magnitude regressions this exists for.
+/// A scenario counts as a regression when it is at least this much slower than the
+/// baseline. Wide enough to absorb timing noise, tight enough to catch the
+/// order-of-magnitude regressions this exists for.
 const REGRESSION_RATIO: f64 = 1.10;
 
 /// The grid every perf harness runs against, matching the reference cat
@@ -106,11 +109,10 @@ struct Sample {
     allocs: u64,
 }
 
-/// A baseline entry: the recorded time, and allocations when saved with the
-/// counting allocator on.
+/// A baseline entry: the recorded time and allocations per op.
 struct Base {
     ns: u64,
-    allocs: Option<u64>,
+    allocs: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -136,8 +138,13 @@ pub fn run(args: &[String]) -> Result<()> {
         return Ok(());
     }
     if regressed.is_empty() {
+        let exact = if alloc::ENABLED {
+            "allocations and footprint"
+        } else {
+            "footprint"
+        };
         println!(
-            "\nNo regressions (speed within {:.0}%, footprint exact). Latest written to {LATEST_PATH}.",
+            "\nNo regressions (speed within {:.0}%, {exact} exact). Latest written to {LATEST_PATH}.",
             (REGRESSION_RATIO - 1.0) * 100.0
         );
         Ok(())
@@ -154,17 +161,30 @@ pub fn run(args: &[String]) -> Result<()> {
 /// establishes the baseline and reports no regression.
 fn gate_samples(samples: &[Sample], save: bool) -> Result<Vec<&'static str>> {
     let Some(baseline) = load_baseline(BASELINE_PATH)? else {
-        write_samples(BASELINE_PATH, samples)?;
-        print_table(samples, &HashMap::new());
+        save_baseline(samples)?;
+        print_table(samples, &HashMap::new(), alloc::ENABLED);
         println!("\nNo baseline existed; wrote {BASELINE_PATH}. Commit it to compare future runs.");
         return Ok(Vec::new());
     };
-    let regressed = print_table(samples, &baseline);
+    let regressed = print_table(samples, &baseline, alloc::ENABLED);
     if save {
-        write_samples(BASELINE_PATH, samples)?;
+        save_baseline(samples)?;
         return Ok(Vec::new());
     }
     Ok(regressed)
+}
+
+/// Write `samples` as the new baseline. Refused unless this run counted allocations:
+/// the baseline would have no counts to compare against, and every later run would
+/// leave allocations ungated.
+fn save_baseline(samples: &[Sample]) -> Result<()> {
+    if !alloc::ENABLED {
+        return Err(Error::msg(format!(
+            "refusing to write {BASELINE_PATH} without allocation counts; \
+             build with --features perf-alloc (`make perf-save` does)"
+        )));
+    }
+    write_samples(BASELINE_PATH, samples)
 }
 
 /// Measure every gate scenario. Each drives a persistent, pre-warmed grid so
@@ -719,13 +739,23 @@ enum Delta {
 }
 
 impl Delta {
-    fn classify(current: u64, base: u64) -> Delta {
-        if is_regression(current, base) {
+    /// A sampled time: only a move of [`REGRESSION_RATIO`] either way counts.
+    fn of_time(current: u64, base: u64) -> Delta {
+        if current as f64 >= base.max(1) as f64 * REGRESSION_RATIO {
             Delta::Regressed
         } else if base as f64 / current.max(1) as f64 >= REGRESSION_RATIO {
             Delta::Improved
         } else {
             Delta::Flat
+        }
+    }
+
+    /// A count: exact and the same on every run, so any change counts.
+    fn of_count(current: u64, base: u64) -> Delta {
+        match current.cmp(&base) {
+            Ordering::Greater => Delta::Regressed,
+            Ordering::Less => Delta::Improved,
+            Ordering::Equal => Delta::Flat,
         }
     }
 
@@ -743,9 +773,13 @@ impl Delta {
 }
 
 /// Print a current-vs-baseline table and return the names that regressed. Time is
-/// always compared; allocations only when both the run and the baseline measured
-/// them, so an unmeasured run never reads as a spurious improvement to zero.
-fn print_table(samples: &[Sample], baseline: &HashMap<String, Base>) -> Vec<&'static str> {
+/// always compared; allocations only when `counted` says this run measured them, so
+/// an unmeasured run never reads as a spurious improvement to zero.
+fn print_table(
+    samples: &[Sample],
+    baseline: &HashMap<String, Base>,
+    counted: bool,
+) -> Vec<&'static str> {
     let mut sorted: Vec<&Sample> = samples.iter().collect();
     sorted.sort_by_key(|s| s.name);
     println!(
@@ -756,7 +790,7 @@ fn print_table(samples: &[Sample], baseline: &HashMap<String, Base>) -> Vec<&'st
     for s in sorted {
         let base = baseline.get(s.name);
 
-        let ns_delta = base.map(|b| Delta::classify(s.ns, b.ns));
+        let ns_delta = base.map(|b| Delta::of_time(s.ns, b.ns));
         let (base_ns_col, ns_flag) = match (base, ns_delta) {
             (Some(b), Some(delta)) => (
                 b.ns.to_string(),
@@ -765,28 +799,22 @@ fn print_table(samples: &[Sample], baseline: &HashMap<String, Base>) -> Vec<&'st
             _ => ("(new)".to_string(), String::new()),
         };
 
-        let base_allocs = base.and_then(|b| b.allocs);
-        let alloc_delta = base_allocs.map(|b| Delta::classify(s.allocs, b));
-        let (alloc_cur, alloc_base, alloc_col) = if alloc::ENABLED {
-            let col = match (base_allocs, alloc_delta) {
-                (Some(b), Some(Delta::Flat)) => format!("{:+.1}%", ratio_pct(s.allocs, b)),
-                (Some(b), Some(delta)) => {
-                    format!("{:+.1}% {}", ratio_pct(s.allocs, b), delta.label())
-                }
-                _ => String::new(),
-            };
+        let alloc_delta = base
+            .filter(|_| counted)
+            .map(|b| Delta::of_count(s.allocs, b.allocs));
+        let (alloc_cur, alloc_base, alloc_col) = if !counted {
+            ("-".to_string(), "-".to_string(), String::new())
+        } else if let (Some(b), Some(delta)) = (base, alloc_delta) {
             (
                 s.allocs.to_string(),
-                base_allocs.map(|b| b.to_string()).unwrap_or_default(),
-                col,
+                b.allocs.to_string(),
+                count_change(s.allocs, b.allocs, delta),
             )
         } else {
-            ("-".to_string(), "-".to_string(), String::new())
+            (s.allocs.to_string(), String::new(), String::new())
         };
 
-        let time_regressed = ns_delta.is_some_and(Delta::regressed);
-        let alloc_regressed = alloc::ENABLED && alloc_delta.is_some_and(Delta::regressed);
-        if time_regressed || alloc_regressed {
+        if ns_delta.is_some_and(Delta::regressed) || alloc_delta.is_some_and(Delta::regressed) {
             regressed.push(s.name);
         }
 
@@ -799,8 +827,7 @@ fn print_table(samples: &[Sample], baseline: &HashMap<String, Base>) -> Vec<&'st
 }
 
 /// Percentage change of `current` over `base` (positive is a regression). Equal
-/// values are exactly 0%, so a steady 0-vs-0 allocation count does not read as a
-/// spurious -100%.
+/// values are exactly 0%, so two zeros do not read as a spurious -100%.
 fn ratio_pct(current: u64, base: u64) -> f64 {
     if current == base {
         0.0
@@ -809,8 +836,15 @@ fn ratio_pct(current: u64, base: u64) -> f64 {
     }
 }
 
-fn is_regression(current: u64, base: u64) -> bool {
-    current as f64 >= base.max(1) as f64 * REGRESSION_RATIO
+/// The Δ column for a count: the signed difference, since a percentage of a zero
+/// baseline says nothing, then the label. Blank when the count held.
+fn count_change(current: u64, base: u64, delta: Delta) -> String {
+    let diff = current.abs_diff(base);
+    match delta {
+        Delta::Regressed => format!("+{diff} {}", delta.label()),
+        Delta::Improved => format!("-{diff} {}", delta.label()),
+        Delta::Flat => String::new(),
+    }
 }
 
 /// Write samples to `path`, sorted by name for a stable diff. The allocation
@@ -841,8 +875,9 @@ fn load_baseline(path: &str) -> Result<Option<HashMap<String, Base>>> {
     }
 }
 
-/// Parse `name<ws>ns[<ws>allocs]`, skipping blank and `#` lines. The allocation
-/// column is optional so a two-column baseline still loads (allocs unmeasured).
+/// Parse `name<ws>ns<ws>allocs`, skipping blank and `#` lines. Every entry needs its
+/// allocation count: a baseline without one would leave allocations ungated, so it is
+/// malformed rather than read as unmeasured.
 fn parse_baseline(text: &str) -> Result<HashMap<String, Base>> {
     let mut out = HashMap::new();
     for line in text.lines() {
@@ -851,19 +886,19 @@ fn parse_baseline(text: &str) -> Result<HashMap<String, Base>> {
             continue;
         }
         let mut it = line.split_whitespace();
-        let (Some(name), Some(ns)) = (it.next(), it.next()) else {
-            return Err(Error::msg(format!("malformed perf line: {line:?}")));
+        let (Some(name), Some(ns), Some(allocs), None) =
+            (it.next(), it.next(), it.next(), it.next())
+        else {
+            return Err(Error::msg(format!(
+                "malformed perf line {line:?}: want name, ns/op and allocs/op"
+            )));
         };
         let ns = ns
             .parse::<u64>()
             .map_err(|_| Error::msg(format!("malformed perf number: {ns:?}")))?;
-        let allocs = match it.next() {
-            Some(a) => Some(
-                a.parse::<u64>()
-                    .map_err(|_| Error::msg(format!("malformed alloc number: {a:?}")))?,
-            ),
-            None => None,
-        };
+        let allocs = allocs
+            .parse::<u64>()
+            .map_err(|_| Error::msg(format!("malformed alloc number: {allocs:?}")))?;
         out.insert(name.to_string(), Base { ns, allocs });
     }
     Ok(out)
@@ -2026,6 +2061,42 @@ fn append(path: &str, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::dev::perf::*;
+
+    #[test]
+    fn allocations_gate_at_equality_and_time_at_a_ratio() {
+        let baseline = parse_baseline(
+            "first_alloc\t100\t0\none_more\t100\t71\none_fewer\t100\t71\n\
+             noisy\t100\t0\nslow\t100\t0\n",
+        )
+        .unwrap();
+        let samples = [
+            ("first_alloc", 100, 1),
+            ("one_more", 100, 72),
+            ("one_fewer", 100, 70),
+            ("noisy", 109, 0),
+            ("slow", 111, 0),
+        ]
+        .map(|(name, ns, allocs)| Sample { name, ns, allocs });
+        assert_eq!(
+            print_table(&samples, &baseline, true),
+            ["first_alloc", "one_more", "slow"]
+        );
+    }
+
+    #[test]
+    fn a_baseline_line_without_its_allocation_count_is_refused() {
+        let baseline = parse_baseline("# header\n\ngrid_reflow\t610355\t71\n").unwrap();
+        let reflow = &baseline["grid_reflow"];
+        assert_eq!((reflow.ns, reflow.allocs), (610355, 71));
+        for bad in [
+            "grid_reflow\t610355",
+            "grid_reflow\t610355\t71\t9",
+            "grid_reflow\t610355\tx",
+            "grid_reflow\tx\t71",
+        ] {
+            assert!(parse_baseline(bad).is_err(), "{bad:?} parsed");
+        }
+    }
 
     #[test]
     fn a_link_scenario_times_only_the_lookup_it_names() {
