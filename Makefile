@@ -104,12 +104,15 @@ flatpak-lint: flatpak
 	$(FLATPAK_BUILDER_LINT) $(LINT_EXCEPTIONS) manifest $(APP_ID).yml
 	$(FLATPAK_BUILDER_LINT) $(LINT_EXCEPTIONS) repo flatpak-repo
 
-# The gate. rustdoc is in it because it is what checks the intra-doc links.
+# The gate. rustdoc is in it because it is what checks the intra-doc links. The last
+# line reruns the perf harness's tests with the counting allocator installed, since the
+# ones that assert allocation counts compile only with it.
 test:
 	cargo fmt --check
 	cargo clippy --all --benches --tests --examples --all-features -- -D clippy::all -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --all-features
 	cargo test
+	cargo test --lib --features perf-alloc -- dev::perf::
 
 # The installer, over file:// URLs, with no network.
 test-install:
