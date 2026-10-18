@@ -1,6 +1,6 @@
 //! SHA-256 (FIPS 180-4), used by [`crate::dev::capture`] to write a `CHECKSUMS`
-//! provenance line beside a recorded fixture. The NIST test vectors at the bottom pin
-//! it against the standard.
+//! provenance line beside a recorded fixture, and by the stream tests to pin the perf
+//! corpora. The NIST test vectors at the bottom pin it against the standard.
 
 /// Round constants: the first 32 bits of the fractional parts of the cube roots of
 /// the first 64 primes (FIPS 180-4 §4.2.2).

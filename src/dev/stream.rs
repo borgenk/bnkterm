@@ -3,6 +3,8 @@
 //! wide and multibyte UTF-8, emoji clusters, and the escape-dense traffic a redrawing
 //! full-screen program emits. A fixed-seed SplitMix64 and no clock, so every run
 //! produces the same bytes and a difference between runs is a difference in the code.
+//! A test pins each stream's SHA-256, so changing what the perf gate measures is never
+//! an accident.
 //!
 //! Generators return bytes rather than `String`: the escape-heavy stream carries
 //! control bytes that are not text. `ascii` and `unicode` hold no combining marks or
@@ -366,6 +368,7 @@ fn invalid_utf8(target: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use crate::dev::sha256;
     use crate::dev::stream::*;
 
     #[test]
@@ -381,11 +384,40 @@ mod tests {
     }
 
     #[test]
-    fn generation_is_deterministic() {
-        for name in NAMES {
-            let a = generate(name, 16 * 1024).unwrap();
-            let b = generate(name, 16 * 1024).unwrap();
-            assert_eq!(a, b, "{name} is not deterministic");
+    fn every_stream_is_pinned_to_its_bytes() {
+        // The perf baselines are numbers about these bytes, so a change to a generator, its
+        // seed or its word list changes what every baseline means. When that is the intent,
+        // re-pin here and re-save the baseline in the same change. Generators append whole
+        // units until they reach the target, so a shorter request is a prefix of this one and
+        // the pin covers every size the gate asks for.
+        const PINNED_BYTES: usize = 64 * 1024;
+        #[rustfmt::skip]
+        const PINS: [(&str, &str); 11] = [
+            ("ascii",          "dc7d32f10ed1b50e04d94cf715e52cdcc8b543c7d8f8dfe67ac838ebe7c6fffd"),
+            ("unicode",        "aeb38cee865a3238d7787d510fdfa61fc547a0b1b89e1ad732e3ab764e9bcf09"),
+            ("unicode_width1", "9899ad8e5428378a8ce0b11101ed74da9ca2aa8ce1d2730ff122f44dae523e7e"),
+            ("unicode_cjk",    "d8e53a9c40ef29ce3667d88b3f5e727d7c9d896fcb3911c5741543419cb384af"),
+            ("unicode_mixed",  "b74954af1e9fe315dbd9229ac50047cee09cfeb417f639ebad498e28c47fa740"),
+            ("emoji",          "7674b6e210f9e52f62fe3f81fa145786edb4558fb92aafc79efbfec28b866a01"),
+            ("combining",      "b8b845fda7c91808af9e1eef1f5b09476390fd2dafca5e268bd69b0c835f4300"),
+            ("escape_heavy",   "3f37a2fdfcdd696e28a3abbae358325bac0057679c0d43dd79775302d708b800"),
+            ("short_runs",     "026c97f40ef4d1d238b4febb7987dd2ebe804395282eea3a16673359446dcbe0"),
+            ("wrap_edges",     "c2d7d0f07c3d83b345a45f724f7997a155e35c0d84ae07f208263d4d8a330b58"),
+            ("invalid_utf8",   "bbd80663a5f2e2c80c1b50e6744669fbda451128fe37fcf285fb091069c85493"),
+        ];
+        assert_eq!(
+            PINS.map(|(name, _)| name),
+            NAMES,
+            "every stream needs a pin"
+        );
+        for (name, pin) in PINS {
+            let stream = generate(name, PINNED_BYTES).unwrap();
+            let gate_chunk = generate(name, 8 * 1024).unwrap();
+            assert!(
+                stream.starts_with(&gate_chunk),
+                "{name}: a shorter request is not a prefix"
+            );
+            assert_eq!(sha256::hex(&stream), pin, "{name} changed");
         }
     }
 

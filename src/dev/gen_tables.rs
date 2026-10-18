@@ -36,15 +36,24 @@ const SCALAR_LIMIT: usize = 0x11_0000;
 const WIDTH_PAGE_LEN: usize = 256;
 
 pub fn run(_args: &[String]) -> Result<()> {
-    let version = read_version(&ucd("EastAsianWidth.txt"))?;
-    std::fs::write(WIDTH_TABLES, gen_width(&version)?)
-        .map_err(|e| Error::msg(format!("write {WIDTH_TABLES}: {e}")))?;
-    std::fs::write(GRAPHEME_TABLES, gen_grapheme(&version)?)
-        .map_err(|e| Error::msg(format!("write {GRAPHEME_TABLES}: {e}")))?;
-    std::fs::write(LINK_TABLES, gen_link(&version)?)
-        .map_err(|e| Error::msg(format!("write {LINK_TABLES}: {e}")))?;
+    let (version, tables) = generate()?;
+    for (path, source) in tables {
+        std::fs::write(path, source).map_err(|e| Error::msg(format!("write {path}: {e}")))?;
+    }
     println!("wrote {WIDTH_TABLES}, {GRAPHEME_TABLES} and {LINK_TABLES} from Unicode {version}");
     Ok(())
+}
+
+/// The Unicode version of `ucd/`, and each table file paired with the source generated
+/// for it. Nothing is written until every table has generated.
+fn generate() -> Result<(String, [(&'static str, String); 3])> {
+    let version = read_version(&ucd("EastAsianWidth.txt"))?;
+    let tables = [
+        (WIDTH_TABLES, gen_width(&version)?),
+        (GRAPHEME_TABLES, gen_grapheme(&version)?),
+        (LINK_TABLES, gen_link(&version)?),
+    ];
+    Ok((version, tables))
 }
 
 /// The path of a vendored UCD file.
@@ -519,6 +528,24 @@ fn emit_tagged(out: &mut String, name: &str, ty: &str, ranges: &[(u32, u32, &'st
 #[cfg(test)]
 mod tests {
     use crate::dev::gen_tables::*;
+
+    #[test]
+    fn the_committed_tables_are_what_the_generator_writes() {
+        let (_, tables) = generate().unwrap();
+        for (path, generated) in tables {
+            let committed = read(path).unwrap();
+            let same_lines = committed
+                .lines()
+                .zip(generated.lines())
+                .take_while(|(c, g)| c == g)
+                .count();
+            assert!(
+                committed == generated,
+                "{path} differs from what `make tables` writes, from line {}",
+                same_lines + 1
+            );
+        }
+    }
 
     #[test]
     fn parses_the_version_from_a_ucd_header() {
