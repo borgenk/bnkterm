@@ -1,4 +1,5 @@
-//! The modal "leader" key tables layered over the terminal, wezterm-style.
+//! The keys the window keeps from the child: the modal "leader" tables layered over the
+//! terminal, wezterm-style, and the direct chords beside them.
 //!
 //! A terminal normally hands every key straight to the child. bnkterm adds an
 //! opt-in modal layer on top: pressing the leader (Ctrl+A) swallows that key and
@@ -20,6 +21,9 @@
 //! Ctrl+C` opens a tab exactly as `Ctrl+A c` does. Typing the sequence fast is how
 //! it is typed in practice, and a lagging Ctrl release must not turn a command into
 //! a silent cancel.
+//!
+//! Normal mode also binds chords that need no leader: Ctrl+Tab and Ctrl+PgUp/PgDn switch
+//! tabs, Ctrl+Shift+T/W open and close one, and Ctrl+Shift+C/V copy and paste.
 //!
 //! The whole thing is two pure functions with no window or PTY: [`advance`] is the
 //! `(mode, key, mods) -> (mode, disposition)` transition, unit-tested as a table;
@@ -49,18 +53,22 @@ pub(crate) enum KeyMode {
     Tabs,
 }
 
-/// A tab-bar operation a leader key resolves to. The app maps these onto the
-/// `app::tabs::Tabs` manager; keeping them a plain enum lets the state
-/// machine stay free of the manager and stay testable.
+/// A window operation a key resolves to. The app applies these to the tab manager and
+/// the clipboard; keeping them a plain enum lets the state machine stay free of both
+/// and stay testable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum TabAction {
-    New,
-    Close,
+pub(crate) enum WindowAction {
+    NewTab,
+    CloseTab,
     /// Make the tab one slot along the active one. Selection wraps at both edges.
-    Select(Dir),
+    SelectTab(Dir),
     /// Reorder the active tab one slot along, keeping it active. Reordering does not
     /// wrap: flinging a tab past the edge to the far side would be surprising.
-    Move(Dir),
+    MoveTab(Dir),
+    /// Put the active tab's selection on the clipboard.
+    Copy,
+    /// Paste the clipboard into the active tab.
+    Paste,
 }
 
 /// Which way along the strip an action travels: toward index 0, or toward the end.
@@ -73,10 +81,10 @@ pub(crate) enum Dir {
 /// What the app does with a key after the mode machine has seen it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Disposition {
-    /// Not a mode key: process it normally (the existing chords, then the child).
+    /// Not bound here: process it normally (the scrollback keys, then the child).
     Passthrough,
     /// The key drove the machine; do not send it onward. Run `action` if present.
-    Consumed(Option<TabAction>),
+    Consumed(Option<WindowAction>),
     /// Leave the mode and send this exact key to the child. The leader escape
     /// hatch: Ctrl+A Ctrl+A types a literal Ctrl+A rather than re-arming.
     SendLiteral(Key, Mods),
@@ -108,6 +116,41 @@ fn command_letter(key: Key, mods: Mods) -> Option<char> {
     }
 }
 
+/// The chords bound without the leader. Each takes a Ctrl key the child would otherwise
+/// receive. The letters also need Shift, because plain Ctrl+T/W/C/V are the child's
+/// (Ctrl+C above all). The letter may be the key's `base` or what it typed: a dead key
+/// that composes with it changes only `typed` (`´` then `Ctrl+Shift+V` types `Ǘ`), and
+/// a layout with Latin on the Shift level changes only `base` (the Hebrew V key is `ה`).
+/// The page keys take Ctrl alone, because Shift+Page is the scrollback's.
+fn window_chord(key: Key, mods: Mods) -> Option<WindowAction> {
+    if !mods.contains(Mods::CTRL) {
+        return None;
+    }
+    match key {
+        Key::Tab if !mods.contains(Mods::ALT) => {
+            let dir = if mods.contains(Mods::SHIFT) {
+                Dir::Prev
+            } else {
+                Dir::Next
+            };
+            Some(WindowAction::SelectTab(dir))
+        }
+        Key::PageUp if mods == Mods::CTRL => Some(WindowAction::SelectTab(Dir::Prev)),
+        Key::PageDown if mods == Mods::CTRL => Some(WindowAction::SelectTab(Dir::Next)),
+        Key::Char { typed, base } if mods.contains(Mods::SHIFT) => {
+            let letter = |c: char| match c.to_ascii_lowercase() {
+                't' => Some(WindowAction::NewTab),
+                'w' => Some(WindowAction::CloseTab),
+                'c' => Some(WindowAction::Copy),
+                'v' => Some(WindowAction::Paste),
+                _ => None,
+            };
+            letter(base).or_else(|| letter(typed))
+        }
+        _ => None,
+    }
+}
+
 /// The transition function. Given the current mode and a resolved key press,
 /// return the next mode and what the app should do with the key. Pure: no I/O, no
 /// manager, so the entire table is pinned by unit tests.
@@ -115,9 +158,11 @@ pub(crate) fn advance(mode: KeyMode, key: Key, mods: Mods) -> (KeyMode, Disposit
     match mode {
         KeyMode::Normal => {
             if is_leader(key, mods) {
-                (KeyMode::Leader, Disposition::Consumed(None))
-            } else {
-                (KeyMode::Normal, Disposition::Passthrough)
+                return (KeyMode::Leader, Disposition::Consumed(None));
+            }
+            match window_chord(key, mods) {
+                Some(action) => (KeyMode::Normal, Disposition::Consumed(Some(action))),
+                None => (KeyMode::Normal, Disposition::Passthrough),
             }
         }
         KeyMode::Leader => {
@@ -131,12 +176,13 @@ pub(crate) fn advance(mode: KeyMode, key: Key, mods: Mods) -> (KeyMode, Disposit
             match command_letter(key, mods) {
                 Some('w') => (KeyMode::Tabs, Disposition::Consumed(None)),
                 // `c` is wezterm's new-tab leader key; `t` is kept as an alias.
-                Some('c') | Some('t') => {
-                    (KeyMode::Normal, Disposition::Consumed(Some(TabAction::New)))
-                }
+                Some('c') | Some('t') => (
+                    KeyMode::Normal,
+                    Disposition::Consumed(Some(WindowAction::NewTab)),
+                ),
                 Some('x') => (
                     KeyMode::Normal,
-                    Disposition::Consumed(Some(TabAction::Close)),
+                    Disposition::Consumed(Some(WindowAction::CloseTab)),
                 ),
                 // Escape, an arrow, or any unbound key cancels the one-shot leader
                 // and is swallowed (the overlay vanishing is the signal it did).
@@ -157,9 +203,9 @@ pub(crate) fn advance(mode: KeyMode, key: Key, mods: Mods) -> (KeyMode, Disposit
                     };
                     // Shift reorders the tab instead of selecting one.
                     let action = if shift {
-                        TabAction::Move(dir)
+                        WindowAction::MoveTab(dir)
                     } else {
-                        TabAction::Select(dir)
+                        WindowAction::SelectTab(dir)
                     };
                     (KeyMode::Tabs, Disposition::Consumed(Some(action)))
                 }
@@ -244,7 +290,7 @@ mod tests {
     };
 
     #[test]
-    fn normal_passes_everything_but_the_leader() {
+    fn normal_arms_the_leader_on_ctrl_a_alone() {
         assert_eq!(
             advance(KeyMode::Normal, Key::plain('a'), Mods::NONE),
             (KeyMode::Normal, Disposition::Passthrough)
@@ -262,6 +308,83 @@ mod tests {
             advance(KeyMode::Normal, Key::plain('a'), Mods::CTRL | Mods::ALT),
             (KeyMode::Normal, Disposition::Passthrough)
         );
+    }
+
+    /// The letter key as Shift types it: `typed` upper, `base` lower.
+    fn shifted(letter: char) -> Key {
+        Key::Char {
+            typed: letter.to_ascii_uppercase(),
+            base: letter,
+        }
+    }
+
+    #[test]
+    fn normal_resolves_the_window_chords_and_stays_normal() {
+        let ctrl_shift = Mods::CTRL | Mods::SHIFT;
+        for (key, mods, action) in [
+            (Key::Tab, Mods::CTRL, WindowAction::SelectTab(Dir::Next)),
+            (Key::Tab, ctrl_shift, WindowAction::SelectTab(Dir::Prev)),
+            (Key::PageUp, Mods::CTRL, WindowAction::SelectTab(Dir::Prev)),
+            (
+                Key::PageDown,
+                Mods::CTRL,
+                WindowAction::SelectTab(Dir::Next),
+            ),
+            (shifted('t'), ctrl_shift, WindowAction::NewTab),
+            (shifted('w'), ctrl_shift, WindowAction::CloseTab),
+            (shifted('c'), ctrl_shift, WindowAction::Copy),
+            (shifted('v'), ctrl_shift, WindowAction::Paste),
+            // A waiting dead key composed with the letter; the key is still V.
+            (
+                Key::Char {
+                    typed: 'Ǘ',
+                    base: 'v',
+                },
+                ctrl_shift,
+                WindowAction::Paste,
+            ),
+            // Hebrew puts Latin on the Shift level; the key itself is ה.
+            (
+                Key::Char {
+                    typed: 'V',
+                    base: 'ה',
+                },
+                ctrl_shift,
+                WindowAction::Paste,
+            ),
+        ] {
+            assert_eq!(
+                advance(KeyMode::Normal, key, mods),
+                (KeyMode::Normal, Disposition::Consumed(Some(action))),
+                "{key:?} with {mods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn near_misses_of_the_window_chords_reach_the_child() {
+        for (key, mods) in [
+            // Ctrl+C is the interrupt and Ctrl+V a literal-next; neither may copy or paste.
+            (Key::plain('c'), Mods::CTRL),
+            (Key::plain('v'), Mods::CTRL),
+            (Key::plain('t'), Mods::CTRL),
+            (Key::plain('w'), Mods::CTRL),
+            (shifted('x'), Mods::CTRL | Mods::SHIFT),
+            (Key::Tab, Mods::NONE),
+            (Key::Tab, Mods::CTRL | Mods::ALT),
+            // Shift+Page belongs to the scrollback, with or without Ctrl.
+            (Key::PageUp, Mods::SHIFT),
+            (Key::PageUp, Mods::CTRL | Mods::SHIFT),
+            (Key::PageDown, Mods::CTRL | Mods::SHIFT),
+            (Key::PageUp, Mods::CTRL | Mods::ALT),
+            (Key::PageDown, Mods::CTRL | Mods::ALT),
+        ] {
+            assert_eq!(
+                advance(KeyMode::Normal, key, mods),
+                (KeyMode::Normal, Disposition::Passthrough),
+                "{key:?} with {mods:?}"
+            );
+        }
     }
 
     #[test]
@@ -289,30 +412,39 @@ mod tests {
         // `c` (wezterm's binding) and its `t` alias both open a new tab and disarm.
         assert_eq!(
             advance(KeyMode::Leader, Key::plain('c'), Mods::NONE),
-            (KeyMode::Normal, Disposition::Consumed(Some(TabAction::New)))
+            (
+                KeyMode::Normal,
+                Disposition::Consumed(Some(WindowAction::NewTab))
+            )
         );
         assert_eq!(
             advance(KeyMode::Leader, Key::plain('t'), Mods::NONE),
-            (KeyMode::Normal, Disposition::Consumed(Some(TabAction::New)))
+            (
+                KeyMode::Normal,
+                Disposition::Consumed(Some(WindowAction::NewTab))
+            )
         );
         assert_eq!(
             advance(KeyMode::Leader, Key::plain('x'), Mods::NONE),
             (
                 KeyMode::Normal,
-                Disposition::Consumed(Some(TabAction::Close))
+                Disposition::Consumed(Some(WindowAction::CloseTab))
             )
         );
         // Ctrl is folded away too: a command typed before the leader's Ctrl comes
         // back up is the same command.
         assert_eq!(
             advance(KeyMode::Leader, Key::plain('c'), Mods::CTRL),
-            (KeyMode::Normal, Disposition::Consumed(Some(TabAction::New)))
+            (
+                KeyMode::Normal,
+                Disposition::Consumed(Some(WindowAction::NewTab))
+            )
         );
         assert_eq!(
             advance(KeyMode::Leader, Key::plain('x'), Mods::CTRL),
             (
                 KeyMode::Normal,
-                Disposition::Consumed(Some(TabAction::Close))
+                Disposition::Consumed(Some(WindowAction::CloseTab))
             )
         );
         assert_eq!(
@@ -346,7 +478,7 @@ mod tests {
         for key in ['a', 'c', 'a', 'c'] {
             let (next, disposition) = advance(mode, Key::plain(key), Mods::CTRL);
             mode = next;
-            if let Disposition::Consumed(Some(TabAction::New)) = disposition {
+            if let Disposition::Consumed(Some(WindowAction::NewTab)) = disposition {
                 opened += 1;
             }
             assert!(
@@ -363,23 +495,23 @@ mod tests {
         for (key, plain, moved) in [
             (
                 Key::Up,
-                TabAction::Select(Dir::Prev),
-                TabAction::Move(Dir::Prev),
+                WindowAction::SelectTab(Dir::Prev),
+                WindowAction::MoveTab(Dir::Prev),
             ),
             (
                 Key::Left,
-                TabAction::Select(Dir::Prev),
-                TabAction::Move(Dir::Prev),
+                WindowAction::SelectTab(Dir::Prev),
+                WindowAction::MoveTab(Dir::Prev),
             ),
             (
                 Key::Down,
-                TabAction::Select(Dir::Next),
-                TabAction::Move(Dir::Next),
+                WindowAction::SelectTab(Dir::Next),
+                WindowAction::MoveTab(Dir::Next),
             ),
             (
                 Key::Right,
-                TabAction::Select(Dir::Next),
-                TabAction::Move(Dir::Next),
+                WindowAction::SelectTab(Dir::Next),
+                WindowAction::MoveTab(Dir::Next),
             ),
         ] {
             assert_eq!(

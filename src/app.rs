@@ -53,7 +53,7 @@ use crate::config::{self, TabBarConfig, FONT_SIZE_RANGE};
 // through the `From` bridge in `crate::error`, so there is one error type here.
 use crate::error::{Error, Result};
 use crate::input;
-use crate::keymode::{self, Dir, Disposition, KeyMode, TabAction};
+use crate::keymode::{self, Disposition, KeyMode, WindowAction};
 use crate::mouse::MouseButton;
 use crate::platform::conn::{Connection, Fill};
 use crate::platform::ffi;
@@ -1479,10 +1479,11 @@ impl State {
         // down would feed a dead key a second time and compose it with itself.
         let resolved = self.resolve_key(keycode, Compose::Advance);
 
-        // The modal leader tables (wezterm-style) get first look at every resolved
-        // key. In Normal mode only Ctrl+A is a mode key, so everything else reports
-        // `Passthrough` and drops to the chords and the child below unchanged; once
-        // a mode is armed the machine owns the keystroke until it returns to Normal.
+        // The window's key bindings get first look at every resolved key. In Normal
+        // mode only the leader and the direct chords are bound, so everything else
+        // reports `Passthrough` and drops to the scrollback keys and the child below
+        // unchanged; once a mode is armed the machine owns the keystroke until it
+        // returns to Normal.
         if let Some(key) = resolved {
             let (next, disposition) = keymode::advance(self.key_mode, key, mods);
             self.set_key_mode(next);
@@ -1490,7 +1491,7 @@ impl State {
                 Disposition::Consumed(action) => {
                     self.stop_repeat();
                     if let Some(action) = action {
-                        self.apply_tab_action(action)?;
+                        self.apply_window_action(action)?;
                     }
                     return Ok(());
                 }
@@ -1506,73 +1507,6 @@ impl State {
             }
         }
 
-        // Ctrl+Tab / Ctrl+Shift+Tab cycle to the next / previous tab, a common
-        // accelerator alongside the leader table. Intercepted here because the
-        // child would otherwise receive a literal tab / back-tab.
-        if mods.contains(input::Mods::CTRL) && !mods.contains(input::Mods::ALT) {
-            if let Some(input::Key::Tab) = input::key_from_keycode(keycode) {
-                self.stop_repeat();
-                if !self.tabs.active().is_demo() {
-                    if mods.contains(input::Mods::SHIFT) {
-                        self.tabs.cycle(Dir::Prev, self.window_focused);
-                    } else {
-                        self.tabs.cycle(Dir::Next, self.window_focused);
-                    }
-                }
-                return Ok(());
-            }
-        }
-
-        // Ctrl+Shift+T/W open and close tabs; C/V retain the terminal copy/paste
-        // convention. Demo mode consumes tab chords without creating a PTY.
-        if mods.contains(input::Mods::CTRL) && mods.contains(input::Mods::SHIFT) {
-            if let Some(c) = self.xkb.key_char(keycode) {
-                match c.to_ascii_lowercase() {
-                    't' => {
-                        self.stop_repeat();
-                        self.open_tab();
-                        return Ok(());
-                    }
-                    'w' => {
-                        self.stop_repeat();
-                        self.close_active_tab();
-                        return Ok(());
-                    }
-                    'c' => {
-                        // The core extracts the selection text and queues an
-                        // `OfferSelection`; the loop's outbox drain owns the clipboard.
-                        self.tabs.active_mut().copy_selection();
-                        return Ok(());
-                    }
-                    'v' => {
-                        self.paste_from(Transport::Clipboard)?;
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            }
-        }
-        // Ctrl+PageUp/PageDown switches tabs. Shift remains reserved for the
-        // scrollback chords below, matching the established terminal convention.
-        if mods == input::Mods::CTRL {
-            match input::key_from_keycode(keycode) {
-                Some(input::Key::PageUp) => {
-                    self.stop_repeat();
-                    if !self.tabs.active().is_demo() {
-                        self.tabs.cycle(Dir::Prev, self.window_focused);
-                    }
-                    return Ok(());
-                }
-                Some(input::Key::PageDown) => {
-                    self.stop_repeat();
-                    if !self.tabs.active().is_demo() {
-                        self.tabs.cycle(Dir::Next, self.window_focused);
-                    }
-                    return Ok(());
-                }
-                _ => {}
-            }
-        }
         // Shift + Page/Home/End scrolls the scrollback view instead of reaching the
         // child (the alt screen has no history, so there it is a normal key). The
         // already-resolved key rather than the keycode, so the keypad's Page/Home/End
@@ -1607,19 +1541,23 @@ impl State {
         }
     }
 
-    /// Run a leader-resolved tab action against the manager. Tab creation is inert
-    /// in the no-PTY demo (as with the Ctrl+Shift chords); switching and reordering
-    /// are naturally no-ops there, since the demo has a single tab.
-    fn apply_tab_action(&mut self, action: TabAction) -> Result<()> {
+    /// Run an action a key resolved to. Opening and closing tabs are inert in the
+    /// no-PTY demo; switching and reordering are naturally no-ops there, since the demo
+    /// has a single tab.
+    fn apply_window_action(&mut self, action: WindowAction) -> Result<()> {
         match action {
-            TabAction::New => self.open_tab(),
-            TabAction::Close => self.close_active_tab(),
-            TabAction::Select(dir) => {
+            WindowAction::NewTab => self.open_tab(),
+            WindowAction::CloseTab => self.close_active_tab(),
+            WindowAction::SelectTab(dir) => {
                 self.tabs.cycle(dir, self.window_focused);
             }
-            TabAction::Move(dir) => {
+            WindowAction::MoveTab(dir) => {
                 self.tabs.move_active(dir);
             }
+            // The core extracts the selection text and queues an `OfferSelection`; the
+            // loop's outbox drain owns the clipboard.
+            WindowAction::Copy => self.tabs.active_mut().copy_selection(),
+            WindowAction::Paste => self.paste_from(Transport::Clipboard)?,
         }
         Ok(())
     }
