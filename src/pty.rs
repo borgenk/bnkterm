@@ -28,7 +28,7 @@
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use core::ffi::{c_char, c_int, c_short, c_ulong};
 
@@ -488,32 +488,18 @@ impl PollSet {
     }
 
     /// Block until a registered descriptor is ready or `timeout` elapses.
-    /// `None` waits indefinitely.
+    /// `None` waits indefinitely, and so does a timeout too long to have a deadline.
     pub fn wait(&mut self, timeout: Option<Duration>) -> Result<()> {
-        let millis = match timeout {
-            None => -1,
-            Some(d) => d.as_millis().min(c_int::MAX as u128) as c_int,
-        };
-        loop {
-            // SAFETY: `fds` owns `len` initialized `Pollfd` entries and remains
-            // exclusively borrowed for the duration of the call.
-            let r = unsafe { ffi::poll(self.fds.as_mut_ptr(), self.fds.len() as c_ulong, millis) };
-            if r < 0 {
-                if ffi::errno() == ffi::EINTR {
-                    continue;
-                }
-                return Err(errno_error("poll"));
-            }
-            return Ok(());
-        }
+        let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
+        ffi::poll_until(&mut self.fds, deadline)
+            .map(drop)
+            .map_err(|e| Error::msg(format!("poll failed: errno {e}")))
     }
 
     /// Whether `idx` was reported readable, hung up, or errored by the last wait.
     /// An out-of-range slot is never ready.
     pub fn readable(&self, idx: usize) -> bool {
-        self.fds
-            .get(idx)
-            .is_some_and(|fd| fd.revents & (ffi::POLLIN | ffi::POLLHUP | ffi::POLLERR) != 0)
+        self.fds.get(idx).is_some_and(ffi::PollFd::readable)
     }
 }
 
@@ -1275,13 +1261,21 @@ mod tests {
     }
 
     #[test]
-    fn poll_set_timeout_reports_nothing_readable() {
+    fn poll_set_timeout_waits_its_length_and_reports_nothing_readable() {
         let (read, write) = test_pipe();
         let mut set = PollSet::new();
         let slot = set.add(read.as_raw_fd());
 
+        // A millisecond is the shortest wait the event loop asks for. Coming back early
+        // spins the loop until the deadline it was waiting on.
+        let start = Instant::now();
         set.wait(Some(Duration::from_millis(1)))
             .expect("poll timeout");
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(1),
+            "returned after {waited:?}"
+        );
 
         assert!(!set.readable(slot));
         drop(write);

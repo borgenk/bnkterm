@@ -131,13 +131,21 @@ struct CmsgHdr {
 // FFI declarations.
 // ---------------------------------------------------------------------------
 
-/// One entry for [`poll`]: the fd to watch, the events wanted, the events that fired.
+/// One entry for [`poll_until`]: the fd to watch, the events wanted, the events that fired.
 /// The crate's only `struct pollfd`; its size is pinned against the C ABI below.
 #[repr(C)]
 pub(crate) struct PollFd {
     pub(crate) fd: c_int,
     pub(crate) events: c_short,
     pub(crate) revents: c_short,
+}
+
+impl PollFd {
+    /// Whether the last wait reported `fd` readable, hung up, or errored: each means a
+    /// read now returns without blocking.
+    pub(crate) fn readable(&self) -> bool {
+        self.revents & (POLLIN | POLLHUP | POLLERR) != 0
+    }
 }
 
 /// What one non-blocking read produced. `Err` carries the raw errno rather than a
@@ -151,7 +159,7 @@ pub(crate) enum Read {
 }
 
 extern "C" {
-    pub(crate) fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
+    fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn mmap(
         addr: *mut c_void,
@@ -570,6 +578,57 @@ pub fn set_nonblocking(fd: RawFd) -> Result<()> {
     Ok(())
 }
 
+/// Wait until one of `fds` is ready or `deadline` passes, returning how many are ready; 0
+/// means the deadline passed. `None` waits indefinitely. Every `poll(2)` in the crate is
+/// this one.
+///
+/// `poll` counts whole milliseconds, so the time left rounds up: truncating it would end
+/// every wait early, and a 1 ms wait measured a moment after its deadline was set would
+/// not wait at all.
+///
+/// A signal interrupting the wait (`EINTR`) retries it against the same absolute deadline,
+/// so a signal storm neither ends the wait early nor restarts its clock. A deadline that has
+/// already passed still polls once without blocking, so the answer is always the fds' state
+/// now rather than a guess. Any other failure is its errno.
+pub(crate) fn poll_until(
+    fds: &mut [PollFd],
+    deadline: Option<Instant>,
+) -> core::result::Result<usize, c_int> {
+    loop {
+        let timeout = match deadline {
+            None => -1,
+            Some(d) => c_int::try_from(
+                d.saturating_duration_since(Instant::now())
+                    .as_nanos()
+                    .div_ceil(1_000_000),
+            )
+            .unwrap_or(c_int::MAX),
+        };
+        // SAFETY: `fds` is an exclusively borrowed slice of initialized `PollFd`s for the
+        // length of the call; poll reads `fd` and `events` and writes `revents` only.
+        let r = unsafe { poll(fds.as_mut_ptr(), fds.len() as c_ulong, timeout) };
+        if let Ok(ready) = usize::try_from(r) {
+            return Ok(ready);
+        }
+        let e = errno();
+        if e != EINTR {
+            return Err(e);
+        }
+    }
+}
+
+/// [`poll_until`] on one fd for `POLLIN`, returning the events that fired (none when the
+/// deadline passed).
+fn poll_one(fd: RawFd, deadline: Option<Instant>) -> core::result::Result<c_short, c_int> {
+    let mut pfd = [PollFd {
+        fd,
+        events: POLLIN,
+        revents: 0,
+    }];
+    poll_until(&mut pfd, deadline)?;
+    Ok(pfd[0].revents)
+}
+
 /// Read `fd` to end-of-file, giving up after `budget` or once `max_bytes` have arrived.
 /// Used to pull a paste payload out of the pipe the compositor writes into.
 ///
@@ -581,8 +640,9 @@ pub fn set_nonblocking(fd: RawFd) -> Result<()> {
 /// paste is a far better outcome than losing the terminal, and a real transfer completes
 /// in well under a millisecond, so the budget is never felt.
 ///
-/// The deadline is absolute, so `EINTR` retries do not restart the clock. `fd` is put in
-/// non-blocking mode here rather than trusted to arrive that way.
+/// The deadline is absolute, so `EINTR` retries do not restart the clock (see
+/// [`poll_until`]). `fd` is put in non-blocking mode here rather than trusted to arrive that
+/// way.
 pub fn read_to_end_bounded(fd: RawFd, budget: Duration, max_bytes: usize) -> Result<Vec<u8>> {
     set_nonblocking(fd)?;
     let deadline = Instant::now() + budget;
@@ -610,28 +670,10 @@ pub fn read_to_end_bounded(fd: RawFd, budget: Duration, max_bytes: usize) -> Res
         if e != EAGAIN {
             return Err(Error::msg(format!("read failed: errno {e}")));
         }
-        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-            return Err(Error::msg("clipboard owner stopped sending"));
-        };
-        let mut pfd = PollFd {
-            fd,
-            events: POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one live PollFd for the length of the call; poll reads `events`, writes
-        // `revents`, and treats `fd` as read-only.
-        let r = unsafe {
-            poll(
-                &mut pfd,
-                1,
-                c_int::try_from(left.as_millis()).unwrap_or(c_int::MAX),
-            )
-        };
-        if r < 0 && errno() != EINTR {
-            return Err(Error::msg(format!("poll failed: errno {}", errno())));
-        }
-        if r == 0 {
-            return Err(Error::msg("clipboard owner stopped sending"));
+        match poll_one(fd, Some(deadline)) {
+            Ok(0) => return Err(Error::msg("clipboard owner stopped sending")),
+            Ok(_) => {}
+            Err(e) => return Err(Error::msg(format!("poll failed: errno {e}"))),
         }
     }
 }
@@ -920,42 +962,18 @@ pub fn drm_syncobj_point_to_sync_file(
 /// A signal delivered mid-wait interrupts `poll` with `EINTR`; this **retries** on it rather
 /// than reporting "not signalled", so a `SIGWINCH` storm during the very resize that triggers
 /// the wait cannot make it return a spurious false and free a buffer the compositor still
-/// holds. The deadline is recomputed each retry, so the total wait stays bounded by
-/// `timeout_ms`. A caller must still treat a `false` as "not known released" and defer the
+/// holds. The deadline is absolute, so the total wait stays bounded by `timeout_ms` (see
+/// [`poll_until`]). A caller must still treat a `false` as "not known released" and defer the
 /// free rather than force it.
 pub fn wait_sync_file(fd: RawFd, timeout_ms: c_int) -> bool {
-    // A positive timeout gets an absolute deadline so EINTR retries do not restart the clock;
-    // zero and negative pass straight through (poll, no wait / block forever).
-    let deadline = (timeout_ms > 0)
-        .then(|| Instant::now() + Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0)));
-    loop {
-        let remaining = match deadline {
-            Some(d) => {
-                let Some(left) = d.checked_duration_since(Instant::now()) else {
-                    return false; // the bounded wait elapsed
-                };
-                c_int::try_from(left.as_millis()).unwrap_or(c_int::MAX)
-            }
-            None => timeout_ms,
-        };
-        let mut pfd = PollFd {
-            fd,
-            events: POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one live PollFd for the length of the call; poll reads `events` and writes
-        // `revents` only, and treats `fd` as read-only.
-        let n = unsafe { poll(&mut pfd, 1, remaining) };
-        if n < 0 {
-            // Interrupted by a signal: retry within the remaining budget. Any other error
-            // (there is no real one for a valid fd) reports "not signalled".
-            if errno() == EINTR {
-                continue;
-            }
-            return false;
-        }
-        return n > 0 && (pfd.revents & POLLIN) != 0;
-    }
+    // A negative timeout is no deadline at all; zero is a deadline already here, which polls
+    // once without waiting.
+    let deadline = u64::try_from(timeout_ms)
+        .ok()
+        .map(|ms| Instant::now() + Duration::from_millis(ms));
+    // Any error other than `EINTR` (there is no real one for a valid fd) reports "not
+    // signalled".
+    poll_one(fd, deadline).is_ok_and(|revents| revents & POLLIN != 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,6 +1124,51 @@ mod tests {
         drop(read_end);
         writer.join().unwrap();
         assert!(format!("{err}").contains("exceeded"), "{err}");
+    }
+
+    /// The buffer-release wait rides on this: a resize sends a `SIGWINCH` per step, during
+    /// exactly the wait that decides whether a buffer the compositor may still hold can be
+    /// freed. A signal must neither end the wait as "not signalled" nor start it over.
+    #[test]
+    fn a_signal_storm_neither_cuts_a_bounded_wait_short_nor_stretches_it() {
+        use std::os::unix::thread::{JoinHandleExt, RawPthread};
+        extern "C" fn interrupt(_: c_int) {}
+        extern "C" {
+            fn signal(signum: c_int, handler: usize) -> usize;
+            fn pthread_kill(thread: RawPthread, sig: c_int) -> c_int;
+        }
+        // Ignored by default and sent by nothing else here. A handler, not `SIG_IGN`, is
+        // what makes a signal interrupt `poll`.
+        const SIGURG: c_int = 23;
+        let handler: extern "C" fn(c_int) = interrupt;
+        unsafe { signal(SIGURG, handler as usize) };
+
+        let (read_end, write_end) = pipe().unwrap();
+        let fd = read_end.as_raw_fd();
+        let waiter = std::thread::spawn(move || {
+            let start = Instant::now();
+            (wait_sync_file(fd, 300), start.elapsed())
+        });
+        // Interrupt until the wait ends. One that restarted its clock on every signal would
+        // never end while this runs, so the loop has a cap of its own.
+        let cap = Instant::now() + Duration::from_secs(3);
+        while !waiter.is_finished() && Instant::now() < cap {
+            unsafe { pthread_kill(waiter.as_pthread_t(), SIGURG) };
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let (signalled, waited) = waiter.join().unwrap();
+        assert!(!signalled, "nothing was written");
+        assert!(
+            waited >= Duration::from_millis(290),
+            "a signal is not a timeout: {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "nor a reason to start over: {waited:?}"
+        );
+
+        write_some(write_end.as_raw_fd(), b"x").unwrap();
+        assert!(wait_sync_file(fd, 0), "a readable fd is a signalled one");
     }
 
     #[test]

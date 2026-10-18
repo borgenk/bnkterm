@@ -62,7 +62,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 
-use core::ffi::{c_int, c_ulong, c_void};
+use core::ffi::c_int;
 
 use crate::error::{Error, Result};
 use crate::platform::ffi;
@@ -251,11 +251,12 @@ struct PollBits {
 }
 
 /// Wait for the PTY read fd, the stop fd, or the child's exit fd (`-1` when there is
-/// none, which `ppoll` ignores), collapsing `ffi::EINTR`.
+/// none, which `poll` ignores). The error is the raw errno, which the stream's end
+/// carries onward.
 ///
 /// The wait is unbounded, and can be, because every watched fd is level-triggered:
 /// a byte sitting unread in the PTY, a nonzero stop-eventfd counter, and an exited
-/// child's pidfd each make the *next* `ppoll` return immediately, so there is no edge
+/// child's pidfd each make the *next* `poll` return immediately, so there is no edge
 /// to miss and no wake to lose. A periodic timeout would buy nothing and cost a timer
 /// wakeup per thread per tick, on a thread whose entire job is to sleep until the
 /// child says something.
@@ -264,29 +265,14 @@ fn wait_for_child(
     stop_fd: RawFd,
     exit_fd: RawFd,
 ) -> core::result::Result<PollBits, c_int> {
-    loop {
-        let mut fds = [read_fd, stop_fd, exit_fd].map(|fd| ffi::PollFd {
-            fd,
-            events: ffi::POLLIN,
-            revents: 0,
-        });
-        // SAFETY: fds points at three valid pollfd entries; a null timeout blocks until
-        // one of them is ready, and a null sigmask leaves the signal mask unchanged.
-        let r = unsafe { ppoll(fds.as_mut_ptr(), 3, core::ptr::null(), core::ptr::null()) };
-        if r < 0 {
-            let e = ffi::errno();
-            if e == ffi::EINTR {
-                continue;
-            }
-            return Err(e);
-        }
-        let hit = |p: &ffi::PollFd| p.revents & (ffi::POLLIN | ffi::POLLHUP | ffi::POLLERR) != 0;
-        return Ok(PollBits {
-            pty: hit(&fds[0]),
-            stop: hit(&fds[1]),
-            exited: hit(&fds[2]),
-        });
-    }
+    let mut fds = [read_fd, stop_fd, exit_fd].map(|fd| ffi::PollFd {
+        fd,
+        events: ffi::POLLIN,
+        revents: 0,
+    });
+    ffi::poll_until(&mut fds, None)?;
+    let [pty, stop, exited] = fds.map(|p| p.readable());
+    Ok(PollBits { pty, stop, exited })
 }
 
 /// The gather loop: wait for the PTY to be readable (or a stop, or the child's exit),
@@ -518,29 +504,6 @@ impl Drop for Gatherer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// FFI. Everything but this `ppoll` is `platform::ffi`'s: the eventfd, the fd
-// duplicate, the read loop.
-// ---------------------------------------------------------------------------
-
-/// `struct timespec` (`time.h`), the `ppoll` timeout; size pinned in the tests.
-#[repr(C)]
-struct KernelTimespec {
-    tv_sec: i64,
-    tv_nsec: i64,
-}
-
-extern "C" {
-    /// `ppoll`, not `poll`: this wait blocks with no timeout, and the signal mask
-    /// argument is what keeps it that way without a race.
-    fn ppoll(
-        fds: *mut ffi::PollFd,
-        nfds: c_ulong,
-        timeout: *const KernelTimespec,
-        sigmask: *const c_void,
-    ) -> c_int;
-}
-
 #[cfg(test)]
 mod tests {
     use crate::gather::*;
@@ -548,14 +511,6 @@ mod tests {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
-
-    // -- ABI pins -----------------------------------------------------------
-
-    #[test]
-    fn the_ppoll_timespec_matches_the_c_abi() {
-        // The `pollfd` mirror this passes is the fd layer's, pinned there.
-        assert_eq!(std::mem::size_of::<KernelTimespec>(), 16);
-    }
 
     // -- Pure pool / state-machine invariants -------------------------------
 
@@ -723,11 +678,7 @@ mod tests {
                 events: ffi::POLLIN,
                 revents: 0,
             }];
-            let ts = KernelTimespec {
-                tv_sec: 0,
-                tv_nsec: 20_000_000,
-            };
-            unsafe { ppoll(fds.as_mut_ptr(), 1, &ts, core::ptr::null()) };
+            let _ = ffi::poll_until(&mut fds, Some(Instant::now() + Duration::from_millis(20)));
             g.clear_wakeup();
             assert!(
                 start.elapsed() < deadline,
@@ -916,7 +867,7 @@ mod tests {
 
     /// Stop while the gather thread is polling an idle child: `Drop` joins promptly.
     ///
-    /// This is the test that holds the unbounded `ppoll` honest. The wait has no
+    /// This is the test that holds the unbounded `poll` honest. The wait has no
     /// timeout to fall back on, so the stop eventfd is the *only* thing that can bring
     /// the thread out of an idle poll: break the wake and this hangs rather than
     /// merely getting slower.
@@ -1046,11 +997,7 @@ mod tests {
                 events: ffi::POLLIN,
                 revents: 0,
             }];
-            let ts = KernelTimespec {
-                tv_sec: 0,
-                tv_nsec: 20_000_000,
-            };
-            unsafe { ppoll(fds.as_mut_ptr(), 1, &ts, core::ptr::null()) };
+            let _ = ffi::poll_until(&mut fds, Some(Instant::now() + Duration::from_millis(20)));
             g.clear_wakeup();
             assert!(start.elapsed() < deadline, "no-alloc drain hung");
         };
