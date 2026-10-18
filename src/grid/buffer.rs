@@ -300,9 +300,13 @@ impl Row {
     ///             ┃ the cut
     /// ```
     ///
-    /// Every shift is a pair of cuts (see [`Buffer::insert_blanks`] and
-    /// [`Buffer::delete_chars`]), which is why this is stated once here rather than
-    /// open-coded per operation: each one gets it independently wrong otherwise.
+    /// A spacer in the final column is the final cell, so blanking it ends the line there,
+    /// as any write to that cell does (see [`Buffer::set_raw`]).
+    ///
+    /// Every shift (see [`Buffer::insert_blanks`] and [`Buffer::delete_chars`]) and every
+    /// overwrite (see [`Buffer::write_cell`] and the bulk fills) is a pair of cuts, which
+    /// is why this is stated once here rather than open-coded per operation: each one
+    /// gets it independently wrong otherwise.
     pub(super) fn split_wide_at(&mut self, col: usize, blank: PackedCell) {
         if !self.cells.get(col).is_some_and(|c| c.is_wide_spacer()) {
             return;
@@ -314,6 +318,9 @@ impl Row {
             slice.iter_mut().for_each(|c| *c = blank);
         }
         self.combining.retain(|m| m.col != lead && m.col != col);
+        if col + 1 == self.cells.len() {
+            self.wrapped = false;
+        }
     }
 
     /// The combining marks attached to `col`, in arrival order; empty if the cell
@@ -595,34 +602,26 @@ impl Buffer {
     /// half-overwritten wide glyph never leaves an orphan on screen, and dropping
     /// any combining marks the overwritten cell carried.
     pub(super) fn write_cell(&mut self, row: usize, col: usize, cell: PackedCell) {
-        let existing = self.cell(row, col);
-        if existing.is_wide_leader() {
-            self.set_raw(row, col + 1, PackedCell::BLANK);
-        } else if existing.is_wide_spacer() && col > 0 {
-            self.set_raw(row, col - 1, PackedCell::BLANK);
-            if let Some(r) = self.lines.get_mut(row) {
-                r.clear_marks(col - 1);
-            }
-        }
-        self.set_raw(row, col, cell);
         if let Some(r) = self.lines.get_mut(row) {
+            r.split_wide_at(col, PackedCell::BLANK);
+            r.split_wide_at(col + 1, PackedCell::BLANK);
             r.clear_marks(col);
         }
+        self.set_raw(row, col, cell);
     }
 
     /// Fill `[start_col, start_col + run.len())` on `row` with `run`'s bytes as
     /// single-width cells sharing `pen` — the bulk equivalent of one
     /// [`write_cell`](Self::write_cell) per byte, but with the row (a `VecDeque`
-    /// index) resolved once instead of three times per cell. This is the ASCII
+    /// index) resolved once instead of once or more per cell. This is the ASCII
     /// print hot path, so the redundant per-cell work is what it strips.
     ///
     /// The wide-pair break only has to look at the two edges: a wide character
     /// wholly inside the run has both halves overwritten (no orphan), so only a
-    /// pair the run *straddles* can leave a partner outside it — a spacer at the
-    /// left edge orphans its leader to the left, a leader at the right edge orphans
-    /// its spacer to the right. Combining marks under the run drop in a single
-    /// retain. The `bulk_ascii_matches_per_char_under_fuzz` test pins this against
-    /// the byte-at-a-time path.
+    /// pair the run *straddles* can leave a partner outside it, which
+    /// [`Row::split_wide_at`] breaks at each end. Combining marks under the run
+    /// drop in a single retain. The `bulk_ascii_matches_per_char_under_fuzz` test
+    /// pins this against the byte-at-a-time path.
     pub(super) fn fill_ascii_run(
         &mut self,
         row: usize,
@@ -630,24 +629,12 @@ impl Buffer {
         run: &[u8],
         pen: PackedPen,
     ) {
-        let cols = self.cols;
         let end_col = start_col + run.len();
         let Some(r) = self.lines.get_mut(row) else {
             return;
         };
-        // Left edge: overwriting a wide spacer orphans its leader one cell left.
-        if start_col > 0 && r.cells.get(start_col).is_some_and(|c| c.is_wide_spacer()) {
-            if let Some(slot) = r.cells.get_mut(start_col - 1) {
-                *slot = PackedCell::BLANK;
-            }
-            r.clear_marks(start_col - 1);
-        }
-        // Right edge: overwriting a wide leader orphans its spacer one cell right.
-        if end_col < cols && r.cells.get(end_col - 1).is_some_and(|c| c.is_wide_leader()) {
-            if let Some(slot) = r.cells.get_mut(end_col) {
-                *slot = PackedCell::BLANK;
-            }
-        }
+        r.split_wide_at(start_col, PackedCell::BLANK);
+        r.split_wide_at(end_col, PackedCell::BLANK);
         for (k, &byte) in run.iter().enumerate() {
             if let Some(slot) = r.cells.get_mut(start_col + k) {
                 *slot = PackedCell::new(char::from(byte), CellWidth::Narrow, pen.style, pen.link);
@@ -682,25 +669,8 @@ impl Buffer {
         let Some(r) = self.lines.get_mut(row) else {
             return;
         };
-        if start_col > 0
-            && r.cells
-                .get(start_col)
-                .is_some_and(|cell| cell.is_wide_spacer())
-        {
-            if let Some(slot) = r.cells.get_mut(start_col - 1) {
-                *slot = PackedCell::BLANK;
-            }
-            r.clear_marks(start_col - 1);
-        }
-        if end_col < r.cells.len()
-            && r.cells
-                .get(end_col.saturating_sub(1))
-                .is_some_and(|cell| cell.is_wide_leader())
-        {
-            if let Some(slot) = r.cells.get_mut(end_col) {
-                *slot = PackedCell::BLANK;
-            }
-        }
+        r.split_wide_at(start_col, PackedCell::BLANK);
+        r.split_wide_at(end_col, PackedCell::BLANK);
 
         let mut col = start_col;
         for (&c, &cell_width) in chars.iter().zip(widths) {

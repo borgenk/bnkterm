@@ -2200,6 +2200,37 @@ fn assert_bulk_equiv_over(bytes: &[u8], label: &str) {
 }
 
 #[test]
+fn breaking_a_wide_glyph_in_the_final_column_ends_the_soft_wrap_on_every_print_path() {
+    // A soft-wrapped row whose last two cells hold a wide glyph. A print over the glyph's
+    // leader blanks its spacer, which is the final cell, so the line stops there as it
+    // does for any write to that cell. The bulk ASCII run, the bulk text run and the
+    // per-character path must agree; the fuzz corpus never places a print there.
+    let setup = "abcdef\u{4e00}g".as_bytes();
+    for (tail, row) in [
+        ("\x1b[1;7Hx", "abcdefx "),
+        ("\x1b[1;6Hxy", "abcdexy "),
+        ("\x1b[1;7H\u{e9}", "abcdef\u{e9} "),
+    ] {
+        let mut bulk = Screen::new(8, 4);
+        let mut per = Screen::new(8, 4);
+        let (mut pb, mut pc) = (crate::vt::Parser::new(), crate::vt::Parser::new());
+        pb.advance_bytes(&mut bulk, setup);
+        assert!(bulk.row_wraps(0), "the setup soft-wraps the glyph's row");
+        pb.advance_bytes(&mut bulk, tail.as_bytes());
+        for &byte in setup.iter().chain(tail.as_bytes()) {
+            pc.advance(&mut per, byte);
+        }
+        for (path, s) in [("bulk", &bulk), ("per char", &per)] {
+            assert_eq!(s.row_string(0), row, "{path} {tail:?}");
+            assert!(
+                !s.row_wraps(0),
+                "{path} {tail:?}: the wrap ends at the blanked cell"
+            );
+        }
+    }
+}
+
+#[test]
 fn bulk_ascii_matches_per_char_under_fuzz() {
     // Two corpora, because they find different things and neither subsumes the other.
     //
