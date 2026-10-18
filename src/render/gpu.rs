@@ -83,20 +83,21 @@ impl Paint {
     }
 }
 
-/// Atlases start here and double when full, up to [`ATLAS_MAX`]; growth wipes
-/// the atlas (sources are cached in `Fonts`, so re-inserting is cheap) and the
-/// frame build restarts so no stale coordinates survive.
+/// Atlases start here and double when full, up to [`ATLAS_MAX`]. Growing wipes the
+/// atlas and the frame build restarts, so no stale coordinates survive. Full at the
+/// cap, an atlas is wiped back to the start instead (see [`Atlas::spent`]). Either way
+/// the live frame's glyphs are rasterized again, a burst bounded by the frame.
 const ATLAS_START: u32 = 1024;
 const ATLAS_MAX: u32 = 8192;
 
 /// The most slot records a glyph cache keeps before it is dropped whole. The atlas
 /// is bounded by [`ATLAS_MAX`], but the slot maps are not: a `None` record is kept
 /// for every distinct non-emoji cluster (the negative cache) and for every glyph
-/// that would not fit a full atlas, so a hostile stream of distinct clusters or
-/// glyphs — attacker-controlled bytes, per the threat model — would grow them
-/// without limit. Far above any real workload's distinct-glyph count, so ordinary
-/// use never trips it; when it does, dropping the map bounds memory and the glyphs
-/// simply re-cache (a bounded burst) rather than accumulating forever.
+/// that would not fit a full atlas, so a child printing a stream of distinct
+/// clusters or glyphs would grow them without limit. Far above any real workload's distinct-glyph count, so ordinary
+/// use never trips it; when it does, the map is dropped and the atlas it pointed
+/// into is wiped, so the glyphs re-cache into reclaimed space (a bounded burst)
+/// rather than accumulating forever.
 const MAX_GLYPH_CACHE: usize = 1 << 16;
 
 /// One vertex, laid out exactly as the pipeline's vertex input expects
@@ -149,8 +150,9 @@ pub struct FrameData {
 pub struct AtlasInfo {
     pub width: u32,
     pub height: u32,
-    /// Bumped whenever the atlas is wiped and regrown; the renderer recreates
-    /// the texture (and re-uploads in full) when it changes.
+    /// Bumped whenever the atlas is wiped, to grow or to reclaim its slots; the
+    /// renderer recreates the texture at the new size (and re-uploads in full)
+    /// when it changes.
     pub generation: u32,
 }
 
@@ -183,6 +185,9 @@ struct PackedGlyph {
 pub struct Atlas {
     width: u32,
     height: u32,
+    /// The side the atlas grows to at most: [`ATLAS_MAX`], or less in tests that
+    /// need to fill one.
+    max: u32,
     /// Bytes per texel: 1 (R8 coverage) or 4 (BGRA emoji).
     bpp: u32,
     pixels: Vec<u8>,
@@ -192,19 +197,36 @@ pub struct Atlas {
     generation: u32,
     /// Union of slots written since the last [`Atlas::take_upload`].
     dirty: Option<(u32, u32, u32, u32)>,
+    /// The atlas holds slots nothing will look up again: it filled at its cap, or
+    /// the records pointing into it were dropped. [`build_frame_into`] wipes it and
+    /// rebuilds the frame into the reclaimed space.
+    spent: bool,
+    /// A slot map pointing into this atlas was dropped since the atlas was last
+    /// wiped (see [`Atlas::records_dropped`]).
+    dropped_since_wipe: bool,
 }
 
 impl Atlas {
     pub fn new(bpp: u32) -> Self {
+        Self::with_max(bpp, ATLAS_MAX)
+    }
+
+    /// An atlas that grows to at most `max` texels a side, starting at
+    /// [`ATLAS_START`] or at `max` when that is smaller.
+    fn with_max(bpp: u32, max: u32) -> Self {
+        let side = ATLAS_START.min(max);
         Self {
-            width: ATLAS_START,
-            height: ATLAS_START,
+            width: side,
+            height: side,
+            max,
             bpp,
-            pixels: vec![0; (ATLAS_START * ATLAS_START * bpp) as usize],
+            pixels: vec![0; (side * side * bpp) as usize],
             shelves: Vec::new(),
             next_y: 0,
             generation: 0,
             dirty: None,
+            spent: false,
+            dropped_since_wipe: false,
         }
     }
 
@@ -216,12 +238,13 @@ impl Atlas {
         }
     }
 
-    /// Reserve a `w` x `h` slot. `None` means the atlas is full even after
-    /// growing to its cap (the caller skips the raster; a pathological case).
-    /// Growing wipes all previous slots and bumps the generation, which the
-    /// frame builder answers by restarting the build.
+    /// Reserve a `w` x `h` slot. `None` means the raster does not fit: it is
+    /// larger than the atlas can grow, or the atlas is full at its cap, which marks
+    /// it [`spent`](Self::spent) so the frame build wipes it and the glyph packs
+    /// into the reclaimed space. Growing wipes all previous slots and bumps the
+    /// generation, which the frame builder answers by restarting the build.
     fn reserve(&mut self, w: u32, h: u32) -> Option<Slot> {
-        if w == 0 || h == 0 || w > ATLAS_MAX || h > ATLAS_MAX {
+        if w == 0 || h == 0 || w > self.max || h > self.max {
             return None;
         }
         loop {
@@ -254,6 +277,7 @@ impl Atlas {
                 return Some(slot);
             }
             if !self.grow() {
+                self.spent = true;
                 return None;
             }
         }
@@ -261,18 +285,43 @@ impl Atlas {
 
     /// Double the atlas (square), wiping every slot. Returns false at the cap.
     fn grow(&mut self) -> bool {
-        let next = (self.width * 2).min(ATLAS_MAX);
+        let next = (self.width * 2).min(self.max);
         if next == self.width {
             return false;
         }
-        self.width = next;
-        self.height = next;
-        self.pixels = vec![0; (next * next * self.bpp) as usize];
+        self.reset(next);
+        true
+    }
+
+    /// Empty the atlas back to its starting side. The mirror is reallocated rather
+    /// than cleared, so the memory an atlas grew into is returned with its slots.
+    fn wipe(&mut self) {
+        self.reset(ATLAS_START.min(self.max));
+        self.dropped_since_wipe = false;
+    }
+
+    /// A slot map pointing into this atlas was dropped, orphaning its slots. The
+    /// first drop after a wipe marks the atlas spent. A second one before the next
+    /// wipe means the screen alone holds more glyphs than the map, so wiping on
+    /// every frame would reclaim nothing; the orphans are left until the atlas fills
+    /// at its cap and is wiped there.
+    fn records_dropped(&mut self) {
+        if !self.dropped_since_wipe {
+            self.spent = true;
+        }
+        self.dropped_since_wipe = true;
+    }
+
+    /// Empty the atlas at `side` texels square and bump the generation, which kills
+    /// every slot handed out before and has the renderer recreate the texture.
+    fn reset(&mut self, side: u32) {
+        self.width = side;
+        self.height = side;
+        self.pixels = vec![0; (side * side * self.bpp) as usize];
         self.shelves.clear();
         self.next_y = 0;
-        self.generation += 1;
+        self.generation = self.generation.wrapping_add(1);
         self.dirty = None;
-        true
     }
 
     /// Extend the dirty rectangle to cover `slot`, so the next upload carries it.
@@ -360,8 +409,8 @@ impl Atlas {
     }
 
     /// The bytes of the dirty region (row-contiguous), clearing the flag.
-    /// A texture recreated after a grow needs no separate full upload: the
-    /// grow wiped the mirror, so everything in it is inside the dirty region.
+    /// A texture recreated after a wipe needs no separate full upload: the
+    /// wipe zeroed the mirror, so everything in it is inside the dirty region.
     pub fn take_upload(&mut self) -> Option<AtlasUpload> {
         let (x0, y0, x1, y1) = self.dirty.take()?;
         let (w, h) = (x1 - x0, y1 - y0);
@@ -442,6 +491,9 @@ pub struct GlyphCache {
     /// steady-state frame takes the per-character path without re-consulting
     /// the `Face`.
     cluster_slots: HashMap<FaceKey, HashMap<String, Option<PackedGlyph>>>,
+    /// The most records `scalar_slots`, or one face's `cluster_slots`, holds before
+    /// it is dropped: [`MAX_GLYPH_CACHE`], or less in tests that need to overflow one.
+    max_records: usize,
 }
 
 impl Default for GlyphCache {
@@ -455,6 +507,7 @@ impl Default for GlyphCache {
             scalar_slots: HashMap::new(),
             box_slots: HashMap::new(),
             cluster_slots: HashMap::new(),
+            max_records: MAX_GLYPH_CACHE,
         }
     }
 }
@@ -475,7 +528,8 @@ impl GlyphCache {
         self.ascii_slots.iter().find(|r| r.face == face)?.slots[i]
     }
 
-    /// Drop every slot record (after an atlas grew and wiped its content).
+    /// Drop every slot record that points into an atlas wiped since `glyphs_gen` or
+    /// `emoji_gen`.
     fn reset_for(&mut self, glyphs_gen: u32, emoji_gen: u32) {
         if self.glyphs.generation != glyphs_gen {
             self.scalar_slots.clear();
@@ -493,8 +547,9 @@ impl GlyphCache {
 
     /// Record a scalar glyph's placement, dropping the whole scalar cache first if it
     /// has reached [`MAX_GLYPH_CACHE`], so distinct-glyph spam cannot grow it without
-    /// bound. Clearing is safe: the already-emitted quads keep their valid atlas
-    /// slots (the atlas is untouched), and the glyphs simply re-cache on next sight.
+    /// bound. The dropped records held glyph-atlas slots that would otherwise be
+    /// orphaned while the glyphs re-pack into fresh space, so the atlas is told (see
+    /// [`Atlas::records_dropped`]).
     fn cache_scalar(&mut self, key: (FaceKey, char), packed: PackedGlyph) {
         let (face, ch) = key;
         if let Some(i) = Self::ascii_index(ch) {
@@ -511,19 +566,22 @@ impl GlyphCache {
             // Past the face ceiling ASCII keeps working, just through the map, which
             // is why `ascii_get` missing is never taken as "no such glyph".
         }
-        if self.scalar_slots.len() >= MAX_GLYPH_CACHE {
+        if self.scalar_slots.len() >= self.max_records {
             self.scalar_slots.clear();
+            self.glyphs.records_dropped();
         }
         self.scalar_slots.insert(key, packed);
     }
 
     /// Record a cluster's placement (or `None` for a non-emoji cluster: the negative
     /// cache that keeps a steady frame off the shaper), capping the per-face map the
-    /// same way so a stream of distinct clusters cannot grow it without bound.
+    /// same way so a stream of distinct clusters cannot grow it without bound, and
+    /// telling the emoji atlas its records pointed into.
     fn cache_cluster(&mut self, face_key: FaceKey, cluster: &str, packed: Option<PackedGlyph>) {
         let by = self.cluster_slots.entry(face_key).or_default();
-        if by.len() >= MAX_GLYPH_CACHE {
+        if by.len() >= self.max_records {
             by.clear();
+            self.emoji.records_dropped();
         }
         by.insert(cluster.to_string(), packed);
     }
@@ -531,8 +589,9 @@ impl GlyphCache {
 
 /// Build one frame's GPU data from the display list into `out` (whose vertex and
 /// batch buffers are cleared and reused, so a steady frame allocates nothing).
-/// Restarts internally if an atlas grows mid-build, so the vertices always
-/// reference current atlas coordinates.
+/// Restarts internally if an atlas is wiped mid-build, by growing or because the
+/// build left it [`spent`](Atlas::spent), so the vertices always reference current
+/// atlas coordinates.
 pub fn build_frame_into(
     fonts: &Fonts,
     list: &[DrawCmd],
@@ -540,6 +599,7 @@ pub fn build_frame_into(
     gamma: TextGamma,
     out: &mut FrameData,
 ) {
+    let mut wiped = false;
     loop {
         let glyphs_gen = cache.glyphs.generation;
         let emoji_gen = cache.emoji.generation;
@@ -557,9 +617,23 @@ pub fn build_frame_into(
                 b.command(cmd);
             }
         }
-        // An atlas grew (and wiped) during the build: earlier quads reference
-        // dead coordinates. Clear the stale slot records and rebuild; the
-        // second pass fits by construction (or skips at the cap).
+        // A spent atlas is wiped and the frame rebuilt into it, once per call. A
+        // frame that alone overfills an atlas then draws what fit, and its other
+        // glyphs stay recorded as unplaced until new glyphs fill the atlas again,
+        // rather than wiping it every frame or rebuilding forever.
+        let glyphs_spent = std::mem::take(&mut cache.glyphs.spent);
+        let emoji_spent = std::mem::take(&mut cache.emoji.spent);
+        if !wiped {
+            if glyphs_spent {
+                cache.glyphs.wipe();
+            }
+            if emoji_spent {
+                cache.emoji.wipe();
+            }
+            wiped = glyphs_spent || emoji_spent;
+        }
+        // An atlas was wiped during the build: earlier quads reference dead
+        // coordinates. Clear the stale slot records and rebuild.
         if cache.glyphs.generation != glyphs_gen || cache.emoji.generation != emoji_gen {
             cache.reset_for(glyphs_gen, emoji_gen);
             continue;
@@ -1300,6 +1374,153 @@ mod tests {
         assert!(
             cache.scalar_slots.is_empty(),
             "the map is dropped as before"
+        );
+    }
+
+    /// One run of `text` in the 16 px prose face.
+    fn prose(text: &str) -> Vec<DrawCmd> {
+        vec![DrawCmd::Text {
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                w: 1000,
+                h: 20,
+            },
+            x: 0,
+            baseline: 16,
+            face: FaceKey::Prose {
+                size: 16,
+                style: crate::platform::freetype::FontStyle::Regular,
+            },
+            color: 0x00ff_ffff,
+            bg: 0,
+            fade: None,
+            text: text.to_string(),
+        }]
+    }
+
+    fn glyph_quads(frame: &FrameData) -> usize {
+        frame
+            .vertices
+            .iter()
+            .filter(|v| v.mode == MODE_GLYPH)
+            .count()
+            / 6
+    }
+
+    /// A glyph first seen after the atlas filled at its cap used to be cached
+    /// unplaced and stay invisible for the life of the process. The full atlas is
+    /// wiped instead, and the frame packs into the reclaimed space.
+    #[test]
+    fn a_glyph_first_seen_after_the_atlas_fills_still_draws() {
+        let fonts = Fonts::new(&[16]).expect("default font");
+        // 64 texels square holds a few dozen 16 px glyphs, so the alphabet fills it.
+        let mut cache = GlyphCache {
+            glyphs: Atlas::with_max(1, 64),
+            ..GlyphCache::default()
+        };
+        for ch in ('A'..='Z').chain('a'..='z').chain('0'..='9') {
+            let frame = build_frame(&fonts, &prose(&ch.to_string()), &mut cache, GAMMA);
+            assert_eq!(glyph_quads(&frame), 1, "{ch:?} drew nothing");
+            assert!(frame.glyph_upload.is_some(), "{ch:?} was never uploaded");
+        }
+        assert!(cache.glyphs.generation > 0, "the atlas never filled");
+    }
+
+    /// Dropping a slot map orphans the atlas slots its records held. Unless the
+    /// atlas is wiped with it, the glyphs re-pack into fresh space and each drop
+    /// walks the atlas closer to its cap. Every fill of the map gets its wipe, not
+    /// only the first.
+    #[test]
+    fn dropping_a_slot_map_wipes_the_atlas_it_pointed_into() {
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let mut cache = GlyphCache {
+            max_records: 16,
+            ..GlyphCache::default()
+        };
+        let face = FaceKey::Prose {
+            size: 16,
+            style: crate::platform::freetype::FontStyle::Regular,
+        };
+        for round in 0..2 {
+            cache.glyphs.reserve(4, 4).expect("fits");
+            cache.emoji.reserve(4, 4).expect("fits");
+            let (glyphs_gen, emoji_gen) = (cache.glyphs.generation, cache.emoji.generation);
+            for i in 0..=cache.max_records {
+                let ch = char::from_u32(0x1_0000 + i as u32).expect("valid scalar");
+                cache.cache_scalar((face, ch), placed());
+                cache.cache_cluster(face, &format!("c{i}"), Some(placed()));
+            }
+
+            build_frame(&fonts, &[], &mut cache, GAMMA);
+            assert_ne!(
+                cache.glyphs.generation, glyphs_gen,
+                "round {round}: the glyph atlas kept its slots"
+            );
+            assert_ne!(
+                cache.emoji.generation, emoji_gen,
+                "round {round}: the emoji atlas kept its slots"
+            );
+            assert_eq!((cache.glyphs.next_y, cache.emoji.next_y), (0, 0));
+        }
+    }
+
+    /// Wiping cannot help a frame whose own glyphs overfill the atlas. It wipes
+    /// once and draws what fits, and drawing it again must not wipe again: that
+    /// would rebuild the frame forever, or throw the atlas away every frame.
+    #[test]
+    fn a_frame_larger_than_the_atlas_wipes_once_and_draws_what_fits() {
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let mut cache = GlyphCache {
+            glyphs: Atlas::with_max(1, 32),
+            ..GlyphCache::default()
+        };
+        let alphabet: String = ('A'..='Z').chain('a'..='z').collect();
+        let list = prose(&alphabet);
+
+        let first = build_frame(&fonts, &list, &mut cache, GAMMA);
+        let drawn = glyph_quads(&first);
+        assert!(0 < drawn && drawn < 52, "{drawn} of 52 glyphs drawn");
+        assert_eq!(cache.glyphs.generation, 1, "wiped once, then drew what fit");
+
+        let again = build_frame(&fonts, &list, &mut cache, GAMMA);
+        assert_eq!(
+            cache.glyphs.generation, 1,
+            "the same frame wiped the atlas again"
+        );
+        assert_eq!(again.vertices, first.vertices);
+
+        // A glyph the atlas has not seen still gets a wipe and draws.
+        let fresh = build_frame(&fonts, &prose("0"), &mut cache, GAMMA);
+        assert_eq!(glyph_quads(&fresh), 1, "the overfilled state stuck");
+        assert_eq!(cache.glyphs.generation, 2);
+    }
+
+    /// A screen holding more distinct glyphs than a slot map drops the map on every
+    /// frame. The first drop wipes the atlas; the ones after it must not, or every
+    /// frame would rebuild and recreate both textures behind a device wait.
+    #[test]
+    fn a_screen_that_overflows_a_slot_map_wipes_the_atlases_once() {
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let mut cache = GlyphCache {
+            max_records: 16,
+            ..GlyphCache::default()
+        };
+        // 25 distinct non-ASCII clusters, past both maps' cap of 16.
+        let greek: String = ('α'..='ω').collect();
+        let list = prose(&greek);
+
+        let first = build_frame(&fonts, &list, &mut cache, GAMMA);
+        let generations = (cache.glyphs.generation, cache.emoji.generation);
+        assert_eq!(generations, (1, 1), "the first drops wipe both atlases");
+        for _ in 0..3 {
+            let again = build_frame(&fonts, &list, &mut cache, GAMMA);
+            assert_eq!(glyph_quads(&again), glyph_quads(&first));
+        }
+        assert_eq!(
+            (cache.glyphs.generation, cache.emoji.generation),
+            generations,
+            "a drop the screen forces on every frame wiped an atlas again"
         );
     }
 
