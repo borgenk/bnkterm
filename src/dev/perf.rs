@@ -131,7 +131,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let samples = measure()?;
     write_samples(LATEST_PATH, &samples)?;
     let mut regressed = gate_samples(&samples, save)?;
-    regressed.extend(gate_footprints(&measure_footprints(), save)?);
+    regressed.extend(gate_footprints(&measure_footprints()?, save)?);
 
     if save {
         println!("\nUpdated baselines at {BASELINE_PATH} and {FOOTPRINT_PATH}.");
@@ -187,13 +187,20 @@ fn save_baseline(samples: &[Sample]) -> Result<()> {
     write_samples(BASELINE_PATH, samples)
 }
 
+/// The named stream from [`stream::generate`], or an error naming it. An empty chunk in
+/// its place would measure nothing, and pass.
+fn corpus(name: &str, bytes: usize) -> Result<Vec<u8>> {
+    stream::generate(name, bytes)
+        .ok_or_else(|| Error::msg(format!("no stream named {name:?} in dev::stream")))
+}
+
 /// Measure every gate scenario. Each drives a persistent, pre-warmed grid so
 /// the numbers are steady state, not first-touch: the parse and print scenarios
 /// then allocate nothing, which the allocation column records and gates.
 fn measure() -> Result<Vec<Sample>> {
-    let ascii = stream::generate("ascii", CHUNK).unwrap_or_default();
-    let unicode = stream::generate("unicode", CHUNK).unwrap_or_default();
-    let escape = stream::generate("escape_heavy", CHUNK).unwrap_or_default();
+    let ascii = corpus("ascii", CHUNK)?;
+    let unicode = corpus("unicode", CHUNK)?;
+    let escape = corpus("escape_heavy", CHUNK)?;
 
     // A screenful of ASCII preceded by a home, so it overwrites in place without
     // scrolling: isolates the cell-write cost.
@@ -226,9 +233,9 @@ fn measure() -> Result<Vec<Sample>> {
         stream_scenario("grid_scroll_dense", &scroll_dense_chunk, 128),
         stream_scenario("grid_combining", &combining_chunk, 128),
         stream_scenario("grid_emoji", &emoji_chunk, 128),
-        frame_tabbar_scenario(),
+        frame_tabbar_scenario()?,
         frame_damage_scenario(),
-        grid_reflow_scenario(),
+        grid_reflow_scenario()?,
         link_preview_scenario()?,
     ];
     for fixture in link_fixtures() {
@@ -464,8 +471,8 @@ fn link_preview_scenario() -> Result<Sample> {
 ///
 /// One column, not ten: that is the step a drag delivers, and the shortcut it measures is
 /// the one a wide swing cannot take.
-fn grid_reflow_scenario() -> Sample {
-    let chunk = stream::generate("ascii", CHUNK).unwrap_or_default();
+fn grid_reflow_scenario() -> Result<Sample> {
+    let chunk = corpus("ascii", CHUNK)?;
     let mut screen = Screen::new(BENCH_COLS, BENCH_ROWS);
     let mut parser = Parser::new();
     warm(&mut parser, &mut screen, &chunk);
@@ -477,11 +484,11 @@ fn grid_reflow_scenario() -> Sample {
         screen.resize(BENCH_COLS - usize::from(wide), BENCH_ROWS);
         screen.cursor() // an observable result, so the work is not elided
     });
-    Sample {
+    Ok(Sample {
         name: "grid_reflow",
         ns,
         allocs,
-    }
+    })
 }
 
 /// Diff two display lists differing by a handful of recolored fills, the small
@@ -554,7 +561,7 @@ fn repeated_lines(cell: &str, cells: usize, lines: usize) -> Vec<u8> {
 /// display-list path. This guards both CPU cost and the stronger invariant: once
 /// both list buffers and their strings are warm, one complete frame allocates
 /// nothing.
-fn frame_tabbar_scenario() -> Sample {
+fn frame_tabbar_scenario() -> Result<Sample> {
     use crate::color::Theme;
     use crate::config::TabBarConfig;
     use crate::tab_bar::{self, BarGeom, TabLabel};
@@ -611,7 +618,8 @@ fn frame_tabbar_scenario() -> Sample {
     // The labels are the proportional interface font, so painting the bar needs the
     // fonts to measure advances. Load them once (outside the measured loop); a bar
     // repaint itself allocates nothing.
-    let fonts = crate::platform::freetype::Fonts::new(&[METRICS.size]).expect("open fonts");
+    let fonts = crate::platform::freetype::Fonts::new(&[METRICS.size])
+        .map_err(|e| Error::msg(format!("frame_tabbar needs the default fonts: {e}")))?;
     let bar = BarGeom {
         metrics: METRICS,
         label: METRICS,
@@ -655,11 +663,11 @@ fn frame_tabbar_scenario() -> Sample {
         black_box(build());
     }
     let (ns, allocs) = best_of(GATE_ROUNDS, 512, &mut build);
-    Sample {
+    Ok(Sample {
         name: "frame_tabbar",
         ns,
         allocs,
-    }
+    })
 }
 
 /// Measure feeding `chunk` into a warmed grid. Warmup fills the scrollback ring
@@ -956,21 +964,21 @@ struct Footprint {
 /// floor: cells and nothing else) through emoji (the combining side table's worst
 /// case). Same corpora as the timing scenarios, so a change that trades bytes for
 /// speed shows up in both tables of one run.
-fn measure_footprints() -> Vec<Footprint> {
-    vec![
-        footprint_scenario("mem_ascii", "ascii"),
-        footprint_scenario("mem_styled", "short_runs"),
-        footprint_scenario("mem_mixed", "unicode_mixed"),
-        footprint_scenario("mem_emoji", "emoji"),
-        resized_footprint_scenario("mem_resized", "ascii"),
-    ]
+fn measure_footprints() -> Result<Vec<Footprint>> {
+    Ok(vec![
+        footprint_scenario("mem_ascii", "ascii")?,
+        footprint_scenario("mem_styled", "short_runs")?,
+        footprint_scenario("mem_mixed", "unicode_mixed")?,
+        footprint_scenario("mem_emoji", "emoji")?,
+        resized_footprint_scenario("mem_resized", "ascii")?,
+    ])
 }
 
 /// Fill a fresh grid's scrollback to the ring's cap with `corpus`. Untimed: every
 /// footprint is a property of the resulting structure, not of the work that built
 /// it, so nothing here needs warming, rounds, or a `black_box`.
-fn filled_screen(corpus: &str) -> Screen {
-    let chunk = stream::generate(corpus, FOOTPRINT_CHUNK).unwrap_or_default();
+fn filled_screen(name: &str) -> Result<Screen> {
+    let chunk = corpus(name, FOOTPRINT_CHUNK)?;
     let mut screen = Screen::new(BENCH_COLS, BENCH_ROWS);
     let mut parser = Parser::new();
     let mut passes = 0;
@@ -978,12 +986,12 @@ fn filled_screen(corpus: &str) -> Screen {
         parser.advance_bytes(&mut screen, &chunk);
         passes += 1;
     }
-    screen
+    Ok(screen)
 }
 
 /// What a filled grid holds, straight off the fill.
-fn footprint_scenario(name: &'static str, corpus: &str) -> Footprint {
-    weigh(name, &filled_screen(corpus))
+fn footprint_scenario(name: &'static str, corpus: &str) -> Result<Footprint> {
+    Ok(weigh(name, &filled_screen(corpus)?))
 }
 
 /// The same grid after the window has been widened and pulled back to where it
@@ -995,11 +1003,11 @@ fn footprint_scenario(name: &'static str, corpus: &str) -> Footprint {
 /// permanent: rows reset in place and keep the buffer they have, and steady scrolling
 /// recycles those same over-wide buffers. Measured at 20 columns of widening, one round
 /// trip.
-fn resized_footprint_scenario(name: &'static str, corpus: &str) -> Footprint {
-    let mut screen = filled_screen(corpus);
+fn resized_footprint_scenario(name: &'static str, corpus: &str) -> Result<Footprint> {
+    let mut screen = filled_screen(corpus)?;
     screen.resize(BENCH_COLS + 20, BENCH_ROWS);
     screen.resize(BENCH_COLS, BENCH_ROWS);
-    weigh(name, &screen)
+    Ok(weigh(name, &screen))
 }
 
 fn weigh(name: &'static str, screen: &Screen) -> Footprint {
@@ -1261,7 +1269,7 @@ pub fn render_bench(args: &[String]) -> Result<()> {
     // A little over a screenful of real prose per frame, enough to turn the whole
     // grid over — the worst case a fast cat hits, so the diff sees a fully changed
     // screen and every cell is rebuilt.
-    let feed = stream::generate("ascii", BENCH_COLS * BENCH_ROWS * 2).unwrap_or_default();
+    let feed = corpus("ascii", BENCH_COLS * BENCH_ROWS * 2)?;
 
     // Warm: rasterize every glyph and size the pool's buffers, string pool, and the
     // frame's vertex capacity, so the timed loop and the alloc snapshot measure
