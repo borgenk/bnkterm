@@ -29,13 +29,13 @@
 //! a notice plus a surface yields draw commands, so it is tested by reading the list
 //! back rather than by looking at a window.
 
-use crate::color::{Rgb, Theme};
+use crate::color::Theme;
 use crate::config::ShellStartupConfig;
-use crate::platform::freetype::{FaceKey, FontStyle};
+use crate::panel::Panel;
 use crate::platform::geom::Rect;
 use crate::platform::verdict::Refusal;
-use crate::render::display::{DisplayList, DrawCmd};
-use crate::term_render::{self, CellMetrics};
+use crate::render::display::DisplayList;
+use crate::term_render::CellMetrics;
 use crate::width;
 use std::time::{Duration, Instant};
 
@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 /// eye resolves on a 400ms ramp.
 const FADE_FRAME: Duration = Duration::from_millis(16);
 
-/// Mix resolution for the fade: parts-of-total as [`Rgb::mix`] takes them, so the ramp
+/// Mix resolution for the fade: parts-of-total as [`crate::color::Rgb::mix`] takes them, so the ramp
 /// needs no float and lands exactly on the background at the end.
 ///
 /// 255 is a ceiling, not a taste. `Rgb::mix` weights in `u16`, so `channel * total` must
@@ -163,53 +163,32 @@ pub(crate) fn paint(
         Phase::Fading(strength) => strength,
     };
 
-    let content_cols = width::text_cells(&notice.text) as i32;
-    let pad_x = metrics.w;
-    let pad_y = (metrics.h / 2).max(1);
-    let panel_w = content_cols * metrics.w + 2 * pad_x;
-    let panel_h = metrics.h + 2 * pad_y;
+    let panel = Panel::roomy(metrics);
+    let panel_w = panel.width(width::text_cells(&notice.text) as i32);
+    let panel_h = panel.height(1);
     // Inset from the corner by one cell, so the panel reads as floating over the grid
     // rather than welded to the window edge.
     let margin = metrics.w;
     let x0 = (surface_w - panel_w - margin).max(0);
     let y0 = margin.min((surface_h - panel_h).max(0));
 
-    // The panel is the same darkened plate the leader overlay uses, so the two pieces of
-    // chrome that float over the grid look like one family.
-    let panel_bg = theme.bg.mix(Rgb::new(0, 0, 0), 1, 2);
-    let faded_bg = theme.bg.mix(panel_bg, strength, FULL);
+    let rect = Rect {
+        x: x0,
+        y: y0,
+        w: panel_w,
+        h: panel_h,
+    };
     let faded_fg = theme.bg.mix(theme.fg, strength, FULL);
-    let radius = (metrics.h / 3).max(2);
-
-    out.push(DrawCmd::RoundRect {
-        rect: Rect {
-            x: x0,
-            y: y0,
-            w: panel_w,
-            h: panel_h,
-        },
-        color: faded_bg.to_u32(),
-        radius,
-    });
-    term_render::push_cell_text(
-        out,
-        strings,
-        &notice.text,
-        x0 + pad_x,
-        y0 + pad_y + metrics.baseline,
-        metrics,
-        FaceKey::Prose {
-            size: metrics.size,
-            style: FontStyle::Regular,
-        },
-        faded_fg.to_u32(),
-        faded_bg.to_u32(),
-    );
+    let faded_plate = theme.bg.mix(Panel::plate(theme), strength, FULL);
+    panel
+        .open(out, strings, rect, faded_fg, faded_plate)
+        .write(0, 0, &notice.text);
 }
 
 #[cfg(test)]
 mod tests {
     use crate::notice::*;
+    use crate::render::display::DrawCmd;
 
     const METRICS: CellMetrics = CellMetrics {
         size: 16,

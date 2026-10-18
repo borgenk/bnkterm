@@ -62,6 +62,7 @@
 
 use crate::color::{Ground, Rgb, Theme};
 use crate::grid::{AbsRow, Attrs, Cell, RowEpoch, Screen, UnderlineStyle};
+use crate::panel::Panel;
 use crate::platform::freetype::{FaceKey, FontStyle, Fonts, Metrics};
 use crate::platform::geom::{Rect, Scale};
 use crate::platform::grapheme;
@@ -1466,17 +1467,17 @@ impl Painter<'_> {
         if m.w <= 0 || m.h <= 0 {
             return;
         }
-        let (pad_x, pad_y) = preview_pad(m);
+        let panel = Panel::snug(m);
         let grid_w = cols as i32 * m.w;
         let room = preview_room(cols, m);
         let (top, bottom) = (self.cell_y(0), self.cell_y(rows));
-        let panel_h = m.h + 2 * pad_y;
+        let panel_h = panel.height(1);
         if room == 0 || panel_h > bottom - top {
             return;
         }
         let (shown, cut) = fit_cells(text, room);
-        let text_w = (width::text_cells(shown) + usize::from(cut)) as i32 * m.w;
-        let panel_w = text_w + 2 * pad_x;
+        let shown_cols = width::text_cells(shown) as i32;
+        let panel_w = panel.width(shown_cols + i32::from(cut));
 
         let below = self.cell_y(hover.span.end.0 + 1);
         let above = self.cell_y(hover.span.start.0) - panel_h;
@@ -1494,48 +1495,22 @@ impl Painter<'_> {
             .min(self.cell_x(0) + grid_w - panel_w)
             .max(self.cell_x(0));
 
-        // The same darkened plate the corner notice and the leader overlay float on.
-        let plate = self.theme.bg.mix(Rgb::new(0, 0, 0), 1, 2).to_u32();
-        let fg = self.theme.fg.to_u32();
-        self.list.push(DrawCmd::RoundRect {
-            rect: Rect {
-                x: x0,
-                y: y0,
-                w: panel_w,
-                h: panel_h,
-            },
-            color: plate,
-            radius: (m.h / 4).max(2),
-        });
-        let face = FaceKey::Prose {
-            size: m.size,
-            style: FontStyle::Regular,
+        let rect = Rect {
+            x: x0,
+            y: y0,
+            w: panel_w,
+            h: panel_h,
         };
-        let (x, baseline) = (x0 + pad_x, y0 + pad_y + m.baseline);
-        push_cell_text(
+        let mut pen = panel.open(
             self.list,
             self.strings,
-            shown,
-            x,
-            baseline,
-            m,
-            face,
-            fg,
-            plate,
+            rect,
+            self.theme.fg,
+            Panel::plate(self.theme),
         );
+        pen.write(0, 0, shown);
         if cut {
-            let x = x + text_w - m.w;
-            push_cell_text(
-                self.list,
-                self.strings,
-                "…",
-                x,
-                baseline,
-                m,
-                face,
-                fg,
-                plate,
-            );
+            pen.write(0, shown_cols, "…");
         }
     }
 
@@ -1585,20 +1560,13 @@ pub(crate) fn push_text_run(
     });
 }
 
-/// The preview plate's padding: half a cell either side, a sixth of a cell above and
-/// below.
-fn preview_pad(m: CellMetrics) -> (i32, i32) {
-    ((m.w / 2).max(1), (m.h / 6).max(1))
-}
-
 /// How many cells of a link's preview fit across a grid `cols` wide, inside the plate's
 /// padding: what [`crate::link_preview::write`] fits its line to.
 pub(crate) fn preview_room(cols: usize, m: CellMetrics) -> usize {
     if m.w <= 0 {
         return 0;
     }
-    let inside = cols as i32 * m.w - 2 * preview_pad(m).0;
-    usize::try_from(inside / m.w).unwrap_or(0)
+    usize::try_from(Panel::snug(m).cols_within(cols as i32 * m.w)).unwrap_or(0)
 }
 
 /// The longest start of `text` that fits `cols` cells with room left for a `…`, and

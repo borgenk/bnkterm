@@ -13,6 +13,7 @@ mod keymode;
 mod link_preview;
 pub mod mouse;
 mod notice;
+mod panel;
 mod platform;
 pub mod pty;
 mod render;

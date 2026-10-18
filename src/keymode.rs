@@ -27,12 +27,12 @@
 //! like any other frame content. The app owns the current [`KeyMode`], feeds every
 //! resolved key through [`advance`], and acts on the [`Disposition`].
 
-use crate::color::{Rgb, Theme};
+use crate::color::Theme;
 use crate::input::{Key, Mods};
-use crate::platform::freetype::{FaceKey, FontStyle};
+use crate::panel::Panel;
 use crate::platform::geom::Rect;
-use crate::render::display::{DisplayList, DrawCmd};
-use crate::term_render::{self, CellMetrics};
+use crate::render::display::DisplayList;
+use crate::term_render::CellMetrics;
 use crate::width;
 
 /// The modal key-table state. `Normal` is the transparent default in which every
@@ -174,7 +174,7 @@ pub(crate) fn advance(mode: KeyMode, key: Key, mods: Mods) -> (KeyMode, Disposit
 
 /// The overlay hint per armed mode: the keys the mode binds. Only single-width
 /// clusters (ASCII plus the arrows) so the fixed-pitch
-/// [`term_render::push_cell_text`] runs never break.
+/// [`crate::term_render::push_cell_text`] runs never break.
 const LEADER_LINES: &[&str] = &["w tabs   c new   x close   esc cancel"];
 const TABS_LINES: &[&str] = &["↑↓ switch   shift+↑↓ reorder   esc done"];
 
@@ -208,49 +208,22 @@ pub(crate) fn paint_overlay(
         .map(|line| width::text_cells(line))
         .max()
         .unwrap_or(0) as i32;
-    let pad_x = metrics.w;
-    let pad_y = (metrics.h / 2).max(1);
-    let panel_w = content_cols * metrics.w + 2 * pad_x;
-    let panel_h = lines.len() as i32 * metrics.h + 2 * pad_y;
-    let x0 = ((surface_w - panel_w) / 2).max(0);
-    let y0 = ((surface_h - panel_h) / 2).max(0);
-
-    let panel_bg = theme.bg.mix(Rgb::new(0, 0, 0), 1, 2);
-    let radius = (metrics.h / 3).max(2);
-
-    // A darkened rounded panel, no accent frame: the hint text alone names the mode.
-    out.push(DrawCmd::RoundRect {
-        rect: Rect {
-            x: x0,
-            y: y0,
-            w: panel_w,
-            h: panel_h,
-        },
-        color: panel_bg.to_u32(),
-        radius,
-    });
-
-    let face = FaceKey::Prose {
-        size: metrics.size,
-        style: FontStyle::Regular,
+    let panel = Panel::roomy(metrics);
+    let panel_w = panel.width(content_cols);
+    let panel_h = panel.height(lines.len() as i32);
+    let rect = Rect {
+        x: ((surface_w - panel_w) / 2).max(0),
+        y: ((surface_h - panel_h) / 2).max(0),
+        w: panel_w,
+        h: panel_h,
     };
+
+    // No accent frame: the hint text alone names the mode.
+    let mut pen = panel.open(out, strings, rect, theme.fg, Panel::plate(theme));
     for (index, line) in lines.iter().enumerate() {
         // Center each line within the content box.
         let line_cols = width::text_cells(line) as i32;
-        let offset = (content_cols - line_cols) / 2 * metrics.w;
-        let x = x0 + pad_x + offset;
-        let baseline = y0 + pad_y + index as i32 * metrics.h + metrics.baseline;
-        term_render::push_cell_text(
-            out,
-            strings,
-            line,
-            x,
-            baseline,
-            metrics,
-            face,
-            theme.fg.to_u32(),
-            panel_bg.to_u32(),
-        );
+        pen.write(index as i32, (content_cols - line_cols) / 2, line);
     }
 }
 
@@ -258,6 +231,7 @@ pub(crate) fn paint_overlay(
 mod tests {
     use crate::keymode::*;
     use crate::platform::grapheme;
+    use crate::render::display::DrawCmd;
 
     const METRICS: CellMetrics = CellMetrics {
         size: 16,
