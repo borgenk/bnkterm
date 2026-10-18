@@ -536,25 +536,51 @@ impl Screen {
         }
     }
 
+    /// The flag behind a mode that is nothing but a flag: setting it stores `enable`, and
+    /// DECRQM reports what is stored. `None` for every other mode, including the ones
+    /// with side effects, which [`set_mode`](Self::set_mode) and
+    /// [`mode_state`](Self::mode_state) name one by one.
+    ///
+    /// Both read the plain modes from here, so none of them can be settable but
+    /// unreported, or reported but ignored.
+    fn mode_flag(&mut self, mode: u16, private: bool) -> Option<&mut bool> {
+        Some(match (private, mode) {
+            (false, 4) => &mut self.insert_mode, // IRM
+            (true, 1) => &mut self.app_cursor_keys,
+            (true, 7) => &mut self.autowrap,
+            (true, 25) => &mut self.cursor_visible,
+            // `?12` blinks the cursor without saying anything about its shape, which is
+            // the one thing DECSCUSR cannot do: its parameters bind the two together. A
+            // program that wants a blinking bar and finds a steady block has to be able
+            // to say only "blink".
+            (true, 12) => &mut self.cursor_appearance.blink,
+            (true, 1004) => &mut self.focus_events,
+            // The SGR mouse encoding, orthogonal to the reporting level.
+            (true, 1006) => &mut self.mouse.sgr,
+            (true, 2004) => &mut self.bracketed_paste,
+            (true, 2026) => &mut self.synchronized,
+            _ => return None,
+        })
+    }
+
     /// Whether we implement `mode`, and if so whether it is currently on. `None` means
     /// we do not know it, which is exactly what DECRQM needs to hear and the one thing
     /// it must never be told falsely.
     ///
-    /// Every mode [`set_mode`](Self::set_mode) acts on appears here, and nothing else
-    /// does. If you teach the terminal a new mode, teach this at the same time — the two
-    /// lists disagreeing is how a terminal ends up claiming a feature it does not have.
-    pub(super) fn mode_state(&self, mode: u16, private: bool) -> Option<bool> {
+    /// Takes `&mut self` only to share [`mode_flag`](Self::mode_flag) with `set_mode`.
+    /// Every mode with side effects that `set_mode` acts on appears here as well, and
+    /// nothing else does. If you teach the terminal a new one, teach this at the same
+    /// time: the two lists disagreeing is how a terminal ends up claiming a feature it
+    /// does not have.
+    pub(super) fn mode_state(&mut self, mode: u16, private: bool) -> Option<bool> {
+        if let Some(&mut on) = self.mode_flag(mode, private) {
+            return Some(on);
+        }
         if !private {
-            return match mode {
-                4 => Some(self.insert_mode), // IRM
-                _ => None,
-            };
+            return None;
         }
         Some(match mode {
-            1 => self.app_cursor_keys,
             6 => self.origin_mode,
-            7 => self.autowrap,
-            25 => self.cursor_visible,
             47 | 1047 | 1049 => self.on_alt,
             // `?1048` has no mode state of its own — it is DECSC/DECRC spelled as a mode
             // — so xterm reports whether a cursor is currently saved, and so does this.
@@ -564,12 +590,7 @@ impl Screen {
             1000 => self.mouse.protocol == MouseProtocol::Press,
             1002 => self.mouse.protocol == MouseProtocol::ButtonEvent,
             1003 => self.mouse.protocol == MouseProtocol::AnyEvent,
-            1006 => self.mouse.sgr,
-            12 => self.cursor_appearance.blink,
-            1004 => self.focus_events,
             2048 => self.in_band_resize,
-            2004 => self.bracketed_paste,
-            2026 => self.synchronized,
             2027 => self.grapheme_clustering,
             _ => return None,
         })
@@ -587,62 +608,52 @@ impl Screen {
     /// Set or reset a mode. `private` distinguishes the DEC private modes
     /// (`?`-prefixed, like DECAWM) from the ANSI modes (like IRM).
     pub(super) fn set_mode(&mut self, mode: u16, private: bool, enable: bool) {
-        if private {
-            match mode {
-                1 => self.app_cursor_keys = enable,
-                6 => {
-                    self.origin_mode = enable;
-                    self.move_to(0, 0);
-                }
-                7 => self.autowrap = enable,
-                25 => self.cursor_visible = enable,
-                47 => self.switch_alt(enable, AltClear::Never),
-                1047 => self.switch_alt(enable, AltClear::OnExit),
-                // `?1048` is DECSC/DECRC on its own, and `?1049` is defined as `?1047`
-                // plus `?1048` plus a clear. A program emitting the pre-1049 pair got the
-                // screen switch and silently no cursor save.
-                1048 => {
-                    if enable {
-                        self.save_cursor();
-                    } else {
-                        self.restore_cursor();
-                    }
-                }
-                1049 => {
-                    if enable {
-                        self.save_cursor();
-                        self.switch_alt(true, AltClear::OnEntry);
-                    } else {
-                        self.switch_alt(false, AltClear::OnEntry);
-                        self.restore_cursor();
-                    }
-                }
-                // `?12` blinks the cursor without saying anything about its shape, which
-                // is the one thing DECSCUSR cannot do: its parameters bind the two
-                // together. A program that wants a blinking bar and finds a steady block
-                // has to be able to say only "blink".
-                12 => self.cursor_appearance.blink = enable,
-                1004 => self.focus_events = enable,
-                2048 => self.set_in_band_resize(enable),
-                2004 => self.bracketed_paste = enable,
-                2026 => self.synchronized = enable,
-                2027 => {
-                    self.grapheme_clustering = enable;
-                    // Whatever was on screen was measured the other way; start clean.
-                    self.cluster.reset();
-                    self.cluster_anchor = None;
-                }
-                // Mouse reporting: the ?1000/?1002/?1003 levels are mutually
-                // exclusive (enabling one, or disabling any, sets the level);
-                // ?1006 is the orthogonal SGR encoding flag.
-                1000 => self.set_mouse_protocol(MouseProtocol::Press, enable),
-                1002 => self.set_mouse_protocol(MouseProtocol::ButtonEvent, enable),
-                1003 => self.set_mouse_protocol(MouseProtocol::AnyEvent, enable),
-                1006 => self.mouse.sgr = enable,
-                _ => {}
+        if let Some(flag) = self.mode_flag(mode, private) {
+            *flag = enable;
+            return;
+        }
+        if !private {
+            return;
+        }
+        match mode {
+            6 => {
+                self.origin_mode = enable;
+                self.move_to(0, 0);
             }
-        } else if mode == 4 {
-            self.insert_mode = enable;
+            47 => self.switch_alt(enable, AltClear::Never),
+            1047 => self.switch_alt(enable, AltClear::OnExit),
+            // `?1048` is DECSC/DECRC on its own, and `?1049` is defined as `?1047` plus
+            // `?1048` plus a clear. A program emitting the pre-1049 pair got the screen
+            // switch and silently no cursor save.
+            1048 => {
+                if enable {
+                    self.save_cursor();
+                } else {
+                    self.restore_cursor();
+                }
+            }
+            1049 => {
+                if enable {
+                    self.save_cursor();
+                    self.switch_alt(true, AltClear::OnEntry);
+                } else {
+                    self.switch_alt(false, AltClear::OnEntry);
+                    self.restore_cursor();
+                }
+            }
+            2048 => self.set_in_band_resize(enable),
+            2027 => {
+                self.grapheme_clustering = enable;
+                // Whatever was on screen was measured the other way; start clean.
+                self.cluster.reset();
+                self.cluster_anchor = None;
+            }
+            // Mouse reporting: the ?1000/?1002/?1003 levels are mutually exclusive
+            // (enabling one, or disabling any, sets the level).
+            1000 => self.set_mouse_protocol(MouseProtocol::Press, enable),
+            1002 => self.set_mouse_protocol(MouseProtocol::ButtonEvent, enable),
+            1003 => self.set_mouse_protocol(MouseProtocol::AnyEvent, enable),
+            _ => {}
         }
     }
 

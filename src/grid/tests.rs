@@ -4980,6 +4980,48 @@ fn decrqm_reports_the_modes_we_have_and_admits_the_ones_we_do_not() {
 }
 
 #[test]
+fn every_mode_reports_what_setting_and_resetting_it_did() {
+    // DECRQM must agree with `h` and `l` for every mode the terminal acts on: a mode it
+    // sets but does not report is never discovered, and one it reports but ignores is a
+    // lie a program will build on. `?1048` is left out: its reset is a cursor restore,
+    // which keeps the save, so it stays reported as set (its own test covers it).
+    let modes: &[(&str, u16)] = &[
+        ("", 4),
+        ("?", 1),
+        ("?", 6),
+        ("?", 7),
+        ("?", 12),
+        ("?", 25),
+        ("?", 47),
+        ("?", 1000),
+        ("?", 1002),
+        ("?", 1003),
+        ("?", 1004),
+        ("?", 1006),
+        ("?", 1047),
+        ("?", 1049),
+        ("?", 2004),
+        ("?", 2026),
+        ("?", 2027),
+        ("?", 2048),
+    ];
+    for &(prefix, mode) in modes {
+        let mut s = Screen::new(10, 4);
+        for (action, state) in [("h", 1), ("l", 2)] {
+            feed(&mut s, format!("\x1b[{prefix}{mode}{action}").as_bytes());
+            // `?2048h` answers with a size report; only the DECRPM is under test.
+            s.take_responses();
+            feed(&mut s, format!("\x1b[{prefix}{mode}$p").as_bytes());
+            assert_eq!(
+                String::from_utf8(s.take_responses()).unwrap(),
+                format!("\x1b[{prefix}{mode};{state}$y"),
+                "{prefix}{mode}{action}"
+            );
+        }
+    }
+}
+
+#[test]
 fn osc_11_answers_what_the_background_actually_is() {
     // The reply nvim and helix wait for. They ask whether they are sitting on a dark
     // or a light background and choose an entire colour scheme from the answer; a
