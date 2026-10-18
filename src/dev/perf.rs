@@ -7,16 +7,16 @@
 //! hyperlink lookup) timed against `stats/baseline.txt`. It writes `data/latest.txt` and exits nonzero
 //! when a scenario is slower than the baseline by [`REGRESSION_RATIO`]. `--save`
 //! accepts the current numbers as the new baseline. Built with `perf-alloc` it also
-//! counts allocations per operation and fails on any increase: a count is exact and
-//! repeats run to run, so a ratio would only let a scenario's first allocation through.
-//! `--save` needs `perf-alloc`, because a baseline without counts would leave them
-//! ungated.
+//! counts the allocations a fixed run of [`COUNTED_OPS`] operations makes and fails on
+//! any increase: a count is exact and repeats run to run, so a ratio would only let a
+//! scenario's first allocation through. `--save` needs `perf-alloc`, because a baseline
+//! without counts would leave them ungated.
 //!
 //! The same run gates the grid's footprint against `stats/footprint.txt`, in its own
 //! table because it is a different kind of number. A time is sampled and noisy, so it
 //! gates at a ratio; a footprint is [`Screen::storage_bytes`] summed from container
 //! capacities, so it is exact, identical on every machine, and gates at equality.
-//! Allocations per operation cannot see that axis at all — a grid that holds twice the
+//! An allocation count cannot see that axis at all — a grid that holds twice the
 //! memory while allocating as often reads as unchanged.
 //!
 //! `--perf-lab` measures whole-pipeline throughput over the generated streams in
@@ -102,14 +102,14 @@ const LAB_MAX_MIB: usize = 512;
 const CAT_REPS: usize = 10;
 
 /// One measured gate scenario: its best per-op time and, when measured, the
-/// allocations one op costs (0 with the counting allocator absent).
+/// allocations [`COUNTED_OPS`] ops make (0 with the counting allocator absent).
 struct Sample {
     name: &'static str,
     ns: u64,
     allocs: u64,
 }
 
-/// A baseline entry: the recorded time and allocations per op.
+/// A baseline entry: the recorded time per op and allocation count.
 struct Base {
     ns: u64,
     allocs: u64,
@@ -189,7 +189,7 @@ fn save_baseline(samples: &[Sample]) -> Result<()> {
 
 /// Measure every gate scenario. Each drives a persistent, pre-warmed grid so
 /// the numbers are steady state, not first-touch: the parse and print scenarios
-/// then allocate nothing per op, which the allocation column records and gates.
+/// then allocate nothing, which the allocation column records and gates.
 fn measure() -> Result<Vec<Sample>> {
     let ascii = stream::generate("ascii", CHUNK).unwrap_or_default();
     let unicode = stream::generate("unicode", CHUNK).unwrap_or_default();
@@ -526,8 +526,8 @@ fn frame_damage_scenario() -> Sample {
     // A far larger inner count than the other scenarios, because the op is an order of
     // magnitude smaller (~200 ns against 4.5 us for the next smallest). At 512 iterations
     // a round timed a 0.1 ms window, too short to be reproducible; this puts it on the
-    // same ~1.5 ms footing as the rest. The figure is per-op, so the baseline stays
-    // comparable either way.
+    // same ~1.5 ms footing as the rest. The time is per op and the allocation count
+    // does not depend on the inner count, so the baseline stays comparable either way.
     let (ns, allocs) = best_of(GATE_ROUNDS, 8192, &mut diff);
     Sample {
         name: "frame_damage",
@@ -706,16 +706,26 @@ fn warm(parser: &mut Parser, screen: &mut Screen, chunk: &[u8]) {
     }
 }
 
+/// The operations each scenario's allocation count covers. Separate from the timing's
+/// `rounds * inner`, so retuning a scenario's timing never moves its count. Even, so a
+/// scenario that alternates two steps (`grid_reflow`) counts both alike, and long enough
+/// that growth amortised over many ops, such as a buffer doubling now and then, shows.
+const COUNTED_OPS: u64 = 64;
+
 /// The best (minimum) ns per op over `rounds`, each timing `inner` ops, plus the
-/// allocations one op makes. The minimum is the least-noisy estimator for a
-/// microbenchmark. Allocations are taken from one warmed, untimed op after a
-/// reset, so counting never skews the time; the counter is per thread (see
-/// [`alloc`]), so a parallel sibling never bleeds into the count. `black_box` stops
-/// the optimizer eliding the work.
+/// allocations [`COUNTED_OPS`] ops make in total. The minimum is the least-noisy
+/// estimator for a microbenchmark. The count is a total because a per-op average would
+/// round an occasional allocation down to zero. It comes from an untimed pass after one
+/// warm op, and the counter is per thread (see [`alloc`]), so a parallel sibling never
+/// bleeds into it. Under `perf-alloc` the timed rounds still pay the counter on every
+/// allocation they make, so an allocating scenario times a little slower there than in a
+/// plain build. `black_box` stops the optimizer eliding the work.
 fn best_of<T>(rounds: u32, inner: u64, mut f: impl FnMut() -> T) -> (u64, u64) {
     black_box(f());
     alloc::reset();
-    black_box(f());
+    for _ in 0..COUNTED_OPS {
+        black_box(f());
+    }
     let allocs = alloc::snapshot().allocs;
 
     let mut best = u64::MAX;
@@ -782,9 +792,10 @@ fn print_table(
 ) -> Vec<&'static str> {
     let mut sorted: Vec<&Sample> = samples.iter().collect();
     sorted.sort_by_key(|s| s.name);
+    let allocs = format!("allocs/{COUNTED_OPS}");
     println!(
-        "\n{:<16} {:>11} {:>11} {:>16}   {:>8} {:>8} {:>16}",
-        "metric", "ns/op", "base", "Δ", "allocs", "base", "Δ"
+        "\n{:<16} {:>11} {:>11} {:>16}   {:>9} {:>8} {:>16}",
+        "metric", "ns/op", "base", "Δ", allocs, "base", "Δ"
     );
     let mut regressed = Vec::new();
     for s in sorted {
@@ -819,7 +830,7 @@ fn print_table(
         }
 
         println!(
-            "{:<16} {:>11} {:>11} {:>16}   {:>8} {:>8} {:>16}",
+            "{:<16} {:>11} {:>11} {:>16}   {:>9} {:>8} {:>16}",
             s.name, s.ns, base_ns_col, ns_flag, alloc_cur, alloc_base, alloc_col
         );
     }
@@ -855,7 +866,7 @@ fn write_samples(path: &str, samples: &[Sample]) -> Result<()> {
     let mut sorted: Vec<&Sample> = samples.iter().collect();
     sorted.sort_by_key(|s| s.name);
     let mut text =
-        String::from("# bnkterm perf results: name, ns/op, allocs/op (lower is better)\n");
+        format!("# bnkterm perf results: name, ns/op, allocations over {COUNTED_OPS} ops (lower is better)\n");
     for s in sorted {
         if alloc::ENABLED {
             let _ = writeln!(text, "{}\t{}\t{}", s.name, s.ns, s.allocs);
@@ -890,7 +901,7 @@ fn parse_baseline(text: &str) -> Result<HashMap<String, Base>> {
             (it.next(), it.next(), it.next(), it.next())
         else {
             return Err(Error::msg(format!(
-                "malformed perf line {line:?}: want name, ns/op and allocs/op"
+                "malformed perf line {line:?}: want name, ns/op and allocations"
             )));
         };
         let ns = ns
@@ -2124,10 +2135,27 @@ mod tests {
 
     #[cfg(feature = "perf-alloc")]
     #[test]
+    fn an_allocation_every_few_ops_is_counted() {
+        let mut calls = 0u64;
+        let (_, allocs) = best_of(1, 1, || {
+            calls += 1;
+            if calls.is_multiple_of(8) {
+                black_box(Vec::<u8>::with_capacity(16));
+            }
+        });
+        assert_eq!(allocs, COUNTED_OPS / 8);
+    }
+
+    #[cfg(feature = "perf-alloc")]
+    #[test]
     fn a_warmed_link_lookup_allocates_nothing() {
         for f in link_fixtures() {
             let s = link_scenario(&LinkFixture { iters: 8, ..f }).unwrap();
-            assert_eq!(s.allocs, 0, "{} allocated {} per lookup", s.name, s.allocs);
+            assert_eq!(
+                s.allocs, 0,
+                "{} allocated {} over {COUNTED_OPS} lookups",
+                s.name, s.allocs
+            );
         }
     }
 
@@ -2146,7 +2174,11 @@ mod tests {
             ("emoji", repeated_lines("🇳🇴", 40, 24)),
         ] {
             let s = stream_scenario("t", &chunk, 8);
-            assert_eq!(s.allocs, 0, "parse {name} allocated {} per chunk", s.allocs);
+            assert_eq!(
+                s.allocs, 0,
+                "parse {name} allocated {} over {COUNTED_OPS} chunks",
+                s.allocs
+            );
         }
     }
 
