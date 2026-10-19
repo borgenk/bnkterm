@@ -450,6 +450,34 @@ struct AsciiRow {
     slots: Box<[Option<PackedGlyph>; ASCII_SLOTS]>,
 }
 
+/// Emoji placements per face, by cluster. Nested so lookups borrow the cluster as
+/// `&str` (no per-frame `String`). A `None` value records a cluster that is not
+/// color emoji, so a steady-state frame takes the per-character path without
+/// re-consulting the `Face`.
+type ClusterSlots = HashMap<FaceKey, HashMap<String, Option<PackedGlyph>>>;
+
+/// The size an emoji cluster is rasterized at, which also picks the map that caches
+/// it. The face key fixes both sizes, so `(face_key, cluster)` is a complete key
+/// within either map.
+#[derive(Clone, Copy)]
+enum EmojiFit {
+    /// The em, for a wide cluster on the [`Batcher::text`] path: the ~square glyph
+    /// fills both cells and its advance carries the pen.
+    Em,
+    /// One cell's width, for a single-width cluster on the [`Batcher::cells`] path,
+    /// so it does not spill past its column.
+    Cell(u32),
+}
+
+impl EmojiFit {
+    fn target(self, face_key: FaceKey) -> u32 {
+        match self {
+            EmojiFit::Em => face_key.size(),
+            EmojiFit::Cell(width) => width,
+        }
+    }
+}
+
 pub struct GlyphCache {
     pub glyphs: Atlas,
     pub emoji: Atlas,
@@ -486,12 +514,15 @@ pub struct GlyphCache {
     /// Bounded by construction: [`boxdraw::is_glyph`] is 416 codepoints, so this holds at
     /// most `416 * faces` and needs no cap of its own.
     box_slots: HashMap<(FaceKey, char), PackedGlyph>,
-    /// Nested so lookups borrow the cluster as `&str` (no per-frame `String`).
-    /// A `None` value records a cluster that is not color emoji, so a
-    /// steady-state frame takes the per-character path without re-consulting
-    /// the `Face`.
-    cluster_slots: HashMap<FaceKey, HashMap<String, Option<PackedGlyph>>>,
-    /// The most records `scalar_slots`, or one face's `cluster_slots`, holds before
+    /// Emoji rasters at the em ([`EmojiFit::Em`]).
+    cluster_slots: ClusterSlots,
+    /// Emoji rasters at one cell's width ([`EmojiFit::Cell`]), held apart for the
+    /// reason `box_slots` is: one cluster can reach both paths. ⚠️ and ❤️ are one
+    /// column or two depending on mode 2027, and one that turns wide at the right
+    /// margin stays narrow, so a shared key let whichever size drew first stand in
+    /// for the other for the life of the process.
+    cell_cluster_slots: ClusterSlots,
+    /// The most records `scalar_slots`, or one face's map of clusters, holds before
     /// it is dropped: [`MAX_GLYPH_CACHE`], or less in tests that need to overflow one.
     max_records: usize,
 }
@@ -507,6 +538,7 @@ impl Default for GlyphCache {
             scalar_slots: HashMap::new(),
             box_slots: HashMap::new(),
             cluster_slots: HashMap::new(),
+            cell_cluster_slots: HashMap::new(),
             max_records: MAX_GLYPH_CACHE,
         }
     }
@@ -542,6 +574,15 @@ impl GlyphCache {
         }
         if self.emoji.generation != emoji_gen {
             self.cluster_slots.clear();
+            self.cell_cluster_slots.clear();
+        }
+    }
+
+    /// The map that caches emoji at `fit`'s size.
+    fn clusters(&self, fit: EmojiFit) -> &ClusterSlots {
+        match fit {
+            EmojiFit::Em => &self.cluster_slots,
+            EmojiFit::Cell(_) => &self.cell_cluster_slots,
         }
     }
 
@@ -577,8 +618,18 @@ impl GlyphCache {
     /// cache that keeps a steady frame off the shaper), capping the per-face map the
     /// same way so a stream of distinct clusters cannot grow it without bound, and
     /// telling the emoji atlas its records pointed into.
-    fn cache_cluster(&mut self, face_key: FaceKey, cluster: &str, packed: Option<PackedGlyph>) {
-        let by = self.cluster_slots.entry(face_key).or_default();
+    fn cache_cluster(
+        &mut self,
+        fit: EmojiFit,
+        face_key: FaceKey,
+        cluster: &str,
+        packed: Option<PackedGlyph>,
+    ) {
+        let map = match fit {
+            EmojiFit::Em => &mut self.cluster_slots,
+            EmojiFit::Cell(_) => &mut self.cell_cluster_slots,
+        };
+        let by = map.entry(face_key).or_default();
         if by.len() >= self.max_records {
             by.clear();
             self.emoji.records_dropped();
@@ -784,11 +835,8 @@ impl Batcher<'_> {
         // Only the emoji cluster path needs the keyed face directly; the
         // per-scalar path resolves its own face (primary or fallback) per glyph.
         let face = self.fonts.face_for(face_key);
-        // A wide cluster spans two cells, so its emoji is drawn at the em (its
-        // natural, ~square size fills both cells and its advance carries the pen).
-        let target = face_key.size();
         for (_, cluster) in grapheme::graphemes(text) {
-            match self.packed_cluster(face, face_key, cluster, target) {
+            match self.packed_cluster(face, face_key, cluster, EmojiFit::Em) {
                 Some(packed) => {
                     self.emit_glyph(&packed, pen, baseline, MODE_EMOJI, paint);
                     pen += packed.advance;
@@ -875,11 +923,8 @@ impl Batcher<'_> {
                 self.emit_glyph(&packed, pen, baseline, MODE_GLYPH, paint);
                 continue;
             }
-            // A single-width color emoji (e.g. a bare ⚠) is scaled to one cell so
-            // it does not balloon to the em (~two cells) and spill past its
-            // column; the emoji is roughly square, so fitting the cell width caps
-            // it at one cell.
-            match self.packed_cluster(face, face_key, cluster, cell_w.max(1) as u32) {
+            let fit = EmojiFit::Cell(cell_w.max(1) as u32);
+            match self.packed_cluster(face, face_key, cluster, fit) {
                 Some(packed) => self.emit_glyph(
                     &center_in_cell(packed, cell_w),
                     pen,
@@ -997,22 +1042,18 @@ impl Batcher<'_> {
     /// (beyond reporting the atlas hit for the frame stats). Non-emoji clusters
     /// are not tallied, matching the pre-atlas emoji-cache accounting.
     ///
-    /// `target` is the pixel size to rasterize the color glyph at, chosen by the
-    /// caller to fit its path: the em for a wide (two-cell) cluster on the
-    /// [`Self::text`] path, one cell width for a single-width emoji on the
-    /// [`Self::cells`] path so it does not overflow its column. A cluster only
-    /// ever travels one path (its grid width is fixed), so the `(face_key,
-    /// cluster)` cache key stays unique despite the per-path `target`.
+    /// `fit` is the size the caller's path draws at, and picks the map: the same
+    /// cluster can arrive on both paths, and each keeps its own raster.
     fn packed_cluster(
         &mut self,
         face: &Face,
         face_key: FaceKey,
         cluster: &str,
-        target: u32,
+        fit: EmojiFit,
     ) -> Option<PackedGlyph> {
         if let Some(&packed) = self
             .cache
-            .cluster_slots
+            .clusters(fit)
             .get(&face_key)
             .and_then(|by| by.get(cluster))
         {
@@ -1022,16 +1063,18 @@ impl Batcher<'_> {
             return packed;
         }
         let atlas = &mut self.cache.emoji;
-        let packed = face.cluster_glyph(cluster, target).map(|g| PackedGlyph {
-            slot: pack_argb(atlas, g.width as u32, g.rows as u32, &g.argb),
-            left: g.left,
-            top: g.top,
-            advance: g.advance,
-        });
+        let packed = face
+            .cluster_glyph(cluster, fit.target(face_key))
+            .map(|g| PackedGlyph {
+                slot: pack_argb(atlas, g.width as u32, g.rows as u32, &g.argb),
+                left: g.left,
+                top: g.top,
+                advance: g.advance,
+            });
         if packed.is_some() {
             face.record_cluster_miss();
         }
-        self.cache.cache_cluster(face_key, cluster, packed);
+        self.cache.cache_cluster(fit, face_key, cluster, packed);
         packed
     }
 
@@ -1301,11 +1344,14 @@ mod tests {
         for i in 0..MAX_GLYPH_CACHE + 5 {
             let ch = char::from_u32(0x1_0000 + i as u32).expect("valid scalar");
             cache.cache_scalar((face, ch), none);
-            cache.cache_cluster(face, &format!("c{i}"), None);
+            cache.cache_cluster(EmojiFit::Em, face, &format!("c{i}"), None);
+            cache.cache_cluster(EmojiFit::Cell(8), face, &format!("c{i}"), None);
         }
         assert!(cache.scalar_slots.len() <= MAX_GLYPH_CACHE);
-        let clusters: usize = cache.cluster_slots.values().map(|m| m.len()).sum();
-        assert!(clusters <= MAX_GLYPH_CACHE);
+        for map in [&cache.cluster_slots, &cache.cell_cluster_slots] {
+            let clusters: usize = map.values().map(|m| m.len()).sum();
+            assert!(clusters <= MAX_GLYPH_CACHE);
+        }
     }
 
     #[test]
@@ -1449,7 +1495,7 @@ mod tests {
             for i in 0..=cache.max_records {
                 let ch = char::from_u32(0x1_0000 + i as u32).expect("valid scalar");
                 cache.cache_scalar((face, ch), placed());
-                cache.cache_cluster(face, &format!("c{i}"), Some(placed()));
+                cache.cache_cluster(EmojiFit::Em, face, &format!("c{i}"), Some(placed()));
             }
 
             build_frame(&fonts, &[], &mut cache, GAMMA);
@@ -2142,6 +2188,68 @@ mod tests {
                 "and it fits about one cell (cell_w = {cell_w}, got {cell_px})"
             );
         }
+    }
+
+    /// One cluster can reach both paths, so each must keep its own raster in a
+    /// shared cache, whichever path draws it first.
+    #[test]
+    fn an_emoji_drawn_by_both_paths_keeps_a_raster_per_path() {
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let key = FaceKey::Prose {
+            size: 16,
+            style: crate::platform::freetype::FontStyle::Regular,
+        };
+        let warn = "\u{26A0}\u{FE0F}".to_string();
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 20,
+        };
+        let cells = DrawCmd::Cells {
+            bounds,
+            x: 0,
+            baseline: 16,
+            cell_w: 10,
+            face: key,
+            color: 0x00ff_ffff,
+            bg: 0,
+            text: warn.clone(),
+        };
+        let text = DrawCmd::Text {
+            bounds,
+            x: 0,
+            baseline: 16,
+            face: key,
+            color: 0x00ff_ffff,
+            bg: 0,
+            fade: None,
+            text: warn,
+        };
+        // The width of each emoji quad, in the order the commands drew them.
+        let widths = |list: &[DrawCmd], cache: &mut GlyphCache| -> Vec<f32> {
+            let frame = build_frame(&fonts, list, cache, GAMMA);
+            frame
+                .vertices
+                .chunks(6)
+                .filter(|quad| quad[0].mode == MODE_EMOJI)
+                .map(|quad| quad[4].pos[0] - quad[0].pos[0])
+                .collect()
+        };
+        let cell = widths(std::slice::from_ref(&cells), &mut GlyphCache::default());
+        let em = widths(std::slice::from_ref(&text), &mut GlyphCache::default());
+        let ([cell], [em]) = (cell.as_slice(), em.as_slice()) else {
+            eprintln!("no colour emoji font here; nothing to compare");
+            return;
+        };
+        assert!(cell < em, "the cell raster ({cell}) is the em one ({em})");
+
+        let shared = &mut GlyphCache::default();
+        let both = widths(&[cells.clone(), text.clone()], shared);
+        assert_eq!(both, [*cell, *em], "the cell path drew first");
+        let shared = &mut GlyphCache::default();
+        let both = widths(&[text, cells], shared);
+        assert_eq!(both, [*em, *cell], "the text path drew first");
     }
 
     #[test]
