@@ -1264,13 +1264,12 @@ impl Gpu {
             uploads.push(PendingUpload {
                 image: tex.image,
                 was_initialized: true,
-                staging_offset: staging.len(),
+                staging_offset: stage_bytes(staging, &up.bytes),
                 x: up.x,
                 y: up.y,
                 w: up.w,
                 h: up.h,
             });
-            staging.extend_from_slice(&up.bytes);
         }
     }
 
@@ -1511,4 +1510,41 @@ struct PendingUpload {
     y: u32,
     w: u32,
     h: u32,
+}
+
+/// Every upload's bytes start on a multiple of this. A copy into an image must
+/// start on a whole texel of its format (VUID-vkCmdCopyBufferToImage-dstImage-07975),
+/// the emoji atlas's BGRA texels are four bytes, and the glyph atlas's one-byte
+/// texels can leave the staging at any length before them.
+const STAGING_ALIGN: usize = 4;
+
+/// Append an upload's bytes to the frame's staging at the next aligned offset,
+/// returning that offset for the copy to read from.
+fn stage_bytes(staging: &mut Vec<u8>, bytes: &[u8]) -> usize {
+    let offset = staging.len().next_multiple_of(STAGING_ALIGN);
+    staging.resize(offset, 0);
+    staging.extend_from_slice(bytes);
+    offset
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::render::vulkan::target::stage_bytes;
+
+    /// The glyph atlas stages first, so a 9x17 glyph leaves 153 bytes ahead of the
+    /// emoji upload. Copying BGRA texels from offset 153 is invalid usage, so the
+    /// emoji bytes have to start at 156.
+    #[test]
+    fn an_upload_after_an_odd_length_one_starts_on_a_whole_texel() {
+        let glyph = vec![0x11; 9 * 17];
+        let emoji = vec![0x22; 4 * 3 * 2];
+        let mut staging = Vec::new();
+
+        assert_eq!(stage_bytes(&mut staging, &glyph), 0);
+        let emoji_at = stage_bytes(&mut staging, &emoji);
+
+        assert_eq!(emoji_at, 156);
+        assert_eq!(&staging[..glyph.len()], glyph.as_slice());
+        assert_eq!(&staging[emoji_at..], emoji.as_slice());
+    }
 }
