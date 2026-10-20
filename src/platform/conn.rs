@@ -72,13 +72,18 @@ impl Connection {
         };
         let stream = UnixStream::connect(&path)
             .map_err(|e| Error::msg(format!("connect to {}: {e}", path.display())))?;
-        Ok(Self {
+        Ok(Self::from_stream(stream))
+    }
+
+    /// A connection over an already-connected socket, with nothing queued either way.
+    pub(crate) fn from_stream(stream: UnixStream) -> Self {
+        Self {
             stream,
             out: Vec::new(),
             in_buf: Vec::new(),
             in_pos: 0,
             fds: VecDeque::new(),
-        })
+        }
     }
 
     /// The socket's raw fd, so an event loop can `poll` it alongside other fds
@@ -252,11 +257,8 @@ mod tests {
     fn primed(in_buf: Vec<u8>) -> Connection {
         let (stream, _peer) = UnixStream::pair().expect("socketpair");
         Connection {
-            stream,
-            out: Vec::new(),
             in_buf,
-            in_pos: 0,
-            fds: VecDeque::new(),
+            ..Connection::from_stream(stream)
         }
     }
 

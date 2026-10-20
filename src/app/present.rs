@@ -65,36 +65,74 @@ struct RetiredImage {
 }
 
 /// Client-owned explicit-sync state (`linux-drm-syncobj-v1`), negotiated over a
-/// live GPU backend when the compositor advertises the manager. Two DRM syncobj
+/// live GPU backend when the compositor advertises the manager. DRM syncobj
 /// timelines the compositor shares: we signal `acquire` with each frame's
-/// render-done fence, and it signals `release` when done reading a buffer. A
-/// scratch binary syncobj carries the sync-file transfers, and a binary syncobj
-/// created signalled is the acquire fence of a frame with no render-done fence.
-/// `point` increments per present; `buffer_release[i]` is the release point last
-/// published for buffer slot `i`, so that slot's next reuse waits on it. Dropping
-/// this closes the render-node fd, which frees every syncobj created on it.
+/// render-done fence, and it signals a buffer slot's `release` timeline when done
+/// reading that buffer. A scratch binary syncobj carries the sync-file transfers,
+/// and a binary syncobj created signalled is the acquire fence of a frame with no
+/// render-done fence. `point` increments per present and numbers both of a frame's
+/// points. Dropping this closes the render-node fd, which frees every syncobj
+/// created on it.
 pub(super) struct ExplicitSync {
     drm: OwnedFd,
     acquire_syncobj: u32,
-    release_syncobj: u32,
     scratch: u32,
     signalled: u32,
     acquire_timeline: u32,
-    release_timeline: u32,
+    release: [ReleaseTimeline; 2],
     surface: u32,
     point: u64,
-    buffer_release: [Option<u64>; 2],
+}
+
+/// One buffer slot's release timeline. Each slot has its own because signalling a
+/// timeline point signals every earlier point too, and a compositor may release
+/// buffers in a different order than they were committed: one buffer's release
+/// must never signal a point another buffer is waiting on.
+#[derive(Default)]
+struct ReleaseTimeline {
+    syncobj: u32,
+    /// The protocol object the compositor imported `syncobj` as.
+    timeline: u32,
+    /// The point last published for the slot's buffer, which its next reuse waits
+    /// on. `None` before the slot's first frame and after a resize replaced it.
+    point: Option<u64>,
 }
 
 impl ExplicitSync {
+    /// Create the client's syncobjs on `drm`: the acquire timeline, a release
+    /// timeline per buffer slot, and the scratch and signalled binaries. Their
+    /// protocol objects are zero until [`State::negotiate_explicit_sync`] shares
+    /// them with the compositor.
+    fn new(drm: OwnedFd) -> Result<Self> {
+        let fd = drm.as_raw_fd();
+        let mut release = [ReleaseTimeline::default(), ReleaseTimeline::default()];
+        for slot in &mut release {
+            slot.syncobj = ffi::drm_syncobj_create(fd, false)?;
+        }
+        Ok(Self {
+            acquire_syncobj: ffi::drm_syncobj_create(fd, false)?,
+            scratch: ffi::drm_syncobj_create(fd, false)?,
+            signalled: ffi::drm_syncobj_create(fd, true)?,
+            drm,
+            acquire_timeline: 0,
+            release,
+            surface: 0,
+            point: 0,
+        })
+    }
+
     /// The sync file to wait on before rendering into buffer `idx`: the
     /// compositor's release of that buffer's previous frame, or `None` the first
     /// time the slot is used (nothing has read it yet).
     fn release_fence(&self, idx: usize) -> Result<Option<OwnedFd>> {
-        match self.buffer_release[idx] {
+        let slot = self
+            .release
+            .get(idx)
+            .ok_or_else(|| Error::msg(format!("no buffer slot {idx}")))?;
+        match slot.point {
             Some(p) => Ok(Some(ffi::drm_syncobj_point_to_sync_file(
                 self.drm.as_raw_fd(),
-                self.release_syncobj,
+                slot.syncobj,
                 p,
                 self.scratch,
             )?)),
@@ -103,7 +141,7 @@ impl ExplicitSync {
     }
 
     /// Publish this frame's render-done `fence` as buffer `idx`'s acquire point
-    /// and claim the matching release point on a fresh timeline value, so the
+    /// and claim the matching release point on that buffer's own timeline, so the
     /// compositor waits for the GPU before reading and signals the point when it
     /// is done (the buffer's next reuse waits on that via [`Self::release_fence`]).
     ///
@@ -117,6 +155,10 @@ impl ExplicitSync {
         fence: Option<&OwnedFd>,
         idx: usize,
     ) -> Result<()> {
+        let slot = self
+            .release
+            .get_mut(idx)
+            .ok_or_else(|| Error::msg(format!("no buffer slot {idx}")))?;
         self.point += 1;
         let p = self.point;
         let drm = self.drm.as_raw_fd();
@@ -130,7 +172,8 @@ impl ExplicitSync {
             )?,
             None => ffi::drm_syncobj_signal_point(drm, self.acquire_syncobj, p, self.signalled)?,
         }
-        self.buffer_release[idx] = Some(p);
+        slot.point = Some(p);
+        let release_timeline = slot.timeline;
         let (hi, lo) = ((p >> 32) as u32, p as u32);
         conn.request(
             self.surface,
@@ -144,11 +187,7 @@ impl ExplicitSync {
         conn.request(
             self.surface,
             wp_linux_drm_syncobj_surface_v1::SET_RELEASE_POINT,
-            &[
-                Arg::Object(self.release_timeline),
-                Arg::Uint(hi),
-                Arg::Uint(lo),
-            ],
+            &[Arg::Object(release_timeline), Arg::Uint(hi), Arg::Uint(lo)],
         );
         Ok(())
     }
@@ -156,7 +195,9 @@ impl ExplicitSync {
     /// Forget every buffer's published release point (the buffers they named are
     /// gone, e.g. after a resize), so the next use of each slot waits on nothing.
     fn forget_buffers(&mut self) {
-        self.buffer_release = [None, None];
+        for slot in &mut self.release {
+            slot.point = None;
+        }
     }
 }
 
@@ -296,39 +337,25 @@ impl State {
         }
     }
 
-    /// Create the two client-owned timelines plus the scratch and signalled
-    /// syncobjs, share the timelines with the compositor, and attach explicit sync
-    /// to the surface.
+    /// Create the client-owned syncobjs, share the timelines with the compositor,
+    /// and attach explicit sync to the surface.
     pub(super) fn negotiate_explicit_sync(
         &mut self,
         manager: u32,
         minor: u32,
     ) -> Result<ExplicitSync> {
-        let drm = ffi::open_drm_render_node(minor)?;
-        let fd = drm.as_raw_fd();
-        let acquire_syncobj = ffi::drm_syncobj_create(fd, false)?;
-        let release_syncobj = ffi::drm_syncobj_create(fd, false)?;
-        let scratch = ffi::drm_syncobj_create(fd, false)?;
-        let signalled = ffi::drm_syncobj_create(fd, true)?;
-        let acquire_timeline = self.import_timeline(manager, fd, acquire_syncobj)?;
-        let release_timeline = self.import_timeline(manager, fd, release_syncobj)?;
-        let surface = self.create_for(
+        let mut es = ExplicitSync::new(ffi::open_drm_render_node(minor)?)?;
+        let fd = es.drm.as_raw_fd();
+        es.acquire_timeline = self.import_timeline(manager, fd, es.acquire_syncobj)?;
+        for slot in &mut es.release {
+            slot.timeline = self.import_timeline(manager, fd, slot.syncobj)?;
+        }
+        es.surface = self.create_for(
             manager,
             wp_linux_drm_syncobj_manager_v1::GET_SURFACE,
             self.surface,
         );
-        Ok(ExplicitSync {
-            drm,
-            acquire_syncobj,
-            release_syncobj,
-            scratch,
-            signalled,
-            acquire_timeline,
-            release_timeline,
-            surface,
-            point: 0,
-            buffer_release: [None, None],
-        })
+        Ok(es)
     }
 
     /// Export `syncobj` as a DRM syncobj fd and import it into the compositor as
@@ -979,7 +1006,70 @@ fn clear_color_linear(color: u32) -> [f32; 4] {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
     use crate::app::present::*;
+    use crate::platform::wire::Message;
+
+    /// Frames go into buffer 0 and then buffer 1, and the compositor finishes with
+    /// buffer 1 first, which the protocol allows. Buffer 0 is still being read, so
+    /// it must not read as released until its own point signals. The compositor
+    /// here acts only on what the requests on the socket name.
+    #[test]
+    fn a_buffer_released_out_of_order_does_not_release_the_other() {
+        let Some(drm) = ffi::open_any_render_node() else {
+            eprintln!("no DRM render node; skipping the release-order test");
+            return;
+        };
+        let mut es = ExplicitSync::new(drm).expect("create the syncobjs");
+        // The ids the compositor knows the release timelines by after negotiation.
+        es.release[0].timeline = 10;
+        es.release[1].timeline = 11;
+        let (stream, peer) = UnixStream::pair().expect("socketpair");
+        let mut conn = Connection::from_stream(stream);
+        es.publish(&mut conn, None, 0).expect("frame into buffer 0");
+        es.publish(&mut conn, None, 1).expect("frame into buffer 1");
+        conn.flush().expect("send the sync requests");
+
+        // Each commit's release point, as the timeline and point it named.
+        let mut compositor = Connection::from_stream(peer);
+        compositor
+            .fill(Some(Duration::from_secs(1)))
+            .expect("read the sync requests");
+        let mut msg = Message::default();
+        let mut commits = Vec::new();
+        while compositor.next_message_into(&mut msg).expect("decode") {
+            if msg.opcode == wp_linux_drm_syncobj_surface_v1::SET_RELEASE_POINT {
+                let mut r = Reader::new(&msg.body);
+                let timeline = r.u32().unwrap();
+                let point = (u64::from(r.u32().unwrap()) << 32) | u64::from(r.u32().unwrap());
+                commits.push((timeline, point));
+            }
+        }
+        assert_eq!(commits.len(), 2, "one release point per commit");
+
+        // What the compositor does when it is done with a commit's buffer: signal
+        // the point it named on the syncobj behind the timeline it named.
+        let release = |es: &ExplicitSync, (timeline, point): (u32, u64)| {
+            let slot = es.release.iter().find(|s| s.timeline == timeline).unwrap();
+            ffi::drm_syncobj_signal_point(es.drm.as_raw_fd(), slot.syncobj, point, es.signalled)
+                .expect("signal the release point");
+        };
+        // A point the compositor has not signalled yet holds no fence, so it cannot
+        // be exported and `release_fence` errors: the buffer reads as held.
+        let released = |es: &ExplicitSync, idx: usize| matches!(es.release_fence(idx), Ok(Some(f)) if ffi::wait_sync_file(f.as_raw_fd(), 0));
+
+        release(&es, commits[1]);
+        assert!(released(&es, 1), "buffer 1 reads as released");
+        assert!(!released(&es, 0), "buffer 0 is still being read");
+
+        release(&es, commits[0]);
+        assert!(
+            released(&es, 0),
+            "buffer 0 reads as released once its own point signals"
+        );
+    }
 
     #[test]
     fn sync_status_formats_without_allocating_a_string() {

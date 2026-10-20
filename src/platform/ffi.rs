@@ -1052,6 +1052,26 @@ fn parse_cmsgs(cbuf: &CmsgBuf, controllen: usize, out: &mut Vec<OwnedFd>) {
     }
 }
 
+/// Open the first usable DRM render node, or `None` when the machine has none
+/// (a GPU-less box, or a sandbox without `/dev/dri`), so a syncobj test skips
+/// rather than fails. Drives the production `open_drm_render_node` on the way.
+#[cfg(test)]
+pub(crate) fn open_any_render_node() -> Option<OwnedFd> {
+    for entry in std::fs::read_dir("/dev/dri").ok()?.flatten() {
+        let minor = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.strip_prefix("renderD"))
+            .and_then(|n| n.parse::<u32>().ok());
+        if let Some(minor) = minor {
+            if let Ok(fd) = open_drm_render_node(minor) {
+                return Some(fd);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use crate::platform::ffi::*;
@@ -1250,25 +1270,6 @@ mod tests {
         assert_eq!(DRM_IOCTL_SYNCOBJ_TRANSFER, 0xC020_64CC);
         // `struct pollfd` (poll.h): int + short + short.
         assert_eq!(mem::size_of::<PollFd>(), 8);
-    }
-
-    /// Open the first usable DRM render node, or `None` when the machine has
-    /// none (a GPU-less box), so the round-trip test skips rather than fails.
-    /// Drives the production `open_drm_render_node` on the way.
-    fn open_any_render_node() -> Option<OwnedFd> {
-        for entry in std::fs::read_dir("/dev/dri").ok()?.flatten() {
-            let minor = entry
-                .file_name()
-                .to_str()
-                .and_then(|n| n.strip_prefix("renderD"))
-                .and_then(|n| n.parse::<u32>().ok());
-            if let Some(minor) = minor {
-                if let Ok(fd) = open_drm_render_node(minor) {
-                    return Some(fd);
-                }
-            }
-        }
-        None
     }
 
     // A real round-trip against the kernel's DRM syncobj interface: push a
