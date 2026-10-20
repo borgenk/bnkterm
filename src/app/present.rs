@@ -445,7 +445,7 @@ impl State {
         es.surface = self.create_for(
             manager,
             wp_linux_drm_syncobj_manager_v1::GET_SURFACE,
-            self.surface,
+            self.objects.surface,
         );
         Ok(es)
     }
@@ -686,7 +686,7 @@ impl State {
     pub(super) fn ack_configure(&mut self, serial: u32) {
         self.declare_surface_scale();
         self.conn.request(
-            self.xdg_surface,
+            self.objects.xdg_surface,
             xdg_surface::ACK_CONFIGURE,
             &[Arg::Uint(serial)],
         );
@@ -701,7 +701,7 @@ impl State {
     pub(super) fn declare_surface_scale(&mut self) {
         let (lw, lh) = (self.scale.logical.0 as i32, self.scale.logical.1 as i32);
         self.conn.request(
-            self.xdg_surface,
+            self.objects.xdg_surface,
             xdg_surface::SET_WINDOW_GEOMETRY,
             &[Arg::Int(0), Arg::Int(0), Arg::Int(lw), Arg::Int(lh)],
         );
@@ -713,8 +713,11 @@ impl State {
             );
         } else {
             let n = (self.scale.factor_120 / 120).max(1) as i32;
-            self.conn
-                .request(self.surface, wl_surface::SET_BUFFER_SCALE, &[Arg::Int(n)]);
+            self.conn.request(
+                self.objects.surface,
+                wl_surface::SET_BUFFER_SCALE,
+                &[Arg::Int(n)],
+            );
         }
         self.scale.synced = true;
     }
@@ -820,7 +823,8 @@ impl State {
             // applies it against the current, already correctly sized buffer.
             if let Some(serial) = ack {
                 self.ack_configure(serial);
-                self.conn.request(self.surface, wl_surface::COMMIT, &[]);
+                self.conn
+                    .request(self.objects.surface, wl_surface::COMMIT, &[]);
             }
             return Ok(true);
         }
@@ -873,7 +877,7 @@ impl State {
 
         let buffer = self.presentation.buffers[idx];
         self.conn.request(
-            self.surface,
+            self.objects.surface,
             wl_surface::ATTACH,
             &[Arg::Object(buffer), Arg::Int(0), Arg::Int(0)],
         );
@@ -895,14 +899,15 @@ impl State {
         // The two spaces coincide only at scale 1.0.
         for r in &self.presentation.damage {
             self.conn.request(
-                self.surface,
+                self.objects.surface,
                 wl_surface::DAMAGE_BUFFER,
                 &[Arg::Int(r.x), Arg::Int(r.y), Arg::Int(r.w), Arg::Int(r.h)],
             );
         }
-        let callback = self.create(self.surface, wl_surface::FRAME);
+        let callback = self.create(self.objects.surface, wl_surface::FRAME);
         self.frame_callback = callback;
-        self.conn.request(self.surface, wl_surface::COMMIT, &[]);
+        self.conn
+            .request(self.objects.surface, wl_surface::COMMIT, &[]);
         self.presentation.busy[idx] = true;
         // The first commit with a buffer maps the window, which activation needs to act on.
         self.spend_launch_token();
@@ -1022,7 +1027,7 @@ impl State {
     /// print what the GPU presentation path has to work with, without opening a
     /// window. A successful probe means the terminal's GPU prerequisites hold.
     pub(super) fn probe_dmabuf(&mut self) -> Result<()> {
-        self.registry = self.create(protocol::WL_DISPLAY, wl_display::GET_REGISTRY);
+        self.objects.registry = self.create(protocol::WL_DISPLAY, wl_display::GET_REGISTRY);
         self.roundtrip()?;
         if self.presentation.dmabuf.is_none() {
             println!(

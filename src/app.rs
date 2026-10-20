@@ -414,6 +414,60 @@ impl Scaling {
     }
 }
 
+/// The window's Wayland object ids. Globals are `Option` (discovered via the
+/// registry); ids we create are 0 (never valid) until assigned.
+#[derive(Default)]
+struct Objects {
+    registry: u32,
+    compositor: Option<u32>,
+    wm_base: Option<u32>,
+    seat: Option<u32>,
+    /// The cursor-shape manager, absent when the compositor lacks
+    /// `wp_cursor_shape_manager_v1`; the pointer then keeps the compositor's default
+    /// shape (an arrow) rather than the I-beam we would ask for over the grid.
+    cursor_shape_manager: Option<u32>,
+    keyboard: u32,
+    pointer: u32,
+    /// The per-pointer shape device the manager hands out, `0` until the pointer
+    /// exists (and forever if there is no manager).
+    cursor_shape_device: u32,
+    surface: u32,
+    xdg_surface: u32,
+    toplevel: u32,
+}
+
+/// The pointer over the window: where it is, the cursor shape it shows, and the
+/// press gestures in progress.
+#[derive(Default)]
+struct PointerState {
+    /// Latest position in surface pixels. `axis_accum` gathers fractional wheel
+    /// deltas into whole notches (the button held for drag reporting lives on the
+    /// core, with the mouse mode it reports under).
+    x: f32,
+    y: f32,
+    /// The cursor shape currently applied (a `wp_cursor_shape_device_v1::SHAPE_*`),
+    /// or `0` when none is set yet. Tracked so motion only re-sends `set_shape` when
+    /// the pointer crosses between the grid (I-beam) and the tab strip (arrow).
+    shape: u32,
+    /// The serial of the latest `wl_pointer.enter`, which `set_shape` must cite to
+    /// change the cursor (`0` before the pointer has entered).
+    enter_serial: u32,
+    axis_accum: f32,
+    /// A button press that began in the tab bar. Its matching release is swallowed
+    /// even if closing a tab made the bar disappear in between.
+    bar_button: Option<MouseButton>,
+    /// Whether a left press took the visible tab's scrollbar thumb and is scrubbing it.
+    /// The drag owns the pointer wherever it wanders (off the lane, off the grid), and
+    /// swallows its own release, so it can neither start a selection nor leave the thumb
+    /// stuck to the pointer. Where inside the thumb it grabbed lives on the bar itself.
+    drag_scroll: bool,
+    /// Multi-click tracking for word/line selection: the wl time (ms) and cell of the
+    /// last left press, and the running count (1 character, 2 word, 3 line, cycling).
+    last_click_time: u32,
+    last_click_cell: (usize, usize),
+    click_count: usize,
+}
+
 struct State {
     conn: Connection,
     fonts: Fonts,
@@ -455,14 +509,10 @@ struct State {
     /// Compositor scale factor and the objects that report it.
     scale: Scaling,
 
-    // Object ids. Globals are Option (discovered via the registry); ids we
-    // create default to 0 (never valid) until assigned.
-    registry: u32,
-    compositor: Option<u32>,
-    wm_base: Option<u32>,
-    seat: Option<u32>,
-    /// The version `seat` is bound at, which decides whether its keyboard and pointer
-    /// can be released.
+    /// The window's Wayland objects.
+    objects: Objects,
+    /// The version [`Objects::seat`] is bound at, which decides whether its keyboard and
+    /// pointer can be released.
     seat_version: u32,
     /// Keyboards released after the seat lost its keyboard, until the compositor confirms
     /// the deletion with `wl_display.delete_id` (for good on a seat below version 3, which
@@ -470,47 +520,11 @@ struct State {
     /// arrives with an fd, which must be taken off the connection's fd queue or every later
     /// fd-carrying event receives the one before it.
     released_keyboards: Vec<u32>,
-    /// The cursor-shape manager, absent when the compositor lacks
-    /// `wp_cursor_shape_manager_v1`; the pointer then keeps the compositor's default
-    /// shape (an arrow) rather than the I-beam we would ask for over the grid.
-    cursor_shape_manager: Option<u32>,
-    keyboard: u32,
-    pointer: u32,
-    /// The per-pointer shape device the manager hands out, `0` until the pointer
-    /// exists (and forever if there is no manager).
-    cursor_shape_device: u32,
-    /// The cursor shape currently applied (a `wp_cursor_shape_device_v1::SHAPE_*`),
-    /// or `0` when none is set yet. Tracked so motion only re-sends `set_shape` when
-    /// the pointer crosses between the grid (I-beam) and the tab strip (arrow).
-    pointer_shape: u32,
+    /// Where the pointer is, the cursor it shows, and the press gestures in progress.
+    pointer: PointerState,
     /// Whether the frame shows the hovered link's preview: the pointer offers a Ctrl+click
     /// on a link ([`link_preview_shown`]).
     link_preview: bool,
-    /// The serial of the latest `wl_pointer.enter`, which `set_shape` must cite to
-    /// change the cursor (`0` before the pointer has entered).
-    pointer_enter_serial: u32,
-    /// Latest pointer position in surface pixels. `axis_accum` gathers fractional
-    /// wheel deltas into whole notches (the button held for drag reporting lives
-    /// on the core, with the mouse mode it reports under).
-    pointer_x: f32,
-    pointer_y: f32,
-    axis_accum: f32,
-    /// A button press that began in the tab bar. Its matching release is swallowed
-    /// even if closing a tab made the bar disappear in between.
-    bar_button: Option<MouseButton>,
-    /// Whether a left press took the visible tab's scrollbar thumb and is scrubbing it.
-    /// The drag owns the pointer wherever it wanders (off the lane, off the grid), and
-    /// swallows its own release, so it can neither start a selection nor leave the thumb
-    /// stuck to the pointer. Where inside the thumb it grabbed lives on the bar itself.
-    drag_scroll: bool,
-    /// Multi-click tracking for word/line selection: the wl time (ms) and cell of the
-    /// last left press, and the running count (1 character, 2 word, 3 line, cycling).
-    last_click_time: u32,
-    last_click_cell: (usize, usize),
-    click_count: usize,
-    surface: u32,
-    xdg_surface: u32,
-    toplevel: u32,
     /// The clipboard (Ctrl+Shift+C/V) and the primary selection (select-to-copy,
     /// middle-click paste), indexed by [`Transport`]. One state machine over two object
     /// families; a transport whose manager the compositor never advertised is a no-op.
@@ -652,30 +666,11 @@ impl State {
             key_mode: KeyMode::Normal,
             tab_bar_config,
             scale: Scaling::new((width, height)),
-            registry: 0,
-            compositor: None,
-            wm_base: None,
-            seat: None,
+            objects: Objects::default(),
             seat_version: 0,
             released_keyboards: Vec::new(),
-            cursor_shape_manager: None,
-            keyboard: 0,
-            pointer: 0,
-            cursor_shape_device: 0,
-            pointer_shape: 0,
+            pointer: PointerState::default(),
             link_preview: false,
-            pointer_enter_serial: 0,
-            pointer_x: 0.0,
-            pointer_y: 0.0,
-            axis_accum: 0.0,
-            bar_button: None,
-            drag_scroll: false,
-            last_click_time: 0,
-            last_click_cell: (0, 0),
-            click_count: 0,
-            surface: 0,
-            xdg_surface: 0,
-            toplevel: 0,
             selections: SelectionTransport::pair(),
             pending_sends: Vec::new(),
             last_serial: 0,
@@ -736,16 +731,17 @@ impl State {
     /// screenshot harness runs it until the capture is written).
     fn bring_up_surface(&mut self) -> Result<()> {
         // Discover and bind globals.
-        self.registry = self.create(protocol::WL_DISPLAY, wl_display::GET_REGISTRY);
+        self.objects.registry = self.create(protocol::WL_DISPLAY, wl_display::GET_REGISTRY);
         self.roundtrip()?;
 
-        let compositor = self.compositor.ok_or_else(|| {
+        let compositor = self.objects.compositor.ok_or_else(|| {
             Error::msg(format!(
                 "compositor has no wl_compositor at version {} or newer",
                 protocol::VERSION_COMPOSITOR
             ))
         })?;
         let wm_base = self
+            .objects
             .wm_base
             .ok_or_else(|| Error::msg("compositor has no xdg_wm_base"))?;
 
@@ -758,11 +754,12 @@ impl State {
             .map_err(|e| Error::msg(format!("requires a Vulkan device; none available: {e}")))?;
 
         // Surface stack: wl_surface -> xdg_surface -> xdg_toplevel.
-        self.surface = self.create(compositor, wl_compositor::CREATE_SURFACE);
-        self.xdg_surface = self.create_for(wm_base, xdg_wm_base::GET_XDG_SURFACE, self.surface);
-        self.toplevel = self.create(self.xdg_surface, xdg_surface::GET_TOPLEVEL);
+        self.objects.surface = self.create(compositor, wl_compositor::CREATE_SURFACE);
+        self.objects.xdg_surface =
+            self.create_for(wm_base, xdg_wm_base::GET_XDG_SURFACE, self.objects.surface);
+        self.objects.toplevel = self.create(self.objects.xdg_surface, xdg_surface::GET_TOPLEVEL);
         self.conn.request(
-            self.toplevel,
+            self.objects.toplevel,
             xdg_toplevel::SET_APP_ID,
             &[Arg::Str("bnkterm")],
         );
@@ -778,14 +775,15 @@ impl State {
             self.scale.fractional_scale = self.create_for(
                 fmgr,
                 wp_fractional_scale_manager_v1::GET_FRACTIONAL_SCALE,
-                self.surface,
+                self.objects.surface,
             );
-            self.scale.viewport = self.create_for(vp, wp_viewporter::GET_VIEWPORT, self.surface);
+            self.scale.viewport =
+                self.create_for(vp, wp_viewporter::GET_VIEWPORT, self.objects.surface);
         }
 
         // The devices drive copy and paste; each is skipped when the compositor has no
         // manager for it, leaving that transport unavailable rather than broken.
-        if let Some(seat) = self.seat {
+        if let Some(seat) = self.objects.seat {
             self.create_selection_devices(seat);
         }
 
@@ -794,7 +792,8 @@ impl State {
 
         // Empty commit to get the initial configure; the loop draws once
         // `configured` is set.
-        self.conn.request(self.surface, wl_surface::COMMIT, &[]);
+        self.conn
+            .request(self.objects.surface, wl_surface::COMMIT, &[]);
         self.run_until(|s| s.configured)?;
 
         // Now that the window has its granted size, spawn the shell on a PTY
@@ -984,7 +983,7 @@ impl State {
     /// so every hit-test against them has to scale up first.
     fn pointer_device(&self) -> (f32, f32) {
         let scale = self.scale.factor();
-        (scale.pxf(self.pointer_x), scale.pxf(self.pointer_y))
+        (scale.pxf(self.pointer.x), scale.pxf(self.pointer.y))
     }
 
     /// The logical window size scaled to the device buffer size, clamped so a bogus
@@ -1148,7 +1147,7 @@ impl State {
             return Ok(());
         }
 
-        if msg.object == self.registry && msg.opcode == wl_registry::EV_GLOBAL {
+        if msg.object == self.objects.registry && msg.opcode == wl_registry::EV_GLOBAL {
             return self.on_global(&mut r);
         }
 
@@ -1173,7 +1172,7 @@ impl State {
             return Ok(());
         }
 
-        if msg.object == self.xdg_surface && msg.opcode == xdg_surface::EV_CONFIGURE {
+        if msg.object == self.objects.xdg_surface && msg.opcode == xdg_surface::EV_CONFIGURE {
             self.pending_configure = Some(r.u32()?);
             if let Some((lw, lh)) = self.pending_size.take() {
                 // The configure size is logical (surface-local); the buffer and
@@ -1203,7 +1202,7 @@ impl State {
 
         // wl_surface.enter/leave and wl_output.scale drive the integer fallback
         // (used only when the fractional path is absent).
-        if msg.object == self.surface
+        if msg.object == self.objects.surface
             && (msg.opcode == wl_surface::EV_ENTER || msg.opcode == wl_surface::EV_LEAVE)
         {
             let output = r.u32()?;
@@ -1230,7 +1229,7 @@ impl State {
             return Ok(());
         }
 
-        if msg.object == self.toplevel {
+        if msg.object == self.objects.toplevel {
             match msg.opcode {
                 xdg_toplevel::EV_CONFIGURE => {
                     let w = r.u32()?;
@@ -1246,38 +1245,38 @@ impl State {
             return Ok(());
         }
 
-        if Some(msg.object) == self.wm_base && msg.opcode == xdg_wm_base::EV_PING {
+        if Some(msg.object) == self.objects.wm_base && msg.opcode == xdg_wm_base::EV_PING {
             let serial = r.u32()?;
             self.conn
                 .request(msg.object, xdg_wm_base::PONG, &[Arg::Uint(serial)]);
             return Ok(());
         }
 
-        if Some(msg.object) == self.seat && msg.opcode == wl_seat::EV_CAPABILITIES {
+        if Some(msg.object) == self.objects.seat && msg.opcode == wl_seat::EV_CAPABILITIES {
             // A capability can go and come back: a keyboard unplugged, a KVM switch, a
             // Bluetooth device asleep. The compositor makes the old object inert when it
             // goes, so it is released then, and a fresh one is created when it returns.
             let caps = r.u32()?;
             let has_keyboard = caps & wl_seat::CAP_KEYBOARD != 0;
             let has_pointer = caps & wl_seat::CAP_POINTER != 0;
-            if !has_keyboard && self.keyboard != 0 {
+            if !has_keyboard && self.objects.keyboard != 0 {
                 self.release_keyboard()?;
             }
-            if !has_pointer && self.pointer != 0 {
+            if !has_pointer && self.objects.pointer != 0 {
                 self.release_pointer()?;
             }
-            if has_keyboard && self.keyboard == 0 {
-                self.keyboard = self.create(msg.object, wl_seat::GET_KEYBOARD);
+            if has_keyboard && self.objects.keyboard == 0 {
+                self.objects.keyboard = self.create(msg.object, wl_seat::GET_KEYBOARD);
             }
-            if has_pointer && self.pointer == 0 {
+            if has_pointer && self.objects.pointer == 0 {
                 let pointer = self.create(msg.object, wl_seat::GET_POINTER);
-                self.pointer = pointer;
+                self.objects.pointer = pointer;
                 // Pair the pointer with a cursor-shape device so we can ask for the
                 // I-beam over the grid. The manager is bound in the same global burst
                 // as the seat, so it is known by the time capabilities arrive; without
                 // it the pointer keeps the compositor default shape.
-                if let Some(manager) = self.cursor_shape_manager {
-                    self.cursor_shape_device =
+                if let Some(manager) = self.objects.cursor_shape_manager {
+                    self.objects.cursor_shape_device =
                         self.create_for(manager, wp_cursor_shape_manager_v1::GET_POINTER, pointer);
                 }
             }
@@ -1291,11 +1290,11 @@ impl State {
             return Ok(());
         }
 
-        if self.keyboard != 0 && msg.object == self.keyboard {
+        if self.objects.keyboard != 0 && msg.object == self.objects.keyboard {
             return self.on_keyboard(msg.opcode, &mut r);
         }
 
-        if self.pointer != 0 && msg.object == self.pointer {
+        if self.objects.pointer != 0 && msg.object == self.objects.pointer {
             return self.on_pointer(msg.opcode, &mut r);
         }
 
@@ -1421,7 +1420,7 @@ impl State {
     /// The seat lost its keyboard: release the inert object and forget it, remembering
     /// its id until the compositor confirms the deletion (see `released_keyboards`).
     fn release_keyboard(&mut self) -> Result<()> {
-        let keyboard = std::mem::take(&mut self.keyboard);
+        let keyboard = std::mem::take(&mut self.objects.keyboard);
         if self.seat_version >= wl_seat::VERSION_RELEASE {
             self.conn.request(keyboard, wl_keyboard::RELEASE, &[]);
         }
@@ -1433,19 +1432,19 @@ impl State {
     /// object and forget it. Pointer events carry no fds, so nothing in flight for it
     /// needs taking off the fd queue.
     fn release_pointer(&mut self) -> Result<()> {
-        if self.cursor_shape_device != 0 {
+        if self.objects.cursor_shape_device != 0 {
             self.conn.request(
-                self.cursor_shape_device,
+                self.objects.cursor_shape_device,
                 wp_cursor_shape_device_v1::DESTROY,
                 &[],
             );
-            self.cursor_shape_device = 0;
+            self.objects.cursor_shape_device = 0;
         }
-        let pointer = std::mem::take(&mut self.pointer);
+        let pointer = std::mem::take(&mut self.objects.pointer);
         if self.seat_version >= wl_seat::VERSION_RELEASE {
             self.conn.request(pointer, wl_pointer::RELEASE, &[]);
         }
-        self.pointer_enter_serial = 0;
+        self.pointer.enter_serial = 0;
         self.pointer_left_grid()
     }
 
@@ -1748,7 +1747,7 @@ impl State {
             // A scrollbar is a control, not text, so over its grab band (and for as
             // long as its thumb is held) the I-beam gives way to the arrow.
             on_chrome: self.pointer_in_tab_bar()
-                || self.drag_scroll
+                || self.pointer.drag_scroll
                 || self.tabs.active().on_scrollbar(px, py),
             ctrl_link: self
                 .tabs
@@ -1764,16 +1763,16 @@ impl State {
             self.tabs.mark_dirty();
         }
         let shape = pointer_shape_for(facts);
-        if shape == self.pointer_shape {
+        if shape == self.pointer.shape {
             return;
         }
-        if self.cursor_shape_device != 0 && self.pointer_enter_serial != 0 {
+        if self.objects.cursor_shape_device != 0 && self.pointer.enter_serial != 0 {
             self.conn.request(
-                self.cursor_shape_device,
+                self.objects.cursor_shape_device,
                 wp_cursor_shape_device_v1::SET_SHAPE,
-                &[Arg::Uint(self.pointer_enter_serial), Arg::Uint(shape)],
+                &[Arg::Uint(self.pointer.enter_serial), Arg::Uint(shape)],
             );
-            self.pointer_shape = shape;
+            self.pointer.shape = shape;
         }
     }
 
@@ -1795,15 +1794,16 @@ impl State {
     /// count. `wrapping_sub` keeps the comparison correct across the wl clock's u32
     /// wrap.
     fn click_count(&mut self, time: u32, cell: (usize, usize)) -> usize {
-        let quick = time.wrapping_sub(self.last_click_time) <= MULTI_CLICK_MS;
-        self.click_count = if quick && self.last_click_cell == cell && self.click_count < 3 {
-            self.click_count + 1
-        } else {
-            1
-        };
-        self.last_click_time = time;
-        self.last_click_cell = cell;
-        self.click_count
+        let quick = time.wrapping_sub(self.pointer.last_click_time) <= MULTI_CLICK_MS;
+        self.pointer.click_count =
+            if quick && self.pointer.last_click_cell == cell && self.pointer.click_count < 3 {
+                self.pointer.click_count + 1
+            } else {
+                1
+            };
+        self.pointer.last_click_time = time;
+        self.pointer.last_click_cell = cell;
+        self.pointer.click_count
     }
 
     /// One wl_pointer event: track the position, and either report to the child or
@@ -1814,11 +1814,11 @@ impl State {
                 // The enter serial is the one `set_shape` must cite; a fresh enter is
                 // also where the compositor resets the cursor, so forget the last
                 // shape and re-apply whichever fits the entry position.
-                self.pointer_enter_serial = r.u32()?;
+                self.pointer.enter_serial = r.u32()?;
                 let _surface = r.u32()?;
-                self.pointer_x = r.fixed()?;
-                self.pointer_y = r.fixed()?;
-                self.pointer_shape = 0;
+                self.pointer.x = r.fixed()?;
+                self.pointer.y = r.fixed()?;
+                self.pointer.shape = 0;
                 self.update_pointer_shape();
             }
             wl_pointer::EV_LEAVE => {
@@ -1829,10 +1829,10 @@ impl State {
             }
             wl_pointer::EV_MOTION => {
                 let _time = r.u32()?;
-                self.pointer_x = r.fixed()?;
-                self.pointer_y = r.fixed()?;
+                self.pointer.x = r.fixed()?;
+                self.pointer.y = r.fixed()?;
                 let (px, py) = self.pointer_device();
-                if self.drag_scroll {
+                if self.pointer.drag_scroll {
                     // A thumb the pointer is holding follows it anywhere, including out
                     // of the lane and off the grid. Nothing else sees the move.
                     self.tabs.active_mut().drag_scrollbar(py);
@@ -1865,20 +1865,20 @@ impl State {
                 let button = r.u32()?;
                 let pressed = r.u32()? == wl_pointer::BUTTON_STATE_PRESSED;
                 let mapped = pointer_button(button);
-                if !pressed && self.bar_button == mapped {
+                if !pressed && self.pointer.bar_button == mapped {
                     // The release that matches a bar press ends any drag it armed. This
                     // keys off the pressed button, not the pointer position, so a
                     // release dragged off the strip still settles the tab.
                     self.tabs.end_drag();
-                    self.bar_button = None;
+                    self.pointer.bar_button = None;
                     self.update_pointer_shape();
                     return Ok(());
                 }
                 // The release that ends a thumb drag is the scrollbar's, wherever the
                 // pointer has wandered to by now: it must not reach the grid as the end
                 // of a selection that never began.
-                if !pressed && self.drag_scroll && mapped == Some(MouseButton::Left) {
-                    self.drag_scroll = false;
+                if !pressed && self.pointer.drag_scroll && mapped == Some(MouseButton::Left) {
+                    self.pointer.drag_scroll = false;
                     self.tabs.active_mut().release_scrollbar();
                     let at = self.pointer_device();
                     self.tabs.active_mut().track_scrollbar(Some(at));
@@ -1886,7 +1886,7 @@ impl State {
                     return Ok(());
                 }
                 if self.pointer_in_tab_bar() && pressed {
-                    self.bar_button = mapped;
+                    self.pointer.bar_button = mapped;
                     if let (Some(button), Some(id)) = (mapped, self.pointer_bar_tab()) {
                         match button {
                             MouseButton::Left => {
@@ -1910,7 +1910,7 @@ impl State {
                 if pressed && mapped == Some(MouseButton::Left) {
                     let (px, py) = self.pointer_device();
                     if self.tabs.active_mut().press_scrollbar(px, py) {
-                        self.drag_scroll = true;
+                        self.pointer.drag_scroll = true;
                         return Ok(());
                     }
                 }
@@ -1962,7 +1962,7 @@ impl State {
         // Gather fractional deltas (touchpads send many small ones) into whole
         // notches, then hand them to the terminal (which reports them, scrolls the
         // view, or sends arrow keys — see `apply_pointer`).
-        let notches = wheel_notches(&mut self.axis_accum, value);
+        let notches = wheel_notches(&mut self.pointer.axis_accum, value);
         if notches == 0 {
             return Ok(());
         }
@@ -1996,18 +1996,18 @@ impl State {
                     return Ok(());
                 }
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_COMPOSITOR);
-                self.compositor = Some(id);
+                self.objects.compositor = Some(id);
             }
             protocol::IFACE_WM_BASE => {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_WM_BASE);
-                self.wm_base = Some(id);
+                self.objects.wm_base = Some(id);
             }
             // The first seat only. The keyboard and pointer belong to the seat that created
             // them, so a second seat whose capabilities lack a keyboard must not be able to
             // release the first seat's.
-            protocol::IFACE_SEAT if self.seat.is_none() => {
+            protocol::IFACE_SEAT if self.objects.seat.is_none() => {
                 let id = self.bind_capped(name, interface, version, protocol::VERSION_SEAT);
-                self.seat = Some(id);
+                self.objects.seat = Some(id);
                 self.seat_version = version.min(protocol::VERSION_SEAT);
             }
             protocol::IFACE_CURSOR_SHAPE_MANAGER => {
@@ -2017,7 +2017,7 @@ impl State {
                     version,
                     protocol::VERSION_CURSOR_SHAPE_MANAGER,
                 );
-                self.cursor_shape_manager = Some(id);
+                self.objects.cursor_shape_manager = Some(id);
             }
             protocol::IFACE_DATA_DEVICE_MANAGER => {
                 let id = self.bind_capped(
@@ -2112,7 +2112,7 @@ impl State {
     /// for the initial app name.
     fn set_toplevel_title(&mut self, title: &str) {
         self.conn.request(
-            self.toplevel,
+            self.objects.toplevel,
             xdg_toplevel::SET_TITLE,
             &[Arg::Str(wire::fit_sole_string(title))],
         );
@@ -2148,7 +2148,7 @@ impl State {
     fn bind_capped(&mut self, name: u32, interface: &str, version: u32, max: u32) -> u32 {
         let id = self.alloc_id();
         self.conn.request(
-            self.registry,
+            self.objects.registry,
             wl_registry::BIND,
             &[
                 Arg::Uint(name),
@@ -2630,7 +2630,7 @@ mod tests {
 
     #[test]
     fn the_shape_is_never_the_unset_zero() {
-        // `pointer_shape: 0` is the sentinel for "forget what was applied" on enter, so
+        // `PointerState::shape` 0 is the sentinel for "forget what was applied" on enter, so
         // no real choice may collide with it or the re-apply would be skipped.
         let links = [
             None,

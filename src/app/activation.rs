@@ -89,7 +89,7 @@ impl State {
             self.conn.request(
                 global,
                 xdg_activation_v1::ACTIVATE,
-                &[Arg::Str(&token), Arg::Object(self.surface)],
+                &[Arg::Str(&token), Arg::Object(self.objects.surface)],
             );
         }
     }
@@ -97,7 +97,7 @@ impl State {
     /// Follow a clicked link. With the global, a token is requested for the click first,
     /// citing its serial, and the link is followed when the token arrives.
     pub(super) fn launch_link(&mut self, link: ClickedLink) {
-        let (Some(global), Some(seat)) = (self.activation.global, self.seat) else {
+        let (Some(global), Some(seat)) = (self.activation.global, self.objects.seat) else {
             self.follow(link, None);
             return;
         };
@@ -110,7 +110,7 @@ impl State {
         self.conn.request(
             request,
             xdg_activation_token_v1::SET_SURFACE,
-            &[Arg::Object(self.surface)],
+            &[Arg::Object(self.objects.surface)],
         );
         self.conn
             .request(request, xdg_activation_token_v1::COMMIT, &[]);
