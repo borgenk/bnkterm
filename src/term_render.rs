@@ -45,13 +45,14 @@
 //! Per painted row, in stacking order (the list order the damage diff and the GPU
 //! rely on): the base background fill (once, whole surface), then per-cell
 //! background runs where a cell's background differs from the theme's, then the
-//! foreground as fixed-pitch [`DrawCmd::Cells`] runs (with wide glyphs and
-//! astral-plane runes broken out into their own [`DrawCmd::Text`] so the pitch
-//! stays uniform), then underline/strike rules and the hovered link's rule, and
-//! finally the cursor on top. Over the whole grid come the overlay scrollbar and, while
-//! Ctrl is held over a link, the plate that previews its target. Everything past the
-//! base fill is emitted only where it is not the default, so an idle screen of
-//! mostly-blank cells produces a short list and an unchanged frame diffs to nothing.
+//! foreground as fixed-pitch [`DrawCmd::Cells`] runs (with wide glyphs broken out
+//! into their own [`DrawCmd::Text`], and a rune that could join its neighbour's
+//! cluster drawn as a run of one, so the pitch stays uniform), then underline/strike
+//! rules and the hovered link's rule, and finally the cursor on top. Over the whole
+//! grid come the overlay scrollbar and, while Ctrl is held over a link, the plate
+//! that previews its target. Everything past the base fill is emitted only where it
+//! is not the default, so an idle screen of mostly-blank cells produces a short list
+//! and an unchanged frame diffs to nothing.
 //!
 //! The two overlays the app hands in — the selection band and the hovered hyperlink's
 //! underline — both cover a [`CellSpan`], and both resolve to *one inclusive column
@@ -576,13 +577,13 @@ struct RunStyle {
 /// What one cell actually shows: the rune to draw, whether its combining marks go with
 /// it, and whether any of that is ink.
 ///
-/// The painter draws a cell's glyph from three places — the batched run, the standalone
-/// glyph, and the cursor's inverted stamp — and every one of them has to conceal an
+/// The painter draws a cell's glyph from three places (the batched run, the wide
+/// glyph, and the cursor's inverted stamp), and every one of them has to conceal an
 /// `SGR 8` cell identically. Three copies of that rule is exactly how the third came to
 /// be missing it: a TUI masking a password with `SGR 8` rather than tty echo-off showed
 /// the most recently typed character under the cursor, one keystroke at a time.
 ///
-/// So it is stated once and asked for twice — by [`Painter::push_glyph`] and
+/// So it is stated once and asked for twice, by [`Painter::push_wide_glyph`] and
 /// [`Painter::stamp_inverted_glyph`], the two that build a one-cell string. The batched
 /// run keeps the rule spelled out flat instead, and that exception is measured rather
 /// than assumed: constructing this per cell in the run scan cost `frame_tabbar` +3-6%,
@@ -700,9 +701,10 @@ impl Painter<'_> {
     /// The foreground glyphs and text decorations for one row. Consecutive
     /// single-width cells that share a foreground colour, face style, and
     /// underline/strike state batch into one fixed-pitch [`DrawCmd::Cells`] run;
-    /// a wide glyph (its leader) and an astral-plane rune break out into their own
-    /// [`DrawCmd::Text`] so the run's one-cluster-per-cell contract holds. See the
-    /// module header for why the pitch, not the advance, drives placement.
+    /// a wide glyph (its leader) breaks out into its own [`DrawCmd::Text`], and a
+    /// cell [`cells_safe`] excludes is a run of one, so the run's one-cluster-per-cell
+    /// contract holds. See the module header for why the pitch, not the advance,
+    /// drives placement.
     fn foreground_row(&mut self, row: usize, cols: usize) {
         let baseline = self.baseline(row);
         let mut col = 0;
@@ -714,11 +716,11 @@ impl Painter<'_> {
                 col += 1;
                 continue;
             }
-            if stands_alone(cell) {
-                // Wide glyphs and astral runes stand alone at their exact column,
-                // so their non-uniform advance can never shift a following cell.
-                self.push_glyph(row, col, cell, baseline);
-                col += if cell.is_wide_leader() { 2 } else { 1 };
+            if cell.is_wide_leader() {
+                // A wide glyph stands alone at its exact column, so its advance can
+                // never shift a following cell.
+                self.push_wide_glyph(row, col, cell, baseline);
+                col += 2;
                 continue;
             }
             col = self.push_run(row, col, cols, cell, baseline);
@@ -728,9 +730,10 @@ impl Painter<'_> {
     }
 
     /// Emit a fixed-pitch run starting at `col`: the maximal span of single-width,
-    /// same-style cells. The [`DrawCmd::Cells`] text is trimmed to the last inked
-    /// cell (trailing blanks in the run draw nothing, so carrying them would only
-    /// cost allocation and coarsen the damage diff), while underline/strike rules
+    /// same-style cells, or just the first when [`cells_safe`] excludes its rune (the
+    /// next cell could join its cluster). The [`DrawCmd::Cells`] text is trimmed to the
+    /// last inked cell (trailing blanks in the run draw nothing, so carrying them would
+    /// only cost allocation and coarsen the damage diff), while underline/strike rules
     /// span the full styled run, because a styled trailing space still shows its
     /// rule (xterm draws it).
     ///
@@ -781,8 +784,13 @@ impl Painter<'_> {
         // trailing blank never lands in the emitted text.
         let mut inked_bytes = 0;
         let mut inked_cells = 0;
+        let limit = if cells_safe(first.rune) {
+            cols
+        } else {
+            col + 1
+        };
         let mut end = col;
-        while end < cols {
+        while end < limit {
             // The caller already read the first cell to decide this was a run at all.
             let cell = if end == col {
                 first
@@ -790,8 +798,8 @@ impl Painter<'_> {
                 self.cell(row, end)
             };
             if end > col {
-                // A wide glyph or an astral rune stands alone, and anything the run can
-                // only draw one of ends it: past here is a different command.
+                // A wide glyph stands alone and an excluded rune starts a run of its
+                // own: past here is a different command.
                 if cell.is_wide_leader() || cell.is_wide_spacer() || !cells_safe(cell.rune) {
                     break;
                 }
@@ -1014,11 +1022,6 @@ impl Painter<'_> {
         (self.metrics.size as i32 / 12).max(1)
     }
 
-    /// One cell's glyph as a standalone [`DrawCmd::Text`] at its exact column,
-    /// used for wide glyphs and astral runes (base rune plus any combining marks).
-    /// A hidden or blank cell draws no glyph, but still takes its decorations: an
-    /// underline runs under the cells it covers whether or not they have ink, the
-    /// same rule [`Self::push_run`] follows for a styled trailing space.
     /// Push one glyph as a [`DrawCmd::Text`] spanning `width_cells` columns from `x`.
     /// The shape every standalone glyph takes: a wide character, the glyph stamped
     /// inside a block cursor, and the lock all differ only in their colours and in what
@@ -1048,10 +1051,15 @@ impl Painter<'_> {
         });
     }
 
-    fn push_glyph(&mut self, row: usize, col: usize, cell: Cell, baseline: i32) {
+    /// A wide cell's glyph (base rune plus any combining marks) as a standalone
+    /// [`DrawCmd::Text`] at its exact column. A hidden or blank cell draws no glyph, but
+    /// still takes its decorations: an underline runs under the cells it covers whether
+    /// or not they have ink, the same rule [`Self::push_run`] follows for a styled
+    /// trailing space.
+    fn push_wide_glyph(&mut self, row: usize, col: usize, cell: Cell, baseline: i32) {
         let m = self.metrics;
         let x = self.cell_x(col);
-        let width_cells = if cell.is_wide_leader() { 2 } else { 1 };
+        let width_cells = 2;
         let (fg, bg) = (self.cell_fg(cell), self.cell_bg_of(cell));
         let shown = self.shown(row, col, cell);
         if shown.inked {
@@ -1200,8 +1208,8 @@ impl Painter<'_> {
     /// Re-draw the glyph beneath a focused block cursor in the cell's background
     /// colour, so the character shows as a cutout in the cursor block.
     ///
-    /// Drawn through the same command as the row ([`stands_alone`]), so a box, block, or
-    /// braille glyph stays procedural under the cursor.
+    /// Drawn through the same command as the row, so a box, block, or braille glyph
+    /// stays procedural under the cursor and a narrow emoji keeps its cell size.
     ///
     /// A concealed cell has no glyph to cut out: [`Shown`] returns a space with no ink,
     /// and this draws nothing. That is the point of asking rather than reading the cell
@@ -1227,7 +1235,7 @@ impl Painter<'_> {
         let ink = self.cell_bg_of(cell);
         let style = style_of(cell.attrs);
         let cursor = self.theme.cursor;
-        if stands_alone(cell) {
+        if cell.is_wide_leader() {
             self.push_glyph_text(x, baseline, width_cells, style, (ink, cursor), text);
         } else {
             let face = FaceKey::Prose {
@@ -1589,9 +1597,10 @@ fn fit_cells(text: &str, cols: usize) -> (&str, bool) {
 }
 
 /// Append styled cell text at a fixed-pitch origin, recycling every command's
-/// owned string from `strings`. Single-column clusters coalesce into `Cells`;
-/// wide or astral clusters break out as `Text` at their exact cell position so
-/// they can never desynchronise the fixed-pitch run that follows.
+/// owned string from `strings`. Single-column clusters coalesce into `Cells`, and
+/// one [`cells_safe`] excludes is a `Cells` of its own; wide clusters break out as
+/// `Text` at their exact cell position so they can never desynchronise the
+/// fixed-pitch run that follows.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn push_cell_text(
     out: &mut DisplayList,
@@ -1644,17 +1653,26 @@ pub(crate) fn push_cell_text(
             }
             let mut glyph = take_string_with_capacity(strings, cluster.len());
             glyph.push_str(cluster);
-            let glyph_x = x + pen_cells as i32 * metrics.w;
-            out.push(DrawCmd::Text {
-                bounds: text_bounds(glyph_x, baseline, width as i32 * metrics.w, metrics),
-                x: glyph_x,
-                baseline,
-                face,
-                color,
-                bg,
-                fade: None,
-                text: glyph,
-            });
+            if width == 1 {
+                let one = Pending {
+                    start_cell: pen_cells,
+                    cells: 1,
+                    text: glyph,
+                };
+                flush(out, one);
+            } else {
+                let glyph_x = x + pen_cells as i32 * metrics.w;
+                out.push(DrawCmd::Text {
+                    bounds: text_bounds(glyph_x, baseline, width as i32 * metrics.w, metrics),
+                    x: glyph_x,
+                    baseline,
+                    face,
+                    color,
+                    bg,
+                    fade: None,
+                    text: glyph,
+                });
+            }
         }
         pen_cells += width;
     }
@@ -1746,15 +1764,9 @@ fn text_bounds(x: i32, baseline: i32, run_w: i32, m: CellMetrics) -> Rect {
 /// all: it lives in the grid's combining-mark side list, and the run text picks it up
 /// with the cell it belongs to.
 ///
-/// An excluded rune is drawn standalone, the same treatment a wide rune already gets.
+/// An excluded rune is drawn as a run of one cell.
 fn cells_safe(rune: char) -> bool {
     (rune as u32) <= 0xFFFF && !grapheme::joins_across_cells(rune)
-}
-
-/// Whether a cell draws as its own [`DrawCmd::Text`] instead of in a fixed-pitch run.
-/// Shared by the row painter and the cursor stamp, so both draw a cell the same way.
-fn stands_alone(cell: Cell) -> bool {
-    cell.is_wide_leader() || !cells_safe(cell.rune)
 }
 
 /// The font style a cell's bold/italic attributes select. Takes the attributes rather
@@ -3005,18 +3017,81 @@ mod tests {
         }
     }
 
+    /// A single-width cell a run cannot batch is a run of one, so an emoji in it is sized
+    /// to the cell rather than the em.
     #[test]
-    fn astral_rune_is_drawn_standalone() {
-        let mut s = Screen::new(6, 1);
-        // U+1D400 MATHEMATICAL BOLD CAPITAL A: astral, width 1, must not batch.
-        feed(&mut s, "a\u{1D400}b".as_bytes());
+    fn a_single_width_cell_a_run_cannot_batch_is_a_run_of_one() {
+        let mut s = Screen::new(8, 2);
+        // The ZWJ composes onto 🌡's cell and ❤ takes the next one; in one run the two
+        // would segment as one cluster.
+        feed(
+            &mut s,
+            "a\u{1F321}\u{200D}\u{2764}b\u{1D400}\r\n".as_bytes(),
+        );
+        // Under ?2027 a ZWJ sequence of two narrow pictographs is one narrow cell.
+        feed(&mut s, "\x1b[?2027h\u{1F321}\u{200D}\u{1F321}x".as_bytes());
         let list = list_of(&s);
-        let has_astral_text = list
-            .iter()
-            .any(|c| matches!(c, DrawCmd::Text { text, .. } if text == "\u{1D400}"));
         assert!(
-            has_astral_text,
-            "the astral rune breaks out into its own Text"
+            !list.iter().any(|c| matches!(c, DrawCmd::Text { .. })),
+            "nothing single-width draws at the em: {list:?}"
+        );
+        let (top, bottom) = (M.baseline, M.h + M.baseline);
+        let runs = cells_runs(&list);
+        let runs: Vec<(i32, i32, &str)> = runs
+            .iter()
+            .map(|(x, baseline, text)| (*x, *baseline, text.as_str()))
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                (0, top, "a"),
+                (M.w, top, "\u{1F321}\u{200D}"),
+                (2 * M.w, top, "\u{2764}b"),
+                (4 * M.w, top, "\u{1D400}"),
+                (0, bottom, "\u{1F321}\u{200D}\u{1F321}"),
+                (M.w, bottom, "x"),
+            ]
+        );
+    }
+
+    /// Panel text follows the grid's rule: a single-width cluster a run cannot batch is
+    /// a run of one, and only a wide one is `Text`.
+    #[test]
+    fn cell_text_draws_a_single_width_cluster_in_its_cell() {
+        let mut out = DisplayList::new();
+        let face = FaceKey::Prose {
+            size: M.size,
+            style: FontStyle::Regular,
+        };
+        let text = "a\u{1F321}b\u{6F22}";
+        push_cell_text(
+            &mut out,
+            &mut Vec::new(),
+            text,
+            0,
+            M.baseline,
+            M,
+            face,
+            0,
+            0,
+        );
+        let drawn: Vec<(bool, i32, &str)> = out
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Cells { x, text, .. } => Some((true, *x, text.as_str())),
+                DrawCmd::Text { x, text, .. } => Some((false, *x, text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            drawn,
+            [
+                (true, 0, "a"),
+                (true, M.w, "\u{1F321}"),
+                (true, 2 * M.w, "b"),
+                (false, 3 * M.w, "\u{6F22}"),
+            ],
+            "(is Cells, x, text)"
         );
     }
 
