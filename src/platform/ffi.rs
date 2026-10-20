@@ -779,8 +779,45 @@ struct DrmSyncobjTransfer {
     pad: u32,
 }
 
+/// `struct drm_syncobj_timeline_wait`: wait on the fence at `points[i]` of each
+/// `handles[i]` until the absolute `CLOCK_MONOTONIC` time `timeout_nsec`. The
+/// arrays are passed as user addresses.
+#[repr(C)]
+struct DrmSyncobjTimelineWait {
+    handles: u64,
+    points: u64,
+    timeout_nsec: i64,
+    count_handles: u32,
+    flags: u32,
+    first_signaled: u32,
+    pad: u32,
+    deadline_nsec: u64,
+}
+
+/// `struct drm_syncobj_eventfd`: have the kernel add 1 to eventfd `fd` once the
+/// fence at (`handle`, `point`) signals, or with [`DRM_SYNCOBJ_WAIT_AVAILABLE`]
+/// once one sits there at all.
+#[repr(C)]
+struct DrmSyncobjEventfd {
+    handle: u32,
+    flags: u32,
+    point: u64,
+    fd: c_int,
+    pad: u32,
+}
+
 /// `DRM_SYNCOBJ_CREATE_SIGNALED`: start the object already signalled.
 const DRM_SYNCOBJ_CREATE_SIGNALED: u32 = 1;
+/// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT`: a point that has no fence yet is
+/// waited for, where without it the wait fails with `EINVAL`.
+const DRM_SYNCOBJ_WAIT_FOR_SUBMIT: u32 = 2;
+/// `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE`: done once a fence sits at the point,
+/// signalled or not.
+const DRM_SYNCOBJ_WAIT_AVAILABLE: u32 = 4;
+/// A wait that ran out of time.
+const ETIME: c_int = 62;
+/// The driver lacks a feature the ioctl needs (for the syncobj ioctls, timelines).
+const EOPNOTSUPP: c_int = 95;
 /// `DRM_SYNCOBJ_{HANDLE_TO_FD_FLAGS_EXPORT,FD_TO_HANDLE_FLAGS_IMPORT}_SYNC_FILE`:
 /// read/write a sync file at the binary syncobj's point 0 rather than moving the
 /// syncobj object itself. Both directions use the same flag value.
@@ -798,6 +835,9 @@ const DRM_IOCTL_SYNCOBJ_CREATE: c_ulong = drm_iowr(0xBF, mem::size_of::<DrmSynco
 const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: c_ulong = drm_iowr(0xC1, mem::size_of::<DrmSyncobjHandle>());
 const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: c_ulong = drm_iowr(0xC2, mem::size_of::<DrmSyncobjHandle>());
 const DRM_IOCTL_SYNCOBJ_TRANSFER: c_ulong = drm_iowr(0xCC, mem::size_of::<DrmSyncobjTransfer>());
+const DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT: c_ulong =
+    drm_iowr(0xCA, mem::size_of::<DrmSyncobjTimelineWait>());
+const DRM_IOCTL_SYNCOBJ_EVENTFD: c_ulong = drm_iowr(0xCF, mem::size_of::<DrmSyncobjEventfd>());
 
 /// Open the GPU's DRM render node (`/dev/dri/renderD<minor>`) read-write, for
 /// creating the sync objects that back explicit sync. Render nodes need no DRM
@@ -874,7 +914,7 @@ fn drm_syncobj_transfer(
     dst: u32,
     dst_point: u64,
 ) -> Result<()> {
-    let arg = DrmSyncobjTransfer {
+    let mut arg = DrmSyncobjTransfer {
         src_handle: src,
         dst_handle: dst,
         src_point,
@@ -882,11 +922,81 @@ fn drm_syncobj_transfer(
         flags: 0,
         pad: 0,
     };
-    // SAFETY: arg is a live drm_syncobj_transfer; the kernel only reads it.
+    // SAFETY: arg is a live drm_syncobj_transfer. The ioctl is read-write, so the
+    // kernel copies the struct back into it.
     ok_or_errno(
-        unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_TRANSFER, &arg) },
+        unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_TRANSFER, &mut arg) },
         "DRM_IOCTL_SYNCOBJ_TRANSFER",
     )
+}
+
+/// Whether a fence sits at timeline `point` of `timeline` yet, signalled or not.
+/// It never blocks: the kernel treats a zero timeout as a poll, checking once
+/// and reporting `ETIME` when there is no fence.
+pub fn drm_syncobj_point_available(drm: RawFd, timeline: u32, point: u64) -> Result<bool> {
+    let mut arg = DrmSyncobjTimelineWait {
+        handles: &timeline as *const u32 as u64,
+        points: &point as *const u64 as u64,
+        timeout_nsec: 0,
+        count_handles: 1,
+        flags: DRM_SYNCOBJ_WAIT_FOR_SUBMIT | DRM_SYNCOBJ_WAIT_AVAILABLE,
+        first_signaled: 0,
+        pad: 0,
+        deadline_nsec: 0,
+    };
+    // SAFETY: arg is a live drm_syncobj_timeline_wait whose `handles` and `points`
+    // address one u32 and one u64 that outlive the call; the kernel reads those and
+    // writes `first_signaled`.
+    let rc = unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &mut arg) };
+    match rc {
+        0 => Ok(true),
+        _ if errno() == ETIME => Ok(false),
+        _ => Err(errno_error("DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT")),
+    }
+}
+
+/// Have the kernel add 1 to `eventfd` once a fence sits at timeline `point` of
+/// `timeline`, at once if one already does. Each call registers one wake, which
+/// the kernel drops when it fires. Needs Linux 6.6.
+pub fn drm_syncobj_eventfd_when_available(
+    drm: RawFd,
+    timeline: u32,
+    point: u64,
+    eventfd: RawFd,
+) -> Result<()> {
+    ok_or_errno(
+        syncobj_eventfd(drm, timeline, point, eventfd),
+        "DRM_IOCTL_SYNCOBJ_EVENTFD",
+    )
+}
+
+/// Whether `drm` can signal an eventfd from a syncobj, which needs Linux 6.6 and a
+/// driver with timeline syncobjs. It asks by registering `eventfd` on `signalled`,
+/// a binary syncobj created signalled, so where it can the eventfd fires at once and
+/// the caller clears it. An older kernel answers `EINVAL`, a driver without
+/// timelines `EOPNOTSUPP`; anything else is an error.
+pub fn drm_syncobj_eventfd_supported(drm: RawFd, signalled: u32, eventfd: RawFd) -> Result<bool> {
+    match syncobj_eventfd(drm, signalled, 0, eventfd) {
+        0 => Ok(true),
+        _ if matches!(errno(), EINVAL | EOPNOTSUPP) => Ok(false),
+        _ => Err(errno_error("DRM_IOCTL_SYNCOBJ_EVENTFD")),
+    }
+}
+
+/// `DRM_IOCTL_SYNCOBJ_EVENTFD` with [`DRM_SYNCOBJ_WAIT_AVAILABLE`], returning the
+/// ioctl's result so the caller reads `errno` straight after it.
+fn syncobj_eventfd(drm: RawFd, handle: u32, point: u64, eventfd: RawFd) -> c_int {
+    let mut arg = DrmSyncobjEventfd {
+        handle,
+        flags: DRM_SYNCOBJ_WAIT_AVAILABLE,
+        point,
+        fd: eventfd,
+        pad: 0,
+    };
+    // SAFETY: arg is a live drm_syncobj_eventfd. The ioctl is read-write, so the
+    // kernel copies the struct back into it, and it takes its own reference to the
+    // eventfd.
+    unsafe { ioctl(drm, DRM_IOCTL_SYNCOBJ_EVENTFD, &mut arg) }
 }
 
 /// Export sync object `handle` as a shareable DRM syncobj fd (the object itself,
@@ -1258,16 +1368,23 @@ mod tests {
     // numbers must match `DRM_IOWR(0xNN, struct)` exactly. These are computed
     // from the struct sizes; pin them against the values a C compiler emits
     // from this machine's `drm.h` (verified against /usr/include/drm/drm.h,
-    // where drm_syncobj_handle carries the timeline `point` field = 24 bytes).
+    // where drm_syncobj_handle carries the timeline `point` field = 24 bytes and
+    // drm_syncobj_timeline_wait the `deadline_nsec` field = 48 bytes).
     #[test]
     fn drm_syncobj_ioctl_numbers_match_the_abi() {
         assert_eq!(mem::size_of::<DrmSyncobjCreate>(), 8);
         assert_eq!(mem::size_of::<DrmSyncobjHandle>(), 24);
         assert_eq!(mem::size_of::<DrmSyncobjTransfer>(), 32);
+        assert_eq!(mem::size_of::<DrmSyncobjTimelineWait>(), 48);
+        assert_eq!(mem::offset_of!(DrmSyncobjTimelineWait, first_signaled), 32);
+        assert_eq!(mem::size_of::<DrmSyncobjEventfd>(), 24);
+        assert_eq!(mem::offset_of!(DrmSyncobjEventfd, fd), 16);
         assert_eq!(DRM_IOCTL_SYNCOBJ_CREATE, 0xC008_64BF);
         assert_eq!(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, 0xC018_64C1);
         assert_eq!(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, 0xC018_64C2);
         assert_eq!(DRM_IOCTL_SYNCOBJ_TRANSFER, 0xC020_64CC);
+        assert_eq!(DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, 0xC030_64CA);
+        assert_eq!(DRM_IOCTL_SYNCOBJ_EVENTFD, 0xC018_64CF);
         // `struct pollfd` (poll.h): int + short + short.
         assert_eq!(mem::size_of::<PollFd>(), 8);
     }

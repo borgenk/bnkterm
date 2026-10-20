@@ -914,6 +914,9 @@ impl State {
                 .as_ref()
                 .and_then(HostChecks::wake_fd)
                 .map(|fd| self.poll_set.add(fd));
+            // Under explicit sync, a frame held back because the compositor holds both
+            // buffers waits here for one of them to be released. It stays quiet otherwise.
+            let release_slot = self.release_wake_fd().map(|fd| self.poll_set.add(fd));
             self.poll_set.wait(wait)?;
             // Before anything else: whatever the far side will now take. Cheap when
             // nothing is owed, and it is what keeps a queued paste or copy moving.
@@ -921,6 +924,9 @@ impl State {
             self.pump_selection_sends();
             if host_check_slot.is_some_and(|slot| self.poll_set.readable(slot)) {
                 self.finish_host_checks();
+            }
+            if release_slot.is_some_and(|slot| self.poll_set.readable(slot)) {
+                self.on_release_wake();
             }
             if self.poll_set.readable(wayland_slot) {
                 // poll said the socket has data (or hung up); this recv returns

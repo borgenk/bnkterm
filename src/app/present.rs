@@ -73,6 +73,11 @@ struct RetiredImage {
 /// render-done fence. `point` increments per present and numbers both of a frame's
 /// points. Dropping this closes the render-node fd, which frees every syncobj
 /// created on it.
+///
+/// A buffer is free for the next frame once its release point has a fence, and
+/// `wl_buffer.release` plays no part: the protocol leaves its delivery undefined
+/// under explicit sync. When both buffers are held, `wake` is registered on their
+/// release points and the event loop polls it, so the release itself ends the wait.
 pub(super) struct ExplicitSync {
     drm: OwnedFd,
     acquire_syncobj: u32,
@@ -82,6 +87,18 @@ pub(super) struct ExplicitSync {
     release: [ReleaseTimeline; 2],
     surface: u32,
     point: u64,
+    wake: OwnedFd,
+}
+
+/// Where a buffer slot stands for the next frame rendered into it.
+enum SlotRelease {
+    /// No frame has gone into the slot's buffer: render into it at once.
+    Unused,
+    /// The compositor still holds the buffer: its release point has no fence yet.
+    Held,
+    /// The compositor released the buffer: a fence sits at its release point, which
+    /// the next render into it waits on. It may not have signalled yet.
+    Released,
 }
 
 /// One buffer slot's release timeline. Each slot has its own because signalling a
@@ -96,6 +113,10 @@ struct ReleaseTimeline {
     /// The point last published for the slot's buffer, which its next reuse waits
     /// on. `None` before the slot's first frame and after a resize replaced it.
     point: Option<u64>,
+    /// The point the release wake was last registered on. A registration fires as
+    /// soon as its point has a fence, so while the slot is held at this point one is
+    /// still pending, and the kernel keeps each until it fires.
+    waking: Option<u64>,
 }
 
 impl ExplicitSync {
@@ -103,27 +124,54 @@ impl ExplicitSync {
     /// timeline per buffer slot, and the scratch and signalled binaries. Their
     /// protocol objects are zero until [`State::negotiate_explicit_sync`] shares
     /// them with the compositor.
-    fn new(drm: OwnedFd) -> Result<Self> {
+    ///
+    /// `None` where the kernel or driver has no syncobj eventfds (Linux 6.6), which
+    /// the release wake needs. The caller then keeps the implicit bridge.
+    fn new(drm: OwnedFd) -> Result<Option<Self>> {
         let fd = drm.as_raw_fd();
         let mut release = [ReleaseTimeline::default(), ReleaseTimeline::default()];
         for slot in &mut release {
             slot.syncobj = ffi::drm_syncobj_create(fd, false)?;
         }
-        Ok(Self {
+        let signalled = ffi::drm_syncobj_create(fd, true)?;
+        let wake = ffi::make_eventfd()?;
+        if !ffi::drm_syncobj_eventfd_supported(fd, signalled, wake.as_raw_fd())? {
+            return Ok(None);
+        }
+        ffi::efd_clear(wake.as_raw_fd());
+        Ok(Some(Self {
             acquire_syncobj: ffi::drm_syncobj_create(fd, false)?,
             scratch: ffi::drm_syncobj_create(fd, false)?,
-            signalled: ffi::drm_syncobj_create(fd, true)?,
+            signalled,
             drm,
             acquire_timeline: 0,
             release,
             surface: 0,
             point: 0,
-        })
+            wake,
+        }))
     }
 
-    /// The sync file to wait on before rendering into buffer `idx`: the
-    /// compositor's release of that buffer's previous frame, or `None` the first
-    /// time the slot is used (nothing has read it yet).
+    /// Where buffer slot `idx` stands: unused, held by the compositor, or released.
+    fn slot_release(&self, idx: usize) -> Result<SlotRelease> {
+        let slot = self
+            .release
+            .get(idx)
+            .ok_or_else(|| Error::msg(format!("no buffer slot {idx}")))?;
+        let Some(p) = slot.point else {
+            return Ok(SlotRelease::Unused);
+        };
+        if ffi::drm_syncobj_point_available(self.drm.as_raw_fd(), slot.syncobj, p)? {
+            Ok(SlotRelease::Released)
+        } else {
+            Ok(SlotRelease::Held)
+        }
+    }
+
+    /// The fence a render into buffer `idx` waits on: the compositor's release of
+    /// the slot's last frame, or `None` before its first. Only for a slot that is
+    /// not [`SlotRelease::Held`]: a held slot's point has no fence to export, and
+    /// asking for one is an error.
     fn release_fence(&self, idx: usize) -> Result<Option<OwnedFd>> {
         let slot = self
             .release
@@ -138,6 +186,41 @@ impl ExplicitSync {
             )?)),
             None => Ok(None),
         }
+    }
+
+    /// The slot the next frame goes into, or `None` while the compositor holds both
+    /// buffers. Then [`Self::wake_fd`] becomes readable once either is released: each
+    /// held point carries one registration, made by the first wait that finds it held.
+    fn free_slot(&mut self) -> Result<Option<usize>> {
+        for idx in 0..self.release.len() {
+            if !matches!(self.slot_release(idx)?, SlotRelease::Held) {
+                return Ok(Some(idx));
+            }
+        }
+        let drm = self.drm.as_raw_fd();
+        for slot in &mut self.release {
+            if let Some(p) = slot.point.filter(|&p| slot.waking != Some(p)) {
+                ffi::drm_syncobj_eventfd_when_available(
+                    drm,
+                    slot.syncobj,
+                    p,
+                    self.wake.as_raw_fd(),
+                )?;
+                slot.waking = Some(p);
+            }
+        }
+        Ok(None)
+    }
+
+    /// The eventfd the event loop polls for a held buffer's release.
+    fn wake_fd(&self) -> RawFd {
+        self.wake.as_raw_fd()
+    }
+
+    /// The wake fired: clear it, so the next registration to fire wakes the loop
+    /// again.
+    fn woke(&mut self) {
+        ffi::efd_clear(self.wake.as_raw_fd());
     }
 
     /// Publish this frame's render-done `fence` as buffer `idx`'s acquire point
@@ -194,6 +277,9 @@ impl ExplicitSync {
 
     /// Forget every buffer's published release point (the buffers they named are
     /// gone, e.g. after a resize), so the next use of each slot waits on nothing.
+    /// A registration still pending on a forgotten point stays: the slot's next
+    /// buffer publishes later points on the same timeline, and their release fires
+    /// it too.
     fn forget_buffers(&mut self) {
         for slot in &mut self.release {
             slot.point = None;
@@ -221,6 +307,10 @@ pub(super) struct GpuPresentation {
     pub(super) syncobj_manager: Option<u32>,
     pub(super) explicit_sync: Option<ExplicitSync>,
     pub(super) buffers: [u32; 2],
+    /// Whether the compositor holds each buffer, as `wl_buffer.release` reports it.
+    /// It picks the slot on the implicit path only; under explicit sync the release
+    /// points do, and this is consulted only when a resize frees a buffer whose
+    /// release point has no fence yet.
     pub(super) busy: [bool; 2],
     /// Images a resize retired that the compositor may still be reading, awaiting their
     /// release before they are freed (see [`RetiredImage`]).
@@ -344,7 +434,9 @@ impl State {
         manager: u32,
         minor: u32,
     ) -> Result<ExplicitSync> {
-        let mut es = ExplicitSync::new(ffi::open_drm_render_node(minor)?)?;
+        let Some(mut es) = ExplicitSync::new(ffi::open_drm_render_node(minor)?)? else {
+            return Err(Error::msg("the kernel has no syncobj eventfds (Linux 6.6)"));
+        };
         let fd = es.drm.as_raw_fd();
         es.acquire_timeline = self.import_timeline(manager, fd, es.acquire_syncobj)?;
         for slot in &mut es.release {
@@ -356,6 +448,23 @@ impl State {
             self.surface,
         );
         Ok(es)
+    }
+
+    /// The fd the event loop polls for a held buffer's release, while explicit sync
+    /// is on.
+    pub(super) fn release_wake_fd(&self) -> Option<RawFd> {
+        self.presentation
+            .explicit_sync
+            .as_ref()
+            .map(ExplicitSync::wake_fd)
+    }
+
+    /// A held buffer's release point got its fence: clear the wake, so the next
+    /// turn's frame can take that buffer.
+    pub(super) fn on_release_wake(&mut self) {
+        if let Some(es) = self.presentation.explicit_sync.as_mut() {
+            es.woke();
+        }
     }
 
     /// Export `syncobj` as a DRM syncobj fd and import it into the compositor as
@@ -473,12 +582,13 @@ impl State {
         for (idx, image) in images.into_iter().enumerate() {
             let buffer = buffers.get(idx).copied().unwrap_or(0);
             // The compositor's "done reading" signal: the explicit-sync release fence when we
-            // have one, else the implicit busy flag the `wl_buffer.release` event clears.
-            let fence = self
-                .presentation
-                .explicit_sync
-                .as_ref()
-                .and_then(|es| es.release_fence(idx).ok().flatten());
+            // have one, else the busy flag the `wl_buffer.release` event clears.
+            let fence = self.presentation.explicit_sync.as_ref().and_then(|es| {
+                match es.slot_release(idx) {
+                    Ok(SlotRelease::Released) => es.release_fence(idx).ok().flatten(),
+                    _ => None,
+                }
+            });
             let released = match &fence {
                 Some(f) => ffi::wait_sync_file(f.as_raw_fd(), BUFFER_RELEASE_WAIT_MS),
                 None => buffer == 0 || !busy.get(idx).copied().unwrap_or(false),
@@ -611,7 +721,8 @@ impl State {
 
     /// Build the current frame and present it on the GPU. Returns false if both
     /// buffers are still held by the compositor, leaving `dirty` set so the next
-    /// buffer release retries.
+    /// buffer release retries: a `wl_buffer.release` on the implicit path, the
+    /// release wake under explicit sync.
     ///
     /// The display list is built and diffed against `present_list` (what is on
     /// screen): an identical frame early-outs (the common idle case), otherwise
@@ -632,7 +743,11 @@ impl State {
             self.destroy_buffers();
             self.create_buffers()?;
         }
-        let Some(idx) = (0..2).find(|&i| !self.presentation.busy[i]) else {
+        let slot = match self.presentation.explicit_sync.as_mut() {
+            Some(es) => es.free_slot()?,
+            None => (0..2).find(|&i| !self.presentation.busy[i]),
+        };
+        let Some(idx) = slot else {
             return Ok(false);
         };
         let started = self.verbosity.frame_stats().then(Instant::now);
@@ -1006,11 +1121,27 @@ fn clear_color_linear(color: u32) -> [f32; 4] {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
     use crate::app::present::*;
     use crate::platform::wire::Message;
+
+    /// Explicit-sync state on this machine's first render node, or `None`, after
+    /// saying why, where `test` cannot run: no render node, or a kernel without
+    /// syncobj eventfds. Any other failure fails the test.
+    fn explicit_sync(test: &str) -> Option<ExplicitSync> {
+        let Some(drm) = ffi::open_any_render_node() else {
+            eprintln!("no DRM render node; skipping {test}");
+            return None;
+        };
+        let es = ExplicitSync::new(drm).expect("create the syncobjs");
+        if es.is_none() {
+            eprintln!("no syncobj eventfds (Linux 6.6); skipping {test}");
+        }
+        es
+    }
 
     /// Frames go into buffer 0 and then buffer 1, and the compositor finishes with
     /// buffer 1 first, which the protocol allows. Buffer 0 is still being read, so
@@ -1018,11 +1149,9 @@ mod tests {
     /// here acts only on what the requests on the socket name.
     #[test]
     fn a_buffer_released_out_of_order_does_not_release_the_other() {
-        let Some(drm) = ffi::open_any_render_node() else {
-            eprintln!("no DRM render node; skipping the release-order test");
+        let Some(mut es) = explicit_sync("the release-order test") else {
             return;
         };
-        let mut es = ExplicitSync::new(drm).expect("create the syncobjs");
         // The ids the compositor knows the release timelines by after negotiation.
         es.release[0].timeline = 10;
         es.release[1].timeline = 11;
@@ -1056,19 +1185,138 @@ mod tests {
             ffi::drm_syncobj_signal_point(es.drm.as_raw_fd(), slot.syncobj, point, es.signalled)
                 .expect("signal the release point");
         };
-        // A point the compositor has not signalled yet holds no fence, so it cannot
-        // be exported and `release_fence` errors: the buffer reads as held.
-        let released = |es: &ExplicitSync, idx: usize| matches!(es.release_fence(idx), Ok(Some(f)) if ffi::wait_sync_file(f.as_raw_fd(), 0));
+        let released = |es: &ExplicitSync, idx: usize| {
+            matches!(es.slot_release(idx), Ok(SlotRelease::Released))
+                && matches!(es.release_fence(idx), Ok(Some(f)) if ffi::wait_sync_file(f.as_raw_fd(), 0))
+        };
 
         release(&es, commits[1]);
         assert!(released(&es, 1), "buffer 1 reads as released");
-        assert!(!released(&es, 0), "buffer 0 is still being read");
+        assert!(
+            matches!(es.slot_release(0), Ok(SlotRelease::Held)),
+            "buffer 0 is still being read"
+        );
 
         release(&es, commits[0]);
         assert!(
             released(&es, 0),
             "buffer 0 reads as released once its own point signals"
         );
+    }
+
+    /// The compositor holds both buffers and never sends `wl_buffer.release`, which
+    /// the protocol allows under explicit sync. The frame waits, and the release of
+    /// one buffer both wakes the event loop and frees that buffer for the frame.
+    #[test]
+    fn a_release_point_alone_frees_a_held_buffer_and_wakes_the_loop() {
+        let Some(mut es) = explicit_sync("the release-wake test") else {
+            return;
+        };
+        let (stream, _compositor) = UnixStream::pair().expect("socketpair");
+        let mut conn = Connection::from_stream(stream);
+        // The wake is an eventfd, readable while its counter is nonzero.
+        let woken = |es: &ExplicitSync| ffi::wait_sync_file(es.wake_fd(), 0);
+
+        assert!(matches!(es.free_slot(), Ok(Some(0))), "unused buffer 0");
+        es.publish(&mut conn, None, 0).expect("frame into buffer 0");
+        assert!(matches!(es.free_slot(), Ok(Some(1))), "unused buffer 1");
+        es.publish(&mut conn, None, 1).expect("frame into buffer 1");
+
+        assert!(matches!(es.free_slot(), Ok(None)), "both buffers are held");
+        assert!(!woken(&es), "nothing has been released");
+        assert!(
+            matches!(es.free_slot(), Ok(None)),
+            "still held, already armed"
+        );
+
+        // The compositor is done with buffer 1 and signals its release point.
+        let slot = &es.release[1];
+        let point = slot.point.expect("a published release point");
+        ffi::drm_syncobj_signal_point(es.drm.as_raw_fd(), slot.syncobj, point, es.signalled)
+            .expect("signal the release point");
+
+        assert!(woken(&es), "the release wakes the loop");
+        es.woke();
+        assert!(!woken(&es), "the wake is cleared");
+        assert!(matches!(es.free_slot(), Ok(Some(1))), "buffer 1 is free");
+        let Ok(Some(fence)) = es.release_fence(1) else {
+            panic!("buffer 1's render waits on the compositor's release");
+        };
+        assert!(
+            ffi::wait_sync_file(fence.as_raw_fd(), 0),
+            "the render waits on the release the compositor signalled"
+        );
+    }
+
+    /// The compositor keeps buffer 0 while buffer 1 goes round a hundred times, each
+    /// round a wait with both held. Every registration is a kernel allocation that
+    /// lives until it fires, so buffer 0's one point must carry one registration, not
+    /// one per wait.
+    #[test]
+    fn a_held_buffer_keeps_one_wake_registration_while_the_other_cycles() {
+        let Some(mut es) = explicit_sync("the registration test") else {
+            return;
+        };
+        let (stream, _compositor) = UnixStream::pair().expect("socketpair");
+        let mut conn = Connection::from_stream(stream);
+        // Reading the eventfd returns how many registrations fired since the last read.
+        let mut wake = std::fs::File::from(ffi::dup_cloexec(es.wake_fd()).unwrap());
+        let mut fired = || {
+            let mut count = [0u8; 8];
+            wake.read_exact(&mut count).expect("a registration fired");
+            u64::from_ne_bytes(count)
+        };
+        let release = |es: &ExplicitSync, idx: usize| {
+            let slot = &es.release[idx];
+            let point = slot.point.expect("a published release point");
+            ffi::drm_syncobj_signal_point(es.drm.as_raw_fd(), slot.syncobj, point, es.signalled)
+                .expect("signal the release point");
+        };
+
+        es.publish(&mut conn, None, 0).expect("frame into buffer 0");
+        es.publish(&mut conn, None, 1).expect("frame into buffer 1");
+        for _ in 0..100 {
+            assert!(matches!(es.free_slot(), Ok(None)), "both buffers are held");
+            release(&es, 1);
+            assert_eq!(fired(), 1, "buffer 1's release");
+            es.woke();
+            assert!(matches!(es.free_slot(), Ok(Some(1))), "buffer 1 is free");
+            es.publish(&mut conn, None, 1).expect("frame into buffer 1");
+        }
+
+        release(&es, 0);
+        assert_eq!(fired(), 1, "buffer 0's release fires one registration");
+    }
+
+    /// A resize while both old buffers are held and the wake is armed: when both new
+    /// buffers are held too, a new buffer's release must still wake the loop.
+    #[test]
+    fn a_wake_armed_before_a_resize_still_wakes_on_a_new_buffers_release() {
+        let Some(mut es) = explicit_sync("the resize wake test") else {
+            return;
+        };
+        let (stream, _compositor) = UnixStream::pair().expect("socketpair");
+        let mut conn = Connection::from_stream(stream);
+        let woken = |es: &ExplicitSync| ffi::wait_sync_file(es.wake_fd(), 0);
+
+        es.publish(&mut conn, None, 0)
+            .expect("frame into old buffer 0");
+        es.publish(&mut conn, None, 1)
+            .expect("frame into old buffer 1");
+        assert!(matches!(es.free_slot(), Ok(None)), "both old buffers held");
+
+        es.forget_buffers();
+        es.publish(&mut conn, None, 0)
+            .expect("frame into new buffer 0");
+        es.publish(&mut conn, None, 1)
+            .expect("frame into new buffer 1");
+        assert!(matches!(es.free_slot(), Ok(None)), "both new buffers held");
+
+        let slot = &es.release[0];
+        let point = slot.point.expect("a published release point");
+        ffi::drm_syncobj_signal_point(es.drm.as_raw_fd(), slot.syncobj, point, es.signalled)
+            .expect("signal the release point");
+        assert!(woken(&es), "the new buffer's release wakes the loop");
     }
 
     #[test]
