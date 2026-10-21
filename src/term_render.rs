@@ -913,27 +913,22 @@ impl Painter<'_> {
         let thickness = self.rule_thickness();
         let base = self.underline_rect(x, w, baseline);
 
+        let floor = self.cell_floor(baseline);
+
         match style {
             UnderlineStyle::Single => self.list.push(DrawCmd::Fill { rect: base, color }),
             UnderlineStyle::Double => {
-                // Two rules, with a gap of at least a pixel, sitting inside the space one
-                // underline would have had so the second never collides with the row below.
-                let gap = thickness.max(1);
-                self.list.push(DrawCmd::Fill {
-                    rect: Rect {
-                        h: thickness,
-                        ..base
-                    },
-                    color,
-                });
-                self.list.push(DrawCmd::Fill {
-                    rect: Rect {
-                        y: base.y + thickness + gap,
-                        h: thickness,
-                        ..base
-                    },
-                    color,
-                });
+                // Two rules and a gap as tall as one, raised as far as it takes to end
+                // above the cell floor. A descent too shallow for that at full weight
+                // (keeping a pixel clear under the text) thins the rules, down to one.
+                let t = thickness.min(((m.descent - 1) / 3).max(1));
+                let top = base.y.min(floor - 3 * t);
+                for y in [top, top + 2 * t] {
+                    self.list.push(DrawCmd::Fill {
+                        rect: Rect { y, h: t, ..base },
+                        color,
+                    });
+                }
             }
             UnderlineStyle::Dotted | UnderlineStyle::Dashed => {
                 // A dash and its gap, tiled across the run. Dotted is a short dash; the
@@ -958,22 +953,23 @@ impl Painter<'_> {
                 }
             }
             UnderlineStyle::Curly => {
-                // A triangle wave, drawn as a staircase of short rects. The amplitude is
-                // the underline's own thickness, which keeps the squiggle inside the
-                // descent at every font size instead of biting into the row below.
+                // A triangle wave, drawn as a staircase of short rects whose amplitude is
+                // the rule's own thickness. Like the double, the wave is raised to end
+                // above the cell floor and thinned where the descent cannot hold it.
                 let step = (m.w / 3).max(2);
-                let amplitude = thickness;
+                let t = thickness.min(((m.descent - 1) / 2).max(1));
+                let top = base.y.min(floor - 2 * t);
                 let mut at = base.x;
                 let end = base.x + base.w;
                 let mut up = true;
                 while at < end {
-                    let y = if up { base.y } else { base.y + amplitude };
+                    let y = if up { top } else { top + t };
                     self.list.push(DrawCmd::Fill {
                         rect: Rect {
                             x: at,
                             y,
                             w: step.min(end - at),
-                            h: thickness,
+                            h: t,
                         },
                         color,
                     });
@@ -984,16 +980,25 @@ impl Painter<'_> {
         }
     }
 
-    /// The box an underline rule occupies: `w` pixels from `x`, just below `baseline`.
-    /// Shared by the SGR underline and the hovered link's rule, so the two can never
-    /// end up at different heights.
+    /// The box an underline rule occupies: `w` pixels from `x`, just below `baseline`
+    /// and never past the cell floor. Shared by the SGR underline and the hovered link's
+    /// rule, so the two can never end up at different heights.
     fn underline_rect(&self, x: i32, w: i32, baseline: i32) -> Rect {
+        let h = self.rule_thickness();
+        let y = baseline + (self.metrics.descent / 2).max(1);
         Rect {
             x,
-            y: baseline + (self.metrics.descent / 2).max(1),
+            y: y.min(self.cell_floor(baseline) - h),
             w,
-            h: self.rule_thickness(),
+            h,
         }
+    }
+
+    /// The first pixel row of the cell below the one whose text sits on `baseline`.
+    /// Nothing drawn for a cell may reach it: the next row paints over it, and a damage
+    /// diff of this row alone would leave it behind.
+    fn cell_floor(&self, baseline: i32) -> i32 {
+        baseline - self.metrics.baseline + self.metrics.h
     }
 
     /// The underline and strike rules for a run, drawn as solid fills spanning the
@@ -2113,6 +2118,74 @@ mod tests {
         assert_eq!(rule.0.x, 0);
         assert_eq!(rule.0.w, 2 * M.w, "the rule spans the whole run");
         assert_eq!(rule.1, t.fg.to_u32());
+    }
+
+    #[test]
+    fn every_underline_style_stays_inside_its_row_at_common_sizes() {
+        // An underline hangs in the descent, which ends at the cell floor. A rule past the
+        // floor paints over the top of the next row and is wiped when that row repaints.
+        // Measured on the installed monospace face at the sizes people use, then on
+        // shallower descents than it has, where the curly bled too.
+        let sizes = [10, 12, 13, 14, 16, 18, 20, 24, 28, 32];
+        let fonts = crate::platform::freetype::Fonts::new(&sizes).expect("a monospace face");
+        let shallow = [(24, 6), (24, 5), (16, 3), (12, 2)].map(|(size, descent)| {
+            let h = size as i32 * 7 / 6;
+            CellMetrics {
+                size,
+                w: size as i32 * 3 / 5,
+                h,
+                baseline: h - descent,
+                ascent: h - descent,
+                descent,
+                lock_glyph: false,
+            }
+        });
+        let metrics = sizes
+            .iter()
+            .map(|&size| CellMetrics::from_fonts(&fonts, size))
+            .chain(shallow);
+        let theme = Theme::default();
+        let styles: [(&str, &[u8]); 5] = [
+            ("single", b"\x1b[4m"),
+            ("double", b"\x1b[4:2m"),
+            ("curly", b"\x1b[4:3m"),
+            ("dotted", b"\x1b[4:4m"),
+            ("dashed", b"\x1b[4:5m"),
+        ];
+        let mut strays = Vec::new();
+        for m in metrics {
+            let size = m.size;
+            for (style, sgr) in styles {
+                // Row 1, so the row below exists to be bled into.
+                let mut s = Screen::new(6, 3);
+                feed(&mut s, b"\r\n");
+                feed(&mut s, sgr);
+                feed(&mut s, b"ok");
+                let list = build_display_list(&FrameInputs {
+                    metrics: m,
+                    surface: (6 * m.w, 3 * m.h),
+                    ..inputs(&s, &theme)
+                });
+                let (top, floor) = (m.h, 2 * m.h);
+                let rules: Vec<Rect> = fills(&list)
+                    .into_iter()
+                    .filter(|(_, color)| *color == theme.fg.to_u32())
+                    .map(|(rect, _)| rect)
+                    .collect();
+                assert!(!rules.is_empty(), "{style} at {size}px draws something");
+                for r in rules {
+                    if r.y < top || r.y + r.h > floor {
+                        strays.push(format!(
+                            "{style} at {size}px: rows {}..{} outside {top}..{floor} (descent {})",
+                            r.y,
+                            r.y + r.h,
+                            m.descent
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(strays.is_empty(), "{}", strays.join("\n"));
     }
 
     #[test]
