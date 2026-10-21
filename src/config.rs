@@ -13,6 +13,11 @@ use std::time::Duration;
 /// Valid device-pixel font sizes for configuration and display scaling.
 pub const FONT_SIZE_RANGE: std::ops::RangeInclusive<u32> = 6..=72;
 
+/// Valid tab-strip heights, in logical pixels. Zero is fine, since the strip floors at one
+/// text row. The top is several rows of the largest font, and keeps every position the
+/// layout derives from it small enough to add up in device pixels.
+pub const TAB_BAR_HEIGHT_RANGE: std::ops::RangeInclusive<u32> = 0..=256;
+
 /// The compiled defaults with the on-disk config layered over them.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
@@ -111,9 +116,10 @@ impl Default for ShellStartupConfig {
 pub struct TabBarConfig {
     /// Top or bottom of the window (default `Bottom`).
     pub position: TabBarPosition,
-    /// Strip height in *logical* pixels. It is DPI-scaled at use and floored at
-    /// one text row, so a value below the row height simply yields a one-row bar
-    /// rather than clipping the label.
+    /// Strip height in *logical* pixels, within [`TAB_BAR_HEIGHT_RANGE`] when it comes
+    /// from the config file. It is DPI-scaled at use and floored at one text row, so a
+    /// value below the row height simply yields a one-row bar rather than clipping the
+    /// label.
     pub height_px: u32,
     /// Breathing room between the strip and the grid, in *logical* pixels (the same
     /// unit as [`Self::height_px`], DPI-scaled at use). Reserved from the grid on the

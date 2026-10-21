@@ -61,11 +61,17 @@ pub(super) fn window(
     bar: Option<&TabBarConfig>,
 ) -> WindowLayout {
     let (width, height) = surface;
+    let (w, h) = (saturating_i32(width), saturating_i32(height));
     // Reserve the padding on all sides, so the grid fits inside the margins.
     let pad = scale.px(WINDOW_PADDING);
+    let inner_h = h.saturating_sub(2 * pad).max(0);
+    // The strip and its gap take no more than the height inside the padding, so every
+    // position derived from them below lands inside the window.
     let (bar_h, gap) = strip(bar, scale, metrics);
-    let usable_w = (width as i32 - 2 * pad).max(0);
-    let usable_h = (height as i32 - 2 * pad - bar_h - gap).max(0);
+    let bar_h = bar_h.min(inner_h);
+    let gap = gap.min(inner_h - bar_h);
+    let usable_w = w.saturating_sub(2 * pad).max(0);
+    let usable_h = inner_h - bar_h - gap;
     let (cols, rows) = metrics.columns_rows(usable_w, usable_h);
     // The strip steals its height (and the gap) from the side it sits on: a top bar
     // tucks under the padding and pushes the grid down past the gap; a bottom bar sits
@@ -73,7 +79,7 @@ pub(super) fn window(
     let (origin_y, bar_y) = match bar.map(|cfg| cfg.position).filter(|_| bar_h > 0) {
         None => (pad, pad),
         Some(TabBarPosition::Top) => (pad + bar_h + gap, pad),
-        Some(TabBarPosition::Bottom) => (pad, height as i32 - pad - bar_h),
+        Some(TabBarPosition::Bottom) => (pad, h - pad - bar_h),
     };
     WindowLayout {
         terminal: TerminalGeometry {
@@ -100,9 +106,14 @@ fn strip(bar: Option<&TabBarConfig>, scale: Scale, metrics: CellMetrics) -> (i32
         return (0, 0);
     };
     (
-        scale.px(cfg.height_px as i32).max(metrics.h),
-        scale.px(cfg.gap_px as i32),
+        scale.px(saturating_i32(cfg.height_px)).max(metrics.h),
+        scale.px(saturating_i32(cfg.gap_px)),
     )
+}
+
+/// `v` as an `i32`, saturating at `i32::MAX` rather than wrapping negative.
+fn saturating_i32(v: u32) -> i32 {
+    i32::try_from(v).unwrap_or(i32::MAX)
 }
 
 /// The device surface that holds exactly `cols` x `rows` cells with the padding and the
@@ -188,6 +199,28 @@ mod tests {
         };
         let layout = laid_out((800, 600), Scale::ONE, Some(&cfg));
         assert_eq!(layout.bar_h, METRICS.h, "a 4px strip would clip its label");
+    }
+
+    #[test]
+    fn an_enormous_strip_height_stays_inside_the_window() {
+        // A config is bounded on load, but the layout must not trust that: a height near
+        // `i32::MAX` overflowed `pad + bar_h + gap` and put a bottom strip far above the
+        // window.
+        for height_px in [i32::MAX as u32, u32::MAX] {
+            for position in [TabBarPosition::Top, TabBarPosition::Bottom] {
+                let cfg = TabBarConfig {
+                    height_px,
+                    ..bar(position)
+                };
+                let layout = laid_out((800, 600), Scale::ONE, Some(&cfg));
+                assert!(
+                    layout.bar_y >= 0 && layout.bar_y + layout.bar_h <= 600,
+                    "{height_px} at {position:?}: strip {}..{}",
+                    layout.bar_y,
+                    layout.bar_y + layout.bar_h
+                );
+            }
+        }
     }
 
     #[test]

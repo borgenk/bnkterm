@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::color::{parse_x11_color, Rgb};
-use crate::config::{Config, TabBarPosition, FONT_SIZE_RANGE};
+use crate::config::{Config, TabBarPosition, FONT_SIZE_RANGE, TAB_BAR_HEIGHT_RANGE};
 
 /// A config line the loader could not use.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,7 +201,17 @@ fn apply(
                 other => return Err(format!("tab_bar {other:?} is not top or bottom")),
             }
         }
-        "tab_bar_height" => config.tab_bar.height_px = value.parse().map_err(|_| number(value))?,
+        "tab_bar_height" => {
+            let px: u32 = value.parse().map_err(|_| number(value))?;
+            if !TAB_BAR_HEIGHT_RANGE.contains(&px) {
+                return Err(format!(
+                    "tab_bar_height {px} is outside {}..={}",
+                    TAB_BAR_HEIGHT_RANGE.start(),
+                    TAB_BAR_HEIGHT_RANGE.end()
+                ));
+            }
+            config.tab_bar.height_px = px;
+        }
         "tab_bar_label_scale" => {
             config.tab_bar.label_scale_pct = value.parse().map_err(|_| number(value))?;
         }
@@ -376,6 +386,23 @@ mod tests {
         assert_eq!(config.font_size, None);
         assert_eq!(problems.len(), 1);
         assert!(problems[0].message.contains("400"), "{problems:?}");
+    }
+
+    #[test]
+    fn an_out_of_range_tab_bar_height_is_refused() {
+        // The layout adds the height into device-pixel positions, where an enormous one
+        // overflowed. The range's ends are the limits, and past them the default stands.
+        let default = Config::default().tab_bar.height_px;
+        let (config, problems) = parse("tab_bar_height 3000000000");
+        assert_eq!(config.tab_bar.height_px, default, "the default stands");
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].message.contains("3000000000"), "{problems:?}");
+
+        let top = *TAB_BAR_HEIGHT_RANGE.end();
+        let (config, problems) = parse(&format!("tab_bar_height {top}"));
+        assert_eq!((config.tab_bar.height_px, problems.len()), (top, 0));
+        let (config, problems) = parse(&format!("tab_bar_height {}", top + 1));
+        assert_eq!((config.tab_bar.height_px, problems.len()), (default, 1));
     }
 
     #[test]
