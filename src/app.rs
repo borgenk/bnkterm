@@ -46,7 +46,7 @@ use self::message::{PointerEvent, Side, ToWindow};
 use self::present::GpuPresentation;
 use self::tabs::Tabs;
 use self::terminal::TerminalCore;
-use crate::config::{self, TabBarConfig, FONT_SIZE_RANGE};
+use crate::config::{self, Config, TabBarConfig, FONT_SIZE_RANGE};
 // The app orchestrates the platform/render layers (which carry their own error
 // type) and the terminal core (which uses the crate-level one). It speaks the
 // crate-level `Error`/`Result` throughout; a `?` on a platform call converts
@@ -592,6 +592,21 @@ impl State {
         for problem in &problems {
             eprintln!("bnkterm: {problem}");
         }
+        let conn = Connection::connect()?;
+        Self::with_config(conn, config, demo, verbosity, launch, launch_token)
+    }
+
+    /// The window over `conn`, set up from `config` and not yet bound to anything: all
+    /// of [`Self::new`] past reading the config file and reaching the compositor, so a
+    /// test can drive the window's handlers over a socketpair.
+    fn with_config(
+        conn: Connection,
+        config: Config,
+        demo: bool,
+        verbosity: Verbosity,
+        launch: Launch,
+        launch_token: Option<String>,
+    ) -> Result<Self> {
         let (font_selection, used_default_prose) = resolve_configured_fonts(&config.fonts)?;
         if used_default_prose {
             eprintln!(
@@ -599,7 +614,6 @@ impl State {
                 config.fonts.families
             );
         }
-        let conn = Connection::connect()?;
         // Open at unity scale; the compositor's real scale arrives after bring-up
         // and reopens the fonts (see `apply_scale`).
         let font_size = config_font_px(SCALE_120_UNITY, config.font_size);
@@ -1788,6 +1802,19 @@ impl State {
         Ok(())
     }
 
+    /// End the press gesture the window owns, if one is live: a press in the tab strip
+    /// with the tab drag it armed, or a scrollbar thumb drag. Without its release the
+    /// gesture would follow a pointer with no button held, and the next release would
+    /// be taken for its end.
+    fn end_pointer_gesture(&mut self) {
+        if self.pointer.bar_button.take().is_some() {
+            self.tabs.end_drag();
+        }
+        if std::mem::take(&mut self.pointer.drag_scroll) {
+            self.tabs.active_mut().release_scrollbar();
+        }
+    }
+
     /// The click multiplicity of a left press: 1, 2, or 3 for successive presses on
     /// the same cell within [`MULTI_CLICK_MS`], cycling back to 1 past a triple so a
     /// fourth click starts fresh. A press elsewhere or after the window restarts the
@@ -1824,6 +1851,9 @@ impl State {
             wl_pointer::EV_LEAVE => {
                 let _serial = r.u32()?;
                 let _surface = r.u32()?;
+                // A held button keeps the pointer on the surface, so a leave mid-gesture
+                // is a compositor grab that took the release with it.
+                self.end_pointer_gesture();
                 // The pointer is gone, so nothing is under it: drop any hovered link.
                 self.pointer_left_grid()?;
             }
@@ -2858,5 +2888,118 @@ mod tests {
         assert!(!Verbosity::Verbose.frame_stats());
         assert!(Verbosity::Stats.verbose());
         assert!(Verbosity::Stats.frame_stats());
+    }
+    /// A window over a socketpair, on the default config and the demo grid with a tab per
+    /// title, and no compositor behind it, so its handlers can be driven directly. The
+    /// other end of the socket comes back with it, so its requests have somewhere to go.
+    fn window(titles: &[&str]) -> (State, std::os::unix::net::UnixStream) {
+        let (ours, compositor) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let mut state = State::with_config(
+            Connection::from_stream(ours),
+            Config::default(),
+            true,
+            Verbosity::Quiet,
+            Launch::new(Vec::new(), Target::Local),
+            None,
+        )
+        .expect("the window state");
+        state.stage_demo_tabs(titles);
+        state.flush_layout();
+        (state, compositor)
+    }
+
+    /// Hand the window one `wl_pointer` event, its arguments encoded as the wire carries
+    /// them: a `u32` each, a position in 24.8 fixed point.
+    fn pointer_event(state: &mut State, opcode: u16, args: &[u32]) {
+        let body: Vec<u8> = args.iter().flat_map(|a| a.to_ne_bytes()).collect();
+        state
+            .on_pointer(opcode, &mut Reader::new(&body))
+            .expect("the pointer event");
+    }
+
+    fn fixed(v: f32) -> u32 {
+        (v * 256.0) as i32 as u32
+    }
+
+    fn enter(state: &mut State, x: f32, y: f32) {
+        pointer_event(state, wl_pointer::EV_ENTER, &[1, 0, fixed(x), fixed(y)]);
+    }
+
+    fn motion(state: &mut State, x: f32, y: f32) {
+        pointer_event(state, wl_pointer::EV_MOTION, &[0, fixed(x), fixed(y)]);
+    }
+
+    fn press_left(state: &mut State) {
+        let pressed = wl_pointer::BUTTON_STATE_PRESSED;
+        pointer_event(
+            state,
+            wl_pointer::EV_BUTTON,
+            &[2, 0, wl_pointer::BTN_LEFT, pressed],
+        );
+    }
+
+    fn leave(state: &mut State) {
+        pointer_event(state, wl_pointer::EV_LEAVE, &[3, 0]);
+    }
+
+    /// A compositor grab that takes the pointer mid-drag (an interactive move, a popup)
+    /// sends `leave` and keeps the release for itself. The tab drag has to end with the
+    /// leave, or it keeps reordering under a pointer with no button held, and the next
+    /// left release is swallowed as its end.
+    #[test]
+    fn leaving_the_window_ends_a_tab_drag() {
+        let (mut state, _compositor) = window(&["one", "two", "three"]);
+        let grid = state.layout.terminal;
+        let bar_y = (state.layout.bar_y + state.layout.bar_h / 2) as f32;
+        let first_x = (grid.pad + grid.metrics.w) as f32;
+        enter(&mut state, first_x, bar_y);
+        press_left(&mut state);
+        assert!(state.tabs.dragging(), "the press on a tab armed a drag");
+        let first = state.tabs.tab_at_bar_col(1);
+
+        leave(&mut state);
+        enter(&mut state, first_x, bar_y);
+        motion(&mut state, (grid.width - 1) as f32, bar_y);
+        assert_eq!(
+            state.tabs.tab_at_bar_col(1),
+            first,
+            "motion with no button held does not move a tab"
+        );
+        assert!(!state.tabs.dragging(), "the leave ended the drag");
+        assert_eq!(
+            state.pointer.bar_button, None,
+            "no release is owed to the strip"
+        );
+    }
+
+    /// The same cut-off for a scrollbar thumb drag: once the pointer has left, moving it
+    /// back over the window must not scroll the view.
+    #[test]
+    fn leaving_the_window_ends_a_scrollbar_drag() {
+        let (mut state, _compositor) = window(&["one"]);
+        let history: String = (0..300).map(|i| format!("line {i}\r\n")).collect();
+        state.tabs.active_mut().feed_test_bytes(history.as_bytes());
+        let grid = state.layout.terminal;
+        let y = (grid.height / 2) as f32;
+        let lane_x = (0..grid.width)
+            .rev()
+            .map(|x| x as f32)
+            .find(|&x| state.tabs.active().on_scrollbar(x, y))
+            .expect("a scrollbar lane");
+        enter(&mut state, lane_x, y);
+        press_left(&mut state);
+        assert!(state.pointer.drag_scroll, "the press took the thumb");
+
+        let resting = state.tabs.active().scroll_position();
+
+        leave(&mut state);
+        enter(&mut state, lane_x, y);
+        motion(&mut state, lane_x, 1.0);
+        assert_eq!(
+            state.tabs.active().scroll_position(),
+            resting,
+            "motion with no button held does not scroll"
+        );
+        assert!(!state.pointer.drag_scroll, "the leave let go of the thumb");
     }
 }

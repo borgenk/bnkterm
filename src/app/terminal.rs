@@ -635,6 +635,12 @@ impl TerminalCore {
         self.screen.row_string(row)
     }
 
+    /// Test-only: how far down the history the view rests, which a scroll moves.
+    #[cfg(test)]
+    pub(super) fn scroll_position(&self) -> i32 {
+        self.screen.scroll_position()
+    }
+
     /// The frame background as a `0x00RRGGBB`, for the GPU clear (which must match
     /// the display list's own base fill).
     /// The palette the grid is currently rendering with.
