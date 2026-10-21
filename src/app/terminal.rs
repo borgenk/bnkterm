@@ -1905,9 +1905,14 @@ impl TerminalCore {
 
     /// Reset the cursor to its lit phase, refill the toggle budget, and restart the
     /// blink timer, so it shows solid immediately after activity (a keystroke, output)
-    /// and blinks only when idle. A no-op's timer stays `None` while unfocused.
+    /// and blinks only when idle. A no-op's timer stays `None` while unfocused. Relighting
+    /// marks the frame dirty itself, because a keystroke the child does not echo (a
+    /// password prompt) changes nothing else on screen.
     fn bump_cursor(&mut self) {
-        self.blink_on = true;
+        if !self.blink_on {
+            self.blink_on = true;
+            self.dirty = true;
+        }
         self.blinks_left = BLINK_TOGGLES;
         self.blink_at = self.focused.then(|| Instant::now() + BLINK_INTERVAL);
     }
@@ -2795,6 +2800,29 @@ mod tests {
         core.feed_test_bytes(b"x");
         let rearmed = core.next_deadline().expect("output wakes the blink");
         assert!(rearmed > Instant::now(), "and ahead of us, not behind");
+    }
+
+    #[test]
+    fn a_keystroke_in_the_off_phase_shows_the_cursor() {
+        // A password prompt echoes nothing, so the keystroke is the only thing that can
+        // bring a blinked-off cursor back: it has to repaint the frame by itself, or the
+        // next toggle turns the cursor off again before anything drew it lit.
+        let mut core = TerminalCore::new(false, geom(80, 24, 640, 384));
+        core.feed_test_bytes(b"\x1b[?12h");
+        core.focus(true).expect("focus");
+        core.service_due(Instant::now() + BLINK_INTERVAL);
+        assert!(!core.blink_on, "the blink is in its off phase");
+        core.dirty = false; // that frame is on screen
+
+        core.key(
+            input::Key::plain('a'),
+            input::Mods::NONE,
+            input::KeyEvent::Press,
+        )
+        .unwrap();
+
+        assert!(core.blink_on, "the keystroke relit the cursor");
+        assert!(core.dirty, "and the frame repaints to show it");
     }
 
     #[test]
