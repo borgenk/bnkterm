@@ -432,6 +432,33 @@ impl Screen {
         }
     }
 
+    /// The span `a`..`b` with each end widened to a whole wide character: an end on one
+    /// half takes the other half too, so neither a highlight nor a copy can split a
+    /// glyph. The two ends come back in the order they went in.
+    pub fn whole_glyph_span(
+        &self,
+        a: (AbsRow, usize),
+        b: (AbsRow, usize),
+    ) -> ((AbsRow, usize), (AbsRow, usize)) {
+        let last_col = self.dimensions().0.saturating_sub(1);
+        let back = |(row, col): (AbsRow, usize)| match col.checked_sub(1) {
+            Some(left) if self.abs_cell(row, col).is_wide_spacer() => (row, left),
+            _ => (row, col),
+        };
+        let forward = |(row, col): (AbsRow, usize)| {
+            if col < last_col && self.abs_cell(row, col).is_wide_leader() {
+                (row, col + 1)
+            } else {
+                (row, col)
+            }
+        };
+        if a <= b {
+            (back(a), forward(b))
+        } else {
+            (forward(a), back(b))
+        }
+    }
+
     /// Whether absolute `row` soft-wrapped into the next one, so the two are one
     /// logical line. False for a row that has aged out of history.
     pub(super) fn wraps(&self, row: AbsRow) -> bool {

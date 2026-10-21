@@ -1138,12 +1138,24 @@ impl TerminalCore {
     /// the same picked text can join or split across a soft wrap and copy with a
     /// different set of newlines than it did before.
     fn set_selection(&mut self, sel: Option<Selection>) {
+        let sel = sel.map(|sel| self.whole_glyphs(sel));
         self.selection_text.clear();
         if let Some(sel) = sel {
             self.screen
                 .selection_text_into(sel.anchor, sel.head, &mut self.selection_text);
         }
         self.selection = sel;
+    }
+
+    /// `sel` with each end widened to a whole wide character, the span both the highlight
+    /// and the copy take.
+    fn whole_glyphs(&self, sel: Selection) -> Selection {
+        let (anchor, head) = self.screen.whole_glyph_span(sel.anchor, sel.head);
+        Selection {
+            anchor,
+            head,
+            ..sel
+        }
     }
 
     /// Copy the selection's captured text into the outbox for the window to own on the
@@ -1260,10 +1272,12 @@ impl TerminalCore {
                 Some((anchor.0.min(unit.0), anchor.1.max(unit.1)))
             }
         };
-        let sel = range.map(|(start, end)| Selection {
-            anchor: start,
-            head: end,
-            epoch: drag.epoch,
+        let sel = range.map(|(start, end)| {
+            self.whole_glyphs(Selection {
+                anchor: start,
+                head: end,
+                epoch: drag.epoch,
+            })
         });
         if self.selection != sel {
             self.set_selection(sel);
@@ -3876,6 +3890,20 @@ mod tests {
 
         assert!(core.selection.is_none(), "typing left the highlight up");
         assert_eq!(copied(&mut core), None, "and left something to copy");
+    }
+
+    #[test]
+    fn a_drag_across_half_a_wide_character_copies_it_whole() {
+        // The drag starts on the right half of `漢` (columns 1-2) and ends on the left half
+        // of `字` (columns 4-5). Both are copied whole, over the span the highlight covers.
+        let mut core = core_showing("a漢b字c");
+        press_in(&mut core, 2, 0, Side::Left);
+        drag_in(&mut core, 4, 0, Side::Right);
+        press(&mut core, MouseButton::Left, false, 4, 0);
+
+        assert_eq!(copied(&mut core).as_deref(), Some("漢b字"));
+        let (start, end) = core.selection.expect("a selection").ordered();
+        assert_eq!((start.1, end.1), (1, 5), "the selection covers both pairs");
     }
 
     #[test]

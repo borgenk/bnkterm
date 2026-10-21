@@ -1417,16 +1417,31 @@ impl Painter<'_> {
     /// here, at paint time. That is also where the clipping comes from for free: a
     /// selection whose top has scrolled above the window simply has no display row
     /// inside it until the part you can see, so the visible part still highlights.
+    ///
+    /// Each end is widened to a whole wide character as it is painted. The selection was
+    /// stored that way, but output since can have put a wide character across one of its
+    /// ends, and half a highlighted glyph reads as a rendering fault.
     fn selection_cols(&self, row: usize) -> Option<(usize, usize)> {
         let (start, end) = self.selection?.ordered();
         let abs = self.screen.abs_row(row);
-        self.row_in_span(
+        let (first, last) = self.row_in_span(
             abs >= start.0 && abs <= end.0,
             abs == start.0,
             abs == end.0,
             start.1,
             end.1,
-        )
+        )?;
+        let last_col = self.screen.dimensions().0.saturating_sub(1);
+        let first = match first.checked_sub(1) {
+            Some(left) if self.screen.view_cell(row, first).is_wide_spacer() => left,
+            _ => first,
+        };
+        let last = if last < last_col && self.screen.view_cell(row, last).is_wide_leader() {
+            last + 1
+        } else {
+            last
+        };
+        Some((first, last))
     }
 
     /// The underline under the hovered hyperlink where it crosses `row`, drawn over its
@@ -2855,6 +2870,29 @@ mod tests {
                 w: 3 * M.w,
                 h: M.h
             }
+        );
+    }
+
+    #[test]
+    fn a_selection_never_paints_half_a_wide_character() {
+        // `漢` fills columns 1-2 and `字` columns 4-5. A selection from the right half of
+        // the first to the left half of the second paints both whole.
+        let mut s = Screen::new(8, 1);
+        feed(&mut s, "a漢b字c".as_bytes());
+        let list = list_selecting(&s, sel(&s, (0, 2), (0, 4)));
+        let band = fills(&list)
+            .into_iter()
+            .find(|(_, c)| *c == SELECTION_BG.to_u32())
+            .expect("a selection band");
+        assert_eq!(
+            band.0,
+            Rect {
+                x: M.w,
+                y: 0,
+                w: 5 * M.w,
+                h: M.h
+            },
+            "columns 1 to 5"
         );
     }
 
