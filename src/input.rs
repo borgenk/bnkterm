@@ -400,11 +400,13 @@ pub fn encode(key: Key, mods: Mods, modes: Modes, out: &mut Vec<u8>) {
 /// - A **release** is reported only for keys that are reported as escape codes in the
 ///   first place. A key that produces text produces text; there is no text for "the `a`
 ///   key came back up", so nothing is sent.
-/// - **`Enter`, `Tab` and `Backspace` never report a release**, even under the flag. The
-///   spec spells out why, and it is a good reason: a program that turns this mode on and
-///   dies without turning it off would otherwise leave the shell underneath receiving an
-///   escape sequence every time you let go of `Enter` — and you could no longer type
-///   `reset` to fix it.
+/// - **`Enter`, `Tab` and `Backspace` never report a release**, even under the flag.
+///   kitty's keyboard protocol spec spells out why, and it is a good reason: a program
+///   that turns this mode on and dies without turning it off would otherwise leave the
+///   shell underneath receiving an escape sequence every time you let go of `Enter`, and
+///   you could no longer type `reset` to fix it. The spec says nothing about a repeat;
+///   kitty's own encoder sends an unmodified one's legacy byte on repeat as well as on
+///   press, and so does this.
 ///
 /// A **repeat** with the flag off is a press, which is exactly what a repeat has always
 /// looked like to a terminal.
@@ -584,7 +586,8 @@ fn encode_kitty(key: Key, mods: Mods, event: KeyEvent, modes: Modes, out: &mut V
         }
         Key::Enter | Key::Tab | Key::Backspace => {
             let code = text_key_code(key);
-            if mods.0 == 0 && event == KeyEvent::Press {
+            // A repeat keeps the legacy byte too; a release never gets this far.
+            if mods.0 == 0 && event != KeyEvent::Release {
                 out.push(legacy_text_byte(key));
             } else {
                 csi_u(code, mods, event, out);
@@ -1314,6 +1317,30 @@ mod tests {
         assert_eq!(
             enc_event(Key::Enter, Mods::SHIFT, KeyEvent::Press, m),
             b"\x1b[13;2u"
+        );
+    }
+
+    #[test]
+    fn a_held_enter_tab_or_backspace_repeats_its_legacy_byte() {
+        // The spec is silent on a held key, but kitty's own encoder sends the legacy byte
+        // on press and repeat alike. Holding Backspace over a mistyped `reset` then
+        // deletes characters rather than typing escape codes.
+        let m = kitty_events();
+        for (key, byte) in [
+            (Key::Enter, b"\r"),
+            (Key::Tab, b"\t"),
+            (Key::Backspace, b"\x7f"),
+        ] {
+            assert_eq!(
+                enc_event(key, Mods::NONE, KeyEvent::Repeat, m),
+                byte,
+                "{key:?}"
+            );
+        }
+        // A modified one is an escape code either way, and says it is a repeat.
+        assert_eq!(
+            enc_event(Key::Enter, Mods::SHIFT, KeyEvent::Repeat, m),
+            b"\x1b[13;2:2u"
         );
     }
 
