@@ -202,6 +202,8 @@ impl Tabs {
         }
         let id = self.allocate_id();
         self.entries.push(TabEntry { id, core });
+        // A drag holds the active tab, which the new one replaces.
+        self.drag = None;
         self.active = self.entries.len() - 1;
         self.bar_dirty = true;
         self.rebuild_bar();
@@ -276,6 +278,8 @@ impl Tabs {
         let _ = self.active_mut().focus(false);
         // The pointer stays with the window, so a background tab has nothing under it.
         self.active_mut().drop_hover();
+        // A drag holds the active tab, which this one replaces.
+        self.drag = None;
         self.active = index;
         let _ = self.active_mut().focus(window_focused);
         self.active_mut().dirty = true;
@@ -1280,6 +1284,47 @@ mod tests {
 
         tabs.end_drag();
         assert!(!tabs.dragging(), "the drag is done");
+    }
+
+    /// Ctrl+Tab in the middle of a mouse drag makes another tab active, and the dragged
+    /// tab is always the active one (the strip paints it so), so the switch ends the
+    /// drag: the held tab settles where it was, and later motion moves no tab.
+    #[test]
+    fn a_keyboard_switch_mid_drag_ends_the_drag() {
+        let mut tabs = dragging_tabs(3, 30);
+        let ids: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
+        let pitch = 10 * METRICS.w;
+
+        tabs.begin_drag(ids[0], 0);
+        tabs.drag_to(5); // lifted, still in slot 0
+        assert!(tabs.cycle(Dir::Next, false), "Ctrl+Tab selects tab 1");
+        tabs.drag_to(2 * pitch + 5);
+
+        let order: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
+        assert_eq!(
+            order,
+            vec![ids[0], ids[1], ids[2]],
+            "later motion moves no tab"
+        );
+        assert_eq!(tabs.active_id(), Some(ids[1]), "the selected tab is active");
+        assert!(!tabs.dragging(), "the switch ended the drag");
+    }
+
+    /// A new tab opened mid-drag (Ctrl+Shift+T) becomes the active tab, so it ends the
+    /// drag the same way.
+    #[test]
+    fn opening_a_tab_mid_drag_ends_the_drag() {
+        let mut tabs = dragging_tabs(2, 20);
+        let ids: Vec<_> = tabs.entries.iter().map(|entry| entry.id).collect();
+        tabs.launch = Launch::new(vec!["/bin/cat".to_string()], Target::Local);
+
+        tabs.begin_drag(ids[0], 0);
+        tabs.drag_to(5); // lifted, still in slot 0
+        if tabs.open(geom(40, 10), false).is_err() {
+            eprintln!("fork/exec unavailable; skipping");
+            return;
+        }
+        assert!(!tabs.dragging(), "the new tab ended the drag");
     }
 
     #[test]
