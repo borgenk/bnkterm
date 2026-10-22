@@ -1,14 +1,20 @@
-use bnkterm::app::{self, Verbosity};
+use bnkterm::app;
+use bnkterm::cli::{Invocation, Mode, USAGE};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let verbosity = Verbosity::from_args(&args);
-    let result = if args.iter().any(|a| a == "--gpu-probe") {
-        app::gpu_probe()
-    } else if args.iter().any(|a| a == "--demo") {
-        app::run_demo(verbosity)
-    } else {
-        app::run(verbosity)
+    let stats_env = std::env::var_os("BNKTERM_STATS").is_some();
+    let invocation = match Invocation::parse(&args, stats_env) {
+        Ok(invocation) => invocation,
+        Err(arg) => {
+            eprintln!("bnkterm: unknown argument {arg:?}; {USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let result = match invocation.mode {
+        Mode::GpuProbe => app::gpu_probe(),
+        Mode::Demo => app::run_demo(invocation.verbosity),
+        Mode::Run => app::run(invocation.verbosity),
     };
     if let Err(e) = result {
         eprintln!("bnkterm: {e}");

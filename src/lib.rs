@@ -1,6 +1,7 @@
 #![allow(rustdoc::private_intra_doc_links)]
 
 pub mod app;
+pub mod cli;
 pub mod color;
 pub mod config;
 pub mod dev;

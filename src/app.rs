@@ -138,24 +138,6 @@ pub enum Verbosity {
 }
 
 impl Verbosity {
-    /// Read the verbosity out of the command line. `BNKTERM_STATS` in the environment
-    /// is the same knob as `--stats`, for a launcher that cannot pass arguments.
-    pub fn from_args(args: &[String]) -> Self {
-        Self::parse(args, std::env::var_os("BNKTERM_STATS").is_some())
-    }
-
-    /// The parse itself, with the environment passed in so it stays pure (and so
-    /// the test does not have to mutate a process-wide variable to run).
-    fn parse(args: &[String], stats_env: bool) -> Self {
-        if stats_env || args.iter().any(|a| a == "--stats") {
-            Self::Stats
-        } else if args.iter().any(|a| a == "--verbose" || a == "-v") {
-            Self::Verbose
-        } else {
-            Self::Quiet
-        }
-    }
-
     /// Whether bring-up narrates itself: the grid it opened on, the renderer it
     /// chose, the sync path it negotiated.
     fn verbose(self) -> bool {
@@ -257,8 +239,9 @@ fn terminal_env() -> Vec<EnvVar> {
     ]
 }
 
-/// `--demo`: open the window on a static styled grid, without a PTY. The phase-2
-/// bring-up, kept for isolating a render question from the live shell.
+/// `--demo`: open the window on the static styled grid, without a PTY. It is the same grid
+/// the screenshot asset is captured from (`make screenshot`), which is why the flag stays,
+/// and it isolates a render question from a live shell.
 pub fn run_demo(verbosity: Verbosity) -> crate::error::Result<()> {
     let launch_token = activation::take_launch_token();
     let mut state = State::new(
@@ -2849,41 +2832,12 @@ mod tests {
         assert!(!s.is_fractional(), "no viewport yet");
     }
 
-    fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|a| a.to_string()).collect()
-    }
-
     #[test]
-    fn verbosity_is_quiet_unless_asked_for() {
-        // The plain launch, and a launch whose other flags say nothing about noise.
-        assert_eq!(Verbosity::parse(&args(&[]), false), Verbosity::Quiet);
-        assert_eq!(
-            Verbosity::parse(&args(&["--demo"]), false),
-            Verbosity::Quiet
-        );
+    fn each_verbosity_prints_what_its_level_promises() {
+        // Quiet prints neither; `--stats` implies the bring-up lines too, since the frame
+        // lines are useless without knowing which renderer produced them.
         assert!(!Verbosity::Quiet.verbose());
         assert!(!Verbosity::Quiet.frame_stats());
-    }
-
-    #[test]
-    fn verbose_and_stats_flags_climb_the_ladder() {
-        assert_eq!(Verbosity::parse(&args(&["-v"]), false), Verbosity::Verbose);
-        assert_eq!(
-            Verbosity::parse(&args(&["--verbose"]), false),
-            Verbosity::Verbose
-        );
-        assert_eq!(
-            Verbosity::parse(&args(&["--stats"]), false),
-            Verbosity::Stats
-        );
-        // The env var is the same knob as `--stats`, and `--stats` implies verbose:
-        // the frame lines are useless without knowing which renderer produced them.
-        assert_eq!(Verbosity::parse(&args(&[]), true), Verbosity::Stats);
-        assert_eq!(
-            Verbosity::parse(&args(&["--verbose"]), true),
-            Verbosity::Stats,
-            "the louder of the two wins"
-        );
         assert!(Verbosity::Verbose.verbose());
         assert!(!Verbosity::Verbose.frame_stats());
         assert!(Verbosity::Stats.verbose());
