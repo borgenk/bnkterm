@@ -904,8 +904,7 @@ impl State {
                 &[Arg::Int(r.x), Arg::Int(r.y), Arg::Int(r.w), Arg::Int(r.h)],
             );
         }
-        let callback = self.create(self.objects.surface, wl_surface::FRAME);
-        self.frame_callback = callback;
+        self.arm_frame_callback(Instant::now());
         self.conn
             .request(self.objects.surface, wl_surface::COMMIT, &[]);
         self.presentation.busy[idx] = true;

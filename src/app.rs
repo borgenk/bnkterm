@@ -103,6 +103,11 @@ const MULTI_CLICK_MS: u32 = 400;
 /// size from blowing up the buffer-size arithmetic.
 const MAX_DIMENSION: u32 = 16384;
 
+/// How long past the latest frame a pending configure waits for the frame callback before
+/// it draws without it. A few refreshes at any common rate, and short of the 100 ms labwc
+/// waits for an ack before it carries on without one.
+const FRAME_CALLBACK_OVERDUE: Duration = Duration::from_millis(50);
+
 /// First object id in Wayland's server-allocated range. Client-created ids stay
 /// below this; the free list only ever recycles client ids.
 const SERVER_ID_BASE: u32 = 0xff00_0000;
@@ -451,6 +456,15 @@ struct PointerState {
     click_count: usize,
 }
 
+/// A `wl_surface.frame` callback the compositor has not fired yet.
+#[derive(Clone, Copy)]
+struct FrameCallback {
+    id: u32,
+    /// When the latest frame was committed. A hidden window's callback never fires, so a
+    /// pending configure waits for it only so long past this (see [`State::may_draw`]).
+    last_frame: Instant,
+}
+
 struct State {
     conn: Connection,
     fonts: Fonts,
@@ -548,10 +562,9 @@ struct State {
     #[cfg(test)]
     capture_cells: Option<(usize, usize)>,
     closed: bool,
-    /// The in-flight frame callback's id, or 0 when none is pending. While it is
-    /// nonzero the loop holds off redrawing, so bursts coalesce into at most one
-    /// frame per refresh (frame pacing).
-    frame_callback: u32,
+    /// The frame callback in flight, if any. While there is one the loop holds off
+    /// redrawing, so bursts coalesce into at most one frame per refresh (frame pacing).
+    frame_callback: Option<FrameCallback>,
     /// A grid geometry the window has worked out but not yet handed to the tabs, set by
     /// [`Self::resize_to`] and delivered by [`Self::flush_layout`] at the next paint. See
     /// `flush_layout` for why the expensive half of a resize is paced with the frames.
@@ -685,7 +698,7 @@ impl State {
             #[cfg(test)]
             capture_cells: None,
             closed: false,
-            frame_callback: 0,
+            frame_callback: None,
             pending_layout: false,
             verbosity,
         })
@@ -863,12 +876,12 @@ impl State {
             // Fire any blink toggle or key repeat that has come due, all against one
             // clock read: a timer that fires must disarm against the same instant its
             // neighbours were judged by.
-            self.service_timers(Instant::now())?;
-            // Pace to the compositor: only draw when no frame callback is
-            // outstanding, so a burst collapses into a single repaint. A resize the
-            // configures have piled up rides the same pacing, and lands before the
-            // frame that has to show it.
-            if self.configured && self.frame_callback == 0 {
+            let now = Instant::now();
+            self.service_timers(now)?;
+            // Pace to the compositor, so a burst collapses into a single repaint. A
+            // resize the configures have piled up rides the same pacing, and lands
+            // before the frame that has to show it.
+            if self.configured && self.may_draw(now) {
                 self.flush_layout();
                 if self.tabs.needs_frame() && self.render_frame()? {
                     self.tabs.clear_dirty();
@@ -887,7 +900,7 @@ impl State {
                 // Read the clock again rather than reusing the turn's `now`: painting
                 // the frame above can take milliseconds, and a wait measured from before
                 // it would overshoot every deadline by however long it took.
-                self.next_wake(Instant::now())
+                self.next_wake(now, Instant::now())
             };
             self.poll_set.clear();
             let wayland_slot = self.poll_set.add(self.conn.fd());
@@ -952,11 +965,47 @@ impl State {
         Ok(())
     }
 
+    /// Whether the loop may draw now. Not while a frame callback is in flight, so a burst
+    /// coalesces into one frame per refresh, unless a configure is waiting and the
+    /// callback is overdue. A hidden window gets no callbacks, and the configure would
+    /// otherwise stay unacked until the window is shown again. Its ack still rides a
+    /// frame drawn at its size.
+    fn may_draw(&self, now: Instant) -> bool {
+        self.frame_callback.is_none() || self.configure_overdue_at().is_some_and(|at| at <= now)
+    }
+
+    /// When a pending configure stops waiting for the frame callback in flight.
+    fn configure_overdue_at(&self) -> Option<Instant> {
+        self.pending_configure?;
+        self.frame_callback
+            .map(|callback| callback.last_frame + FRAME_CALLBACK_OVERDUE)
+    }
+
+    /// Ask for a frame callback with the frame about to be committed. One still in flight
+    /// means a configure is drawing past it. It stays, since it already asks for the next
+    /// frame, and the next configure waits for it another [`FRAME_CALLBACK_OVERDUE`], so
+    /// a stalled compositor gets a frame per period rather than one per configure.
+    fn arm_frame_callback(&mut self, now: Instant) {
+        match &mut self.frame_callback {
+            Some(callback) => callback.last_frame = now,
+            None => {
+                let id = self.create(self.objects.surface, wl_surface::FRAME);
+                self.frame_callback = Some(FrameCallback {
+                    id,
+                    last_frame: now,
+                });
+            }
+        }
+    }
+
     /// How long to block for input: the soonest of the pending cursor-blink, scrollbar
-    /// fade, corner-notice, and key-repeat deadlines, or `None` (block indefinitely) when
-    /// none is armed. The blink and fade deadlines are the core's; the key-repeat
-    /// deadline is the window's.
-    fn next_wake(&self, now: Instant) -> Option<Duration> {
+    /// fade, corner-notice, and key-repeat deadlines and the moment a configure stops
+    /// waiting for the frame callback, or `None` (block indefinitely) when none is armed.
+    /// The blink and fade deadlines are the core's; the others are the window's.
+    ///
+    /// `turn` is the instant the turn judged whether to draw, and `now` the clock as the
+    /// wait begins.
+    fn next_wake(&self, turn: Instant, now: Instant) -> Option<Duration> {
         let due = |at: Instant| {
             at.saturating_duration_since(now)
                 .max(Duration::from_millis(1))
@@ -964,8 +1013,12 @@ impl State {
         // While a frame callback is outstanding the compositor is driving the fade, so
         // the loop does not also need to wake for it (see the callback handler).
         [
-            self.tabs.next_deadline(now, self.frame_callback != 0),
+            self.tabs.next_deadline(now, self.frame_callback.is_some()),
             self.repeat_at,
+            // Only while it was ahead when the turn judged the draw. One that had passed
+            // by then was drawn, or is waiting on a buffer release, and waiting on it
+            // again would spin. One that passed since is still owed its draw.
+            self.configure_overdue_at().filter(|&at| at > turn),
         ]
         .into_iter()
         .flatten()
@@ -1154,11 +1207,12 @@ impl State {
         }
 
         // The frame callback fired: the compositor is ready for the next frame.
-        if self.frame_callback != 0
-            && msg.object == self.frame_callback
+        if self
+            .frame_callback
+            .is_some_and(|callback| callback.id == msg.object)
             && msg.opcode == wl_callback::EV_DONE
         {
-            self.frame_callback = 0;
+            self.frame_callback = None;
             // Keep a fade going: a scrollbar mid-transition wants the frame the
             // compositor has just offered. A step whose quantised colours did not move
             // presents nothing and arms no new callback, which is what `retry_at` and the
@@ -2955,5 +3009,88 @@ mod tests {
             "motion with no button held does not scroll"
         );
         assert!(!state.pointer.drag_scroll, "the leave let go of the thumb");
+    }
+
+    /// Hand the window one event on `object`, a `u32` per argument.
+    fn event(state: &mut State, object: u32, opcode: u16, args: &[u32]) {
+        let body = args.iter().flat_map(|a| a.to_ne_bytes()).collect();
+        state
+            .handle(&Message {
+                object,
+                opcode,
+                body,
+            })
+            .expect("the event");
+    }
+
+    /// A hidden window gets no frame callbacks. A configure that waited for the one in
+    /// flight stayed unacked until the window was shown again, and labwc gave up on it
+    /// after 100 ms. Once the callback is overdue the configure draws without it, and the
+    /// loop wakes for that moment. A callback a refresh old still paces it, and so does
+    /// the frame drawn past it, so the next configure waits a period from that frame.
+    #[test]
+    fn a_configure_does_not_wait_for_an_overdue_frame_callback() {
+        let (mut state, _compositor) = window(&["one"]);
+        state.configured = true;
+        state.objects.xdg_surface = 30;
+        let drawn = Instant::now();
+        state.frame_callback = Some(FrameCallback {
+            id: 40,
+            last_frame: drawn,
+        });
+        let overdue = drawn + FRAME_CALLBACK_OVERDUE;
+        let soon = drawn + Duration::from_millis(5);
+        assert!(
+            !state.may_draw(overdue + Duration::from_secs(60)),
+            "output alone waits for the callback, however long"
+        );
+        assert_eq!(state.next_wake(soon, soon), None, "nothing to wake for yet");
+
+        event(&mut state, 30, xdg_surface::EV_CONFIGURE, &[7]);
+        assert!(
+            !state.may_draw(soon),
+            "a fresh callback paces the configure"
+        );
+        assert_eq!(
+            state.next_wake(soon, soon),
+            Some(overdue - soon),
+            "the loop wakes when the callback is overdue"
+        );
+        let after = overdue + Duration::from_micros(10);
+        assert_eq!(
+            state.next_wake(soon, after),
+            Some(Duration::from_millis(1)),
+            "a deadline that passed after the turn judged the draw is still owed one"
+        );
+        assert!(
+            state.may_draw(overdue),
+            "an overdue callback holds nothing back"
+        );
+        assert_eq!(
+            state.next_wake(overdue, after),
+            None,
+            "a turn that tried the draw does not wait on the deadline again"
+        );
+
+        state.arm_frame_callback(overdue);
+        event(&mut state, 30, xdg_surface::EV_CONFIGURE, &[8]);
+        assert_eq!(
+            state.frame_callback.map(|callback| callback.id),
+            Some(40),
+            "the frame drawn past the callback keeps it in flight"
+        );
+        let next = overdue + Duration::from_millis(10);
+        assert!(
+            !state.may_draw(next),
+            "the next configure waits a period from the frame drawn past it"
+        );
+        assert_eq!(
+            state.next_wake(next, next),
+            Some(FRAME_CALLBACK_OVERDUE - Duration::from_millis(10)),
+            "and the loop wakes when that period is up"
+        );
+
+        event(&mut state, 40, wl_callback::EV_DONE, &[0]);
+        assert!(state.may_draw(soon), "a fired callback paces nothing");
     }
 }
