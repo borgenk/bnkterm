@@ -128,15 +128,12 @@ impl Xkb {
         })
     }
 
-    /// Build a Compose state from the user's locale (`$LC_ALL`, `$LC_CTYPE`, or
-    /// `$LANG`, defaulting to `C`). Returns `None` if no compose table is found,
-    /// which is not an error: input simply has no dead-key support then. The
-    /// table is released once the state holds its own reference.
+    /// Build a Compose state from the user's locale (see [`compose_locale`]). Returns
+    /// `None` if no compose table is found, which is not an error: input simply has no
+    /// dead-key support then. The table is released once the state holds its own
+    /// reference.
     fn new_compose(ctx: NonNull<c_void>) -> Option<NonNull<c_void>> {
-        let locale = std::env::var("LC_ALL")
-            .or_else(|_| std::env::var("LC_CTYPE"))
-            .or_else(|_| std::env::var("LANG"))
-            .unwrap_or_else(|_| "C".to_string());
+        let locale = compose_locale(|name| std::env::var(name).ok());
         let locale = std::ffi::CString::new(locale)
             .or_else(|_| std::ffi::CString::new("C"))
             .ok()?;
@@ -453,9 +450,60 @@ impl Drop for Xkb {
     }
 }
 
+/// The locale whose compose table to load: the first of `$LC_ALL`, `$LC_CTYPE` and `$LANG`
+/// that is set and not empty, else `C`. POSIX reads an empty one as unset. `var` reads one
+/// variable.
+fn compose_locale(var: impl Fn(&str) -> Option<String>) -> String {
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .filter_map(var)
+        .find(|value| !value.is_empty())
+        .unwrap_or_else(|| "C".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::platform::xkb::*;
+
+    /// POSIX reads a locale variable that is set but empty as unset. An empty `LC_ALL`
+    /// named no locale, found no compose table, and turned dead keys off.
+    #[test]
+    fn an_empty_locale_variable_reads_as_unset() {
+        fn env<'a>(vars: &'a [(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'a {
+            move |name| {
+                vars.iter()
+                    .find(|(var, _)| *var == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        }
+        let all = [
+            ("LC_ALL", "fr_FR.UTF-8"),
+            ("LC_CTYPE", "de_DE.UTF-8"),
+            ("LANG", "en_US.UTF-8"),
+        ];
+        assert_eq!(compose_locale(env(&all)), "fr_FR.UTF-8");
+        assert_eq!(compose_locale(env(&[])), "C");
+        assert_eq!(
+            compose_locale(env(&[
+                ("LC_ALL", ""),
+                ("LC_CTYPE", "de_DE.UTF-8"),
+                ("LANG", "en_US.UTF-8")
+            ])),
+            "de_DE.UTF-8"
+        );
+        assert_eq!(
+            compose_locale(env(&[
+                ("LC_ALL", ""),
+                ("LC_CTYPE", ""),
+                ("LANG", "en_US.UTF-8")
+            ])),
+            "en_US.UTF-8"
+        );
+        assert_eq!(
+            compose_locale(env(&[("LC_ALL", ""), ("LC_CTYPE", ""), ("LANG", "")])),
+            "C"
+        );
+    }
 
     #[test]
     fn queries_are_inert_without_a_keymap() {
