@@ -296,6 +296,45 @@ pub(crate) struct FtBitmap {
     palette: *mut c_void,
 }
 
+impl FtBitmap {
+    /// The rows top down, the first `row_bytes` of each, or `None` when FreeType gave no
+    /// buffer or a row would not fit in the pitch. A negative pitch stores the rows bottom
+    /// up, with `buffer` at the last.
+    pub(crate) fn rows_top_down(&self, row_bytes: usize) -> Option<impl Iterator<Item = &[u8]>> {
+        let stride = self.pitch.unsigned_abs() as usize;
+        if self.buffer.is_null() || row_bytes > stride {
+            return None;
+        }
+        let rows = self.rows as usize;
+        let bottom_up = self.pitch < 0;
+        Some((0..rows).map(move |y| {
+            let line = if bottom_up { rows - 1 - y } else { y };
+            // SAFETY: FreeType's buffer holds `rows` lines of `|pitch|` bytes in memory
+            // order, so line `line` starts `line * |pitch|` bytes in and its first
+            // `row_bytes <= |pitch|` bytes lie inside it. The slice borrows the bitmap,
+            // whose buffer FreeType keeps until the glyph slot's next load.
+            unsafe { std::slice::from_raw_parts(self.buffer.add(line * stride), row_bytes) }
+        }))
+    }
+}
+
+#[cfg(test)]
+impl FtBitmap {
+    /// A bitmap over `buffer` as FreeType describes one, for the copy tests.
+    pub(crate) fn over(rows: c_uint, width: c_uint, pitch: c_int, buffer: *const u8) -> Self {
+        Self {
+            rows,
+            width,
+            pitch,
+            buffer,
+            num_grays: 256,
+            pixel_mode: 0,
+            palette_mode: 0,
+            palette: ptr::null_mut(),
+        }
+    }
+}
+
 #[repr(C)]
 #[allow(dead_code)]
 struct FtSizeMetrics {
@@ -1191,26 +1230,17 @@ fn open_variant(file: &FontFile, size: u32, emoji: Option<&Rc<EmojiFont>>) -> Op
 }
 
 /// Copy a FreeType bitmap into a tightly packed top-down coverage buffer of
-/// `width * rows` bytes, dropping inter-row pitch padding. Row y starts at
-/// `buffer + y*pitch` for either pitch sign. Assumes one coverage byte per
-/// pixel, so the caller must confirm FT_PIXEL_MODE_GRAY first.
+/// `width * rows` bytes, dropping inter-row pitch padding, or an empty one when
+/// FreeType gave no buffer. Assumes one coverage byte per pixel, so the caller
+/// must confirm FT_PIXEL_MODE_GRAY first.
 fn copy_coverage(bitmap: &FtBitmap) -> Vec<u8> {
     let width = bitmap.width as usize;
-    let rows = bitmap.rows as usize;
-    let total = rows * width;
-    if width == 0 || rows == 0 || bitmap.buffer.is_null() {
+    let Some(rows) = bitmap.rows_top_down(width) else {
         return Vec::new();
-    }
-    let mut out = vec![0u8; total];
-    let pitch = bitmap.pitch as isize;
-    for y in 0..rows {
-        // SAFETY: FreeType guarantees |pitch| >= width bytes per row, so the
-        // width-byte read at buffer + y*pitch stays within that row; out is a
-        // distinct buffer.
-        unsafe {
-            let src = bitmap.buffer.offset(y as isize * pitch);
-            ptr::copy_nonoverlapping(src, out[y * width..].as_mut_ptr(), width);
-        }
+    };
+    let mut out = Vec::with_capacity(width * bitmap.rows as usize);
+    for row in rows {
+        out.extend_from_slice(row);
     }
     out
 }
@@ -1683,6 +1713,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// FreeType stores a bitmap with a negative pitch bottom up, `buffer` at its last row.
+    /// Read top down from `buffer`, its rows came from the memory before it.
+    #[test]
+    fn coverage_copies_top_down_for_either_pitch_sign() {
+        // Three rows of three bytes, four bytes apart, and a spare row of slack.
+        let down = [1, 1, 1, 0, 2, 2, 2, 0, 3, 3, 3, 0, 0, 0, 0, 0];
+        // The same rows bottom up, after two rows of something else.
+        let up = [9, 9, 9, 9, 9, 9, 9, 9, 3, 3, 3, 0, 2, 2, 2, 0, 1, 1, 1, 0];
+        let expected = [1, 1, 1, 2, 2, 2, 3, 3, 3];
+        assert_eq!(
+            copy_coverage(&FtBitmap::over(3, 3, 4, down.as_ptr())),
+            expected
+        );
+        assert_eq!(
+            copy_coverage(&FtBitmap::over(3, 3, -4, up[8..].as_ptr())),
+            expected
+        );
+        assert!(copy_coverage(&FtBitmap::over(3, 3, 4, ptr::null())).is_empty());
+        assert!(
+            copy_coverage(&FtBitmap::over(3, 5, 4, down.as_ptr())).is_empty(),
+            "a row wider than the pitch is no bitmap FreeType makes"
+        );
     }
 
     #[test]

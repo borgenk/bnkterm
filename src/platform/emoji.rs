@@ -267,12 +267,13 @@ impl EmojiFont {
         if slot.bitmap.pixel_mode != FT_PIXEL_MODE_BGRA {
             return None;
         }
+        let (width, rows, argb) = copy_bgra(&slot.bitmap);
         Some(StrikeBitmap {
             left: slot.bitmap_left,
             top: slot.bitmap_top,
-            width: slot.bitmap.width as usize,
-            rows: slot.bitmap.rows as usize,
-            argb: copy_bgra(&slot.bitmap),
+            width,
+            rows,
+            argb,
         })
     }
 }
@@ -310,32 +311,54 @@ struct Composited {
 /// resampling stay premultiplied; [`straight_from_premultiplied`] converts the
 /// final display-size pixels for the straight-alpha blitter. The caller must
 /// confirm FT_PIXEL_MODE_BGRA first.
-fn copy_bgra(bitmap: &FtBitmap) -> Vec<u32> {
+///
+/// Returns the width and rows it copied along with the pixels, all zero when
+/// FreeType gave no buffer, so the size never claims pixels the copy lacks.
+fn copy_bgra(bitmap: &FtBitmap) -> (usize, usize, Vec<u32>) {
     let width = bitmap.width as usize;
-    let rows = bitmap.rows as usize;
-    if width == 0 || rows == 0 || bitmap.buffer.is_null() {
-        return Vec::new();
+    let rows = width
+        .checked_mul(4)
+        .and_then(|row_bytes| bitmap.rows_top_down(row_bytes));
+    let Some(rows) = rows else {
+        return (0, 0, Vec::new());
+    };
+    let mut argb = Vec::with_capacity(width * bitmap.rows as usize);
+    for row in rows {
+        let pixels = row.as_chunks::<4>().0.iter();
+        argb.extend(pixels.map(|&[b, g, r, a]| u32::from_be_bytes([a, r, g, b])));
     }
-    let mut out = vec![0u32; width * rows];
-    let pitch = bitmap.pitch as isize;
-    for y in 0..rows {
-        for x in 0..width {
-            // SAFETY: FreeType guarantees |pitch| >= width*4 bytes per BGRA row,
-            // so the 4-byte read at buffer + y*pitch + x*4 stays within the row;
-            // out is a distinct buffer.
-            let [b, g, r, a] = unsafe {
-                let p = bitmap.buffer.offset(y as isize * pitch + (x as isize) * 4);
-                [*p, *p.add(1), *p.add(2), *p.add(3)]
-            };
-            out[y * width + x] = u32::from_be_bytes([a, r, g, b]);
-        }
-    }
-    out
+    (width, bitmap.rows as usize, argb)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::platform::emoji::*;
+
+    /// `composite` indexes a strike's pixels by the size the copy reports, so the two
+    /// must agree: no buffer is no pixels and no size. A negative pitch stores the rows
+    /// bottom up, `buffer` at the last, and the copy must not read the memory before it.
+    #[test]
+    fn a_strike_copy_reports_the_size_it_copied() {
+        // Two rows of two BGRA pixels, twelve bytes apart.
+        let top = [1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0];
+        let bottom = [9, 10, 11, 12, 13, 14, 15, 16, 0, 0, 0, 0];
+        let down = [top, bottom].concat();
+        // Bottom up, after a row of something else.
+        let up = [[0xEE; 12], bottom, top].concat();
+        let pixels = vec![0x0403_0201, 0x0807_0605, 0x0C0B_0A09, 0x100F_0E0D];
+        assert_eq!(
+            copy_bgra(&FtBitmap::over(2, 2, 12, std::ptr::null())),
+            (0, 0, Vec::new())
+        );
+        assert_eq!(
+            copy_bgra(&FtBitmap::over(2, 2, 12, down.as_ptr())),
+            (2, 2, pixels.clone())
+        );
+        assert_eq!(
+            copy_bgra(&FtBitmap::over(2, 2, -12, up[12..].as_ptr())),
+            (2, 2, pixels)
+        );
+    }
 
     fn emoji() -> EmojiFont {
         let file = crate::platform::fontconfig::font_for_family(
