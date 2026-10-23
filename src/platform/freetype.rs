@@ -919,8 +919,7 @@ impl SizedFaces {
     }
 
     /// Open (or reuse) the face for a font file the system named. Discovered faces carry
-    /// no emoji font: a colour cluster is resolved through the emoji path long before a
-    /// scalar reaches discovery.
+    /// no emoji font: they draw single scalars, never colour clusters.
     fn open_discovered(&self, file: FontFile) -> Option<Rc<Face>> {
         if let Some(face) = self.opened.borrow().get(&file) {
             return Some(Rc::clone(face));
@@ -1080,8 +1079,9 @@ impl Fonts {
     /// Failing all three, the keyed face is returned again, so a scalar that genuinely
     /// exists nowhere still draws its `.notdef` box, as it always did.
     ///
-    /// Emoji never arrive here: a colour cluster is resolved through the emoji cluster
-    /// path before any scalar is drawn.
+    /// A face with the emoji font resolves a colour cluster through the emoji cluster
+    /// path before any scalar is drawn. An interface face has none, so a tab title's
+    /// emoji arrives here like any other scalar.
     ///
     /// Every step is memoized. Discovery caches per character and per font file
     /// ([`SizedFaces::discover`]), and the GPU batcher caches the raster by `(key, ch)`
@@ -1948,6 +1948,25 @@ mod tests {
                 g.coverage.iter().any(|&c| c > 0),
                 "the branch icon should ink from a fallback face"
             );
+        }
+    }
+
+    /// Discovery opens what the system offers at the cell's pixel size, so it must only
+    /// be offered fonts that open at one. A colour emoji font does not: its glyphs are
+    /// fixed-size bitmaps, though fontconfig calls it scalable. An interface face carries
+    /// no emoji font, so a tab title's emoji asks discovery for one.
+    #[test]
+    fn every_font_offered_for_a_character_opens_at_a_pixel_size() {
+        let fc = Fontconfig::new().expect("fontconfig");
+        for ch in ['😀', '🎉', '❤', '✔', '中', 'ж', '\u{F418}'] {
+            if let Some(file) = fc.font_for_char(ch) {
+                let face = Face::from_file(&file).expect("the offered font reads");
+                assert!(
+                    face.set_pixel_size(16).is_ok(),
+                    "{ch} offered {}, which does not open at 16 px",
+                    file.path.display()
+                );
+            }
         }
     }
 }

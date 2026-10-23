@@ -11,8 +11,9 @@
 //! ```
 //!
 //! Family queries apply the current fontconfig configuration. Fallback discovery ranks
-//! scalable fonts once, then scans their retained character maps. `freetype.rs` memoizes
-//! the selected face per character and opens each discovered file once per size.
+//! the fonts once, scalable first, then scans the character maps of those with outlines.
+//! `freetype.rs` memoizes the selected face per character and opens each discovered file
+//! once per size.
 //!
 //! All C types are opaque except `FcFontSet`, whose layout is pinned against a C compiler
 //! in the tests.
@@ -49,6 +50,7 @@ struct FcConfig {
 const FC_FILE: &[u8] = b"file\0";
 const FC_INDEX: &[u8] = b"index\0";
 const FC_SCALABLE: &[u8] = b"scalable\0";
+const FC_OUTLINE: &[u8] = b"outline\0";
 const FC_CHARSET: &[u8] = b"charset\0";
 const FC_FAMILY: &[u8] = b"family\0";
 const FC_WEIGHT: &[u8] = b"weight\0";
@@ -88,6 +90,12 @@ extern "C" {
         value: *mut *mut c_uchar,
     ) -> c_int;
     fn FcPatternGetInteger(
+        pattern: *const FcPattern,
+        object: *const c_char,
+        index: c_int,
+        value: *mut c_int,
+    ) -> c_int;
+    fn FcPatternGetBool(
         pattern: *const FcPattern,
         object: *const c_char,
         index: c_int,
@@ -305,7 +313,7 @@ fn weight_and_slant(style: FontStyle) -> (c_int, c_int) {
     }
 }
 
-/// The system's scalable fonts, ranked once for fallback lookup.
+/// The system's fonts, ranked once for fallback lookup, scalable ones first.
 ///
 /// Later lookups scan retained character maps instead of running a new match. Fontconfig
 /// trims fonts that add no coverage beyond earlier entries.
@@ -329,8 +337,9 @@ impl Fontconfig {
 
         let query = Pattern::new()?;
         // SAFETY: query is live; the object name is a NUL-terminated literal. A bitmap face
-        // holds one fixed size, so it cannot be opened at the cell's pixel size; asking for
-        // scalable fonts only keeps one out of the ranking entirely.
+        // holds fixed sizes only, so it cannot be opened at the cell's pixel size. Asking
+        // for scalable fonts ranks them first; the sort ranks rather than filters, so
+        // `font_for_char` skips the rest.
         unsafe {
             if FcPatternAddBool(query.0, FC_SCALABLE.as_ptr().cast(), FC_TRUE) != FC_TRUE {
                 return None;
@@ -368,8 +377,8 @@ impl Fontconfig {
         Some(Fontconfig { set })
     }
 
-    /// The font the system would use to draw `ch`: the first in the ranked set whose
-    /// character map contains it, or `None` when nothing installed does.
+    /// The font the system would use to draw `ch`: the first in the ranked set with
+    /// outlines whose character map contains it, or `None` when nothing installed does.
     ///
     /// A charset test against an in-memory bitset, per candidate, until one hits. No call
     /// into fontconfig and no allocation, so this is cheap enough to ask per character and
@@ -396,6 +405,11 @@ impl Fontconfig {
             }
             // SAFETY: charset is a live FcCharSet borrowed from the pattern above.
             if unsafe { FcCharSetHasChar(charset, ch as u32) } != FC_TRUE {
+                continue;
+            }
+            // A font without outlines holds fixed sizes only and cannot open at the cell's
+            // pixel size. A colour emoji font is one, though fontconfig calls it scalable.
+            if pattern_bool(font, FC_OUTLINE) == Some(false) {
                 continue;
             }
             // A font that claims the character. Its file is the answer; a font with no file
@@ -467,6 +481,14 @@ fn pattern_integer(pattern: *const FcPattern, object: &[u8]) -> Option<i32> {
     // SAFETY: as `pattern_string_at`; fontconfig writes the integer through the pointer.
     let result = unsafe { FcPatternGetInteger(pattern, object.as_ptr().cast(), 0, &mut value) };
     (result == FC_RESULT_MATCH).then_some(value)
+}
+
+/// A boolean property of a pattern, or `None` when it does not carry one.
+fn pattern_bool(pattern: *const FcPattern, object: &[u8]) -> Option<bool> {
+    let mut value: c_int = 0;
+    // SAFETY: as `pattern_string_at`; fontconfig writes the FcBool through the pointer.
+    let result = unsafe { FcPatternGetBool(pattern, object.as_ptr().cast(), 0, &mut value) };
+    (result == FC_RESULT_MATCH).then_some(value == FC_TRUE)
 }
 
 /// An owned `FcPattern`, freed on drop. Every early return in construction would otherwise
