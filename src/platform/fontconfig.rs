@@ -191,11 +191,11 @@ pub(super) fn match_family(family_name: &str, style: FontStyle) -> Option<Family
     // SAFETY: query is live and substituted; a null config means the current (system)
     // one; result is a live local. The returned pattern is *owned* by us, which is what
     // the Pattern wrapper is for -- unlike the borrowed patterns inside a sorted set.
-    let matched = unsafe { FcFontMatch(ptr::null_mut(), query.0, &mut result) };
-    if matched.is_null() || result != FC_RESULT_MATCH {
+    // Wrapped before the result is checked, so a pattern returned without a match is freed.
+    let matched = Pattern(unsafe { FcFontMatch(ptr::null_mut(), query.0, &mut result) });
+    if matched.0.is_null() || result != FC_RESULT_MATCH {
         return None;
     }
-    let matched = Pattern(matched);
 
     let families = pattern_strings(matched.0, FC_FAMILY);
     if !is_generic(family_name)
@@ -365,16 +365,17 @@ impl Fontconfig {
                 &mut result,
             )
         };
-        if set.is_null() || result != FC_RESULT_MATCH {
+        if set.is_null() {
             return None;
         }
+        // Owned before anything is checked, so Drop frees a set that is refused. With no
+        // fonts installed, fontconfig returns an empty set and no match.
+        let fonts = Fontconfig { set };
         // SAFETY: set is non-null and was just returned by FcFontSort.
-        if unsafe { (*set).nfont } <= 0 {
-            // SAFETY: set is a live, owned FcFontSet; destroyed exactly once, here.
-            unsafe { FcFontSetDestroy(set) };
+        if result != FC_RESULT_MATCH || unsafe { (*set).nfont } <= 0 {
             return None;
         }
-        Some(Fontconfig { set })
+        Some(fonts)
     }
 
     /// The font the system would use to draw `ch`: the first in the ranked set with
