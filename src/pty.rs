@@ -233,7 +233,6 @@ impl Pty {
         // header).
         let pid = unsafe {
             fork_child_in_pty(
-                master.as_raw_fd(),
                 slave_path.as_ptr(),
                 &ptrs,
                 &env_ptrs,
@@ -707,7 +706,6 @@ fn set_winsize(master: RawFd, cols: usize, rows: usize) -> Result<()> {
 /// caller builds them before forking). `argv` must be non-empty (`argv[0]` is the
 /// program), which the callers ensure.
 unsafe fn fork_child_in_pty(
-    master: RawFd,
     slave_path: *const c_char,
     argv: &[*const c_char],
     envp: &[*const c_char],
@@ -758,10 +756,12 @@ unsafe fn fork_child_in_pty(
             _exit(127);
         }
     }
-    if slave > 2 {
+    // The shell gets the terminal on 0-2 and nothing else. Every fd from 3 up closes: the
+    // slave's own, and any opened without close-on-exec, such as the dmabufs and sync files
+    // a GPU driver exports. Without `close_range` (before Linux 5.9) only the slave closes.
+    if ffi::close_from(3) != 0 && slave > 2 {
         close(slave);
     }
-    close(master);
     // `execve`, not `execvp`. POSIX's list of async-signal-safe functions has `execve` on
     // it and not `execvp`, and this is a post-`fork` child in a threaded process: `execvp`
     // walks `$PATH` and may allocate inside glibc, either of which can deadlock against a
@@ -1067,6 +1067,19 @@ mod tests {
         };
         assert_ne!(local, 0, "a local child owns its terminal");
         assert_eq!(host, 0, "the far side of flatpak-spawn is left to claim it");
+    }
+
+    #[test]
+    fn a_child_inherits_only_its_terminal() {
+        // An fd open without close-on-exec, as the dmabufs and sync files a GPU driver
+        // exports can be. `ls` lists the fds it holds: stdio and the directory it reads.
+        let (_read, _write) = test_pipe();
+        let Some(listed) = output_of(&["/bin/ls", "-1", "/proc/self/fd"]) else {
+            eprintln!("fork/exec unavailable; skipping");
+            return;
+        };
+        let fds: Vec<&str> = listed.lines().map(str::trim).collect();
+        assert_eq!(fds, ["0", "1", "2", "3"], "{listed:?}");
     }
 
     #[test]

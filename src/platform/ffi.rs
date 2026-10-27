@@ -536,6 +536,31 @@ pub(crate) fn pidfd_open(pid: i32) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// `close_range(2)`'s syscall number, shared across architectures like `pidfd_open`'s.
+const SYS_CLOSE_RANGE: c_long = 436;
+
+/// Close every fd from `first` up, in one syscall that neither allocates nor takes a lock,
+/// so a child between `fork` and `exec` may call it. Returns 0, or -1 before Linux 5.9,
+/// where nothing is closed.
+///
+/// # Safety
+///
+/// Nothing may use the closed fds afterwards: the caller must own every fd from `first`
+/// up, as a child about to exec does.
+pub(crate) unsafe fn close_from(first: c_uint) -> c_long {
+    let flags: c_long = 0;
+    // SAFETY: close_range takes two fd bounds and a flags word and touches no memory. The
+    // caller vouches for the fds it closes.
+    unsafe {
+        syscall(
+            SYS_CLOSE_RANGE,
+            c_long::from(first),
+            c_long::from(c_uint::MAX),
+            flags,
+        )
+    }
+}
+
 /// Add 1 to the eventfd's counter to wake a poller. The return is unchecked because
 /// this write cannot meaningfully fail: an 8-byte write to a counter eventfd blocks
 /// (or returns `EAGAIN`) only at `u64::MAX - 1`, which is unreachable when the
