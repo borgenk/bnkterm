@@ -195,6 +195,69 @@ pub(super) struct CombiningMark {
     pub(super) ch: char,
 }
 
+/// A row's combining marks, with the number the last counted cell carries kept beside
+/// them, so a run of marks on one cell counts the row once rather than once a mark.
+/// Reads go through the slice; every change except [`Marks::push`] forgets the count.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Marks {
+    list: Vec<CombiningMark>,
+    /// A column and how many marks it carries, while that is known. Narrow, because every
+    /// row in the scrollback carries it: a column past `u16::MAX` is never remembered.
+    counted: Option<(u16, u16)>,
+}
+
+impl Marks {
+    /// How many marks `col` carries.
+    pub(super) fn count(&mut self, col: usize) -> usize {
+        match self.counted {
+            Some((counted, n)) if usize::from(counted) == col => usize::from(n),
+            _ => {
+                let n = self.list.iter().filter(|m| m.col == col).count();
+                self.counted = u16::try_from(col)
+                    .ok()
+                    .map(|c| (c, u16::try_from(n).unwrap_or(u16::MAX)));
+                n
+            }
+        }
+    }
+
+    pub(super) fn push(&mut self, mark: CombiningMark) {
+        if let Some((col, n)) = &mut self.counted {
+            if usize::from(*col) == mark.col {
+                *n = n.saturating_add(1);
+            }
+        }
+        self.list.push(mark);
+    }
+
+    pub(super) fn retain(&mut self, keep: impl FnMut(&CombiningMark) -> bool) {
+        self.counted = None;
+        self.list.retain(keep);
+    }
+
+    pub(super) fn iter_mut(&mut self) -> core::slice::IterMut<'_, CombiningMark> {
+        self.counted = None;
+        self.list.iter_mut()
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.counted = None;
+        self.list.clear();
+    }
+
+    pub(super) fn capacity(&self) -> usize {
+        self.list.capacity()
+    }
+}
+
+impl core::ops::Deref for Marks {
+    type Target = [CombiningMark];
+
+    fn deref(&self) -> &[CombiningMark] {
+        &self.list
+    }
+}
+
 /// One row of cells plus its rare combining marks. Cells are contiguous, so a
 /// row is cheap to scan and write. Combining marks live in a tiny side list keyed
 /// by column so they ride along when the row scrolls and cost nothing on the
@@ -208,7 +271,7 @@ pub(super) struct Row {
     /// row reuses its capacity and a warmed combining/emoji line allocates nothing.
     /// A column's marks read back by filtering on `col`, which preserves the order
     /// they arrived in.
-    pub(super) combining: Vec<CombiningMark>,
+    pub(super) combining: Marks,
     /// Autowrap carried this line onto the next row: the two are one logical line,
     /// so a selection spanning them copies as unbroken text and a triple-click takes
     /// both. A hard newline leaves this false.
@@ -228,7 +291,7 @@ impl Row {
     pub(super) fn filled(cols: usize, cell: PackedCell) -> Self {
         Row {
             cells: vec![cell; cols],
-            combining: Vec::new(),
+            combining: Marks::default(),
             wrapped: false,
         }
     }
@@ -240,7 +303,7 @@ impl Row {
     pub(super) fn empty() -> Self {
         Row {
             cells: Vec::new(),
-            combining: Vec::new(),
+            combining: Marks::default(),
             wrapped: false,
         }
     }
@@ -345,7 +408,7 @@ impl Row {
         // which would grow this row's side table and every render string it feeds
         // without bound. Beyond the cap the extra marks are dropped: invisible clutter
         // no reader needs, and the bound keeps retained memory and render work finite.
-        if self.combining.iter().filter(|m| m.col == col).count() >= MAX_COMBINING_PER_CELL {
+        if self.combining.count(col) >= MAX_COMBINING_PER_CELL {
             return;
         }
         self.combining.push(CombiningMark { col, ch: mark });
@@ -1090,7 +1153,7 @@ impl Buffer {
             for (i, row) in old_rows.iter().enumerate().take(idx).skip(start) {
                 let base = logical.cells.len();
                 logical.cells.extend_from_slice(&row.cells);
-                for m in &row.combining {
+                for m in row.combining.iter() {
                     logical.combining.push(CombiningMark {
                         col: base + m.col,
                         ch: m.ch,

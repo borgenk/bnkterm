@@ -226,6 +226,13 @@ fn measure() -> Result<Vec<Sample>> {
     // A shell marking a prompt (`OSC 133;A`) on every line. Warmed past the number of marks
     // the grid remembers, so every mark here evicts old ones.
     let prompt_chunk = b"\x1b]133;A\x07\r\n".repeat(CHUNK / 10);
+    // A Zalgo row: each cell's base followed by more marks than a cell keeps, overwritten
+    // in place so the row stays at the cap, about 3,840 marks.
+    let mut zalgo_chunk = b"\x1b[H".to_vec();
+    let zalgo_cell: String = std::iter::once('a')
+        .chain((0..40).filter_map(|i| char::from_u32(0x0300 + i)))
+        .collect();
+    zalgo_chunk.extend_from_slice(zalgo_cell.repeat(BENCH_COLS).as_bytes());
 
     let mut samples = vec![
         stream_scenario("parse_ascii", &ascii, 128),
@@ -237,6 +244,7 @@ fn measure() -> Result<Vec<Sample>> {
         stream_scenario("grid_combining", &combining_chunk, 128),
         stream_scenario("grid_emoji", &emoji_chunk, 128),
         stream_scenario("grid_prompts", &prompt_chunk, 128),
+        stream_scenario("grid_zalgo", &zalgo_chunk, 8),
         frame_tabbar_scenario()?,
         frame_damage_scenario(),
         frame_damage_scroll_scenario(),

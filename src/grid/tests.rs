@@ -2,7 +2,7 @@
 //! module rather than one per sibling implementation file.
 
 use crate::color::{Ground, Rgb};
-use crate::grid::buffer::MAX_LOGICAL_COLS;
+use crate::grid::buffer::{MAX_COMBINING_PER_CELL, MAX_LOGICAL_COLS};
 use crate::grid::osc::base64_decode;
 use crate::grid::*;
 use crate::platform::verdict::Refusal;
@@ -392,6 +392,32 @@ fn combining_mark_attaches_to_base() {
     assert_eq!(s.cursor(), (0, 1)); // zero-width, cursor did not advance
     assert_eq!(s.marks_at(0, 0).collect::<Vec<_>>(), ['\u{0301}']);
     assert_eq!(s.row_string(0).trim_end(), "e\u{0301}");
+}
+
+#[test]
+fn a_cell_keeps_its_cap_of_marks_when_two_cells_take_them_in_turn() {
+    // Zalgo piles thousands of marks on a cell, and each cell keeps only its cap. The
+    // cap is per cell, so marks arriving for two cells in turn fill both to it.
+    let mut s = Screen::new(10, 3);
+    feed(&mut s, b"ab");
+    for _ in 0..MAX_COMBINING_PER_CELL + 8 {
+        feed(&mut s, "\u{0301}\x1b[D\u{0302}\x1b[C".as_bytes());
+    }
+    assert_eq!(s.marks_at(0, 0).count(), MAX_COMBINING_PER_CELL);
+    assert_eq!(s.marks_at(0, 1).count(), MAX_COMBINING_PER_CELL);
+    assert!(s.marks_at(0, 0).all(|m| m == '\u{0302}'));
+    assert!(s.marks_at(0, 1).all(|m| m == '\u{0301}'));
+}
+
+#[test]
+fn a_cell_written_over_at_its_cap_takes_marks_again() {
+    // Overwriting a cell drops its marks, so the new character starts from none.
+    let mut s = Screen::new(10, 3);
+    let zalgo = "\u{0301}".repeat(MAX_COMBINING_PER_CELL + 8);
+    feed(&mut s, format!("a{zalgo}").as_bytes());
+    assert_eq!(s.marks_at(0, 0).count(), MAX_COMBINING_PER_CELL);
+    feed(&mut s, "\x1b[Db\u{0302}".as_bytes());
+    assert_eq!(s.marks_at(0, 0).collect::<Vec<_>>(), ['\u{0302}']);
 }
 
 #[test]
