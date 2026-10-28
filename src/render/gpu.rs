@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 
 use crate::platform::bytes;
+use crate::platform::emoji::wants_emoji;
 use crate::platform::freetype::{Face, FaceKey, Fonts};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
@@ -1044,6 +1045,10 @@ impl Batcher<'_> {
     ///
     /// `fit` is the size the caller's path draws at, and picks the map: the same
     /// cluster can arrive on both paths, and each keeps its own raster.
+    ///
+    /// A cluster that would not be emoji even where the text face lacks its glyph,
+    /// such as a letter, an accented letter or a box-drawing character, returns
+    /// `None` before the lookup, so plain text never enters the map.
     fn packed_cluster(
         &mut self,
         face: &Face,
@@ -1051,6 +1056,9 @@ impl Batcher<'_> {
         cluster: &str,
         fit: EmojiFit,
     ) -> Option<PackedGlyph> {
+        if !wants_emoji(cluster, |_| false) {
+            return None;
+        }
         if let Some(&packed) = self
             .cache
             .clusters(fit)
@@ -1552,22 +1560,54 @@ mod tests {
             max_records: 16,
             ..GlyphCache::default()
         };
-        // 25 distinct non-ASCII clusters, past both maps' cap of 16.
-        let greek: String = ('α'..='ω').collect();
-        let list = prose(&greek);
+        // 25 distinct letters and 25 distinct emoji, past each map's cap of 16.
+        let text: String = ('α'..='ω').chain('😀'..='😘').collect();
+        let list = prose(&text);
+        let emoji_quads = |frame: &FrameData| {
+            frame
+                .vertices
+                .iter()
+                .filter(|v| v.mode == MODE_EMOJI)
+                .count()
+                / 6
+        };
 
         let first = build_frame(&fonts, &list, &mut cache, GAMMA);
+        assert_eq!(emoji_quads(&first), 25, "every emoji drew in colour");
         let generations = (cache.glyphs.generation, cache.emoji.generation);
         assert_eq!(generations, (1, 1), "the first drops wipe both atlases");
         for _ in 0..3 {
             let again = build_frame(&fonts, &list, &mut cache, GAMMA);
             assert_eq!(glyph_quads(&again), glyph_quads(&first));
+            assert_eq!(emoji_quads(&again), emoji_quads(&first));
         }
         assert_eq!(
             (cache.glyphs.generation, cache.emoji.generation),
             generations,
             "a drop the screen forces on every frame wiped an atlas again"
         );
+    }
+
+    /// Text the emoji font never draws stays out of the emoji maps, so a screen of
+    /// distinct letters cannot fill them, drop the emoji placed so far and wipe their
+    /// atlas.
+    #[test]
+    fn plain_text_leaves_the_emoji_cache_alone() {
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let mut cache = GlyphCache {
+            max_records: 16,
+            ..GlyphCache::default()
+        };
+        build_frame(&fonts, &prose("😀"), &mut cache, GAMMA);
+        let emoji_gen = cache.emoji.generation;
+        let greek: String = ('α'..='ω').collect();
+        build_frame(&fonts, &prose(&greek), &mut cache, GAMMA);
+        assert_eq!(
+            cache.emoji.generation, emoji_gen,
+            "letters wiped the emoji atlas"
+        );
+        let clusters: usize = cache.cluster_slots.values().map(|m| m.len()).sum();
+        assert_eq!(clusters, 1, "only the emoji is in the map");
     }
 
     /// The two stores must partition the characters between them: direct-mapped or

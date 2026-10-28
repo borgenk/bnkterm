@@ -254,6 +254,7 @@ fn measure() -> Result<Vec<Sample>> {
         frame_tabbar_scenario()?,
         frame_damage_scenario(),
         frame_damage_scroll_scenario(),
+        frame_text_unicode_scenario()?,
         grid_reflow_scenario()?,
         link_preview_scenario()?,
     ];
@@ -762,6 +763,70 @@ fn frame_tabbar_scenario() -> Result<Sample> {
     let (ns, allocs) = best_of(GATE_ROUNDS, 512, &mut build);
     Ok(Sample {
         name: "frame_tabbar",
+        ns,
+        allocs,
+    })
+}
+
+/// The vertices for a screen of non-ASCII text: box drawing as `tree` prints it beside
+/// accented prose, on every row, so every run takes the segmented path. The display list
+/// is built once; only the vertex build is timed.
+fn frame_text_unicode_scenario() -> Result<Sample> {
+    use crate::color::Theme;
+    use crate::platform::freetype::Fonts;
+    use crate::render::gpu::{build_frame_into, FrameData, GlyphCache, TextGamma};
+    use crate::term_render::{
+        build_display_list_into, CellMetrics, CursorRender, DisplayListPool, FrameInputs,
+    };
+
+    let fonts = Fonts::new(&[RENDER_FONT_PX])
+        .map_err(|e| Error::msg(format!("frame_text_unicode needs the default fonts: {e}")))?;
+    let metrics = CellMetrics::from_fonts(&fonts, RENDER_FONT_PX);
+    let theme = Theme::default();
+    let surface = (metrics.w * BENCH_COLS as i32, metrics.h * BENCH_ROWS as i32);
+
+    let mut screen = Screen::new(BENCH_COLS, BENCH_ROWS);
+    let mut parser = Parser::new();
+    let line: String = "├── café/naïve_résumé.txt │ Ærøskøbing, Größe, façade "
+        .chars()
+        .cycle()
+        .take(BENCH_COLS)
+        .collect();
+    for row in 1..=BENCH_ROWS {
+        parser.advance_bytes(&mut screen, format!("\x1b[{row};1H{line}").as_bytes());
+    }
+
+    let mut lists = DisplayListPool::default();
+    {
+        let (out, strings) = lists.begin();
+        build_display_list_into(
+            out,
+            strings,
+            &FrameInputs {
+                screen: &screen,
+                bell: false,
+                theme: &theme,
+                metrics,
+                surface,
+                origin: (0, 0),
+                cursor: CursorRender::default(),
+                selection: None,
+                hover: None,
+                preview: None,
+                scale: Scale::ONE,
+                scrollbar: &HIDDEN_SCROLLBAR,
+            },
+        );
+    }
+    let list = lists.back();
+    let mut cache = GlyphCache::default();
+    let mut frame = FrameData::default();
+    let (ns, allocs) = best_of(GATE_ROUNDS, 16, || {
+        build_frame_into(&fonts, list, &mut cache, TextGamma::default(), &mut frame);
+        frame.vertices.len()
+    });
+    Ok(Sample {
+        name: "frame_text_unicode",
         ns,
         allocs,
     })
