@@ -9,6 +9,11 @@ use crate::render::vulkan::renderer::{
 };
 use crate::render::vulkan::{pick_memory_type, Gpu};
 
+/// How long a frame waits on the CPU for the compositor to finish reading its buffer,
+/// when that wait cannot ride the GPU. Past it the frame renders anyway: a frame that may
+/// tear beats a render error, which ends the terminal.
+const ACQUIRE_WAIT_MS: core::ffi::c_int = 1000;
+
 // ---------------------------------------------------------------------------
 // Render targets.
 // ---------------------------------------------------------------------------
@@ -610,7 +615,8 @@ impl Gpu {
         capture: bool,
     ) -> Result<Option<OwnedFd>> {
         self.prepare_frame(img, frame, background, capture)?;
-        let wait_acquire = self.import_acquire(img, release_wait)?;
+        // No release point means the buffer's first frame: nothing has read it yet.
+        let wait_acquire = release_wait.is_some_and(|sync| self.import_acquire(img, sync));
         self.submit_frame_explicit(img, wait_acquire)
     }
 
@@ -736,12 +742,10 @@ impl Gpu {
     }
 
     /// Import `sync` (a sync file) as a temporary payload of the acquire
-    /// semaphore so the submission waits on it; `None` arms no wait. Returns
-    /// whether a wait was armed. Consumes `sync` (Vulkan owns it on success).
-    fn import_acquire(&self, img: &GpuImage, sync: Option<OwnedFd>) -> Result<bool> {
-        let Some(sync) = sync else {
-            return Ok(false);
-        };
+    /// semaphore so the submission waits on it. Returns whether a wait was
+    /// armed; when the driver refuses the import, the CPU waits on `sync` here
+    /// instead. Consumes `sync` (Vulkan owns it on success).
+    fn import_acquire(&self, img: &GpuImage, sync: OwnedFd) -> bool {
         let raw = sync.as_raw_fd();
         let info = VkImportSemaphoreFdInfoKHR {
             s_type: VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
@@ -756,20 +760,25 @@ impl Gpu {
         if r == VK_SUCCESS {
             // Ownership moved to Vulkan; do not let OwnedFd close it.
             core::mem::forget(sync);
-            Ok(true)
+            true
         } else {
-            // Failed import: we keep ownership (sync drops); skip the wait.
-            Ok(false)
+            // Failed import: we keep ownership (sync drops) and wait here.
+            crate::platform::ffi::wait_sync_file(raw, ACQUIRE_WAIT_MS);
+            false
         }
     }
 
     /// The implicit-sync bridge's acquire: the dmabuf's current read/write
-    /// fences become the acquire wait.
+    /// fences become the acquire wait. A kernel that cannot export them is
+    /// waited on the CPU instead.
     fn import_read_fences(&self, img: &GpuImage) -> Result<bool> {
-        self.import_acquire(
-            img,
-            crate::platform::ffi::dmabuf_export_sync_file(img.fd())?,
-        )
+        match crate::platform::ffi::dmabuf_export_sync_file(img.fd())? {
+            Some(sync) => Ok(self.import_acquire(img, sync)),
+            None => {
+                crate::platform::ffi::wait_dmabuf_writable(img.fd(), ACQUIRE_WAIT_MS);
+                Ok(false)
+            }
+        }
     }
 
     /// Export the just-submitted release semaphore as a sync file. `None` when

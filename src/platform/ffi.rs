@@ -642,12 +642,16 @@ pub(crate) fn poll_until(
     }
 }
 
-/// [`poll_until`] on one fd for `POLLIN`, returning the events that fired (none when the
+/// [`poll_until`] on one fd for `events`, returning the events that fired (none when the
 /// deadline passed).
-fn poll_one(fd: RawFd, deadline: Option<Instant>) -> core::result::Result<c_short, c_int> {
+fn poll_one(
+    fd: RawFd,
+    events: c_short,
+    deadline: Option<Instant>,
+) -> core::result::Result<c_short, c_int> {
     let mut pfd = [PollFd {
         fd,
-        events: POLLIN,
+        events,
         revents: 0,
     }];
     poll_until(&mut pfd, deadline)?;
@@ -695,7 +699,7 @@ pub fn read_to_end_bounded(fd: RawFd, budget: Duration, max_bytes: usize) -> Res
         if e != EAGAIN {
             return Err(Error::msg(format!("read failed: errno {e}")));
         }
-        match poll_one(fd, Some(deadline)) {
+        match poll_one(fd, POLLIN, Some(deadline)) {
             Ok(0) => return Err(Error::msg("clipboard owner stopped sending")),
             Ok(_) => {}
             Err(e) => return Err(Error::msg(format!("poll failed: errno {e}"))),
@@ -1101,6 +1105,19 @@ pub fn drm_syncobj_point_to_sync_file(
 /// [`poll_until`]). A caller must still treat a `false` as "not known released" and defer the
 /// free rather than force it.
 pub fn wait_sync_file(fd: RawFd, timeout_ms: c_int) -> bool {
+    wait_for(fd, POLLIN, timeout_ms)
+}
+
+/// Block until every fence on `dmabuf`, the compositor's reads and writes, has signalled, or
+/// `timeout_ms` elapses; returns whether they did. A dmabuf polls `POLLOUT`-ready once it is
+/// safe to write, which reaches the same fences [`dmabuf_export_sync_file`] would export, on
+/// kernels that cannot export them (before Linux 6.0).
+pub fn wait_dmabuf_writable(dmabuf: RawFd, timeout_ms: c_int) -> bool {
+    wait_for(dmabuf, POLLOUT, timeout_ms)
+}
+
+/// Poll `fd` for `events` within `timeout_ms`, retrying on `EINTR` (see [`wait_sync_file`]).
+fn wait_for(fd: RawFd, events: c_short, timeout_ms: c_int) -> bool {
     // A negative timeout is no deadline at all; zero is a deadline already here, which polls
     // once without waiting.
     let deadline = u64::try_from(timeout_ms)
@@ -1108,7 +1125,7 @@ pub fn wait_sync_file(fd: RawFd, timeout_ms: c_int) -> bool {
         .map(|ms| Instant::now() + Duration::from_millis(ms));
     // Any error other than `EINTR` (there is no real one for a valid fd) reports "not
     // signalled".
-    poll_one(fd, deadline).is_ok_and(|revents| revents & POLLIN != 0)
+    poll_one(fd, events, deadline).is_ok_and(|revents| revents & events != 0)
 }
 
 // ---------------------------------------------------------------------------
