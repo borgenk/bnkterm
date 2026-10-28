@@ -287,7 +287,9 @@ impl Screen {
                     return;
                 }
                 if self.prompts.len() >= PROMPT_LIMIT {
-                    self.prompts.remove(0);
+                    // A quarter at once: dropping one mark per new one would shift the
+                    // whole list on every prompt of a flood.
+                    self.prompts.drain(..PROMPT_LIMIT / 4);
                 }
                 self.prompts.push(Prompt {
                     row,

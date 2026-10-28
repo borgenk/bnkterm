@@ -1094,6 +1094,30 @@ fn a_prompt_redrawn_in_place_is_still_the_same_prompt() {
 }
 
 #[test]
+fn a_flood_of_prompts_stays_bounded_and_keeps_the_newest() {
+    // A shell in a loop can mark a prompt on every line forever. The list must stop
+    // growing, and what it forgets must be the oldest marks.
+    let mut s = Screen::new(20, 4);
+    for _ in 0..PROMPT_LIMIT * 2 {
+        feed(&mut s, b"\x1b]133;A\x07\r\n");
+    }
+    feed(&mut s, b"\x1b]133;A\x07");
+
+    let rows: Vec<u64> = s.prompts().iter().map(|p| p.row.0).collect();
+    assert!(rows.len() <= PROMPT_LIMIT, "{} marks kept", rows.len());
+    assert!(rows.len() > PROMPT_LIMIT / 2, "{} marks kept", rows.len());
+    assert_eq!(
+        rows.last(),
+        Some(&s.cursor_abs_row().0),
+        "the newest mark is kept"
+    );
+    assert!(
+        rows.windows(2).all(|w| w[1] == w[0] + 1),
+        "the kept marks are the newest run, with none missing"
+    );
+}
+
+#[test]
 fn a_prompt_is_marked_on_the_cursor_row_even_while_the_view_is_scrolled_back() {
     // The shell marks a prompt when it prints one, and that is wherever the *cursor*
     // is — which has nothing to do with what the user happens to be looking at. Run a

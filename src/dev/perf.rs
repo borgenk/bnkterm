@@ -223,6 +223,9 @@ fn measure() -> Result<Vec<Sample>> {
     // capacity high-water instead.
     let combining_chunk = repeated_lines("a\u{0301}\u{0302}", 40, 24);
     let emoji_chunk = repeated_lines("🇳🇴", 40, 24);
+    // A shell marking a prompt (`OSC 133;A`) on every line. Warmed past the number of marks
+    // the grid remembers, so every mark here evicts old ones.
+    let prompt_chunk = b"\x1b]133;A\x07\r\n".repeat(CHUNK / 10);
 
     let mut samples = vec![
         stream_scenario("parse_ascii", &ascii, 128),
@@ -233,6 +236,7 @@ fn measure() -> Result<Vec<Sample>> {
         stream_scenario("grid_scroll_dense", &scroll_dense_chunk, 128),
         stream_scenario("grid_combining", &combining_chunk, 128),
         stream_scenario("grid_emoji", &emoji_chunk, 128),
+        stream_scenario("grid_prompts", &prompt_chunk, 128),
         frame_tabbar_scenario()?,
         frame_damage_scenario(),
         frame_damage_scroll_scenario(),

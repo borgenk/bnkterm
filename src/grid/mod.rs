@@ -1266,9 +1266,10 @@ pub struct Prompt {
     pub exit: Option<i32>,
 }
 
-/// How many prompts to remember. The shell writes these, and a shell in a loop is still a
-/// program the terminal must not let grow its memory without bound. Far more than a
-/// scrollback's worth of prompts, so in practice the ring ages them out first.
+/// The most prompts to remember; past it the oldest quarter is forgotten. The shell writes
+/// these, and a shell in a loop is still a program the terminal must not let grow its
+/// memory without bound. Far more than a scrollback's worth of prompts, so in practice the
+/// ring ages them out first.
 const PROMPT_LIMIT: usize = 4096;
 
 /// The cell a grapheme cluster is being built in, and where the cursor was left after it.
