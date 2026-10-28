@@ -126,12 +126,11 @@ pub(super) const VK_IMAGE_USAGE_TRANSFER_SRC_BIT: u32 = 0x1;
 pub(super) const VK_IMAGE_USAGE_TRANSFER_DST_BIT: u32 = 0x2;
 pub(super) const VK_IMAGE_USAGE_SAMPLED_BIT: u32 = 0x4;
 pub(super) const VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT: u32 = 0x10;
-/// The format features a presentable image's modifier must support: rendering
-/// plus both transfer directions (the screenshot readback uses the source
-/// direction; clears use the destination).
+/// The format features a presentable image's modifier is checked for: drawing
+/// with blending through the sRGB view, and the screenshot readback's copy.
 pub(super) const VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT: u32 = 0x80;
+pub(super) const VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT: u32 = 0x100;
 pub(super) const VK_FORMAT_FEATURE_TRANSFER_SRC_BIT: u32 = 0x4000;
-pub(super) const VK_FORMAT_FEATURE_TRANSFER_DST_BIT: u32 = 0x8000;
 
 pub(super) const VK_IMAGE_LAYOUT_UNDEFINED: u32 = 0;
 /// The layout the image is handed to the compositor in: the only layout
