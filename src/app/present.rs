@@ -337,9 +337,24 @@ impl GpuPresentation {
     /// Everything at rest, but for the text gamma the window resolved from the
     /// environment at startup (see `app::config_text_gamma`).
     pub(super) fn with_gamma(text_gamma: gpu::TextGamma) -> Self {
-        Self {
-            text_gamma,
-            ..Self::default()
+        let mut presentation = Self::default();
+        presentation.text_gamma = text_gamma;
+        presentation
+    }
+}
+
+impl Drop for GpuPresentation {
+    /// The images, live and retired, are the device's children and must go before it
+    /// (VUID-vkDestroyDevice-device-05137). The backend is an earlier field, so it would
+    /// otherwise drop first.
+    fn drop(&mut self) {
+        let Some(gpu) = &self.backend else {
+            return;
+        };
+        gpu.wait_idle();
+        let retired = self.retired.drain(..).map(|retired| retired.image);
+        for image in self.images.drain(..).chain(retired) {
+            gpu.destroy_image(image);
         }
     }
 }
