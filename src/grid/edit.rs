@@ -15,7 +15,7 @@
 // The grid's shared vocabulary: the types in `grid/mod.rs` and the imports it makes.
 // `Screen`'s operations are split across these sibling modules, so each one works on
 // the same definitions rather than re-importing them piecemeal.
-use crate::grid::buffer::{Charsets, Cursor, Pen, Saved, Scrolled};
+use crate::grid::buffer::{Charsets, Cursor, Pen, Saved};
 use crate::grid::*;
 
 impl Screen {
@@ -26,32 +26,40 @@ impl Screen {
     }
 
     /// LF / IND: move down one row, scrolling the region up at the bottom margin.
+    ///
+    /// The blank is made only when the region scrolls, here and in
+    /// [`Screen::reverse_index`]: on a coloured background it costs an intern, and an
+    /// intern into a full style table sweeps it.
     pub(super) fn line_feed(&mut self) {
-        let blank = self.blank_cell();
         let b = self.active_mut();
         b.cursor.pending_wrap = false;
-        let mut scrolled = Scrolled::default();
-        if b.cursor.row == b.scroll_bottom {
-            let (top, bottom) = (b.scroll_top, b.scroll_bottom);
-            scrolled = b.scroll_up_range(top, bottom, 1, blank, top == 0);
-        } else if b.cursor.row + 1 < b.rows {
-            b.cursor.row += 1;
+        if b.cursor.row != b.scroll_bottom {
+            if b.cursor.row + 1 < b.rows {
+                b.cursor.row += 1;
+            }
+            return;
         }
+        let blank = self.blank_cell();
+        let b = self.active_mut();
+        let (top, bottom) = (b.scroll_top, b.scroll_bottom);
+        let scrolled = b.scroll_up_range(top, bottom, 1, blank, top == 0);
         self.after_scroll(scrolled);
     }
 
     /// RI: move up one row, scrolling the region down at the top margin.
     pub(super) fn reverse_index(&mut self) {
-        let blank = self.blank_cell();
         let b = self.active_mut();
         b.cursor.pending_wrap = false;
-        let mut scrolled = Scrolled::default();
-        if b.cursor.row == b.scroll_top {
-            let (top, bottom) = (b.scroll_top, b.scroll_bottom);
-            scrolled = b.scroll_down_range(top, bottom, 1, blank);
-        } else if b.cursor.row > 0 {
-            b.cursor.row -= 1;
+        if b.cursor.row != b.scroll_top {
+            if b.cursor.row > 0 {
+                b.cursor.row -= 1;
+            }
+            return;
         }
+        let blank = self.blank_cell();
+        let b = self.active_mut();
+        let (top, bottom) = (b.scroll_top, b.scroll_bottom);
+        let scrolled = b.scroll_down_range(top, bottom, 1, blank);
         self.after_scroll(scrolled);
     }
 

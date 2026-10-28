@@ -456,6 +456,37 @@ fn line_feed_at_bottom_scrolls_into_scrollback() {
 }
 
 #[test]
+fn only_a_scroll_paints_the_pen_background_into_a_row() {
+    let row_bg =
+        |s: &Screen, row: usize| -> Vec<Color> { (0..4).map(|c| s.cell(row, c).bg).collect() };
+    let mut s = Screen::new(4, 3);
+    feed(&mut s, b"\x1b[44m\n");
+    assert_eq!(
+        row_bg(&s, 1),
+        [Color::Default; 4],
+        "LF onto a row leaves its colour"
+    );
+    feed(&mut s, b"\n\n");
+    assert_eq!(
+        row_bg(&s, 2),
+        [Color::Ansi(4); 4],
+        "LF at the bottom fills the new row"
+    );
+    feed(&mut s, b"\x1b[41m\x1b[2;1H\x1bM");
+    assert_eq!(
+        row_bg(&s, 0),
+        [Color::Default; 4],
+        "RI onto a row leaves its colour"
+    );
+    feed(&mut s, b"\x1bM");
+    assert_eq!(
+        row_bg(&s, 0),
+        [Color::Ansi(1); 4],
+        "RI at the top fills the new row"
+    );
+}
+
+#[test]
 fn the_scrollbar_reads_the_view_as_a_scroll_down_from_the_oldest_line() {
     // Three lines retired into history behind a 2-row screen: 5 lines of content, a
     // 2-line viewport, so the view can scroll 3.

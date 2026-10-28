@@ -233,6 +233,11 @@ fn measure() -> Result<Vec<Sample>> {
         .chain((0..40).filter_map(|i| char::from_u32(0x0300 + i)))
         .collect();
     zalgo_chunk.extend_from_slice(zalgo_cell.repeat(BENCH_COLS).as_bytes());
+    // Newlines on a coloured background that walk down from the home row and never reach
+    // the bottom margin, so none of them scrolls.
+    let mut newline_bg_unit = b"\x1b[44m\x1b[H".to_vec();
+    newline_bg_unit.resize(newline_bg_unit.len() + BENCH_ROWS - 1, b'\n');
+    let newline_bg_chunk = newline_bg_unit.repeat(CHUNK / newline_bg_unit.len());
 
     let mut samples = vec![
         stream_scenario("parse_ascii", &ascii, 128),
@@ -245,6 +250,7 @@ fn measure() -> Result<Vec<Sample>> {
         stream_scenario("grid_emoji", &emoji_chunk, 128),
         stream_scenario("grid_prompts", &prompt_chunk, 128),
         stream_scenario("grid_zalgo", &zalgo_chunk, 8),
+        stream_scenario("grid_newline_bg", &newline_bg_chunk, 128),
         frame_tabbar_scenario()?,
         frame_damage_scenario(),
         frame_damage_scroll_scenario(),
