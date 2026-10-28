@@ -850,9 +850,12 @@ impl Gpu {
                 image: img.image,
                 subresource_range: range,
             };
+            // The acquire semaphore is waited at COLOR_ATTACHMENT_OUTPUT. Starting the
+            // barrier at that stage chains it to the wait, so the transition runs after the
+            // compositor's reads are done.
             (f.cmd_pipeline_barrier)(
                 img.cmd,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                 0,
                 0,
