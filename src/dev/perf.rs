@@ -235,6 +235,7 @@ fn measure() -> Result<Vec<Sample>> {
         stream_scenario("grid_emoji", &emoji_chunk, 128),
         frame_tabbar_scenario()?,
         frame_damage_scenario(),
+        frame_damage_scroll_scenario(),
         grid_reflow_scenario()?,
         link_preview_scenario()?,
     ];
@@ -538,6 +539,84 @@ fn frame_damage_scenario() -> Sample {
     let (ns, allocs) = best_of(GATE_ROUNDS, 8192, &mut diff);
     Sample {
         name: "frame_damage",
+        ns,
+        allocs,
+    }
+}
+
+/// Diff two frames of a full-screen colour scroll: every cell in its own truecolour, as
+/// `lolcat` paints, and the second frame one line further on. Each cell is its own run
+/// and every run moves, so the diff hands the merge two overlapping rectangles per cell,
+/// about 19k, which must still collapse to one full-surface repaint cheaply.
+fn frame_damage_scroll_scenario() -> Sample {
+    use crate::color::Theme;
+    use crate::render::display::{damage_into, DisplayList};
+    use crate::term_render::{build_display_list_into, CellMetrics, CursorRender, FrameInputs};
+
+    const METRICS: CellMetrics = CellMetrics {
+        size: 16,
+        w: 8,
+        h: 16,
+        baseline: 12,
+        ascent: 12,
+        descent: 4,
+        lock_glyph: true,
+    };
+    let surface = (BENCH_COLS as i32 * METRICS.w, BENCH_ROWS as i32 * METRICS.h);
+    let theme = Theme::default();
+    let frame = |screen: &Screen| {
+        let mut out = DisplayList::new();
+        build_display_list_into(
+            &mut out,
+            &mut Vec::new(),
+            &FrameInputs {
+                screen,
+                bell: false,
+                theme: &theme,
+                metrics: METRICS,
+                surface,
+                origin: (0, 0),
+                cursor: CursorRender::default(),
+                selection: None,
+                hover: None,
+                preview: None,
+                scale: Scale::ONE,
+                scrollbar: &HIDDEN_SCROLLBAR,
+            },
+        );
+        out
+    };
+    // No cell shares its colour with its neighbours or the cells above and below it.
+    let rainbow = |first: usize, lines: usize| {
+        let mut out = Vec::new();
+        for n in first..first + lines {
+            for c in 0..BENCH_COLS {
+                let (r, g, b) = ((n * 8 + c * 4) % 256, (n * 4 + c * 8) % 256, (c * 2) % 256);
+                out.extend_from_slice(format!("\x1b[38;2;{r};{g};{b}m#").as_bytes());
+            }
+            out.extend_from_slice(b"\x1b[0m\r\n");
+        }
+        out
+    };
+
+    let mut screen = Screen::new(BENCH_COLS, BENCH_ROWS);
+    let mut parser = Parser::new();
+    parser.advance_bytes(&mut screen, &rainbow(0, BENCH_ROWS));
+    let old = frame(&screen);
+    parser.advance_bytes(&mut screen, &rainbow(BENCH_ROWS, 1));
+    let new = frame(&screen);
+
+    let mut scratch = Vec::new();
+    let mut diff = || {
+        damage_into(&old, &new, surface.0, surface.1, &mut scratch);
+        scratch.len()
+    };
+    for _ in 0..4 {
+        black_box(diff());
+    }
+    let (ns, allocs) = best_of(GATE_ROUNDS, 32, &mut diff);
+    Sample {
+        name: "frame_damage_scroll",
         ns,
         allocs,
     }

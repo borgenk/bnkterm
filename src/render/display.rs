@@ -31,6 +31,11 @@ pub type DisplayList = Vec<DrawCmd>;
 /// cheaper than tracking and clipping each one.
 const MAX_DAMAGE_RECTS: usize = 16;
 
+/// Beyond this many changed regions, the frame repaints whole without merging them,
+/// since merging takes time quadratic in the count. A full-width row with a colour per
+/// cell still merges; a full-screen colour scroll, about 19k regions, does not.
+const MAX_MERGE_RECTS: usize = 256;
+
 /// The horizontal span over which a [`DrawCmd::Text`] run's ink ramps away to
 /// nothing, in screen pixels: full ink at [`from`](Self::from) and to the left of
 /// it, none at [`to`](Self::to) and beyond. The tab bar's only use of it is a
@@ -192,10 +197,13 @@ pub fn damage_into(old: &[DrawCmd], new: &[DrawCmd], width: i32, height: i32, ou
         new[paired..].iter().for_each(&mut damage_bounds);
     }
 
-    coalesce(out);
-    let area: i64 = out.iter().map(|r| r.w as i64 * r.h as i64).sum();
     let surface_area = surface.w as i64 * surface.h as i64;
-    if out.len() > MAX_DAMAGE_RECTS || area * 2 > surface_area {
+    let whole = out.len() > MAX_MERGE_RECTS || {
+        coalesce(out);
+        let area: i64 = out.iter().map(|r| r.w as i64 * r.h as i64).sum();
+        out.len() > MAX_DAMAGE_RECTS || area * 2 > surface_area
+    };
+    if whole {
         // A near-total change: drop the many small rectangles and repaint whole,
         // reusing the buffer rather than allocating a one-element vector.
         out.clear();
@@ -216,8 +224,8 @@ pub fn damage(old: &[DrawCmd], new: &[DrawCmd], width: i32, height: i32) -> Vec<
 }
 
 /// Merge any two overlapping rectangles into their bounding box, repeated until
-/// none overlap, so a region is never cleared and repainted twice. The damage set
-/// is tiny in practice, so the quadratic scan never matters.
+/// none overlap, so a region is never cleared and repainted twice. It sees at most
+/// [`MAX_MERGE_RECTS`] rectangles, which keeps the quadratic scan cheap.
 fn coalesce(rects: &mut Vec<Rect>) {
     let mut merged = true;
     while merged {
