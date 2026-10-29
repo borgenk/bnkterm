@@ -514,13 +514,6 @@ pub struct Face {
     /// dominates the rebuild a selection drag triggers each frame. Interior
     /// mutability so measuring through a shared `&Face` can fill it.
     advances: RefCell<HashMap<char, f32>>,
-    /// Glyph-cache hit and miss tallies, reported by the GPU batcher (which owns
-    /// the atlas-placement cache) via [`Self::record_glyph_hit`] and
-    /// [`Self::record_glyph_miss`]. Pure instrumentation (see [`CacheStats`]): a
-    /// near-zero steady-state miss rate is the evidence that the cache is doing
-    /// its job rather than thrashing.
-    hits: Cell<u64>,
-    misses: Cell<u64>,
     /// The pixel size this face was opened at, recorded by `set_pixel_size`.
     /// The emoji face scales its color glyphs to this so an emoji sits on the
     /// same em square as the surrounding text.
@@ -530,37 +523,6 @@ pub struct Face {
     /// face-only tests, in which case emoji clusters take the per-character
     /// path (tofu, exactly the pre-emoji behavior).
     emoji: Option<Rc<EmojiFont>>,
-}
-
-/// A snapshot of a glyph cache's hit and miss tallies. Summing these across every
-/// face turns "scrolling feels smooth" into a number: once the working set is
-/// packed into the GPU atlas, steady-state frames add hits and almost no misses.
-#[derive(Clone, Copy, Default)]
-pub struct CacheStats {
-    pub hits: u64,
-    pub misses: u64,
-}
-
-impl CacheStats {
-    fn merge(self, other: Self) -> Self {
-        Self {
-            hits: self.hits + other.hits,
-            misses: self.misses + other.misses,
-        }
-    }
-
-    /// Total lookups (hits + misses).
-    pub fn lookups(self) -> u64 {
-        self.hits + self.misses
-    }
-
-    /// Fraction of lookups served from the cache, 0.0 when nothing was looked up.
-    pub fn hit_rate(self) -> f32 {
-        match self.lookups() {
-            0 => 0.0,
-            total => self.hits as f32 / total as f32,
-        }
-    }
 }
 
 /// How a glyph loads, whether to measure it or to draw it, so the pen moves by the
@@ -631,8 +593,6 @@ impl Face {
             face,
             _data: data,
             advances: RefCell::new(HashMap::new()),
-            hits: Cell::new(0),
-            misses: Cell::new(0),
             pixel_size: Cell::new(0),
             emoji: None,
         })
@@ -651,43 +611,6 @@ impl Face {
             return Err(Error::msg("FT_Set_Pixel_Sizes failed"));
         }
         Ok(())
-    }
-
-    /// Record that the GPU batcher served a scalar glyph from its atlas cache
-    /// (the glyph was already packed). Pure instrumentation.
-    pub fn record_glyph_hit(&self) {
-        self.hits.set(self.hits.get() + 1);
-    }
-
-    /// Record that the GPU batcher had to rasterize and pack a scalar glyph (its
-    /// first sight of the character). Pure instrumentation.
-    pub fn record_glyph_miss(&self) {
-        self.misses.set(self.misses.get() + 1);
-    }
-
-    /// Forward a color-cluster cache hit to the shared emoji font, so its tally
-    /// rolls up through [`Fonts::cache_stats`] alongside the scalar counts. A
-    /// no-op when no emoji font is installed.
-    pub fn record_cluster_hit(&self) {
-        if let Some(emoji) = &self.emoji {
-            emoji.record_hit();
-        }
-    }
-
-    /// Forward a color-cluster cache miss (a first-time raster) to the shared
-    /// emoji font. A no-op when no emoji font is installed.
-    pub fn record_cluster_miss(&self) {
-        if let Some(emoji) = &self.emoji {
-            emoji.record_miss();
-        }
-    }
-
-    /// This face's cumulative glyph-cache hit and miss counts.
-    pub fn cache_stats(&self) -> CacheStats {
-        CacheStats {
-            hits: self.hits.get(),
-            misses: self.misses.get(),
-        }
     }
 
     /// Rasterize a character at the current pixel size, copying the coverage
@@ -920,21 +843,6 @@ struct SizedFaces {
 }
 
 impl SizedFaces {
-    /// Every face this size actually opened: the regular face plus whichever
-    /// variants, UI faces, and fallback faces exist. Used to roll up cache stats
-    /// across faces.
-    fn faces(&self) -> impl Iterator<Item = &Face> {
-        std::iter::once(&self.regular)
-            .chain(self.bold.as_ref())
-            .chain(self.italic.as_ref())
-            .chain(self.bold_italic.as_ref())
-            .chain(std::iter::once(&self.ui_regular))
-            .chain(self.ui_medium.as_ref())
-            .chain(self.ui_bold.as_ref())
-            .chain(self.fallback.iter())
-            .map(Rc::as_ref)
-    }
-
     /// The face the system offered for `ch`, opened at this size, or `None` when nothing
     /// installed can draw it. Memoized both ways: once per character, and once per font
     /// file behind it.
@@ -979,9 +887,6 @@ impl SizedFaces {
 /// lookup can never fail and never panics.
 pub struct Fonts {
     sized: Vec<SizedFaces>,
-    /// The color emoji font, opened once and shared by every face, or `None`
-    /// when no emoji font is installed (emoji then render as tofu, as before).
-    emoji: Option<Rc<EmojiFont>>,
     /// The lazily ranked system fallback set. The inner `None` means fontconfig was
     /// unavailable; selected and explicit fallback faces remain usable.
     fc: OnceCell<Option<Fontconfig>>,
@@ -1074,7 +979,6 @@ impl Fonts {
         }
         Ok(Self {
             sized,
-            emoji,
             fc: OnceCell::new(),
         })
     }
@@ -1191,21 +1095,6 @@ impl Fonts {
     /// The metrics for `size`, or the fallback's metrics if `size` was not opened.
     pub fn metrics(&self, size: u32) -> Metrics {
         self.entry(size).metrics
-    }
-
-    /// Glyph-cache hits and misses summed over every open face (the emoji
-    /// font's cluster cache included), for frame-loop instrumentation.
-    pub fn cache_stats(&self) -> CacheStats {
-        let emoji = self
-            .emoji
-            .as_ref()
-            .map(|e| e.cache_stats())
-            .unwrap_or_default();
-        self.sized
-            .iter()
-            .flat_map(SizedFaces::faces)
-            .map(Face::cache_stats)
-            .fold(emoji, CacheStats::merge)
     }
 }
 
@@ -1517,41 +1406,6 @@ mod tests {
         assert_eq!(a.rows, b.rows);
         assert_eq!(a.advance, b.advance);
         assert_eq!(a.coverage, b.coverage);
-    }
-
-    #[test]
-    fn cache_stats_count_misses_then_hits() {
-        let face = open();
-        // A fresh face has been reported no lookups.
-        assert_eq!(face.cache_stats().lookups(), 0);
-        // The GPU batcher reports a miss the first time it packs a glyph into the
-        // atlas and a hit on every later frame that reuses the slot.
-        face.record_glyph_miss();
-        face.record_glyph_miss();
-        face.record_glyph_hit();
-        face.record_glyph_hit();
-        let stats = face.cache_stats();
-        assert_eq!(stats.misses, 2);
-        assert_eq!(stats.hits, 2);
-        assert!((stats.hit_rate() - 0.5).abs() < 1e-6, "2 hits of 4 lookups");
-    }
-
-    #[test]
-    fn fonts_cache_stats_sum_across_faces() {
-        let fonts = Fonts::new(&[16, 24]).expect("a default font should be available");
-        assert_eq!(fonts.cache_stats().lookups(), 0);
-        // Report through two different sizes (hence different faces); the rolled-up
-        // tally must see both faces' counts.
-        let regular = |size| FaceKey::Prose {
-            size,
-            style: FontStyle::Regular,
-        };
-        fonts.face_for(regular(16)).record_glyph_miss();
-        fonts.face_for(regular(24)).record_glyph_miss();
-        fonts.face_for(regular(16)).record_glyph_hit();
-        let stats = fonts.cache_stats();
-        assert_eq!(stats.misses, 2);
-        assert_eq!(stats.hits, 1);
     }
 
     #[test]

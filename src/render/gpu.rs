@@ -479,6 +479,29 @@ impl EmojiFit {
     }
 }
 
+/// The glyph cache's hit and miss tallies, for `--stats`. Once the working set is
+/// packed into the atlas, steady-state frames add hits and almost no misses.
+#[derive(Clone, Copy, Default)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl CacheStats {
+    /// Total lookups (hits + misses).
+    pub fn lookups(self) -> u64 {
+        self.hits + self.misses
+    }
+
+    /// Fraction of lookups served from the cache, 0.0 when nothing was looked up.
+    pub fn hit_rate(self) -> f32 {
+        match self.lookups() {
+            0 => 0.0,
+            total => self.hits as f32 / total as f32,
+        }
+    }
+}
+
 pub struct GlyphCache {
     pub glyphs: Atlas,
     pub emoji: Atlas,
@@ -526,6 +549,8 @@ pub struct GlyphCache {
     /// The most records `scalar_slots`, or one face's map of clusters, holds before
     /// it is dropped: [`MAX_GLYPH_CACHE`], or less in tests that need to overflow one.
     max_records: usize,
+    /// Hits and misses across the scalar, box and emoji lookups since the cache was made.
+    stats: CacheStats,
 }
 
 impl Default for GlyphCache {
@@ -541,11 +566,17 @@ impl Default for GlyphCache {
             cluster_slots: HashMap::new(),
             cell_cluster_slots: HashMap::new(),
             max_records: MAX_GLYPH_CACHE,
+            stats: CacheStats::default(),
         }
     }
 }
 
 impl GlyphCache {
+    /// Hits and misses since the cache was made.
+    pub fn stats(&self) -> CacheStats {
+        self.stats
+    }
+
     /// The direct-mapped index for a printable-ASCII scalar, or `None` for anything
     /// else (which belongs in [`Self::scalar_slots`]). The partition is total: a
     /// character is direct-mapped or hashed, never both, so the two can never
@@ -968,21 +999,18 @@ impl Batcher<'_> {
     /// glyph is rasterized from [`Fonts::glyph_face`], so a scalar the keyed face
     /// lacks (a Nerd Font icon, a stray symbol) inks from a fallback face instead
     /// of the `.notdef` box; the `(key, ch)` cache key stays unique because that
-    /// resolution is deterministic. A cache hit records against the keyed face
-    /// and never re-resolves, so steady-state frames pay no fallback cost. The
-    /// atlas cache is the only glyph raster cache, so its hit and miss are
-    /// reported to the face for the frame stats.
+    /// resolution is deterministic. A cache hit never re-resolves, so
+    /// steady-state frames pay no fallback cost.
     fn packed_scalar(&mut self, face_key: FaceKey, ch: char) -> PackedGlyph {
-        let primary = self.fonts.face_for(face_key);
         if let Some(packed) = self.cache.ascii_get(face_key, ch) {
-            primary.record_glyph_hit();
+            self.cache.stats.hits += 1;
             return packed;
         }
         if let Some(&packed) = self.cache.scalar_slots.get(&(face_key, ch)) {
-            primary.record_glyph_hit();
+            self.cache.stats.hits += 1;
             return packed;
         }
-        primary.record_glyph_miss();
+        self.cache.stats.misses += 1;
         let g = self.fonts.glyph_face(face_key, ch).rasterize(ch);
         let atlas = &mut self.cache.glyphs;
         let packed = PackedGlyph {
@@ -1013,12 +1041,11 @@ impl Batcher<'_> {
         h: i32,
         baseline_offset: i32,
     ) -> PackedGlyph {
-        let primary = self.fonts.face_for(face_key);
         if let Some(&packed) = self.cache.box_slots.get(&(face_key, ch)) {
-            primary.record_glyph_hit();
+            self.cache.stats.hits += 1;
             return packed;
         }
-        primary.record_glyph_miss();
+        self.cache.stats.misses += 1;
         let cov = boxdraw::coverage(ch, w.max(0) as usize, h.max(0) as usize);
         let packed = PackedGlyph {
             slot: self
@@ -1039,9 +1066,8 @@ impl Batcher<'_> {
     /// The cached placement for an emoji cluster, or `None` when the cluster is
     /// not color emoji and the caller should draw its characters instead. The
     /// raster is packed into the color atlas on first sight and the decision
-    /// cached, so a steady-state frame neither re-shapes nor touches the `Face`
-    /// (beyond reporting the atlas hit for the frame stats). Non-emoji clusters
-    /// are not tallied, matching the pre-atlas emoji-cache accounting.
+    /// cached, so a steady-state frame neither re-shapes nor touches the `Face`.
+    /// Only emoji count toward the stats.
     ///
     /// `fit` is the size the caller's path draws at, and picks the map: the same
     /// cluster can arrive on both paths, and each keeps its own raster.
@@ -1066,7 +1092,7 @@ impl Batcher<'_> {
             .and_then(|by| by.get(cluster))
         {
             if packed.is_some() {
-                face.record_cluster_hit();
+                self.cache.stats.hits += 1;
             }
             return packed;
         }
@@ -1080,7 +1106,7 @@ impl Batcher<'_> {
                 advance: g.advance,
             });
         if packed.is_some() {
-            face.record_cluster_miss();
+            self.cache.stats.misses += 1;
         }
         self.cache.cache_cluster(fit, face_key, cluster, packed);
         packed
@@ -1608,6 +1634,40 @@ mod tests {
         );
         let clusters: usize = cache.cluster_slots.values().map(|m| m.len()).sum();
         assert_eq!(clusters, 1, "only the emoji is in the map");
+    }
+
+    /// One glyph on each lookup path: an emoji, then an ASCII letter, a box-drawing
+    /// glyph and an accented letter on the grid. The first frame packs all four and the
+    /// same frame again finds all four.
+    #[test]
+    fn stats_count_each_lookup_path() {
+        let fonts = Fonts::new(&[16]).expect("default font");
+        let mut cache = GlyphCache::default();
+        let mut list = prose("😀");
+        list.push(DrawCmd::Cells {
+            bounds: Rect {
+                x: 0,
+                y: 20,
+                w: 100,
+                h: 20,
+            },
+            x: 0,
+            baseline: 36,
+            cell_w: 10,
+            face: FaceKey::Prose {
+                size: 16,
+                style: crate::platform::freetype::FontStyle::Regular,
+            },
+            color: 0x00ff_ffff,
+            bg: 0,
+            text: "a─é".to_string(),
+        });
+        build_frame(&fonts, &list, &mut cache, GAMMA);
+        let first = cache.stats();
+        assert_eq!((first.hits, first.misses), (0, 4), "a cold frame misses");
+        build_frame(&fonts, &list, &mut cache, GAMMA);
+        let second = cache.stats();
+        assert_eq!((second.hits, second.misses), (4, 4), "a warm frame hits");
     }
 
     /// The two stores must partition the characters between them: direct-mapped or

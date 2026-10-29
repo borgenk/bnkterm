@@ -964,7 +964,7 @@ impl State {
     /// time, the gap since the last present, the glyph-cache hit rate, and which
     /// sync strategy carried the frame.
     fn log_frame_stats(&self, started: Instant) {
-        let cache = self.fonts.cache_stats();
+        let cache = self.presentation.glyphs.stats();
         let gap = self
             .presentation
             .last_present
