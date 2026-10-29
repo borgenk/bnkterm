@@ -79,6 +79,12 @@ const OUT_QUEUE_MAX: usize = 1024 * 1024;
 /// bound. 64 KiB bounds the waste and the copying at once.
 const OUT_COMPACT_AT: usize = 64 * 1024;
 
+/// The most capacity `key_buf` and an emptied `out_buf` keep. A paste of up to 16 MiB
+/// grows both to its size; past this they give it back once the paste is queued and once
+/// it is written, rather than holding it for the life of the tab. A reply batch is at
+/// most 64 KiB, so ordinary traffic never shrinks and regrows.
+const BUF_KEEP: usize = 64 * 1024;
+
 /// How long the visual bell lasts. Long enough to catch the eye, short enough that a
 /// program ringing the bell in a loop reads as a flicker and not a strobe. Only ever
 /// seen while unfocused (see [`TerminalCore::after_output`]), so it is genuinely an "over here"
@@ -796,8 +802,12 @@ impl TerminalCore {
         // highlight going away does not retract what middle-click pastes.
         self.end_selection_on_input();
         self.snap_to_bottom();
-        self.send_key_buf()?;
-        Ok(())
+        let sent = self.send_key_buf();
+        if self.key_buf.capacity() > BUF_KEEP {
+            self.key_buf.clear();
+            self.key_buf.shrink_to(BUF_KEEP);
+        }
+        sent
     }
 
     /// The terminal half of a pointer event: report it to a program grabbing the
@@ -1408,8 +1418,7 @@ impl TerminalCore {
         let Some(pty) = &self.pty else {
             // Demo mode, or a tab whose child is gone: there is nobody to write to, and
             // holding the bytes would keep the fd registered for a wake that never comes.
-            self.out_buf.clear();
-            self.out_head = 0;
+            self.empty_out_buf();
             return Ok(());
         };
         while self.out_head < self.out_buf.len() {
@@ -1420,8 +1429,7 @@ impl TerminalCore {
             self.out_head += n;
         }
         if self.out_head == self.out_buf.len() {
-            self.out_buf.clear();
-            self.out_head = 0;
+            self.empty_out_buf();
         } else if self.out_head >= OUT_COMPACT_AT {
             // Reclaim the written prefix. Deferred to a threshold so a stalled child
             // costs one memmove per that many bytes, not one per partial write.
@@ -1429,6 +1437,13 @@ impl TerminalCore {
             self.out_head = 0;
         }
         Ok(())
+    }
+
+    /// Empty the outbound queue, keeping at most [`BUF_KEEP`] of its capacity.
+    fn empty_out_buf(&mut self) {
+        self.out_buf.clear();
+        self.out_buf.shrink_to(BUF_KEEP);
+        self.out_head = 0;
     }
 
     /// Whether this tab still owes the child bytes, so the event loop should watch its
@@ -2267,7 +2282,30 @@ mod tests {
             let _ = core.pump(1 << 20, Instant::now() + Duration::from_millis(20));
             std::thread::sleep(Duration::from_millis(1));
         }
+        assert!(
+            core.out_buf.capacity() <= BUF_KEEP,
+            "the written queue kept {} bytes",
+            core.out_buf.capacity()
+        );
         let _ = core.into_child();
+    }
+
+    /// A paste grows the key buffer and the outbound queue to its size. Kept, one 16 MiB
+    /// paste would stay held for the life of the tab.
+    #[test]
+    fn a_large_paste_gives_its_size_back() {
+        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
+        core.paste(vec![b'x'; 2 * 1024 * 1024]).expect("paste");
+        assert!(
+            core.key_buf.capacity() <= BUF_KEEP,
+            "key_buf kept {} bytes",
+            core.key_buf.capacity()
+        );
+        assert!(
+            core.out_buf.capacity() <= BUF_KEEP,
+            "out_buf kept {} bytes",
+            core.out_buf.capacity()
+        );
     }
 
     #[test]
