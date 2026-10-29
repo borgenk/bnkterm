@@ -784,8 +784,10 @@ impl Tabs {
         }
     }
 
+    /// Lay the bar out again, or empty it while it is hidden: nothing paints or hit
+    /// tests a hidden bar, and the tab that brings it back calls this again.
     fn rebuild_bar(&mut self) {
-        if self.entries.is_empty() {
+        if !self.shows_bar() {
             self.bar_slots.clear();
             return;
         }
@@ -1421,6 +1423,33 @@ mod tests {
             .take_outbox()
             .into_iter()
             .any(|message| matches!(message, ToWindow::Title(title) if title == "background job")));
+    }
+
+    /// One tab hides the bar, so its title changes leave the bar alone. The tab that
+    /// brings the bar back has to lay it out with the title set in the meantime.
+    #[test]
+    fn a_title_set_while_the_bar_is_hidden_shows_when_it_returns() {
+        let mut tabs = Tabs::new(
+            core(true, 40, 10),
+            TabBarConfig::default(),
+            Rc::new(Theme::default()),
+            Hostname::default(),
+            Launch::new(vec!["/bin/cat".to_string()], Target::Local),
+            ShellStartupConfig::default(),
+        );
+        tabs.active_mut().feed_test_bytes(b"\x1b]2;build\x07");
+        tabs.take_outbox();
+        if tabs.open(geom(40, 10), false).is_err() {
+            eprintln!("second PTY unavailable; skipping");
+            return;
+        }
+        let titles: Vec<_> = tabs
+            .bar_slots
+            .iter()
+            .map(|slot| slot.title.as_str())
+            .collect();
+        assert_eq!(titles.first(), Some(&"build"));
+        assert_eq!(titles.len(), 2);
     }
 
     #[test]
