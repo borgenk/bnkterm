@@ -1048,6 +1048,7 @@ fn is_c0(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::dev::fuzz::Rng;
     use crate::vt::*;
 
     /// A recording [`Perform`]: a real implementation that logs the callbacks,
@@ -1787,16 +1788,12 @@ mod tests {
     #[test]
     fn arbitrary_bytes_never_panic() {
         // The standing hostile-input guard: a deterministic pseudo-random stream
-        // of megabytes must parse without panicking. (A seeded LCG, no crate.)
+        // of megabytes must parse without panicking.
         let mut p = Parser::new();
         let mut r = Recorder::default();
-        let mut seed: u64 = 0x1234_5678_9abc_def0;
+        let mut rng = Rng::new(0x1234_5678_9abc_def0);
         for _ in 0..2_000_000 {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let byte = (seed >> 33) as u8;
-            p.advance(&mut r, byte);
+            p.advance(&mut r, rng.byte());
             // Keep the recorder from growing without bound over the whole run.
             r.actions.clear();
         }
@@ -1868,13 +1865,10 @@ mod tests {
         // toward printable ASCII (long runs) but salted with the interesting bytes:
         // ESC, C0 controls, DEL, and UTF-8 lead/continuation/invalid bytes, so run
         // boundaries, SWAR word edges, and every state transition get exercised.
-        let mut seed: u64 = 0xdead_beef_0bad_f00d;
+        let mut rng = Rng::new(0xdead_beef_0bad_f00d);
         let mut bytes = Vec::with_capacity(50_000);
         for _ in 0..50_000 {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let r = (seed >> 33) as u32;
+            let r = rng.next() as u32;
             let b = match r % 16 {
                 0 => 0x1b,                           // ESC (starts a sequence)
                 1 => ((r >> 8) as u8) | 0x80,        // UTF-8 lead / continuation / invalid

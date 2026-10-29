@@ -34,7 +34,7 @@ impl Rng {
     }
 
     /// The next draw, from the high bits.
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 = self
             .0
             .wrapping_mul(6364136223846793005)

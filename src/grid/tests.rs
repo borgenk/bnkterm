@@ -2,6 +2,7 @@
 //! module rather than one per sibling implementation file.
 
 use crate::color::{Ground, Rgb};
+use crate::dev::fuzz::Rng;
 use crate::grid::buffer::{MAX_COMBINING_PER_CELL, MAX_LOGICAL_COLS};
 use crate::grid::osc::base64_decode;
 use crate::grid::*;
@@ -1872,16 +1873,10 @@ fn violent_resize_never_panics_and_keeps_invariants() {
         b"\x1b]133;A\x07user@host ~/some/long/path  main\r\n> ",
     );
 
-    let mut seed = 0x9e3779b97f4a7c15u64;
-    let mut rng = || {
-        seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        seed >> 33
-    };
+    let mut rng = Rng::new(0x9e3779b97f4a7c15);
     for _ in 0..4000 {
-        let cols = 1 + (rng() % 220) as usize;
-        let rows = 1 + (rng() % 70) as usize;
+        let cols = 1 + (rng.next() % 220) as usize;
+        let rows = 1 + (rng.next() % 70) as usize;
         s.resize(cols, rows);
         let (c, r) = s.dimensions();
         assert_eq!((c, r), (cols, rows), "size drifted");
@@ -1908,7 +1903,7 @@ fn violent_resize_never_panics_and_keeps_invariants() {
             }
         }
         // Interleave a shell SIGWINCH redraw and fresh marks, as a live session would.
-        match rng() % 4 {
+        match rng.next() % 4 {
             0 => p.advance_bytes(&mut s, b"\r\x1b[J\x1b]133;A\x07user@host ~/p  main\r\n> "),
             1 => p.advance_bytes(&mut s, "wide 世世世 and text\r\n".as_bytes()),
             _ => {}
@@ -2317,12 +2312,9 @@ fn bulk_ascii_matches_per_char_under_fuzz() {
     // and `?2027` never, and those are exactly the modes that take the printer *off* its
     // bulk path — so on its own it was comparing two fast paths to each other.
     let mut uniform = Vec::with_capacity(300 * 4096);
-    let mut seed: u64 = 0x0BAD_C0DE_1234_5678;
+    let mut rng = Rng::new(0x0BAD_C0DE_1234_5678);
     for _ in 0..300 * 4096 {
-        seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let r = (seed >> 33) as u32;
+        let r = rng.next() as u32;
         // ~1 in 6 bytes is full-range (keeps escapes/controls/UTF-8 in the
         // mix); the rest are printable ASCII, so runs are long enough to wrap.
         uniform.push(if r.is_multiple_of(6) {
