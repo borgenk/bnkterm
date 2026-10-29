@@ -1201,11 +1201,13 @@ mod tests {
             path: path.clone(),
             index: source.index,
         });
-        let maps = std::fs::read_to_string("/proc/self/maps").expect("read the process maps");
+        // Bytes, not a string: a test opening a non-UTF-8 path may have its file mapped too.
+        let maps = std::fs::read("/proc/self/maps").expect("read the process maps");
         let _ = std::fs::remove_file(&path);
         let _face = opened.expect("the copied font opens");
+        let name = path.as_os_str().as_bytes();
         assert!(
-            maps.contains(&*path.to_string_lossy()),
+            maps.windows(name.len()).any(|line| line == name),
             "the font file is not mapped"
         );
     }
