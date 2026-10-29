@@ -1399,7 +1399,13 @@ impl Screen {
     /// link are likewise outside it, which is what splits the run the hover probe
     /// walks — exactly the behaviour you want, since the text either side of the gap
     /// is no longer one label.
+    ///
+    /// On the default background that is [`PackedCell::BLANK`], returned without asking
+    /// the style table.
     fn blank_cell(&mut self) -> PackedCell {
+        if self.pen.bg == Color::Default {
+            return PackedCell::BLANK;
+        }
         let style = Style {
             fg: Color::Default,
             bg: self.pen.bg,
