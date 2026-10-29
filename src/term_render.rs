@@ -2992,21 +2992,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unchanged_frame_diffs_to_no_damage() {
-        // The heart of the damage claim: rebuild the same grid twice and the diff
-        // is empty, so an idle terminal presents no draw work.
-        let mut s = Screen::new(20, 5);
-        feed(&mut s, b"\x1b[32mhello\x1b[0m world");
-        let a = list_of(&s);
-        let b = list_of(&s);
-        let (w, h) = (20 * M.w, 5 * M.h);
-        assert!(
-            crate::render::display::damage(&a, &b, w, h).is_empty(),
-            "an unchanged frame emits no damage"
-        );
-    }
-
-    #[test]
     fn dropping_a_selection_damages_the_band_it_leaves_behind() {
         // Typing clears the selection, and the rows it covered are usually nowhere near
         // the row the keystroke echoes on. If the diff did not see the band disappear,

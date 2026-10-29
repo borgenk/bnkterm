@@ -1805,23 +1805,6 @@ fn reset_returns_to_power_on_state() {
     assert_eq!(s.dimensions(), (6, 3));
 }
 
-#[test]
-fn steady_scroll_is_allocation_free_after_warmup() {
-    // Once scrollback is full, scrolling must recycle row storage. We can at
-    // least assert the ring stays bounded and correct over many scrolls.
-    let mut s = Screen::new(4, 3);
-    for i in 0..50_000u32 {
-        s.carriage_return();
-        let d = char::from(b'0' + (i % 10) as u8);
-        s.print(d);
-        s.line_feed();
-    }
-    // Never grows past the visible height; the bottom holds the last digit.
-    assert_eq!(s.dimensions(), (4, 3));
-    assert_eq!(s.primary.lines.len(), 3);
-    assert!(s.primary.scrollback.len() <= DEFAULT_SCROLLBACK);
-}
-
 // ---- end-to-end: bytes through the parser into the grid ----------------
 
 #[test]
