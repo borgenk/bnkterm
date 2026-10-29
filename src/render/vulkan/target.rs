@@ -610,23 +610,30 @@ impl Gpu {
             "vkResetFences",
         )?;
 
-        // Textures first: (re)create atlases and image textures, assemble the
-        // staging bytes and the copy list.
-        let (staging_bytes, uploads) = self.sync_frame_textures(frame)?;
-        if !staging_bytes.is_empty() {
+        // Textures first: (re)create the atlases, lay out the staging buffer and list
+        // the copies, then write each atlas's new rasters straight into it.
+        let (staging_len, uploads) = self.sync_frame_textures(frame)?;
+        if staging_len > 0 {
             self.grow_host_buffer(
                 &mut img.staging,
-                staging_bytes.len(),
+                staging_len,
                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             )?;
-            // SAFETY: staging is mapped with at least staging_bytes.len()
-            // capacity (grown above) and the GPU is done with it (fence).
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    staging_bytes.as_ptr(),
-                    img.staging.ptr,
-                    staging_bytes.len(),
-                );
+            for up in &uploads {
+                let Some(slot) = up.atlas else {
+                    continue;
+                };
+                let bytes = &frame_upload(frame, slot).bytes;
+                // SAFETY: staging is mapped with at least `staging_len` bytes (grown
+                // above), `stage` placed these bytes inside that length, and the GPU is
+                // done with the buffer (fence).
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        img.staging.ptr.add(up.staging_offset),
+                        bytes.len(),
+                    );
+                }
             }
         }
 
@@ -913,7 +920,7 @@ impl Gpu {
         )?;
 
         for up in uploads {
-            self.record_upload(img, up);
+            self.record_upload(img, up, frame);
         }
 
         let range = color_range();
@@ -1161,9 +1168,10 @@ impl Gpu {
         }
     }
 
-    /// Record one texture upload, or the bare initialization barrier a texture
-    /// created this frame gets (an upload that carries no bytes).
-    fn record_upload(&self, img: &GpuImage, up: &PendingUpload) {
+    /// Record one atlas's uploads, one copy per new raster between a single pair of
+    /// barriers, or the bare initialization barrier a texture created this frame gets
+    /// (an upload that carries no bytes).
+    fn record_upload(&self, img: &GpuImage, up: &PendingUpload, frame: &FrameData) {
         let f = &self.fns;
         let range = color_range();
         let (old_layout, src_stage, src_access) = if up.was_initialized {
@@ -1205,9 +1213,13 @@ impl Gpu {
                 1,
                 &to_dst,
             );
-            if up.w > 0 && up.h > 0 {
+            let regions = match up.atlas {
+                Some(slot) => frame_upload(frame, slot).regions.as_slice(),
+                None => &[],
+            };
+            for r in regions {
                 let region = VkBufferImageCopy {
-                    buffer_offset: up.staging_offset as u64,
+                    buffer_offset: (up.staging_offset + r.offset) as u64,
                     buffer_row_length: 0,
                     buffer_image_height: 0,
                     image_subresource: VkImageSubresourceLayers {
@@ -1217,13 +1229,13 @@ impl Gpu {
                         layer_count: 1,
                     },
                     image_offset: VkOffset3D {
-                        x: up.x as i32,
-                        y: up.y as i32,
+                        x: r.x as i32,
+                        y: r.y as i32,
                         z: 0,
                     },
                     image_extent: VkExtent3D {
-                        width: up.w,
-                        height: up.h,
+                        width: r.w,
+                        height: r.h,
                         depth: 1,
                     },
                 };
@@ -1263,43 +1275,40 @@ impl Gpu {
         }
     }
 
-    /// Reconcile the renderer's textures with this frame's data: (re)create atlas
-    /// textures on generation changes, repoint the descriptor set at them, and
-    /// assemble the staging bytes plus copy list.
-    fn sync_frame_textures(&mut self, frame: &FrameData) -> Result<(Vec<u8>, Vec<PendingUpload>)> {
-        let mut staging = Vec::new();
+    /// Bring both atlas textures in line with the frame and lay out its uploads: how
+    /// many staging bytes they take, and the uploads to record, each knowing where its
+    /// atlas's bytes start in the staging buffer.
+    fn sync_frame_textures(&mut self, frame: &FrameData) -> Result<(usize, Vec<PendingUpload>)> {
         let mut uploads = Vec::new();
 
-        // Atlas textures follow the CPU mirrors' generations, then take any
-        // dirty-region upload for the frame. The shared set is repointed once, after
-        // both exist; a create that fails ends the frame before anything draws. The
-        // syncs come first because the data uploads start from SHADER_READ_ONLY, which
-        // a texture created this frame reaches only through its initialization entry.
+        // Atlas textures follow the CPU-side generations, then take the frame's new
+        // rasters. The shared set is repointed once, after both exist; a create that
+        // fails ends the frame before anything draws. The syncs come first because the
+        // data uploads start from SHADER_READ_ONLY, which a texture created this frame
+        // reaches only through its initialization entry.
         let glyph_changed = self.sync_atlas(AtlasSlot::Glyph, &frame.glyph_atlas, &mut uploads)?;
         let emoji_changed = self.sync_atlas(AtlasSlot::Emoji, &frame.emoji_atlas, &mut uploads)?;
         if glyph_changed || emoji_changed {
             self.update_atlas_set()?;
         }
+        let mut staging_len = 0;
         self.stage_atlas_upload(
             AtlasSlot::Glyph,
             &frame.glyph_upload,
-            &mut staging,
+            &mut staging_len,
             &mut uploads,
         );
         self.stage_atlas_upload(
             AtlasSlot::Emoji,
             &frame.emoji_upload,
-            &mut staging,
+            &mut staging_len,
             &mut uploads,
         );
-
-        // Uploads whose staging_offset was pushed before later bytes landed
-        // stay valid: offsets only ever append.
-        Ok((staging, uploads))
+        Ok((staging_len, uploads))
     }
 
-    /// Rebuild an atlas texture when its CPU mirror's generation moved (or it
-    /// does not exist yet), returning whether it did. The other frame in flight may
+    /// Rebuild an atlas texture when its atlas's generation moved (or it does not
+    /// exist yet), returning whether it did. The other frame in flight may
     /// still sample the texture being replaced, so the queue is drained before it is
     /// destroyed; the caller repoints the shared descriptor set.
     /// The new texture's bare initialization barrier is queued on `uploads`, so it
@@ -1324,37 +1333,30 @@ impl Gpu {
             image: tex.image,
             was_initialized: false,
             staging_offset: 0,
-            x: 0,
-            y: 0,
-            w: 0,
-            h: 0,
+            atlas: None,
         });
         *self.renderer.atlas_mut(slot) = Some((tex, info.generation));
         Ok(true)
     }
 
-    /// Queue an atlas's dirty region for upload into its live texture, appending
-    /// the bytes to `staging`. A no-op when the frame carried no change for that
-    /// slot.
+    /// Queue an atlas's new rasters for upload into its live texture, reserving their
+    /// bytes in the staging layout. A no-op when the frame added none to that atlas.
     fn stage_atlas_upload(
         &mut self,
         slot: AtlasSlot,
-        upload: &Option<AtlasUpload>,
-        staging: &mut Vec<u8>,
+        upload: &AtlasUpload,
+        staging_len: &mut usize,
         uploads: &mut Vec<PendingUpload>,
     ) {
-        let Some(up) = upload else {
+        if upload.is_empty() {
             return;
-        };
+        }
         if let Some((tex, _)) = self.renderer.atlas_mut(slot) {
             uploads.push(PendingUpload {
                 image: tex.image,
                 was_initialized: true,
-                staging_offset: stage_bytes(staging, &up.bytes),
-                x: up.x,
-                y: up.y,
-                w: up.w,
-                h: up.h,
+                staging_offset: stage(staging_len, upload.bytes.len()),
+                atlas: Some(slot),
             });
         }
     }
@@ -1591,11 +1593,20 @@ struct PendingUpload {
     /// False only for the initialization barrier of a texture created this frame,
     /// the one transition that starts from `UNDEFINED`.
     was_initialized: bool,
+    /// Where the atlas's bytes start in the staging buffer; each region's offset counts
+    /// from here.
     staging_offset: usize,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
+    /// The atlas whose frame upload this copies, or `None` for a bare initialization
+    /// barrier.
+    atlas: Option<AtlasSlot>,
+}
+
+/// The frame's new rasters for `slot`'s atlas.
+fn frame_upload(frame: &FrameData, slot: AtlasSlot) -> &AtlasUpload {
+    match slot {
+        AtlasSlot::Glyph => &frame.glyph_upload,
+        AtlasSlot::Emoji => &frame.emoji_upload,
+    }
 }
 
 /// Every upload's bytes start on a multiple of this. A copy into an image must
@@ -1604,33 +1615,28 @@ struct PendingUpload {
 /// texels can leave the staging at any length before them.
 const STAGING_ALIGN: usize = 4;
 
-/// Append an upload's bytes to the frame's staging at the next aligned offset,
-/// returning that offset for the copy to read from.
-fn stage_bytes(staging: &mut Vec<u8>, bytes: &[u8]) -> usize {
-    let offset = staging.len().next_multiple_of(STAGING_ALIGN);
-    staging.resize(offset, 0);
-    staging.extend_from_slice(bytes);
+/// Reserve `bytes` in a staging layout `len` bytes long so far, at the next aligned
+/// offset, returning that offset for the copy to read from.
+fn stage(len: &mut usize, bytes: usize) -> usize {
+    let offset = len.next_multiple_of(STAGING_ALIGN);
+    *len = offset + bytes;
     offset
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::render::vulkan::target::stage_bytes;
+    use crate::render::vulkan::target::stage;
 
     /// The glyph atlas stages first, so a 9x17 glyph leaves 153 bytes ahead of the
     /// emoji upload. Copying BGRA texels from offset 153 is invalid usage, so the
     /// emoji bytes have to start at 156.
     #[test]
     fn an_upload_after_an_odd_length_one_starts_on_a_whole_texel() {
-        let glyph = vec![0x11; 9 * 17];
-        let emoji = vec![0x22; 4 * 3 * 2];
-        let mut staging = Vec::new();
-
-        assert_eq!(stage_bytes(&mut staging, &glyph), 0);
-        let emoji_at = stage_bytes(&mut staging, &emoji);
+        let mut len = 0;
+        assert_eq!(stage(&mut len, 9 * 17), 0);
+        let emoji_at = stage(&mut len, 4 * 3 * 2);
 
         assert_eq!(emoji_at, 156);
-        assert_eq!(&staging[..glyph.len()], glyph.as_slice());
-        assert_eq!(&staging[emoji_at..], emoji.as_slice());
+        assert_eq!(len, 156 + 4 * 3 * 2);
     }
 }

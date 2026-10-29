@@ -1,6 +1,6 @@
 //! The GPU backend's CPU half: turning a display list into GPU-consumable
 //! data. This module is deliberately free of Vulkan: it packs glyph rasters
-//! into atlas mirrors and emits vertices and draw batches as plain values, so
+//! into atlases and emits vertices and draw batches as plain values, so
 //! the geometry and packing logic is unit-testable without a device.
 //! `vulkan.rs` consumes the output ([`FrameData`]) verbatim.
 //!
@@ -122,14 +122,47 @@ pub struct Batch {
     pub count: u32,
 }
 
-/// A rectangle of an atlas that changed and needs a texture upload, with its
-/// bytes extracted row-contiguous from the mirror.
+/// The atlas texels written since the last frame took them: each new raster's rectangle,
+/// with its bytes tight and row-major in `bytes` from the region's `offset`. Only the
+/// rasters are uploaded, never the box around them, which for two glyphs on shelves far
+/// apart is most of the atlas.
+#[derive(Default)]
 pub struct AtlasUpload {
+    pub regions: Vec<UploadRegion>,
+    pub bytes: Vec<u8>,
+}
+
+/// One raster's rectangle in an [`AtlasUpload`], and where its bytes start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UploadRegion {
     pub x: u32,
     pub y: u32,
     pub w: u32,
     pub h: u32,
-    pub bytes: Vec<u8>,
+    pub offset: usize,
+}
+
+impl AtlasUpload {
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.regions.clear();
+        self.bytes.clear();
+    }
+
+    /// Queue a raster written at `slot`, its bytes appended by `fill`.
+    fn push(&mut self, slot: Slot, fill: impl FnOnce(&mut Vec<u8>)) {
+        self.regions.push(UploadRegion {
+            x: slot.x,
+            y: slot.y,
+            w: slot.w,
+            h: slot.h,
+            offset: self.bytes.len(),
+        });
+        fill(&mut self.bytes);
+    }
 }
 
 /// Everything the Vulkan renderer needs to draw one frame. Reused across frames by
@@ -142,9 +175,9 @@ pub struct FrameData {
     /// Atlas geometry and generation, so the renderer can (re)create textures.
     pub glyph_atlas: AtlasInfo,
     pub emoji_atlas: AtlasInfo,
-    /// Dirty-region uploads for the two atlases, if any.
-    pub glyph_upload: Option<AtlasUpload>,
-    pub emoji_upload: Option<AtlasUpload>,
+    /// The rasters each atlas gained this frame, empty when it gained none.
+    pub glyph_upload: AtlasUpload,
+    pub emoji_upload: AtlasUpload,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -179,10 +212,10 @@ struct PackedGlyph {
     advance: f32,
 }
 
-/// A shelf-packing texture atlas with a CPU mirror. Rasters are packed onto
-/// horizontal shelves (rows share a height class); the mirror holds the texel
-/// bytes so the GPU texture can be (re)filled at any time, and a dirty
-/// rectangle accumulates what changed since the last upload.
+/// A shelf-packing texture atlas. Rasters are packed onto horizontal shelves (rows
+/// share a height class), and each new raster's bytes wait in an [`AtlasUpload`] until
+/// the frame takes them. The texels live only on the GPU: a texture is recreated only
+/// when the atlas is wiped, and the rasters packed after the wipe are its whole upload.
 pub struct Atlas {
     width: u32,
     height: u32,
@@ -191,13 +224,12 @@ pub struct Atlas {
     max: u32,
     /// Bytes per texel: 1 (R8 coverage) or 4 (BGRA emoji).
     bpp: u32,
-    pixels: Vec<u8>,
     /// Shelves as (y, height, x_used).
     shelves: Vec<(u32, u32, u32)>,
     next_y: u32,
     generation: u32,
-    /// Union of slots written since the last [`Atlas::take_upload`].
-    dirty: Option<(u32, u32, u32, u32)>,
+    /// Rasters written since the last [`Atlas::take_upload`].
+    pending: AtlasUpload,
     /// The atlas holds slots nothing will look up again: it filled at its cap, or
     /// the records pointing into it were dropped. [`build_frame_into`] wipes it and
     /// rebuilds the frame into the reclaimed space.
@@ -221,11 +253,10 @@ impl Atlas {
             height: side,
             max,
             bpp,
-            pixels: vec![0; (side * side * bpp) as usize],
             shelves: Vec::new(),
             next_y: 0,
             generation: 0,
-            dirty: None,
+            pending: AtlasUpload::default(),
             spent: false,
             dropped_since_wipe: false,
         }
@@ -294,8 +325,7 @@ impl Atlas {
         true
     }
 
-    /// Empty the atlas back to its starting side. The mirror is reallocated rather
-    /// than cleared, so the memory an atlas grew into is returned with its slots.
+    /// Empty the atlas back to its starting side.
     fn wipe(&mut self) {
         self.reset(ATLAS_START.min(self.max));
         self.dropped_since_wipe = false;
@@ -318,55 +348,32 @@ impl Atlas {
     fn reset(&mut self, side: u32) {
         self.width = side;
         self.height = side;
-        self.pixels = vec![0; (side * side * self.bpp) as usize];
         self.shelves.clear();
         self.next_y = 0;
         self.generation = self.generation.wrapping_add(1);
-        self.dirty = None;
+        self.pending.clear();
     }
 
-    /// Extend the dirty rectangle to cover `slot`, so the next upload carries it.
-    fn mark_dirty(&mut self, slot: Slot) {
-        let rect = (slot.x, slot.y, slot.x + slot.w, slot.y + slot.h);
-        self.dirty = Some(match self.dirty {
-            None => rect,
-            Some((x0, y0, x1, y1)) => (
-                x0.min(rect.0),
-                y0.min(rect.1),
-                x1.max(rect.2),
-                y1.max(rect.3),
-            ),
-        });
-    }
-
-    /// Write a raster's rows into the mirror at `slot` and extend the dirty
-    /// rectangle over it. `src` is `w * h * bpp` bytes, row-major, tight.
+    /// Queue a raster written at `slot` for the next upload. `src` is `w * h * bpp`
+    /// bytes, row-major, tight; [`Self::pack`] has checked it holds that many.
     fn write(&mut self, slot: Slot, src: &[u8]) {
-        let row_bytes = (slot.w * self.bpp) as usize;
-        for row in 0..slot.h {
-            let src_start = row as usize * row_bytes;
-            let dst_start = (((slot.y + row) * self.width + slot.x) * self.bpp) as usize;
-            self.pixels[dst_start..dst_start + row_bytes]
-                .copy_from_slice(&src[src_start..src_start + row_bytes]);
+        if let Some(src) = src.get(..self.raster_len(slot.w, slot.h)) {
+            self.pending
+                .push(slot, |bytes| bytes.extend_from_slice(src));
         }
-        self.mark_dirty(slot);
     }
 
-    /// Write a `w`-word-per-row ARGB raster (`w * h` words, row-major, tight) into
-    /// the mirror at `slot`, one pixel's `to_ne_bytes` at a time. Lets the color
-    /// atlas (`bpp == 4`) pack a glyph straight from its words without first
-    /// collecting them into a byte vector.
+    /// Queue a `w`-word-per-row ARGB raster (`w * h` words, row-major, tight) written at
+    /// `slot`, one pixel's `to_ne_bytes` at a time. Lets the color atlas (`bpp == 4`)
+    /// pack a glyph straight from its words without first collecting them into a byte
+    /// vector.
     fn write_words(&mut self, slot: Slot, src: &[u32]) {
-        let w = slot.w as usize;
-        for row in 0..slot.h {
-            let src_row = row as usize * w;
-            let dst_row = (((slot.y + row) * self.width + slot.x) * self.bpp) as usize;
-            for x in 0..w {
-                let dst = dst_row + x * self.bpp as usize;
-                self.pixels[dst..dst + 4].copy_from_slice(&src[src_row + x].to_ne_bytes());
-            }
+        let words = (slot.w as usize).saturating_mul(slot.h as usize);
+        if let Some(src) = src.get(..words) {
+            self.pending.push(slot, |bytes| {
+                bytes.extend(src.iter().flat_map(|word| word.to_ne_bytes()));
+            });
         }
-        self.mark_dirty(slot);
     }
 
     /// Reserve a slot for a `w` x `h` raster and write `src` into it, returning
@@ -382,8 +389,8 @@ impl Atlas {
         Some(slot)
     }
 
-    /// Like [`pack`](Self::pack) but from ARGB words (the color-glyph path), writing
-    /// them into the 4-bpp mirror directly. `src` is `w * h` words, row-major, tight.
+    /// Like [`pack`](Self::pack) but from ARGB words (the color-glyph path), queuing
+    /// their bytes directly. `src` is `w * h` words, row-major, tight.
     fn pack_words(&mut self, w: u32, h: u32, src: &[u32]) -> Option<Slot> {
         if w == 0 || h == 0 || src.len() < (w as usize).saturating_mul(h as usize) {
             return None;
@@ -409,25 +416,12 @@ impl Atlas {
             .saturating_mul(self.bpp as usize)
     }
 
-    /// The bytes of the dirty region (row-contiguous), clearing the flag.
-    /// A texture recreated after a wipe needs no separate full upload: the
-    /// wipe zeroed the mirror, so everything in it is inside the dirty region.
-    pub fn take_upload(&mut self) -> Option<AtlasUpload> {
-        let (x0, y0, x1, y1) = self.dirty.take()?;
-        let (w, h) = (x1 - x0, y1 - y0);
-        let row_bytes = (w * self.bpp) as usize;
-        let mut bytes = Vec::with_capacity(row_bytes * h as usize);
-        for row in y0..y1 {
-            let start = ((row * self.width + x0) * self.bpp) as usize;
-            bytes.extend_from_slice(&self.pixels[start..start + row_bytes]);
-        }
-        Some(AtlasUpload {
-            x: x0,
-            y: y0,
-            w,
-            h,
-            bytes,
-        })
+    /// Hand the rasters written since the last call to `out`, which takes them in
+    /// place of what it held; the two buffers trade back and forth, so a frame of new
+    /// glyphs allocates nothing once both have grown.
+    pub fn take_upload(&mut self, out: &mut AtlasUpload) {
+        out.clear();
+        std::mem::swap(out, &mut self.pending);
     }
 }
 
@@ -723,8 +717,8 @@ pub fn build_frame_into(
         }
         out.glyph_atlas = cache.glyphs.info();
         out.emoji_atlas = cache.emoji.info();
-        out.glyph_upload = cache.glyphs.take_upload();
-        out.emoji_upload = cache.emoji.take_upload();
+        cache.glyphs.take_upload(&mut out.glyph_upload);
+        cache.emoji.take_upload(&mut out.emoji_upload);
         return;
     }
 }
@@ -1159,8 +1153,8 @@ impl Batcher<'_> {
 /// `None` for a zero-area or malformed glyph or a full atlas; the placement is
 /// recorded as `None` so the pen advances without drawing.
 fn pack_argb(atlas: &mut Atlas, w: u32, h: u32, argb: &[u32]) -> Option<Slot> {
-    // ARGB words are B,G,R,A bytes in memory: B8G8R8A8 verbatim, written straight
-    // into the mirror rather than first collected into a byte-conversion vector.
+    // ARGB words are B,G,R,A bytes in memory: B8G8R8A8 verbatim, queued straight from
+    // the words rather than first collected into a byte-conversion vector.
     // `pack_words` owns the dimension-versus-buffer check, so no caller can skip it.
     atlas.pack_words(w, h, argb)
 }
@@ -1303,7 +1297,7 @@ mod tests {
     };
 
     #[test]
-    fn atlas_packs_onto_shelves_and_tracks_dirty() {
+    fn atlas_packs_onto_shelves_and_queues_what_it_writes() {
         let mut a = Atlas::new(1);
         let s1 = a.reserve(10, 8).expect("fits");
         let s2 = a.reserve(6, 8).expect("fits on the same shelf");
@@ -1312,10 +1306,55 @@ mod tests {
         let s3 = a.reserve(10, 20).expect("taller: a new shelf");
         assert_eq!(s3.y, 8, "new shelf below the first");
         a.write(s1, &[7u8; 80]);
-        let up = a.take_upload().expect("dirty after write");
-        assert_eq!((up.x, up.y, up.w, up.h), (0, 0, 10, 8));
+        let mut up = AtlasUpload::default();
+        a.take_upload(&mut up);
+        assert_eq!(
+            up.regions,
+            [UploadRegion {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 8,
+                offset: 0
+            }]
+        );
         assert!(up.bytes.iter().all(|&b| b == 7));
-        assert!(a.take_upload().is_none(), "dirty cleared");
+        a.take_upload(&mut up);
+        assert!(up.is_empty(), "taken once");
+    }
+
+    /// Two glyphs far apart in the atlas upload their own texels. Their bounding box,
+    /// what used to go up, is here most of a shelf's width by two shelves' height.
+    #[test]
+    fn an_upload_carries_only_the_rasters_written() {
+        let mut a = Atlas::new(1);
+        a.pack(900, 8, &[1; 900 * 8])
+            .expect("a wide raster on the first shelf");
+        a.pack(10, 300, &[2; 10 * 300])
+            .expect("a tall one on a second shelf");
+        let mut up = AtlasUpload::default();
+        a.take_upload(&mut up);
+
+        let near = a.pack(10, 8, &[3; 10 * 8]).expect("beside the wide one");
+        let far = a
+            .pack(10, 300, &[4; 10 * 300])
+            .expect("beside the tall one");
+        a.take_upload(&mut up);
+
+        assert_eq!(
+            up.bytes.len(),
+            10 * 8 + 10 * 300,
+            "only the two new rasters"
+        );
+        let placed: Vec<_> = up.regions.iter().map(|r| (r.x, r.y, r.w, r.h)).collect();
+        assert_eq!(
+            placed,
+            [(near.x, near.y, 10, 8), (far.x, far.y, 10, 300)],
+            "each where it was packed"
+        );
+        let second = up.regions[1].offset;
+        assert!(up.bytes[..second].iter().all(|&b| b == 3));
+        assert!(up.bytes[second..].iter().all(|&b| b == 4));
     }
 
     #[test]
@@ -1348,14 +1387,15 @@ mod tests {
 
     #[test]
     fn pack_words_lays_down_the_same_bytes_as_a_conversion_would() {
-        // The color-glyph path packs ARGB words straight into the 4-bpp mirror; the
+        // The color-glyph path queues ARGB words straight into the 4-bpp upload; the
         // result must match converting each word to its native bytes first, so
         // dropping that conversion vector changed nothing on screen.
         let mut a = Atlas::new(4);
         let argb: [u32; 4] = [0x1122_3344, 0x5566_7788, 0x99AA_BBCC, 0xDDEE_FF00];
         a.pack_words(2, 2, &argb).expect("fits");
-        let up = a.take_upload().expect("dirty");
-        assert_eq!((up.w, up.h), (2, 2));
+        let mut up = AtlasUpload::default();
+        a.take_upload(&mut up);
+        assert_eq!((up.regions[0].w, up.regions[0].h), (2, 2));
         let expect: Vec<u8> = argb.iter().flat_map(|w| w.to_ne_bytes()).collect();
         assert_eq!(up.bytes, expect);
     }
@@ -1502,7 +1542,7 @@ mod tests {
         for ch in ('A'..='Z').chain('a'..='z').chain('0'..='9') {
             let frame = build_frame(&fonts, &prose(&ch.to_string()), &mut cache, GAMMA);
             assert_eq!(glyph_quads(&frame), 1, "{ch:?} drew nothing");
-            assert!(frame.glyph_upload.is_some(), "{ch:?} was never uploaded");
+            assert!(!frame.glyph_upload.is_empty(), "{ch:?} was never uploaded");
         }
         assert!(cache.glyphs.generation > 0, "the atlas never filled");
     }
@@ -1867,14 +1907,17 @@ mod tests {
             text: "abcabc".to_string(),
         }];
         let f1 = build_frame(&fonts, &list, &mut cache, GAMMA);
-        assert!(f1.glyph_upload.is_some(), "first frame uploads new glyphs");
+        assert!(
+            !f1.glyph_upload.is_empty(),
+            "first frame uploads new glyphs"
+        );
         assert!(
             !f1.vertices.is_empty(),
             "glyph quads were emitted ({} vertices)",
             f1.vertices.len()
         );
         let f2 = build_frame(&fonts, &list, &mut cache, GAMMA);
-        assert!(f2.glyph_upload.is_none(), "steady state uploads nothing");
+        assert!(f2.glyph_upload.is_empty(), "steady state uploads nothing");
         assert_eq!(f1.vertices, f2.vertices, "same list, same geometry");
     }
 
@@ -2209,7 +2252,7 @@ mod tests {
         // one it renders as per-character glyphs. Either way it must not
         // crash, and with color output there must be an emoji upload.
         if f.vertices.iter().any(|v| v.mode == MODE_EMOJI) {
-            assert!(f.emoji_upload.is_some(), "the color raster was uploaded");
+            assert!(!f.emoji_upload.is_empty(), "the color raster was uploaded");
         }
     }
 
