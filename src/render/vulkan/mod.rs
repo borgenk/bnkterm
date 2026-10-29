@@ -27,7 +27,7 @@ use crate::platform::ffi::DynLib;
 use crate::render::vulkan::abi::*;
 use crate::render::vulkan::renderer::{create_renderer, Renderer};
 
-pub(crate) use crate::render::vulkan::target::GpuImage;
+pub(crate) use crate::render::vulkan::target::{GpuImage, RenderTarget};
 
 // ---------------------------------------------------------------------------
 // Owned handles.

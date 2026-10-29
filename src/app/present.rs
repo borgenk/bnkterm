@@ -36,7 +36,7 @@ use crate::render::gpu;
 use crate::render::vulkan;
 use crate::term_render;
 
-/// How long [`State::destroy_buffers`] waits for the compositor to release a buffer before
+/// How long [`State::resize_buffers`] waits for the compositor to release a buffer before
 /// giving up on freeing its image *now*. Normally the release has long since signalled and
 /// the wait returns at once; when it does not, the image is not freed anyway (that would be
 /// the use-after-free) but retired to be reaped once the release actually arrives, so this is
@@ -53,9 +53,9 @@ const MAX_RETIRED_IMAGES: usize = 16;
 /// A swap image retired by a resize while the compositor may still be reading its wl_buffer.
 /// Freeing it then is a GPU use-after-free — the intermittent crash a rapid resize raced
 /// into — so it waits here until the release is observed and is destroyed only then. See
-/// [`State::destroy_buffers`], [`State::reap_retired`], and [`State::release_retired`].
+/// [`State::resize_buffers`], [`State::reap_retired`], and [`State::release_retired`].
 struct RetiredImage {
-    image: vulkan::GpuImage,
+    image: vulkan::RenderTarget,
     /// The wl_buffer this image backed, kept alive so the compositor can still signal its
     /// `wl_buffer.release`; destroyed together with the image when reaped.
     buffer: u32,
@@ -352,9 +352,11 @@ impl Drop for GpuPresentation {
             return;
         };
         gpu.wait_idle();
-        let retired = self.retired.drain(..).map(|retired| retired.image);
-        for image in self.images.drain(..).chain(retired) {
+        for image in self.images.drain(..) {
             gpu.destroy_image(image);
+        }
+        for retired in self.retired.drain(..) {
+            gpu.destroy_target(retired.image);
         }
     }
 }
@@ -502,17 +504,11 @@ impl State {
         Ok(id)
     }
 
-    /// Allocate the two presentable buffers at the current size: one exported GPU
-    /// image per swap slot, each wrapped in a wl_buffer via
-    /// `zwp_linux_buffer_params_v1` (`create_immed` is sound because every
-    /// parameter comes from the compositor's own feedback). A failure (a resize
-    /// on a dying device) propagates and ends the process; there is no software
-    /// path to fall back to.
+    /// Allocate the two presentable buffers at the current size: one swap slot per
+    /// buffer, each drawing into an exported GPU image that [`Self::attach_buffers`] wraps
+    /// in a wl_buffer. A failure (a resize on a dying device) propagates and ends the
+    /// process; there is no software path to fall back to.
     pub(super) fn create_buffers(&mut self) -> Result<()> {
-        let dmabuf_global = self
-            .presentation
-            .dmabuf
-            .ok_or_else(|| Error::msg("gpu buffers without zwp_linux_dmabuf_v1"))?;
         let (w, h) = (self.layout.terminal.width, self.layout.terminal.height);
         let mut images = Vec::with_capacity(2);
         {
@@ -523,6 +519,89 @@ impl State {
                 images.push(gpu.create_image(w, h, &self.presentation.modifiers)?);
             }
         }
+        self.presentation.images = images;
+        self.attach_buffers()
+    }
+
+    /// Give both slots a target at the current size, and free the targets they drew into
+    /// or, for any the compositor may still be reading, retire them to be freed once their
+    /// release arrives. A slot's command buffer, fence, semaphores and host buffers carry
+    /// over, so a resize allocates only the two images.
+    ///
+    /// `wait_idle` drains only *our* device; the compositor reading a buffer for scan-out is a
+    /// separate lifetime, and freeing an image while it does is a GPU use-after-free — the
+    /// intermittent crash a rapid resize raced into. So each old target is freed now only when
+    /// its buffer is known released: an explicit-sync release fence that signals within a short
+    /// bounded wait, or, on the implicit path, a slot the compositor is not marked as holding.
+    /// One that is still held is moved to the retired list (its wl_buffer kept alive so the
+    /// release can still be signalled) and reaped later by [`Self::reap_retired`] or
+    /// [`Self::release_retired`]. A timeout therefore never frees a buffer out from under the
+    /// compositor; it only defers the free.
+    pub(super) fn resize_buffers(&mut self) -> Result<()> {
+        // First reap anything an earlier resize retired that has since been released, so a
+        // burst of resizes cannot pile the list up.
+        self.reap_retired();
+
+        let (w, h) = (self.layout.terminal.width, self.layout.terminal.height);
+        let mut images: Vec<vulkan::RenderTarget> = Vec::with_capacity(2);
+        {
+            let presentation = &mut self.presentation;
+            let Some(gpu) = presentation.backend.as_ref() else {
+                return Err(Error::msg("gpu buffers without a gpu backend"));
+            };
+            // Nothing may still render into the old targets, whether they are freed now or
+            // held for later; resize is rare enough that a full drain is the simple correct
+            // answer.
+            gpu.wait_idle();
+            for img in &mut presentation.images {
+                images.push(gpu.retarget(img, w, h, &presentation.modifiers)?);
+            }
+        }
+        let buffers = self.presentation.buffers;
+        let busy = self.presentation.busy;
+        for (idx, image) in images.into_iter().enumerate() {
+            let buffer = buffers.get(idx).copied().unwrap_or(0);
+            // The compositor's "done reading" signal: the explicit-sync release fence when we
+            // have one, else the busy flag the `wl_buffer.release` event clears.
+            let fence = self.presentation.explicit_sync.as_ref().and_then(|es| {
+                match es.slot_release(idx) {
+                    Ok(SlotRelease::Released) => es.release_fence(idx).ok().flatten(),
+                    _ => None,
+                }
+            });
+            let released = match &fence {
+                Some(f) => ffi::wait_sync_file(f.as_raw_fd(), BUFFER_RELEASE_WAIT_MS),
+                None => buffer == 0 || !busy.get(idx).copied().unwrap_or(false),
+            };
+            if released {
+                if buffer != 0 {
+                    self.conn.request(buffer, wl_buffer::DESTROY, &[]);
+                }
+                if let Some(gpu) = &self.presentation.backend {
+                    gpu.destroy_target(image);
+                }
+            } else {
+                self.presentation.retired.push(RetiredImage {
+                    image,
+                    buffer,
+                    fence,
+                });
+            }
+        }
+        self.enforce_retired_cap();
+        self.attach_buffers()
+    }
+
+    /// Wrap each slot's target in a wl_buffer via `zwp_linux_buffer_params_v1`
+    /// (`create_immed` is sound because every parameter comes from the compositor's own
+    /// feedback), and reset what the old buffers left behind.
+    fn attach_buffers(&mut self) -> Result<()> {
+        let dmabuf_global = self
+            .presentation
+            .dmabuf
+            .ok_or_else(|| Error::msg("gpu buffers without zwp_linux_dmabuf_v1"))?;
+        let (w, h) = (self.layout.terminal.width, self.layout.terminal.height);
+        let images = std::mem::take(&mut self.presentation.images);
         for (i, img) in images.iter().enumerate() {
             let params = self.create(dmabuf_global, zwp_linux_dmabuf_v1::CREATE_PARAMS);
             let modifier = img.modifier();
@@ -566,66 +645,6 @@ impl State {
         // frame into them repaints whole rather than trusting the diff.
         self.presentation.lists.reset();
         Ok(())
-    }
-
-    /// Destroy the current buffers and their backing GPU images, or, for any the compositor
-    /// may still be reading, retire them to be freed once their release arrives.
-    ///
-    /// `wait_idle` drains only *our* device; the compositor reading a buffer for scan-out is a
-    /// separate lifetime, and freeing an image while it does is a GPU use-after-free — the
-    /// intermittent crash a rapid resize raced into. So each image is freed now only when its
-    /// buffer is known released: an explicit-sync release fence that signals within a short
-    /// bounded wait, or, on the implicit path, a slot the compositor is not marked as holding.
-    /// One that is still held is moved to the retired list (its wl_buffer kept alive so the
-    /// release can still be signalled) and reaped later by [`Self::reap_retired`] or
-    /// [`Self::release_retired`]. A timeout therefore never frees a buffer out from under the
-    /// compositor; it only defers the free.
-    pub(super) fn destroy_buffers(&mut self) {
-        // First reap anything an earlier resize retired that has since been released, so a
-        // burst of resizes cannot pile the list up.
-        self.reap_retired();
-
-        let buffers = self.presentation.buffers;
-        let busy = self.presentation.busy;
-        let images: Vec<vulkan::GpuImage> = std::mem::take(&mut self.presentation.images);
-        // Nothing may be in flight on *our* device while its images are touched, whether they
-        // are freed now or held for later; resize is rare enough that a full drain is the
-        // simple correct answer.
-        if let Some(gpu) = &self.presentation.backend {
-            gpu.wait_idle();
-        }
-        for (idx, image) in images.into_iter().enumerate() {
-            let buffer = buffers.get(idx).copied().unwrap_or(0);
-            // The compositor's "done reading" signal: the explicit-sync release fence when we
-            // have one, else the busy flag the `wl_buffer.release` event clears.
-            let fence = self.presentation.explicit_sync.as_ref().and_then(|es| {
-                match es.slot_release(idx) {
-                    Ok(SlotRelease::Released) => es.release_fence(idx).ok().flatten(),
-                    _ => None,
-                }
-            });
-            let released = match &fence {
-                Some(f) => ffi::wait_sync_file(f.as_raw_fd(), BUFFER_RELEASE_WAIT_MS),
-                None => buffer == 0 || !busy.get(idx).copied().unwrap_or(false),
-            };
-            if released {
-                if buffer != 0 {
-                    self.conn.request(buffer, wl_buffer::DESTROY, &[]);
-                }
-                if let Some(gpu) = &self.presentation.backend {
-                    gpu.destroy_image(image);
-                }
-            } else {
-                self.presentation.retired.push(RetiredImage {
-                    image,
-                    buffer,
-                    fence,
-                });
-            }
-        }
-        self.enforce_retired_cap();
-        self.presentation.buffers = [0, 0];
-        self.presentation.busy = [false, false];
     }
 
     /// Free every retired image whose buffer the compositor has finished with: an explicit
@@ -672,7 +691,7 @@ impl State {
             self.conn.request(r.buffer, wl_buffer::DESTROY, &[]);
         }
         if let Some(gpu) = &self.presentation.backend {
-            gpu.destroy_image(r.image);
+            gpu.destroy_target(r.image);
         }
     }
 
@@ -751,15 +770,14 @@ impl State {
         // Free any image a prior resize retired that the compositor has now released. Cheap
         // and a no-op once the list drains, which it does within a frame or two of a resize.
         self.reap_retired();
-        // Reallocate the buffers if the surface was resized since they were made;
+        // Resize the buffers if the surface was resized since they were made;
         // deferring from every configure to the first frame after them collapses
         // an interactive resize's dmabuf churn to one reallocation per painted
         // frame (frame-callback paced) instead of one per configure.
         if self.presentation.buffer_size
             != (self.layout.terminal.width, self.layout.terminal.height)
         {
-            self.destroy_buffers();
-            self.create_buffers()?;
+            self.resize_buffers()?;
         }
         let slot = match self.presentation.explicit_sync.as_mut() {
             Some(es) => es.free_slot()?,

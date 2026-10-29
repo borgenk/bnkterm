@@ -18,20 +18,16 @@ const ACQUIRE_WAIT_MS: core::ffi::c_int = 1000;
 // Render targets.
 // ---------------------------------------------------------------------------
 
-/// One presentable render target: a device-local image whose memory is
-/// exported as the dmabuf behind a `wl_buffer`, plus the per-image submission
-/// state (command buffer, completion fence, and the two semaphores of the
-/// implicit-sync bridge). Created and destroyed through [`Gpu`]; it holds raw
-/// handles, so dropping it without [`Gpu::destroy_image`] leaks GPU memory
-/// until the device goes down.
+/// One swap slot: the submission state a frame is recorded and synchronized with (command
+/// buffer, completion fence, and the two semaphores of the implicit-sync bridge), the
+/// host buffers a frame writes, and the [`RenderTarget`] it currently draws into. Only the
+/// target depends on the window size, so a resize swaps it with [`Gpu::retarget`] and keeps
+/// the rest. Created and destroyed through [`Gpu`]; it holds raw handles, so dropping it
+/// without [`Gpu::destroy_image`] leaks GPU memory until the device goes down.
 pub struct GpuImage {
-    image: VkImage,
-    memory: VkDeviceMemory,
-    /// The exported dmabuf, kept for the sync-file ioctls; the compositor
-    /// holds its own reference once the wl_buffer imports it.
-    fd: OwnedFd,
+    target: RenderTarget,
     cmd: VkCommandBuffer,
-    /// Signaled when the last submission touching this image completed.
+    /// Signaled when the last submission from this slot completed.
     fence: VkFence,
     /// Carries the compositor's read fences into the next submission (a
     /// temporary sync-fd import per frame).
@@ -39,16 +35,27 @@ pub struct GpuImage {
     /// Signaled by each submission; exported as a sync file and attached to
     /// the dmabuf so the compositor's reads wait for the render.
     release: VkSemaphore,
-    /// The render-pass view of the image and its framebuffer.
-    view: VkImageView,
-    framebuffer: VkFramebuffer,
     /// This frame slot's vertex buffer and upload staging, safe to rewrite
     /// once the slot's fence has signaled.
     vertices: HostBuffer,
     staging: HostBuffer,
     /// Where a captured frame lands on its way to the CPU. Grown on the first
-    /// capture, so an image that is never captured holds nothing.
+    /// capture, so a slot that is never captured holds nothing.
     readback: HostBuffer,
+}
+
+/// A device-local image whose memory is exported as the dmabuf behind a `wl_buffer`, with
+/// the view and framebuffer a frame renders into it through. Dropping it without
+/// [`Gpu::destroy_target`] leaks GPU memory until the device goes down.
+pub struct RenderTarget {
+    image: VkImage,
+    memory: VkDeviceMemory,
+    /// The exported dmabuf, kept for the sync-file ioctls; the compositor
+    /// holds its own reference once the wl_buffer imports it.
+    fd: OwnedFd,
+    /// The render-pass view of the image and its framebuffer.
+    view: VkImageView,
+    framebuffer: VkFramebuffer,
     width: u32,
     height: u32,
     stride: u32,
@@ -62,46 +69,40 @@ pub struct GpuImage {
 impl GpuImage {
     /// The dmabuf to hand to `zwp_linux_buffer_params_v1.add`.
     pub fn fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.target.fd.as_raw_fd()
     }
 
     pub fn stride(&self) -> u32 {
-        self.stride
+        self.target.stride
     }
 
     pub fn offset(&self) -> u32 {
-        self.offset
+        self.target.offset
     }
 
     /// The modifier the driver actually chose from the allowed list.
     pub fn modifier(&self) -> u64 {
-        self.modifier
+        self.target.modifier
     }
 }
 
-/// Partially constructed image state, so an error mid-`create_image` destroys
-/// exactly what exists so far (handle 0 = never created).
-struct PendingImage<'a> {
+/// Partially constructed render target, so an error mid-`create_target` destroys exactly
+/// what exists so far (handle 0 = never created).
+struct PendingTarget<'a> {
     gpu: &'a Gpu,
     image: VkImage,
     memory: VkDeviceMemory,
-    fence: VkFence,
-    acquire: VkSemaphore,
-    release: VkSemaphore,
-    cmd: VkCommandBuffer,
     view: VkImageView,
     framebuffer: VkFramebuffer,
-    vertices: HostBuffer,
-    staging: HostBuffer,
-    readback: HostBuffer,
 }
 
-impl Drop for PendingImage<'_> {
+impl Drop for PendingTarget<'_> {
     fn drop(&mut self) {
         let d = self.gpu.device.raw;
         let f = &self.gpu.fns;
-        // SAFETY: every non-zero handle below was created on this device and
-        // is destroyed exactly once; nothing was ever submitted with them.
+        // SAFETY: every non-zero handle below was created on this device and is destroyed
+        // exactly once; no submission still renders into it. The fd (if exported) closes
+        // with its OwnedFd owner.
         unsafe {
             if self.framebuffer != 0 {
                 (f.destroy_framebuffer)(d, self.framebuffer, core::ptr::null());
@@ -109,14 +110,41 @@ impl Drop for PendingImage<'_> {
             if self.view != 0 {
                 (f.destroy_image_view)(d, self.view, core::ptr::null());
             }
+            if self.memory != 0 {
+                (f.free_memory)(d, self.memory, core::ptr::null());
+            }
+            if self.image != 0 {
+                (f.destroy_image)(d, self.image, core::ptr::null());
+            }
         }
+    }
+}
+
+/// Partially constructed slot state, so an error mid-`create_slot`, or in the target
+/// created after it, destroys exactly what exists so far (handle 0 = never created).
+struct PendingSlot<'a> {
+    gpu: &'a Gpu,
+    fence: VkFence,
+    acquire: VkSemaphore,
+    release: VkSemaphore,
+    cmd: VkCommandBuffer,
+    vertices: HostBuffer,
+    staging: HostBuffer,
+    readback: HostBuffer,
+}
+
+impl Drop for PendingSlot<'_> {
+    fn drop(&mut self) {
+        let d = self.gpu.device.raw;
+        let f = &self.gpu.fns;
         self.gpu
             .destroy_host_buffer(std::mem::take(&mut self.vertices));
         self.gpu
             .destroy_host_buffer(std::mem::take(&mut self.staging));
         self.gpu
             .destroy_host_buffer(std::mem::take(&mut self.readback));
-        // SAFETY: as above; the fd (if exported) closes with its OwnedFd owner.
+        // SAFETY: every non-zero handle below was created on this device and is destroyed
+        // exactly once; no submission is in flight with it.
         unsafe {
             if !self.cmd.is_null() {
                 (f.free_command_buffers)(d, self.gpu.pool, 1, &self.cmd);
@@ -129,12 +157,6 @@ impl Drop for PendingImage<'_> {
             }
             if self.fence != 0 {
                 (f.destroy_fence)(d, self.fence, core::ptr::null());
-            }
-            if self.memory != 0 {
-                (f.free_memory)(d, self.memory, core::ptr::null());
-            }
-            if self.image != 0 {
-                (f.destroy_image)(d, self.image, core::ptr::null());
             }
         }
     }
@@ -195,11 +217,47 @@ impl Drop for PendingBuffer<'_> {
 }
 
 impl Gpu {
+    /// Create a swap slot drawing into a `width` x `height` target: the slot's submission
+    /// state and buffers (see [`Self::create_slot`]) and the target itself (see
+    /// [`Self::create_target`]).
+    pub fn create_image(&self, width: u32, height: u32, modifiers: &[u64]) -> Result<GpuImage> {
+        let mut slot = self.create_slot()?;
+        // On an error the slot's guard destroys what it holds.
+        let target = self.create_target(width, height, modifiers)?;
+        let img = GpuImage {
+            target,
+            cmd: slot.cmd,
+            fence: slot.fence,
+            acquire: slot.acquire,
+            release: slot.release,
+            vertices: std::mem::take(&mut slot.vertices),
+            staging: std::mem::take(&mut slot.staging),
+            readback: std::mem::take(&mut slot.readback),
+        };
+        core::mem::forget(slot);
+        Ok(img)
+    }
+
+    /// Point `img` at a fresh `width` x `height` target and hand back the one it drew into,
+    /// for the caller to free with [`Self::destroy_target`] or keep until the compositor
+    /// releases it. The slot's command buffer, fence, semaphores and buffers carry over,
+    /// and the buffers keep the size they grew to.
+    pub fn retarget(
+        &self,
+        img: &mut GpuImage,
+        width: u32,
+        height: u32,
+        modifiers: &[u64],
+    ) -> Result<RenderTarget> {
+        let fresh = self.create_target(width, height, modifiers)?;
+        Ok(std::mem::replace(&mut img.target, fresh))
+    }
+
     /// Create a `width` x `height` render target, letting the driver pick a
     /// layout from `modifiers` (the compositor∩device intersection), and
-    /// export its memory as a dmabuf. Returns the image with the geometry the
+    /// export its memory as a dmabuf. Returns the target with the geometry the
     /// wl_buffer needs (chosen modifier, plane stride and offset).
-    pub fn create_image(&self, width: u32, height: u32, modifiers: &[u64]) -> Result<GpuImage> {
+    fn create_target(&self, width: u32, height: u32, modifiers: &[u64]) -> Result<RenderTarget> {
         if width == 0 || height == 0 {
             return Err(Error::msg("gpu image with a zero dimension"));
         }
@@ -208,19 +266,12 @@ impl Gpu {
         }
         let d = self.device.raw;
         let f = &self.fns;
-        let mut pending = PendingImage {
+        let mut pending = PendingTarget {
             gpu: self,
             image: 0,
             memory: 0,
-            fence: 0,
-            acquire: 0,
-            release: 0,
-            cmd: core::ptr::null_mut(),
             view: 0,
             framebuffer: 0,
-            vertices: HostBuffer::default(),
-            staging: HostBuffer::default(),
-            readback: HostBuffer::default(),
         };
 
         // The image: renderable, clearable, exportable, laid out by one of the
@@ -360,8 +411,64 @@ impl Gpu {
         // SAFETY: the driver just handed us ownership of this fd.
         let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
-        // Per-image submission state. The fence starts signaled so the first
-        // frame's wait passes.
+        // The render-pass plumbing: an sRGB view of the image and its
+        // framebuffer, so fixed-function blending runs in linear space.
+        pending.view = self.create_view(pending.image, VK_FORMAT_B8G8R8A8_SRGB)?;
+        let fb_info = VkFramebufferCreateInfo {
+            s_type: VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            p_next: core::ptr::null(),
+            flags: 0,
+            render_pass: self.renderer.render_pass,
+            attachment_count: 1,
+            p_attachments: &pending.view,
+            width,
+            height,
+            layers: 1,
+        };
+        // SAFETY: the render pass and view are live; fb_info outlives the call.
+        check(
+            unsafe {
+                (f.create_framebuffer)(d, &fb_info, core::ptr::null(), &mut pending.framebuffer)
+            },
+            "vkCreateFramebuffer",
+        )?;
+
+        // Success: move the handles out of the guard.
+        let target = RenderTarget {
+            image: pending.image,
+            memory: pending.memory,
+            fd,
+            view: pending.view,
+            framebuffer: pending.framebuffer,
+            width,
+            height,
+            stride,
+            offset,
+            modifier: chosen.drm_format_modifier,
+            used: false,
+        };
+        core::mem::forget(pending);
+        Ok(target)
+    }
+
+    /// Create a slot's submission state: its command buffer, completion fence, the two
+    /// semaphores of the implicit-sync bridge, and its vertex and staging buffers. Returned
+    /// inside its guard, still armed; the caller moves the handles out and forgets it.
+    fn create_slot(&self) -> Result<PendingSlot<'_>> {
+        let d = self.device.raw;
+        let f = &self.fns;
+        let mut pending = PendingSlot {
+            gpu: self,
+            fence: 0,
+            acquire: 0,
+            release: 0,
+            cmd: core::ptr::null_mut(),
+            vertices: HostBuffer::default(),
+            staging: HostBuffer::default(),
+            readback: HostBuffer::default(),
+        };
+
+        // The fence starts signaled so the first frame's wait passes.
         let fence_info = VkFenceCreateInfo {
             s_type: VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
             p_next: core::ptr::null(),
@@ -413,28 +520,6 @@ impl Gpu {
             "vkAllocateCommandBuffers",
         )?;
 
-        // The render-pass plumbing: an sRGB view of the image and its
-        // framebuffer, so fixed-function blending runs in linear space.
-        pending.view = self.create_view(pending.image, VK_FORMAT_B8G8R8A8_SRGB)?;
-        let fb_info = VkFramebufferCreateInfo {
-            s_type: VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-            p_next: core::ptr::null(),
-            flags: 0,
-            render_pass: self.renderer.render_pass,
-            attachment_count: 1,
-            p_attachments: &pending.view,
-            width,
-            height,
-            layers: 1,
-        };
-        // SAFETY: the render pass and view are live; fb_info outlives the call.
-        check(
-            unsafe {
-                (f.create_framebuffer)(d, &fb_info, core::ptr::null(), &mut pending.framebuffer)
-            },
-            "vkCreateFramebuffer",
-        )?;
-
         // Host-visible per-slot buffers; both grow on demand once a frame
         // needs more (the fence has been waited by then, so recreation is safe).
         pending.vertices = self.create_host_buffer(64 * 1024, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)?;
@@ -443,67 +528,56 @@ impl Gpu {
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         )?;
 
-        // Success: move everything out of the guard.
-        let img = GpuImage {
-            image: pending.image,
-            memory: pending.memory,
-            fd,
-            cmd: pending.cmd,
-            fence: pending.fence,
-            acquire: pending.acquire,
-            release: pending.release,
-            view: pending.view,
-            framebuffer: pending.framebuffer,
-            vertices: std::mem::take(&mut pending.vertices),
-            staging: std::mem::take(&mut pending.staging),
-            readback: std::mem::take(&mut pending.readback),
-            width,
-            height,
-            stride,
-            offset,
-            modifier: chosen.drm_format_modifier,
-            used: false,
-        };
-        core::mem::forget(pending);
-        Ok(img)
+        Ok(pending)
     }
 
-    /// Tear an image down. The caller ensures no submission is in flight
+    /// Tear a slot down, target included. The caller ensures no submission is in flight
     /// (waits for release + fence, or [`Gpu::wait_idle`]).
     ///
-    /// The finished image holds exactly the handles a [`PendingImage`] guards, so
-    /// rebuild one from them and let its `Drop` run the single teardown sequence
-    /// (destroying each handle once). The dmabuf `fd` closes when it drops at the
-    /// end of this scope.
+    /// The finished slot holds exactly the handles a [`PendingSlot`] guards, so rebuild
+    /// one from them and let its `Drop` run the single teardown sequence.
     pub fn destroy_image(&self, img: GpuImage) {
         let GpuImage {
+            target,
+            cmd,
+            fence,
+            acquire,
+            release,
+            vertices,
+            staging,
+            readback,
+        } = img;
+        drop(PendingSlot {
+            gpu: self,
+            fence,
+            acquire,
+            release,
+            cmd,
+            vertices,
+            staging,
+            readback,
+        });
+        self.destroy_target(target);
+    }
+
+    /// Tear a render target down. The caller ensures no submission of ours still renders
+    /// into it, and that the compositor has released its buffer. The dmabuf `fd` closes
+    /// when it drops at the end of this scope.
+    pub fn destroy_target(&self, target: RenderTarget) {
+        let RenderTarget {
             image,
             memory,
             fd: _fd,
-            cmd,
-            fence,
-            acquire,
-            release,
             view,
             framebuffer,
-            vertices,
-            staging,
-            readback,
             ..
-        } = img;
-        drop(PendingImage {
+        } = target;
+        drop(PendingTarget {
             gpu: self,
             image,
             memory,
-            fence,
-            acquire,
-            release,
-            cmd,
             view,
             framebuffer,
-            vertices,
-            staging,
-            readback,
         });
     }
 
@@ -573,7 +647,7 @@ impl Gpu {
 
         // Sized to the copy's tight packing, not the dmabuf stride.
         if capture {
-            let bytes = img.width as usize * img.height as usize * 4;
+            let bytes = img.target.width as usize * img.target.height as usize * 4;
             self.grow_host_buffer(&mut img.readback, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT)?;
         }
 
@@ -628,7 +702,7 @@ impl Gpu {
     /// so nothing needs invalidating.
     #[cfg(test)]
     pub fn read_pixels(&self, img: &GpuImage) -> Result<Vec<u32>> {
-        let pixels = img.width as usize * img.height as usize;
+        let pixels = img.target.width as usize * img.target.height as usize;
         let bytes = pixels * 4;
         if img.readback.ptr.is_null() || img.readback.capacity < bytes {
             return Err(Error::msg("no captured frame to read back"));
@@ -656,7 +730,7 @@ impl Gpu {
     /// The acquire side of the per-frame ownership dance: where the image is
     /// coming from (undefined on first use, the compositor after).
     fn acquire_params(&self, img: &GpuImage) -> (u32, u32, u32) {
-        if img.used {
+        if img.target.used {
             (
                 VK_IMAGE_LAYOUT_GENERAL,
                 VK_QUEUE_FAMILY_FOREIGN,
@@ -694,7 +768,7 @@ impl Gpu {
             unsafe { (f.queue_submit)(self.queue, 1, &submit, img.fence) },
             "vkQueueSubmit",
         )?;
-        img.used = true;
+        img.target.used = true;
         Ok(())
     }
 
@@ -856,7 +930,7 @@ impl Gpu {
                 new_layout: VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 src_queue_family_index: src_qf,
                 dst_queue_family_index: dst_qf,
-                image: img.image,
+                image: img.target.image,
                 subresource_range: range,
             };
             // The acquire semaphore is waited at COLOR_ATTACHMENT_OUTPUT. Starting the
@@ -882,12 +956,12 @@ impl Gpu {
                 s_type: VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                 p_next: core::ptr::null(),
                 render_pass: self.renderer.render_pass,
-                framebuffer: img.framebuffer,
+                framebuffer: img.target.framebuffer,
                 render_area: VkRect2D {
                     offset: VkOffset2D { x: 0, y: 0 },
                     extent: VkExtent2D {
-                        width: img.width,
-                        height: img.height,
+                        width: img.target.width,
+                        height: img.target.height,
                     },
                 },
                 clear_value_count: 1,
@@ -904,8 +978,8 @@ impl Gpu {
                 let viewport = VkViewport {
                     x: 0.0,
                     y: 0.0,
-                    width: img.width as f32,
-                    height: img.height as f32,
+                    width: img.target.width as f32,
+                    height: img.target.height as f32,
                     min_depth: 0.0,
                     max_depth: 1.0,
                 };
@@ -913,8 +987,8 @@ impl Gpu {
                 let scissor = VkRect2D {
                     offset: VkOffset2D { x: 0, y: 0 },
                     extent: VkExtent2D {
-                        width: img.width,
-                        height: img.height,
+                        width: img.target.width,
+                        height: img.target.height,
                     },
                 };
                 (f.cmd_set_scissor)(img.cmd, 0, 1, &scissor);
@@ -923,7 +997,7 @@ impl Gpu {
                 // The viewport, the only push constant: the vertex stage maps pixel
                 // coordinates to clip space with it. The coverage exponent that used
                 // to ride along here is now per run, in the vertex data (gpu.rs).
-                let push: [f32; 2] = [img.width as f32, img.height as f32];
+                let push: [f32; 2] = [img.target.width as f32, img.target.height as f32];
                 (f.cmd_push_constants)(
                     img.cmd,
                     self.renderer.pipeline_layout,
@@ -981,7 +1055,7 @@ impl Gpu {
                 new_layout: VK_IMAGE_LAYOUT_GENERAL,
                 src_queue_family_index: self.queue_family,
                 dst_queue_family_index: VK_QUEUE_FAMILY_FOREIGN,
-                image: img.image,
+                image: img.target.image,
                 subresource_range: range,
             };
             (f.cmd_pipeline_barrier)(
@@ -1020,7 +1094,7 @@ impl Gpu {
             new_layout: VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             src_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
             dst_queue_family_index: VK_QUEUE_FAMILY_IGNORED,
-            image: img.image,
+            image: img.target.image,
             subresource_range: range,
         };
         let region = VkBufferImageCopy {
@@ -1035,8 +1109,8 @@ impl Gpu {
             },
             image_offset: VkOffset3D { x: 0, y: 0, z: 0 },
             image_extent: VkExtent3D {
-                width: img.width,
-                height: img.height,
+                width: img.target.width,
+                height: img.target.height,
                 depth: 1,
             },
         };
@@ -1066,7 +1140,7 @@ impl Gpu {
             );
             (f.cmd_copy_image_to_buffer)(
                 img.cmd,
-                img.image,
+                img.target.image,
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 img.readback.buf,
                 1,
