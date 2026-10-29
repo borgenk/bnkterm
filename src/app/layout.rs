@@ -136,16 +136,7 @@ pub(super) fn surface_for_cells(
 #[cfg(test)]
 mod tests {
     use crate::app::layout::*;
-
-    const METRICS: CellMetrics = CellMetrics {
-        size: 16,
-        w: 8,
-        h: 16,
-        baseline: 12,
-        ascent: 12,
-        descent: 4,
-        lock_glyph: true,
-    };
+    use crate::testutil::METRICS;
 
     /// A 20px strip with a 6px gap, at `position`.
     fn bar(position: TabBarPosition) -> TabBarConfig {

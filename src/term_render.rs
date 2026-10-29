@@ -1815,6 +1815,7 @@ mod tests {
     use crate::color::Color;
     use crate::platform::verdict::Refusal;
     use crate::term_render::*;
+    use crate::testutil::{feed, screen_after};
 
     /// Synthetic metrics: a 10x20 cell so column/row math reads off by eye, with a
     /// 2px line gap (ascent 14 + descent 4 < h 20), like every real font ships. The
@@ -1829,11 +1830,6 @@ mod tests {
         descent: 4,
         lock_glyph: true,
     };
-
-    fn feed(s: &mut Screen, bytes: &[u8]) {
-        let mut p = crate::vt::Parser::new();
-        p.advance_bytes(s, bytes);
-    }
 
     /// A bar at rest, for the frames that are not about the scrollbar: it is out of
     /// sight, so it adds nothing to the list they assert over.
@@ -3372,13 +3368,6 @@ mod tests {
                     .any(|r| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)
             })
         })
-    }
-
-    fn screen_after(cols: usize, rows: usize, bytes: &[u8]) -> Screen {
-        let mut s = Screen::new(cols, rows);
-        let mut p = crate::vt::Parser::new();
-        p.advance_bytes(&mut s, bytes);
-        s
     }
 
     /// A frame identical to the one before it asks the compositor for nothing.

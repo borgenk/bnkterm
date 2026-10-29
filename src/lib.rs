@@ -21,5 +21,7 @@ mod render;
 pub mod shell_integration;
 mod tab_bar;
 pub mod term_render;
+#[cfg(test)]
+mod testutil;
 pub mod vt;
 pub mod width;

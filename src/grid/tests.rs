@@ -6,6 +6,7 @@ use crate::grid::buffer::{MAX_COMBINING_PER_CELL, MAX_LOGICAL_COLS};
 use crate::grid::osc::base64_decode;
 use crate::grid::*;
 use crate::platform::verdict::Refusal;
+use crate::testutil::feed;
 
 #[test]
 fn cell_layout_is_pinned() {
@@ -1821,11 +1822,6 @@ fn steady_scroll_is_allocation_free_after_warmup() {
 }
 
 // ---- end-to-end: bytes through the parser into the grid ----------------
-
-fn feed(s: &mut Screen, bytes: &[u8]) {
-    let mut p = crate::vt::Parser::new();
-    p.advance_bytes(s, bytes);
-}
 
 #[test]
 fn the_saved_cursor_follows_its_row_through_a_resize() {

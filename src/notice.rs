@@ -189,16 +189,7 @@ pub(crate) fn paint(
 mod tests {
     use crate::notice::*;
     use crate::render::display::DrawCmd;
-
-    const METRICS: CellMetrics = CellMetrics {
-        size: 16,
-        w: 8,
-        h: 16,
-        baseline: 12,
-        ascent: 12,
-        descent: 4,
-        lock_glyph: true,
-    };
+    use crate::testutil::METRICS;
 
     fn cfg() -> ShellStartupConfig {
         ShellStartupConfig::default()

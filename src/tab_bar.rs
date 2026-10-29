@@ -473,16 +473,7 @@ fn sanitize_title(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::tab_bar::*;
-
-    const METRICS: CellMetrics = CellMetrics {
-        size: 16,
-        w: 8,
-        h: 16,
-        baseline: 12,
-        ascent: 12,
-        descent: 4,
-        lock_glyph: true,
-    };
+    use crate::testutil::METRICS;
 
     fn label(title: &str, active: bool) -> TabLabel<'_> {
         TabLabel { title, active }

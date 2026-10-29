@@ -859,17 +859,7 @@ mod tests {
     use crate::platform::verdict::{Refusal, Verdict};
     use crate::pty::{Launch, PollSet, Target};
     use crate::render::display::DrawCmd;
-    use crate::term_render::CellMetrics;
-
-    const METRICS: CellMetrics = CellMetrics {
-        size: 16,
-        w: 8,
-        h: 16,
-        baseline: 12,
-        ascent: 12,
-        descent: 4,
-        lock_glyph: true,
-    };
+    use crate::testutil::METRICS;
 
     /// A geometry on [`METRICS`] cells sized to fit them exactly, no padding, unity scale.
     fn geom(cols: usize, rows: usize) -> TerminalGeometry {

@@ -52,6 +52,7 @@ use crate::grid::{LinkId, LinkProbe, Screen};
 use crate::platform::geom::Scale;
 use crate::platform::scroll::Scrollbar;
 use crate::platform::verdict::{Refusal, Verdict};
+use crate::term_render::CellMetrics;
 use crate::vt::{Params, Parser, Perform};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -80,6 +81,17 @@ const BENCH_ROWS: usize = 80;
 /// commands. A perf scenario measures the grid, not the chrome that floats over it, and
 /// a bar mid-fade would make the display list depend on the wall clock.
 static HIDDEN_SCROLLBAR: Scrollbar = Scrollbar::hidden();
+
+/// The 8x16 cell the display-list scenarios lay out on, with no fonts loaded.
+const METRICS: CellMetrics = CellMetrics {
+    size: 16,
+    w: 8,
+    h: 16,
+    baseline: 12,
+    ascent: 12,
+    descent: 4,
+    lock_glyph: true,
+};
 
 /// Bytes per gate parse chunk (one "op").
 const CHUNK: usize = 8 * 1024;
@@ -400,21 +412,11 @@ fn link_scenario(fixture: &LinkFixture) -> Result<Sample> {
 fn link_preview_scenario() -> Result<Sample> {
     use crate::color::Theme;
     use crate::term_render::{
-        build_display_list_into, CellMetrics, CellSpan, CursorRender, DisplayListPool, FrameInputs,
-        LinkHover,
+        build_display_list_into, CellSpan, CursorRender, DisplayListPool, FrameInputs, LinkHover,
     };
 
     const COLS: usize = 80;
     const ROWS: usize = 24;
-    const METRICS: CellMetrics = CellMetrics {
-        size: 16,
-        w: 8,
-        h: 16,
-        baseline: 12,
-        ascent: 12,
-        descent: 4,
-        lock_glyph: true,
-    };
     let url = LINK_LONG_URL.replacen("download", "down\u{200B}load", 1);
     let mut screen = Screen::new(COLS, ROWS);
     Parser::new().advance_bytes(&mut screen, format!("\x1b[3Hsee {url} here").as_bytes());
@@ -570,17 +572,8 @@ fn frame_damage_scenario() -> Sample {
 fn frame_damage_scroll_scenario() -> Sample {
     use crate::color::Theme;
     use crate::render::display::{damage_into, DisplayList};
-    use crate::term_render::{build_display_list_into, CellMetrics, CursorRender, FrameInputs};
+    use crate::term_render::{build_display_list_into, CursorRender, FrameInputs};
 
-    const METRICS: CellMetrics = CellMetrics {
-        size: 16,
-        w: 8,
-        h: 16,
-        baseline: 12,
-        ascent: 12,
-        descent: 4,
-        lock_glyph: true,
-    };
     let surface = (BENCH_COLS as i32 * METRICS.w, BENCH_ROWS as i32 * METRICS.h);
     let theme = Theme::default();
     let frame = |screen: &Screen| {
@@ -663,21 +656,10 @@ fn frame_tabbar_scenario() -> Result<Sample> {
     use crate::color::Theme;
     use crate::config::TabBarConfig;
     use crate::tab_bar::{self, BarGeom, TabLabel};
-    use crate::term_render::{
-        build_display_list_into, CellMetrics, CursorRender, DisplayListPool, FrameInputs,
-    };
+    use crate::term_render::{build_display_list_into, CursorRender, DisplayListPool, FrameInputs};
 
     const COLS: usize = 80;
     const ROWS: usize = 24;
-    const METRICS: CellMetrics = CellMetrics {
-        size: 16,
-        w: 8,
-        h: 16,
-        baseline: 12,
-        ascent: 12,
-        descent: 4,
-        lock_glyph: true,
-    };
 
     let mut screen = Screen::new(COLS, ROWS);
     let mut parser = Parser::new();
@@ -775,9 +757,7 @@ fn frame_text_unicode_scenario() -> Result<Sample> {
     use crate::color::Theme;
     use crate::platform::freetype::Fonts;
     use crate::render::gpu::{build_frame_into, FrameData, GlyphCache, TextGamma};
-    use crate::term_render::{
-        build_display_list_into, CellMetrics, CursorRender, DisplayListPool, FrameInputs,
-    };
+    use crate::term_render::{build_display_list_into, CursorRender, DisplayListPool, FrameInputs};
 
     let fonts = Fonts::new(&[RENDER_FONT_PX])
         .map_err(|e| Error::msg(format!("frame_text_unicode needs the default fonts: {e}")))?;
@@ -1398,9 +1378,7 @@ pub fn render_bench(args: &[String]) -> Result<()> {
     use crate::platform::freetype::Fonts;
     use crate::render::display::damage_into;
     use crate::render::gpu::{build_frame_into, FrameData, GlyphCache};
-    use crate::term_render::{
-        build_display_list_into, CellMetrics, CursorRender, DisplayListPool, FrameInputs,
-    };
+    use crate::term_render::{build_display_list_into, CursorRender, DisplayListPool, FrameInputs};
 
     // `--frames N` overrides the default (the smoke test uses a tiny count).
     let frames = args
