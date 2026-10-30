@@ -12,6 +12,19 @@
 //! Text traversal matches how layout measured each run (the ASCII fast path,
 //! then grapheme clusters routed to the emoji or per-character path), so the
 //! pixels the GPU composites land exactly where the caret and wrapping expect.
+//!
+//! This file holds the frame's types, [`build_frame_into`] and the batcher that walks the
+//! list. What the batcher draws from is split out:
+//!
+//! ```text
+//!   atlas.rs  the shelf-packed atlases and the rasters queued for upload
+//!   cache.rs  the slot maps that remember where each glyph was packed
+//!   gamma.rs  a run's paint, and the coverage exponent that weights its edges
+//! ```
+
+mod atlas;
+mod cache;
+mod gamma;
 
 use std::collections::HashMap;
 
@@ -22,20 +35,25 @@ use crate::platform::geom::Rect;
 use crate::platform::grapheme;
 use crate::render::boxdraw;
 use crate::render::display::DrawCmd;
-use crate::render::display::Fade;
+use crate::render::gpu::atlas::{pack_argb, Atlas};
+use crate::render::gpu::cache::{AsciiRow, ClusterSlots, EmojiFit, PackedGlyph};
+use crate::render::gpu::gamma::Paint;
 
 /// Vertex modes, matching shaders/quad.frag. (Mode 3, the decoded-image path,
 /// is excised: a terminal draws no images.)
 pub const MODE_SOLID: u32 = 0;
+
 pub const MODE_GLYPH: u32 = 1;
+
 pub const MODE_EMOJI: u32 = 2;
+
 pub const MODE_ROUND: u32 = 4;
 
 /// How hard to correct the two opposite ways linear-light compositing misweights
 /// anti-aliased text. Two dials, not one, because they pull in opposite directions,
 /// and nothing says the two corrections need the same magnitude; folding them into one
 /// number makes "lighter correction" mean *bolder* in one direction and *thinner* in
-/// the other. Both reach `1.0` for no correction at all. See [`coverage_exponent`],
+/// the other. Both reach `1.0` for no correction at all. See `coverage_exponent`,
 /// which turns them into a run's exponent.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TextGamma {
@@ -45,61 +63,6 @@ pub struct TextGamma {
     /// thickens (it is raised to a negative power), `1.0` is no correction.
     pub dark_on_light: f32,
 }
-
-impl Default for TextGamma {
-    /// The shipping values, before any environment override (see
-    /// `app::config_text_gamma`), so a build's text weight never depends on the
-    /// environment it started in.
-    fn default() -> Self {
-        Self {
-            light_on_dark: 1.5,
-            dark_on_light: 2.0,
-        }
-    }
-}
-
-/// A glyph run's paint, threaded through the glyph emitters as one value: the
-/// foreground `color`, the coverage `exponent` derived once from its contrast with
-/// the run background (see [`coverage_exponent`]), and the optional ink ramp that
-/// dissolves its tail (see [`Fade`]).
-///
-/// `exponent` is derived from the run's *own* colour against its background, and the
-/// fade deliberately leaves that colour alone: were the fade a colour mix toward the
-/// background instead, it would collapse the very contrast this exponent reads, and a
-/// label's stroke weight would drift along its own tail.
-#[derive(Clone, Copy)]
-struct Paint {
-    color: u32,
-    exponent: f32,
-    fade: Option<Fade>,
-}
-
-impl Paint {
-    fn new(color: u32, bg: u32, fade: Option<Fade>, gamma: TextGamma) -> Self {
-        Paint {
-            color,
-            exponent: coverage_exponent(color, bg, gamma),
-            fade,
-        }
-    }
-}
-
-/// Atlases start here and double when full, up to [`ATLAS_MAX`]. Growing wipes the
-/// atlas and the frame build restarts, so no stale coordinates survive. Full at the
-/// cap, an atlas is wiped back to the start instead (see [`Atlas::spent`]). Either way
-/// the live frame's glyphs are rasterized again, a burst bounded by the frame.
-const ATLAS_START: u32 = 1024;
-const ATLAS_MAX: u32 = 8192;
-
-/// The most slot records a glyph cache keeps before it is dropped whole. The atlas
-/// is bounded by [`ATLAS_MAX`], but the slot maps are not: a `None` record is kept
-/// for every distinct non-emoji cluster (the negative cache) and for every glyph
-/// that would not fit a full atlas, so a child printing a stream of distinct
-/// clusters or glyphs would grow them without limit. Far above any real workload's distinct-glyph count, so ordinary
-/// use never trips it; when it does, the map is dropped and the atlas it pointed
-/// into is wiped, so the glyphs re-cache into reclaimed space (a bounded burst)
-/// rather than accumulating forever.
-const MAX_GLYPH_CACHE: usize = 1 << 16;
 
 /// One vertex, laid out exactly as the pipeline's vertex input expects
 /// (`repr(C)`: pos, uv, color, extra, mode). Six of these make a quad.
@@ -142,29 +105,6 @@ pub struct UploadRegion {
     pub offset: usize,
 }
 
-impl AtlasUpload {
-    pub fn is_empty(&self) -> bool {
-        self.regions.is_empty()
-    }
-
-    fn clear(&mut self) {
-        self.regions.clear();
-        self.bytes.clear();
-    }
-
-    /// Queue a raster written at `slot`, its bytes appended by `fill`.
-    fn push(&mut self, slot: Slot, fill: impl FnOnce(&mut Vec<u8>)) {
-        self.regions.push(UploadRegion {
-            x: slot.x,
-            y: slot.y,
-            w: slot.w,
-            h: slot.h,
-            offset: self.bytes.len(),
-        });
-        fill(&mut self.bytes);
-    }
-}
-
 /// Everything the Vulkan renderer needs to draw one frame. Reused across frames by
 /// [`build_frame_into`]: its `vertices`/`batches` are cleared and refilled, so a
 /// steady frame keeps their capacity instead of reallocating.
@@ -190,289 +130,6 @@ pub struct AtlasInfo {
     pub generation: u32,
 }
 
-/// Where a raster landed in an atlas.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Slot {
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-}
-
-/// A glyph's atlas placement plus its pen metrics, cached beside the slot so a
-/// steady-state frame emits the quad without re-rasterising the glyph. `slot` is
-/// `None` for an inkless glyph (a space, or an emoji that shaped to no ink) or
-/// one the atlas could not fit; the pen still advances by `advance`, so the
-/// caret and the glyphs after it land where layout measured.
-#[derive(Clone, Copy)]
-struct PackedGlyph {
-    slot: Option<Slot>,
-    left: i32,
-    top: i32,
-    advance: f32,
-}
-
-/// A shelf-packing texture atlas. Rasters are packed onto horizontal shelves (rows
-/// share a height class), and each new raster's bytes wait in an [`AtlasUpload`] until
-/// the frame takes them. The texels live only on the GPU: a texture is recreated only
-/// when the atlas is wiped, and the rasters packed after the wipe are its whole upload.
-pub struct Atlas {
-    width: u32,
-    height: u32,
-    /// The side the atlas grows to at most: [`ATLAS_MAX`], or less in tests that
-    /// need to fill one.
-    max: u32,
-    /// Bytes per texel: 1 (R8 coverage) or 4 (BGRA emoji).
-    bpp: u32,
-    /// Shelves as (y, height, x_used).
-    shelves: Vec<(u32, u32, u32)>,
-    next_y: u32,
-    generation: u32,
-    /// Rasters written since the last [`Atlas::take_upload`].
-    pending: AtlasUpload,
-    /// The atlas holds slots nothing will look up again: it filled at its cap, or
-    /// the records pointing into it were dropped. [`build_frame_into`] wipes it and
-    /// rebuilds the frame into the reclaimed space.
-    spent: bool,
-    /// A slot map pointing into this atlas was dropped since the atlas was last
-    /// wiped (see [`Atlas::records_dropped`]).
-    dropped_since_wipe: bool,
-}
-
-impl Atlas {
-    pub fn new(bpp: u32) -> Self {
-        Self::with_max(bpp, ATLAS_MAX)
-    }
-
-    /// An atlas that grows to at most `max` texels a side, starting at
-    /// [`ATLAS_START`] or at `max` when that is smaller.
-    fn with_max(bpp: u32, max: u32) -> Self {
-        let side = ATLAS_START.min(max);
-        Self {
-            width: side,
-            height: side,
-            max,
-            bpp,
-            shelves: Vec::new(),
-            next_y: 0,
-            generation: 0,
-            pending: AtlasUpload::default(),
-            spent: false,
-            dropped_since_wipe: false,
-        }
-    }
-
-    pub fn info(&self) -> AtlasInfo {
-        AtlasInfo {
-            width: self.width,
-            height: self.height,
-            generation: self.generation,
-        }
-    }
-
-    /// Reserve a `w` x `h` slot. `None` means the raster does not fit: it is
-    /// larger than the atlas can grow, or the atlas is full at its cap, which marks
-    /// it [`spent`](Self::spent) so the frame build wipes it and the glyph packs
-    /// into the reclaimed space. Growing wipes all previous slots and bumps the
-    /// generation, which the frame builder answers by restarting the build.
-    fn reserve(&mut self, w: u32, h: u32) -> Option<Slot> {
-        if w == 0 || h == 0 || w > self.max || h > self.max {
-            return None;
-        }
-        loop {
-            // A shelf fits if the raster is no taller than the shelf and the
-            // remaining width holds it. Shelves are created at the raster's
-            // height, so height classes cluster and waste stays bounded.
-            if let Some(shelf) = self
-                .shelves
-                .iter_mut()
-                .find(|(_, sh, used)| h <= *sh && used + w <= self.width)
-            {
-                let slot = Slot {
-                    x: shelf.2,
-                    y: shelf.0,
-                    w,
-                    h,
-                };
-                shelf.2 += w;
-                return Some(slot);
-            }
-            if self.next_y + h <= self.height && w <= self.width {
-                self.shelves.push((self.next_y, h, w));
-                let slot = Slot {
-                    x: 0,
-                    y: self.next_y,
-                    w,
-                    h,
-                };
-                self.next_y += h;
-                return Some(slot);
-            }
-            if !self.grow() {
-                self.spent = true;
-                return None;
-            }
-        }
-    }
-
-    /// Double the atlas (square), wiping every slot. Returns false at the cap.
-    fn grow(&mut self) -> bool {
-        let next = (self.width * 2).min(self.max);
-        if next == self.width {
-            return false;
-        }
-        self.reset(next);
-        true
-    }
-
-    /// Empty the atlas back to its starting side.
-    fn wipe(&mut self) {
-        self.reset(ATLAS_START.min(self.max));
-        self.dropped_since_wipe = false;
-    }
-
-    /// A slot map pointing into this atlas was dropped, orphaning its slots. The
-    /// first drop after a wipe marks the atlas spent. A second one before the next
-    /// wipe means the screen alone holds more glyphs than the map, so wiping on
-    /// every frame would reclaim nothing; the orphans are left until the atlas fills
-    /// at its cap and is wiped there.
-    fn records_dropped(&mut self) {
-        if !self.dropped_since_wipe {
-            self.spent = true;
-        }
-        self.dropped_since_wipe = true;
-    }
-
-    /// Empty the atlas at `side` texels square and bump the generation, which kills
-    /// every slot handed out before and has the renderer recreate the texture.
-    fn reset(&mut self, side: u32) {
-        self.width = side;
-        self.height = side;
-        self.shelves.clear();
-        self.next_y = 0;
-        self.generation = self.generation.wrapping_add(1);
-        self.pending.clear();
-    }
-
-    /// Queue a raster written at `slot` for the next upload. `src` is `w * h * bpp`
-    /// bytes, row-major, tight; [`Self::pack`] has checked it holds that many.
-    fn write(&mut self, slot: Slot, src: &[u8]) {
-        if let Some(src) = src.get(..self.raster_len(slot.w, slot.h)) {
-            self.pending
-                .push(slot, |bytes| bytes.extend_from_slice(src));
-        }
-    }
-
-    /// Queue a `w`-word-per-row ARGB raster (`w * h` words, row-major, tight) written at
-    /// `slot`, one pixel's `to_ne_bytes` at a time. Lets the color atlas (`bpp == 4`)
-    /// pack a glyph straight from its words without first collecting them into a byte
-    /// vector.
-    fn write_words(&mut self, slot: Slot, src: &[u32]) {
-        let words = (slot.w as usize).saturating_mul(slot.h as usize);
-        if let Some(src) = src.get(..words) {
-            self.pending.push(slot, |bytes| {
-                bytes.extend(src.iter().flat_map(|word| word.to_ne_bytes()));
-            });
-        }
-    }
-
-    /// Reserve a slot for a `w` x `h` raster and write `src` into it, returning
-    /// the slot; `None` for a zero-area raster or a full atlas (the caller
-    /// records the empty placement so the pen still advances). `src` is
-    /// `w * h * bpp` bytes, row-major, tight.
-    fn pack(&mut self, w: u32, h: u32, src: &[u8]) -> Option<Slot> {
-        if w == 0 || h == 0 || src.len() < self.raster_len(w, h) {
-            return None;
-        }
-        let slot = self.reserve(w, h)?;
-        self.write(slot, src);
-        Some(slot)
-    }
-
-    /// Like [`pack`](Self::pack) but from ARGB words (the color-glyph path), queuing
-    /// their bytes directly. `src` is `w * h` words, row-major, tight.
-    fn pack_words(&mut self, w: u32, h: u32, src: &[u32]) -> Option<Slot> {
-        if w == 0 || h == 0 || src.len() < (w as usize).saturating_mul(h as usize) {
-            return None;
-        }
-        let slot = self.reserve(w, h)?;
-        self.write_words(slot, src);
-        Some(slot)
-    }
-
-    /// How many bytes a tight `w`-by-`h` raster occupies at this atlas's depth: what
-    /// [`Self::write`] will read, and therefore what [`Self::pack`] insists on having.
-    ///
-    /// The check exists because the dimensions and the buffer come from different places
-    /// and are not guaranteed to agree. `copy_coverage` returns an empty `Vec` when
-    /// FreeType hands back a null `bitmap.buffer`, while `Glyph::width`/`rows` keep the
-    /// nonzero dimensions the metrics reported — and `packed_scalar` then packs
-    /// `(g.width, g.rows, &g.coverage)`, so the slice range in `write` traps. Release
-    /// builds are `panic = "abort"`, so that is the whole process for a font or driver
-    /// anomaly. `pack_words` already had this shape; `pack` did not.
-    fn raster_len(&self, w: u32, h: u32) -> usize {
-        (w as usize)
-            .saturating_mul(h as usize)
-            .saturating_mul(self.bpp as usize)
-    }
-
-    /// Hand the rasters written since the last call to `out`, which takes them in
-    /// place of what it held; the two buffers trade back and forth, so a frame of new
-    /// glyphs allocates nothing once both have grown.
-    pub fn take_upload(&mut self, out: &mut AtlasUpload) {
-        out.clear();
-        std::mem::swap(out, &mut self.pending);
-    }
-}
-
-/// The persistent glyph caches the batcher packs into: slots by scalar and by
-/// cluster, over the two atlases. Owned by the app next to the display list;
-/// survives across frames so steady-state frames insert nothing.
-/// The first printable ASCII scalar, and how many there are (`0x20..=0x7E`): the
-/// span [`GlyphCache`] direct-maps.
-const ASCII_FIRST: u32 = 0x20;
-const ASCII_SLOTS: usize = 95;
-
-/// The most faces that hold a direct-mapped ASCII row at once. Four styles across a
-/// couple of sizes is the real ceiling (a `FaceKey`'s size changes only when the
-/// *user* zooms, never at a child's request), so this is slack, not a budget; past
-/// it, ASCII simply falls back to the map and stays correct.
-const MAX_ASCII_FACES: usize = 16;
-
-/// One face's placements for printable ASCII, indexed by `ch - 0x20`.
-struct AsciiRow {
-    face: FaceKey,
-    slots: Box<[Option<PackedGlyph>; ASCII_SLOTS]>,
-}
-
-/// Emoji placements per face, by cluster. Nested so lookups borrow the cluster as
-/// `&str` (no per-frame `String`). A `None` value records a cluster that is not
-/// color emoji, so a steady-state frame takes the per-character path without
-/// re-consulting the `Face`.
-type ClusterSlots = HashMap<FaceKey, HashMap<String, Option<PackedGlyph>>>;
-
-/// The size an emoji cluster is rasterized at, which also picks the map that caches
-/// it. The face key fixes both sizes, so `(face_key, cluster)` is a complete key
-/// within either map.
-#[derive(Clone, Copy)]
-enum EmojiFit {
-    /// The em, for a wide cluster on the [`Batcher::text`] path: the ~square glyph
-    /// fills both cells and its advance carries the pen.
-    Em,
-    /// One cell's width, for a single-width cluster on the [`Batcher::cells`] path,
-    /// so it does not spill past its column.
-    Cell(u32),
-}
-
-impl EmojiFit {
-    fn target(self, face_key: FaceKey) -> u32 {
-        match self {
-            EmojiFit::Em => face_key.size(),
-            EmojiFit::Cell(width) => width,
-        }
-    }
-}
-
 /// The glyph cache's hit and miss tallies, for `--stats`. Once the working set is
 /// packed into the atlas, steady-state frames add hits and almost no misses.
 #[derive(Clone, Copy, Default)]
@@ -481,21 +138,9 @@ pub struct CacheStats {
     pub misses: u64,
 }
 
-impl CacheStats {
-    /// Total lookups (hits + misses).
-    pub fn lookups(self) -> u64 {
-        self.hits + self.misses
-    }
-
-    /// Fraction of lookups served from the cache, 0.0 when nothing was looked up.
-    pub fn hit_rate(self) -> f32 {
-        match self.lookups() {
-            0 => 0.0,
-            total => self.hits as f32 / total as f32,
-        }
-    }
-}
-
+/// The persistent glyph caches the batcher packs into: slots by scalar and by
+/// cluster, over the two atlases. Owned by the app next to the display list;
+/// survives across frames so steady-state frames insert nothing.
 pub struct GlyphCache {
     pub glyphs: Atlas,
     pub emoji: Atlas,
@@ -541,127 +186,10 @@ pub struct GlyphCache {
     /// for the other for the life of the process.
     cell_cluster_slots: ClusterSlots,
     /// The most records `scalar_slots`, or one face's map of clusters, holds before
-    /// it is dropped: [`MAX_GLYPH_CACHE`], or less in tests that need to overflow one.
+    /// it is dropped: `MAX_GLYPH_CACHE`, or less in tests that need to overflow one.
     max_records: usize,
     /// Hits and misses across the scalar, box and emoji lookups since the cache was made.
     stats: CacheStats,
-}
-
-impl Default for GlyphCache {
-    /// Two empty atlases: one byte per pixel for the mono glyphs, four for the colour
-    /// emoji. Both grow on demand.
-    fn default() -> Self {
-        Self {
-            glyphs: Atlas::new(1),
-            emoji: Atlas::new(4),
-            ascii_slots: Vec::new(),
-            scalar_slots: HashMap::new(),
-            box_slots: HashMap::new(),
-            cluster_slots: HashMap::new(),
-            cell_cluster_slots: HashMap::new(),
-            max_records: MAX_GLYPH_CACHE,
-            stats: CacheStats::default(),
-        }
-    }
-}
-
-impl GlyphCache {
-    /// Hits and misses since the cache was made.
-    pub fn stats(&self) -> CacheStats {
-        self.stats
-    }
-
-    /// The direct-mapped index for a printable-ASCII scalar, or `None` for anything
-    /// else (which belongs in [`Self::scalar_slots`]). The partition is total: a
-    /// character is direct-mapped or hashed, never both, so the two can never
-    /// disagree about a placement.
-    fn ascii_index(ch: char) -> Option<usize> {
-        let i = (ch as u32).wrapping_sub(ASCII_FIRST);
-        (i < ASCII_SLOTS as u32).then_some(i as usize)
-    }
-
-    /// A printable-ASCII glyph's cached placement: find the face, index the row.
-    fn ascii_get(&self, face: FaceKey, ch: char) -> Option<PackedGlyph> {
-        let i = Self::ascii_index(ch)?;
-        self.ascii_slots.iter().find(|r| r.face == face)?.slots[i]
-    }
-
-    /// Drop every slot record that points into an atlas wiped since `glyphs_gen` or
-    /// `emoji_gen`.
-    fn reset_for(&mut self, glyphs_gen: u32, emoji_gen: u32) {
-        if self.glyphs.generation != glyphs_gen {
-            self.scalar_slots.clear();
-            // Box rasters live in the same atlas, so a wipe takes them with it.
-            self.box_slots.clear();
-            // The direct-mapped rows hold atlas coordinates too; a wipe invalidates
-            // them exactly as it does the map, and forgetting them here would leave
-            // every ASCII glyph pointing into a dead slot.
-            self.ascii_slots.clear();
-        }
-        if self.emoji.generation != emoji_gen {
-            self.cluster_slots.clear();
-            self.cell_cluster_slots.clear();
-        }
-    }
-
-    /// The map that caches emoji at `fit`'s size.
-    fn clusters(&self, fit: EmojiFit) -> &ClusterSlots {
-        match fit {
-            EmojiFit::Em => &self.cluster_slots,
-            EmojiFit::Cell(_) => &self.cell_cluster_slots,
-        }
-    }
-
-    /// Record a scalar glyph's placement, dropping the whole scalar cache first if it
-    /// has reached [`MAX_GLYPH_CACHE`], so distinct-glyph spam cannot grow it without
-    /// bound. The dropped records held glyph-atlas slots that would otherwise be
-    /// orphaned while the glyphs re-pack into fresh space, so the atlas is told (see
-    /// [`Atlas::records_dropped`]).
-    fn cache_scalar(&mut self, key: (FaceKey, char), packed: PackedGlyph) {
-        let (face, ch) = key;
-        if let Some(i) = Self::ascii_index(ch) {
-            if let Some(row) = self.ascii_slots.iter_mut().find(|r| r.face == face) {
-                row.slots[i] = Some(packed);
-                return;
-            }
-            if self.ascii_slots.len() < MAX_ASCII_FACES {
-                let mut slots = Box::new([None; ASCII_SLOTS]);
-                slots[i] = Some(packed);
-                self.ascii_slots.push(AsciiRow { face, slots });
-                return;
-            }
-            // Past the face ceiling ASCII keeps working, just through the map, which
-            // is why `ascii_get` missing is never taken as "no such glyph".
-        }
-        if self.scalar_slots.len() >= self.max_records {
-            self.scalar_slots.clear();
-            self.glyphs.records_dropped();
-        }
-        self.scalar_slots.insert(key, packed);
-    }
-
-    /// Record a cluster's placement (or `None` for a non-emoji cluster: the negative
-    /// cache that keeps a steady frame off the shaper), capping the per-face map the
-    /// same way so a stream of distinct clusters cannot grow it without bound, and
-    /// telling the emoji atlas its records pointed into.
-    fn cache_cluster(
-        &mut self,
-        fit: EmojiFit,
-        face_key: FaceKey,
-        cluster: &str,
-        packed: Option<PackedGlyph>,
-    ) {
-        let map = match fit {
-            EmojiFit::Em => &mut self.cluster_slots,
-            EmojiFit::Cell(_) => &mut self.cell_cluster_slots,
-        };
-        let by = map.entry(face_key).or_default();
-        if by.len() >= self.max_records {
-            by.clear();
-            self.emoji.records_dropped();
-        }
-        by.insert(cluster.to_string(), packed);
-    }
 }
 
 /// Build one frame's GPU data from the display list into `out` (whose vertex and
@@ -1149,16 +677,6 @@ impl Batcher<'_> {
     }
 }
 
-/// Pack an emoji cluster's straight-`0xAARRGGBB` raster into the color atlas.
-/// `None` for a zero-area or malformed glyph or a full atlas; the placement is
-/// recorded as `None` so the pen advances without drawing.
-fn pack_argb(atlas: &mut Atlas, w: u32, h: u32, argb: &[u32]) -> Option<Slot> {
-    // ARGB words are B,G,R,A bytes in memory: B8G8R8A8 verbatim, queued straight from
-    // the words rather than first collected into a byte-conversion vector.
-    // `pack_words` owns the dimension-versus-buffer check, so no caller can skip it.
-    atlas.pack_words(w, h, argb)
-}
-
 /// Re-place a single-width color-emoji glyph so it sits on the text line rather
 /// than on its natural pen bearing (which seats it near the cell's vertical
 /// middle and reads *low* beside baseline-aligned text). The glyph is
@@ -1238,212 +756,21 @@ fn color_f32(color: u32) -> [f32; 4] {
     ]
 }
 
-/// The power the fragment shader raises a run's glyph coverage to, from the run's
-/// foreground and background colours. Above 1 thins the anti-aliased edges, below 1
-/// thickens them, and exactly 1 leaves the raster alone.
-///
-/// Linear-light compositing (the colour attachment is an sRGB view, so blending is
-/// gamma-correct) misweights anti-aliased text in *opposite* directions depending on
-/// which side is lighter, so the two cases get their own dial (see
-/// [`TextGamma::default`]):
-///
-/// - **Light on dark**, the usual terminal text: rendered heavier than the
-///   gamma-space stacks most terminals use, so thin it by
-///   [`TextGamma::light_on_dark`] flat. The magnitude of the contrast does not enter:
-///   the overweighting is there at any contrast.
-/// - **Dark on light** (a reverse-video paste highlight, a light theme, the active
-///   tab's dark label on its light block): washed out instead, so thicken it by
-///   raising [`TextGamma::dark_on_light`] to a negative power, reaching its inverse
-///   at maximum contrast. This one *does* scale with contrast, because the washout
-///   does. Dark-on-light is never thinned, however faint the contrast: an earlier
-///   `1 + 2d` ramp only crossed into thickening past half-contrast, so a dark label
-///   on a mid-light block (this tab bar's turquoise) came out thin.
-///
-/// Computing this per run rather than per pixel keeps the policy in Rust, where it is
-/// testable, and leaves the shader one `pow` instead of two.
-///
-/// Only the sign of `d` (which side is lighter) and a soft magnitude matter, so a
-/// perceptual (gamma-space) luma is enough.
-fn coverage_exponent(fg: u32, bg: u32, gamma: TextGamma) -> f32 {
-    let d = luma(fg) - luma(bg);
-    if d >= 0.0 {
-        gamma.light_on_dark
-    } else {
-        // `d` is already in `[-1, 0)`; `max` is a defensive clamp, so the exponent
-        // can never fall below the dial's inverse however the colours are chosen.
-        gamma.dark_on_light.powf(d.max(-1.0))
-    }
-}
-
-/// Rec. 709 relative luminance of a `0x00RRGGBB` colour in `[0, 1]`, taken in the
-/// gamma-encoded byte space as a perceptual stand-in (enough to pick the contrast
-/// direction and a soft strength; see [`coverage_exponent`]).
-fn luma(color: u32) -> f32 {
-    let r = ((color >> 16) & 0xff) as f32;
-    let g = ((color >> 8) & 0xff) as f32;
-    let b = (color & 0xff) as f32;
-    (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::render::gpu::atlas::Slot;
     use crate::render::gpu::*;
 
     /// Both dials at 2.0 in tests, so an assertion reads as a plain power and a
     /// change to the shipping values in `app` cannot quietly move these numbers.
-    const GAMMA: TextGamma = TextGamma {
+    pub(super) const GAMMA: TextGamma = TextGamma {
         light_on_dark: 2.0,
         dark_on_light: 2.0,
     };
 
-    #[test]
-    fn atlas_packs_onto_shelves_and_queues_what_it_writes() {
-        let mut a = Atlas::new(1);
-        let s1 = a.reserve(10, 8).expect("fits");
-        let s2 = a.reserve(6, 8).expect("fits on the same shelf");
-        assert_eq!((s1.x, s1.y), (0, 0));
-        assert_eq!((s2.x, s2.y), (10, 0), "same shelf, packed rightward");
-        let s3 = a.reserve(10, 20).expect("taller: a new shelf");
-        assert_eq!(s3.y, 8, "new shelf below the first");
-        a.write(s1, &[7u8; 80]);
-        let mut up = AtlasUpload::default();
-        a.take_upload(&mut up);
-        assert_eq!(
-            up.regions,
-            [UploadRegion {
-                x: 0,
-                y: 0,
-                w: 10,
-                h: 8,
-                offset: 0
-            }]
-        );
-        assert!(up.bytes.iter().all(|&b| b == 7));
-        a.take_upload(&mut up);
-        assert!(up.is_empty(), "taken once");
-    }
-
-    /// Two glyphs far apart in the atlas upload their own texels. Their bounding box,
-    /// what used to go up, is here most of a shelf's width by two shelves' height.
-    #[test]
-    fn an_upload_carries_only_the_rasters_written() {
-        let mut a = Atlas::new(1);
-        a.pack(900, 8, &[1; 900 * 8])
-            .expect("a wide raster on the first shelf");
-        a.pack(10, 300, &[2; 10 * 300])
-            .expect("a tall one on a second shelf");
-        let mut up = AtlasUpload::default();
-        a.take_upload(&mut up);
-
-        let near = a.pack(10, 8, &[3; 10 * 8]).expect("beside the wide one");
-        let far = a
-            .pack(10, 300, &[4; 10 * 300])
-            .expect("beside the tall one");
-        a.take_upload(&mut up);
-
-        assert_eq!(
-            up.bytes.len(),
-            10 * 8 + 10 * 300,
-            "only the two new rasters"
-        );
-        let placed: Vec<_> = up.regions.iter().map(|r| (r.x, r.y, r.w, r.h)).collect();
-        assert_eq!(
-            placed,
-            [(near.x, near.y, 10, 8), (far.x, far.y, 10, 300)],
-            "each where it was packed"
-        );
-        let second = up.regions[1].offset;
-        assert!(up.bytes[..second].iter().all(|&b| b == 3));
-        assert!(up.bytes[second..].iter().all(|&b| b == 4));
-    }
-
-    #[test]
-    fn packing_a_raster_shorter_than_its_dimensions_refuses_instead_of_trapping() {
-        // The dimensions and the buffer come from different places and are not guaranteed
-        // to agree: `copy_coverage` returns an empty `Vec` when FreeType hands back a null
-        // `bitmap.buffer`, while `Glyph::width`/`rows` keep the nonzero dimensions the
-        // metrics reported. `packed_scalar` then packs `(width, rows, &coverage)` and the
-        // slice range inside `write` traps — and release is `panic = "abort"`, so a font
-        // or driver anomaly takes the whole process.
-        let mut a = Atlas::new(1);
-        assert_eq!(a.pack(4, 4, &[]), None, "the empty-coverage case exactly");
-        assert_eq!(a.pack(4, 4, &[0u8; 15]), None, "one byte short is short");
-        assert!(
-            a.pack(4, 4, &[0u8; 16]).is_some(),
-            "and exactly enough fits"
-        );
-
-        // The colour atlas counts four bytes to the pixel, so the same raster needs four
-        // times the buffer. A check that forgot `bpp` would pass this and then trap.
-        let mut a = Atlas::new(4);
-        assert_eq!(a.pack(4, 4, &[0u8; 16]), None);
-        assert!(a.pack(4, 4, &[0u8; 64]).is_some());
-
-        // And the word path, which already refused, still does.
-        let mut a = Atlas::new(4);
-        assert_eq!(a.pack_words(2, 2, &[0u32; 3]), None);
-        assert!(a.pack_words(2, 2, &[0u32; 4]).is_some());
-    }
-
-    #[test]
-    fn pack_words_lays_down_the_same_bytes_as_a_conversion_would() {
-        // The color-glyph path queues ARGB words straight into the 4-bpp upload; the
-        // result must match converting each word to its native bytes first, so
-        // dropping that conversion vector changed nothing on screen.
-        let mut a = Atlas::new(4);
-        let argb: [u32; 4] = [0x1122_3344, 0x5566_7788, 0x99AA_BBCC, 0xDDEE_FF00];
-        a.pack_words(2, 2, &argb).expect("fits");
-        let mut up = AtlasUpload::default();
-        a.take_upload(&mut up);
-        assert_eq!((up.regions[0].w, up.regions[0].h), (2, 2));
-        let expect: Vec<u8> = argb.iter().flat_map(|w| w.to_ne_bytes()).collect();
-        assert_eq!(up.bytes, expect);
-    }
-
-    #[test]
-    fn glyph_caches_stay_bounded_under_distinct_input() {
-        // Past the cap the maps drop and re-fill rather than growing forever, so a
-        // hostile stream of distinct glyphs or clusters cannot exhaust memory.
-        let mut cache = GlyphCache::default();
-        let face = FaceKey::Prose {
-            size: 16,
-            style: crate::platform::freetype::FontStyle::Regular,
-        };
-        let none = PackedGlyph {
-            slot: None,
-            left: 0,
-            top: 0,
-            advance: 0.0,
-        };
-        for i in 0..MAX_GLYPH_CACHE + 5 {
-            let ch = char::from_u32(0x1_0000 + i as u32).expect("valid scalar");
-            cache.cache_scalar((face, ch), none);
-            cache.cache_cluster(EmojiFit::Em, face, &format!("c{i}"), None);
-            cache.cache_cluster(EmojiFit::Cell(8), face, &format!("c{i}"), None);
-        }
-        assert!(cache.scalar_slots.len() <= MAX_GLYPH_CACHE);
-        for map in [&cache.cluster_slots, &cache.cell_cluster_slots] {
-            let clusters: usize = map.values().map(|m| m.len()).sum();
-            assert!(clusters <= MAX_GLYPH_CACHE);
-        }
-    }
-
-    #[test]
-    fn atlas_grows_by_wiping_and_bumping_generation() {
-        let mut a = Atlas::new(1);
-        let g0 = a.generation;
-        // A raster wider than the atlas forces growth.
-        let s = a.reserve(ATLAS_START + 1, 4).expect("grows to fit");
-        assert!(a.generation > g0);
-        assert_eq!(a.width, ATLAS_START * 2);
-        assert_eq!((s.x, s.y), (0, 0), "the grown atlas starts empty");
-        // Beyond the cap is a clean None.
-        assert!(a.reserve(ATLAS_MAX + 1, 1).is_none());
-    }
-
     /// A placed glyph to cache; the coordinates are irrelevant to these tests, only
     /// whether the record survives or is dropped.
-    fn placed() -> PackedGlyph {
+    pub(super) fn placed() -> PackedGlyph {
         PackedGlyph {
             slot: Some(Slot {
                 x: 0,
@@ -1457,48 +784,8 @@ mod tests {
         }
     }
 
-    /// The direct-mapped rows hold atlas coordinates exactly as the map does, so an
-    /// atlas wipe has to drop both. The map has always been dropped on a generation
-    /// bump; if the rows are not, every ASCII glyph silently renders from a dead slot
-    /// — the one corruption splitting the cache in two could introduce, and one no
-    /// rendering test would notice until it was on screen.
-    #[test]
-    fn an_atlas_wipe_invalidates_the_direct_mapped_ascii_rows() {
-        let mut cache = GlyphCache::default();
-        let face = FaceKey::Prose {
-            size: 16,
-            style: crate::platform::freetype::FontStyle::Regular,
-        };
-        cache.cache_scalar((face, 'A'), placed());
-        cache.cache_scalar((face, '\u{2500}'), placed());
-        assert!(cache.ascii_get(face, 'A').is_some());
-        assert!(cache.scalar_slots.contains_key(&(face, '\u{2500}')));
-
-        // A raster wider than the atlas forces it to grow, wiping every slot.
-        let g0 = cache.glyphs.generation;
-        let emoji_gen = cache.emoji.generation;
-        cache
-            .glyphs
-            .reserve(ATLAS_START + 1, 4)
-            .expect("grows to fit");
-        assert!(
-            cache.glyphs.generation > g0,
-            "the wipe bumps the generation"
-        );
-        cache.reset_for(g0, emoji_gen);
-
-        assert!(
-            cache.ascii_get(face, 'A').is_none(),
-            "a direct-mapped ASCII row survived an atlas wipe, so it now points at a dead slot"
-        );
-        assert!(
-            cache.scalar_slots.is_empty(),
-            "the map is dropped as before"
-        );
-    }
-
     /// One run of `text` in the 16 px prose face.
-    fn prose(text: &str) -> Vec<DrawCmd> {
+    pub(super) fn prose(text: &str) -> Vec<DrawCmd> {
         vec![DrawCmd::Text {
             bounds: Rect {
                 x: 0,
@@ -1519,7 +806,7 @@ mod tests {
         }]
     }
 
-    fn glyph_quads(frame: &FrameData) -> usize {
+    pub(super) fn glyph_quads(frame: &FrameData) -> usize {
         frame
             .vertices
             .iter()
@@ -1545,44 +832,6 @@ mod tests {
             assert!(!frame.glyph_upload.is_empty(), "{ch:?} was never uploaded");
         }
         assert!(cache.glyphs.generation > 0, "the atlas never filled");
-    }
-
-    /// Dropping a slot map orphans the atlas slots its records held. Unless the
-    /// atlas is wiped with it, the glyphs re-pack into fresh space and each drop
-    /// walks the atlas closer to its cap. Every fill of the map gets its wipe, not
-    /// only the first.
-    #[test]
-    fn dropping_a_slot_map_wipes_the_atlas_it_pointed_into() {
-        let fonts = Fonts::new(&[16]).expect("default font");
-        let mut cache = GlyphCache {
-            max_records: 16,
-            ..GlyphCache::default()
-        };
-        let face = FaceKey::Prose {
-            size: 16,
-            style: crate::platform::freetype::FontStyle::Regular,
-        };
-        for round in 0..2 {
-            cache.glyphs.reserve(4, 4).expect("fits");
-            cache.emoji.reserve(4, 4).expect("fits");
-            let (glyphs_gen, emoji_gen) = (cache.glyphs.generation, cache.emoji.generation);
-            for i in 0..=cache.max_records {
-                let ch = char::from_u32(0x1_0000 + i as u32).expect("valid scalar");
-                cache.cache_scalar((face, ch), placed());
-                cache.cache_cluster(EmojiFit::Em, face, &format!("c{i}"), Some(placed()));
-            }
-
-            build_frame(&fonts, &[], &mut cache, GAMMA);
-            assert_ne!(
-                cache.glyphs.generation, glyphs_gen,
-                "round {round}: the glyph atlas kept its slots"
-            );
-            assert_ne!(
-                cache.emoji.generation, emoji_gen,
-                "round {round}: the emoji atlas kept its slots"
-            );
-            assert_eq!((cache.glyphs.next_y, cache.emoji.next_y), (0, 0));
-        }
     }
 
     /// Wiping cannot help a frame whose own glyphs overfill the atlas. It wipes
@@ -1651,131 +900,6 @@ mod tests {
             (cache.glyphs.generation, cache.emoji.generation),
             generations,
             "a drop the screen forces on every frame wiped an atlas again"
-        );
-    }
-
-    /// Text the emoji font never draws stays out of the emoji maps, so a screen of
-    /// distinct letters cannot fill them, drop the emoji placed so far and wipe their
-    /// atlas.
-    #[test]
-    fn plain_text_leaves_the_emoji_cache_alone() {
-        let fonts = Fonts::new(&[16]).expect("default font");
-        let mut cache = GlyphCache {
-            max_records: 16,
-            ..GlyphCache::default()
-        };
-        build_frame(&fonts, &prose("😀"), &mut cache, GAMMA);
-        let emoji_gen = cache.emoji.generation;
-        let greek: String = ('α'..='ω').collect();
-        build_frame(&fonts, &prose(&greek), &mut cache, GAMMA);
-        assert_eq!(
-            cache.emoji.generation, emoji_gen,
-            "letters wiped the emoji atlas"
-        );
-        let clusters: usize = cache.cluster_slots.values().map(|m| m.len()).sum();
-        assert_eq!(clusters, 1, "only the emoji is in the map");
-    }
-
-    /// One glyph on each lookup path: an emoji, then an ASCII letter, a box-drawing
-    /// glyph and an accented letter on the grid. The first frame packs all four and the
-    /// same frame again finds all four.
-    #[test]
-    fn stats_count_each_lookup_path() {
-        let fonts = Fonts::new(&[16]).expect("default font");
-        let mut cache = GlyphCache::default();
-        let mut list = prose("😀");
-        list.push(DrawCmd::Cells {
-            bounds: Rect {
-                x: 0,
-                y: 20,
-                w: 100,
-                h: 20,
-            },
-            x: 0,
-            baseline: 36,
-            cell_w: 10,
-            face: FaceKey::Prose {
-                size: 16,
-                style: crate::platform::freetype::FontStyle::Regular,
-            },
-            color: 0x00ff_ffff,
-            bg: 0,
-            text: "a─é".to_string(),
-        });
-        build_frame(&fonts, &list, &mut cache, GAMMA);
-        let first = cache.stats();
-        assert_eq!((first.hits, first.misses), (0, 4), "a cold frame misses");
-        build_frame(&fonts, &list, &mut cache, GAMMA);
-        let second = cache.stats();
-        assert_eq!((second.hits, second.misses), (4, 4), "a warm frame hits");
-    }
-
-    /// The two stores must partition the characters between them: direct-mapped or
-    /// hashed, never both, or the two could disagree about one glyph's placement.
-    #[test]
-    fn ascii_is_direct_mapped_and_every_other_scalar_is_hashed() {
-        let mut cache = GlyphCache::default();
-        let face = FaceKey::Prose {
-            size: 16,
-            style: crate::platform::freetype::FontStyle::Regular,
-        };
-        // The span and both its edges.
-        for ch in [' ', 'A', '~'] {
-            cache.cache_scalar((face, ch), placed());
-            assert!(
-                cache.ascii_get(face, ch).is_some(),
-                "{ch:?} should be mapped"
-            );
-            assert!(
-                !cache.scalar_slots.contains_key(&(face, ch)),
-                "{ch:?} should not also be hashed"
-            );
-        }
-        // Just outside it at either end, plus the exotica an attacker actually picks.
-        for ch in ['\u{1f}', '\u{7f}', 'é', '\u{2500}', '\u{1F600}'] {
-            cache.cache_scalar((face, ch), placed());
-            assert!(
-                cache.ascii_get(face, ch).is_none(),
-                "{ch:?} is not printable ASCII and must not be direct-mapped"
-            );
-            assert!(
-                cache.scalar_slots.contains_key(&(face, ch)),
-                "{ch:?} should be hashed"
-            );
-        }
-    }
-
-    /// Past the face ceiling the rows stop being handed out, and ASCII has to keep
-    /// working through the map — `ascii_get` missing a glyph means "not here", never
-    /// "no such glyph".
-    #[test]
-    fn ascii_past_the_face_ceiling_falls_back_to_the_map() {
-        let mut cache = GlyphCache::default();
-        for i in 0..MAX_ASCII_FACES {
-            cache.cache_scalar(
-                (
-                    FaceKey::Prose {
-                        size: i as u32,
-                        style: crate::platform::freetype::FontStyle::Regular,
-                    },
-                    'A',
-                ),
-                placed(),
-            );
-        }
-        assert_eq!(cache.ascii_slots.len(), MAX_ASCII_FACES);
-        let extra = FaceKey::Prose {
-            size: 9999,
-            style: crate::platform::freetype::FontStyle::Regular,
-        };
-        cache.cache_scalar((extra, 'A'), placed());
-        assert!(
-            cache.ascii_get(extra, 'A').is_none(),
-            "no row is left for this face"
-        );
-        assert!(
-            cache.scalar_slots.contains_key(&(extra, 'A')),
-            "so the glyph must still be reachable through the map"
         );
     }
 
@@ -2443,152 +1567,5 @@ mod tests {
                 "emoji {top} rises above the baseline"
             );
         }
-    }
-
-    /// Build one `Text` run and return its glyph quads' `extra` vectors.
-    fn run_extras(
-        fonts: &Fonts,
-        text: &str,
-        color: u32,
-        bg: u32,
-        fade: Option<Fade>,
-    ) -> Vec<[f32; 4]> {
-        let list = vec![DrawCmd::Text {
-            bounds: Rect {
-                x: 0,
-                y: 0,
-                w: 200,
-                h: 20,
-            },
-            x: 0,
-            baseline: 16,
-            face: FaceKey::Prose {
-                size: 16,
-                style: crate::platform::freetype::FontStyle::Regular,
-            },
-            color,
-            bg,
-            fade,
-            text: text.to_string(),
-        }];
-        let mut cache = GlyphCache::default();
-        build_frame(fonts, &list, &mut cache, GAMMA)
-            .vertices
-            .iter()
-            .filter(|v| v.mode == MODE_GLYPH)
-            .map(|v| v.extra)
-            .collect()
-    }
-
-    #[test]
-    fn a_faded_run_carries_its_ink_ramp_without_disturbing_its_contrast() {
-        let fonts = Fonts::new(&[16]).expect("default font");
-        // The tab bar's dark-on-light case: the label's own colours, plus a ramp.
-        let (fg, bg) = (0x0012_3028, 0x008a_beb7);
-        let fade = Fade { from: 40, to: 72 };
-        let faded = run_extras(&fonts, "hello", fg, bg, Some(fade));
-        let solid = run_extras(&fonts, "hello", fg, bg, None);
-        assert!(!faded.is_empty(), "the run emitted glyphs");
-        assert_eq!(faded.len(), solid.len());
-
-        // Every glyph in the run carries the same span, so the ramp is continuous
-        // across glyph boundaries rather than quantised to them.
-        assert!(
-            faded
-                .iter()
-                .all(|e| e[1] == fade.from as f32 && e[2] == fade.to as f32),
-            "the fade span reaches every glyph quad"
-        );
-        // An unfaded run leaves an empty span, which the shader reads as "no fade".
-        assert!(
-            solid.iter().all(|e| e[2] <= e[1]),
-            "no fade means an empty span, not a hard cut at zero"
-        );
-        // The load-bearing invariant: fading changes the ink, never the contrast the
-        // coverage exponent is derived from. Were the fade a colour mix toward the
-        // background (as it once was), this exponent would drift toward 1.0 exactly as
-        // the tail faded, and the tail would carry ~2x the anti-aliased ink of the
-        // head: a smudge on a light tab rather than a dissolve.
-        let want = coverage_exponent(fg, bg, GAMMA);
-        assert!(
-            faded.iter().chain(&solid).all(|e| e[0] == want),
-            "the run's coverage exponent is untouched by the fade"
-        );
-    }
-
-    #[test]
-    fn coverage_exponent_thins_light_on_dark_and_thickens_dark_on_light() {
-        let white = 0x00ff_ffff;
-        let black = 0x0000_0000;
-        // Light on dark is thinned by the light_on_dark dial, flat: linear-light
-        // compositing overweights it at *any* contrast, so the correction does not
-        // soften as the contrast falls.
-        assert_eq!(coverage_exponent(white, black, GAMMA), 2.0);
-        assert_eq!(coverage_exponent(white, 0x0080_8080, GAMMA), 2.0);
-        // Dark on white (a reverse-video paste highlight) is thickened instead: the
-        // exponent drops below 1, bottoming at the dial's inverse at full contrast.
-        assert_eq!(coverage_exponent(black, white, GAMMA), 0.5);
-        assert!(
-            coverage_exponent(black, white, GAMMA) < coverage_exponent(0x0060_6060, white, GAMMA)
-        );
-        // Dark text on a mid-light block (the tab bar's #123028 on #8abeb7) is
-        // thickened, not left near-untouched: dark-on-light thickens in proportion
-        // to contrast, so a moderately lighter background still gets real weight.
-        let tab = coverage_exponent(0x0012_3028, 0x008a_beb7, GAMMA);
-        assert!(tab < 0.76, "moderate dark-on-light thickens, got {tab}");
-        // Equal luminance takes the thinning branch rather than a discontinuity.
-        assert_eq!(coverage_exponent(0x0044_4444, 0x0044_4444, GAMMA), 2.0);
-        // A run is thinned at most to the dial and thickened at most to its inverse,
-        // so the shader's pow never sees an exponent that could erase or blot text.
-        for &(fg, bg) in &[(white, black), (black, white), (0x0012_3456, 0x00fe_dcba)] {
-            let e = coverage_exponent(fg, bg, GAMMA);
-            assert!((0.5..=2.0).contains(&e), "exponent {e} in range");
-        }
-    }
-
-    #[test]
-    fn each_gamma_dial_moves_only_its_own_contrast_direction() {
-        // The bug the split exists to prevent. With one dial governing both
-        // corrections, softening it slid *both* toward the no-correction exponent of
-        // 1.0 at once, which means opposite visual directions: light-on-dark got
-        // bolder while dark-on-light got thinner. So lowering "the gamma" to embolden
-        // the grid silently thinned the active tab's dark label. Each dial must now
-        // move its own direction and leave the other alone.
-        let grid = (0x00d8_dee9, 0x0028_2c34); // light on dark
-        let label = (0x0012_3028, 0x008a_beb7); // the active tab's dark label
-        let base = GAMMA;
-
-        // Softening the light-on-dark dial emboldens light-on-dark text (a lower
-        // exponent keeps more coverage) and leaves dark-on-light text alone.
-        let softer_light = TextGamma {
-            light_on_dark: 1.5,
-            ..base
-        };
-        assert!(
-            coverage_exponent(grid.0, grid.1, softer_light)
-                < coverage_exponent(grid.0, grid.1, base),
-            "the light-on-dark dial emboldens light-on-dark text"
-        );
-        assert_eq!(
-            coverage_exponent(label.0, label.1, softer_light),
-            coverage_exponent(label.0, label.1, base),
-            "and must not touch the dark-on-light label"
-        );
-
-        // Symmetrically, the dark-on-light dial moves only dark-on-light text.
-        let softer_dark = TextGamma {
-            dark_on_light: 1.5,
-            ..base
-        };
-        assert!(
-            coverage_exponent(label.0, label.1, softer_dark)
-                > coverage_exponent(label.0, label.1, base),
-            "softening the dark-on-light dial thins the dark-on-light label"
-        );
-        assert_eq!(
-            coverage_exponent(grid.0, grid.1, softer_dark),
-            coverage_exponent(grid.0, grid.1, base),
-            "and must not touch light-on-dark grid text"
-        );
     }
 }
