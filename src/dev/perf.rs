@@ -45,14 +45,18 @@
 //!
 //! Every number here needs a `--release` build. A debug build measures nothing.
 
+use crate::color::Theme;
 use crate::dev::{alloc, profile, stream, sys};
 use crate::error::{Error, Result};
 use crate::gather::BUF_CAP;
 use crate::grid::{LinkId, LinkProbe, Screen};
-use crate::platform::geom::Scale;
+use crate::platform::freetype::Fonts;
+use crate::platform::geom::{Rect, Scale};
 use crate::platform::scroll::Scrollbar;
 use crate::platform::verdict::{Refusal, Verdict};
-use crate::term_render::CellMetrics;
+use crate::render::display::{damage_into, DisplayListPool};
+use crate::render::gpu::{build_frame_into, FrameData, GlyphCache, TextGamma};
+use crate::term_render::{build_display_list_into, CellMetrics, CursorRender, FrameInputs};
 use crate::vt::{Params, Parser, Perform};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -92,6 +96,31 @@ const METRICS: CellMetrics = CellMetrics {
     descent: 4,
     lock_glyph: true,
 };
+
+/// The frame a scenario paints: `screen` at the top-left of `surface` under the default
+/// cursor, with nothing selected or hovered and the scrollbar out of sight. A scenario
+/// that needs more (a hovered link, a strip above the grid) sets those fields over it.
+fn plain_frame<'a>(
+    screen: &'a Screen,
+    theme: &'a Theme,
+    metrics: CellMetrics,
+    surface: (i32, i32),
+) -> FrameInputs<'a> {
+    FrameInputs {
+        screen,
+        bell: false,
+        theme,
+        metrics,
+        surface,
+        origin: (0, 0),
+        cursor: CursorRender::default(),
+        selection: None,
+        hover: None,
+        preview: None,
+        scale: Scale::ONE,
+        scrollbar: &HIDDEN_SCROLLBAR,
+    }
+}
 
 /// Bytes per gate parse chunk (one "op").
 const CHUNK: usize = 8 * 1024;
@@ -410,11 +439,7 @@ fn link_scenario(fixture: &LinkFixture) -> Result<Sample> {
 /// cut to the grid, through the window's pooled display-list path. Warm, it allocates
 /// nothing: the line goes into a reused buffer and the frame's strings are recycled.
 fn link_preview_scenario() -> Result<Sample> {
-    use crate::color::Theme;
-    use crate::render::display::DisplayListPool;
-    use crate::term_render::{
-        build_display_list_into, CellSpan, CursorRender, FrameInputs, LinkHover,
-    };
+    use crate::term_render::{CellSpan, LinkHover};
 
     const COLS: usize = 80;
     const ROWS: usize = 24;
@@ -451,18 +476,9 @@ fn link_preview_scenario() -> Result<Sample> {
                 out,
                 strings,
                 &FrameInputs {
-                    screen: &screen,
-                    bell: false,
-                    theme: &theme,
-                    metrics: METRICS,
-                    surface,
-                    origin: (0, 0),
-                    cursor: CursorRender::default(),
-                    selection: None,
                     hover: Some(hover),
                     preview: Some(&line),
-                    scale: Scale::ONE,
-                    scrollbar: &HIDDEN_SCROLLBAR,
+                    ..plain_frame(&screen, &theme, METRICS, surface)
                 },
             );
             out.len()
@@ -519,8 +535,7 @@ fn grid_reflow_scenario() -> Result<Sample> {
 /// reused rectangle buffer. Guards the invariant behind the render bench's zero: a warmed
 /// damage diff reuses its rectangle buffer and allocates nothing.
 fn frame_damage_scenario() -> Sample {
-    use crate::platform::geom::Rect;
-    use crate::render::display::{damage_into, DrawCmd};
+    use crate::render::display::DrawCmd;
 
     const CELL: i32 = 8;
     let (w, h) = (BENCH_COLS as i32 * CELL, BENCH_ROWS as i32 * 16);
@@ -571,9 +586,7 @@ fn frame_damage_scenario() -> Sample {
 /// and every run moves, so the diff hands the merge two overlapping rectangles per cell,
 /// about 19k, which must still collapse to one full-surface repaint cheaply.
 fn frame_damage_scroll_scenario() -> Sample {
-    use crate::color::Theme;
-    use crate::render::display::{damage_into, DisplayList};
-    use crate::term_render::{build_display_list_into, CursorRender, FrameInputs};
+    use crate::render::display::DisplayList;
 
     let surface = (BENCH_COLS as i32 * METRICS.w, BENCH_ROWS as i32 * METRICS.h);
     let theme = Theme::default();
@@ -582,20 +595,7 @@ fn frame_damage_scroll_scenario() -> Sample {
         build_display_list_into(
             &mut out,
             &mut Vec::new(),
-            &FrameInputs {
-                screen,
-                bell: false,
-                theme: &theme,
-                metrics: METRICS,
-                surface,
-                origin: (0, 0),
-                cursor: CursorRender::default(),
-                selection: None,
-                hover: None,
-                preview: None,
-                scale: Scale::ONE,
-                scrollbar: &HIDDEN_SCROLLBAR,
-            },
+            &plain_frame(screen, &theme, METRICS, surface),
         );
         out
     };
@@ -654,11 +654,8 @@ fn repeated_lines(cell: &str, cells: usize, lines: usize) -> Vec<u8> {
 /// both list buffers and their strings are warm, one complete frame allocates
 /// nothing.
 fn frame_tabbar_scenario() -> Result<Sample> {
-    use crate::color::Theme;
     use crate::config::TabBarConfig;
-    use crate::render::display::DisplayListPool;
     use crate::tab_bar::{self, BarGeom, TabLabel};
-    use crate::term_render::{build_display_list_into, CursorRender, FrameInputs};
 
     const COLS: usize = 80;
     const ROWS: usize = 24;
@@ -718,18 +715,8 @@ fn frame_tabbar_scenario() -> Result<Sample> {
                 out,
                 strings,
                 &FrameInputs {
-                    screen: &screen,
-                    bell: false,
-                    theme: &theme,
-                    metrics: METRICS,
-                    surface,
                     origin: (0, METRICS.h),
-                    cursor: CursorRender::default(),
-                    selection: None,
-                    hover: None,
-                    preview: None,
-                    scale: Scale::ONE,
-                    scrollbar: &HIDDEN_SCROLLBAR,
+                    ..plain_frame(&screen, &theme, METRICS, surface)
                 },
             );
             tab_bar::fill_bar(out, strings, &slots, &bar, &cfg, &fonts, None);
@@ -756,12 +743,6 @@ fn frame_tabbar_scenario() -> Result<Sample> {
 /// accented prose, on every row, so every run takes the segmented path. The display list
 /// is built once; only the vertex build is timed.
 fn frame_text_unicode_scenario() -> Result<Sample> {
-    use crate::color::Theme;
-    use crate::platform::freetype::Fonts;
-    use crate::render::display::DisplayListPool;
-    use crate::render::gpu::{build_frame_into, FrameData, GlyphCache, TextGamma};
-    use crate::term_render::{build_display_list_into, CursorRender, FrameInputs};
-
     let fonts = Fonts::new(&[RENDER_FONT_PX])
         .map_err(|e| Error::msg(format!("frame_text_unicode needs the default fonts: {e}")))?;
     let metrics = CellMetrics::from_fonts(&fonts, RENDER_FONT_PX);
@@ -785,20 +766,7 @@ fn frame_text_unicode_scenario() -> Result<Sample> {
         build_display_list_into(
             out,
             strings,
-            &FrameInputs {
-                screen: &screen,
-                bell: false,
-                theme: &theme,
-                metrics,
-                surface,
-                origin: (0, 0),
-                cursor: CursorRender::default(),
-                selection: None,
-                hover: None,
-                preview: None,
-                scale: Scale::ONE,
-                scrollbar: &HIDDEN_SCROLLBAR,
-            },
+            &plain_frame(&screen, &theme, metrics, surface),
         );
     }
     let list = lists.back();
@@ -1032,40 +1000,65 @@ fn write_samples(path: &str, samples: &[Sample]) -> Result<()> {
 
 /// Load a baseline into a name -> entry map, or `None` if it does not exist.
 fn load_baseline(path: &str) -> Result<Option<HashMap<String, Base>>> {
+    read_if_present(path)?
+        .map(|text| parse_baseline(&text))
+        .transpose()
+}
+
+/// Parse `name<ws>ns<ws>allocs`. Every entry needs its allocation count: a baseline
+/// without one would leave allocations ungated, so it is malformed rather than read as
+/// unmeasured.
+fn parse_baseline(text: &str) -> Result<HashMap<String, Base>> {
+    Ok(parse_rows::<2>(text, "perf")?
+        .into_iter()
+        .map(|(name, [ns, allocs])| (name, Base { ns, allocs }))
+        .collect())
+}
+
+/// The text of the file at `path`, or `None` if it does not exist.
+fn read_if_present(path: &str) -> Result<Option<String>> {
     match std::fs::read_to_string(path) {
-        Ok(text) => parse_baseline(&text).map(Some),
+        Ok(text) => Ok(Some(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(Error::msg(format!("read {path}: {e}"))),
     }
 }
 
-/// Parse `name<ws>ns<ws>allocs`, skipping blank and `#` lines. Every entry needs its
-/// allocation count: a baseline without one would leave allocations ungated, so it is
-/// malformed rather than read as unmeasured.
-fn parse_baseline(text: &str) -> Result<HashMap<String, Base>> {
+/// Parse `name<ws>number...` lines into name -> numbers, skipping blank and `#` lines.
+/// Every line must hold exactly `N` numbers, so a short line cannot leave a column
+/// ungated. `what` names the file in an error.
+fn parse_rows<const N: usize>(text: &str, what: &str) -> Result<HashMap<String, [u64; N]>> {
     let mut out = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let mut it = line.split_whitespace();
-        let (Some(name), Some(ns), Some(allocs), None) =
-            (it.next(), it.next(), it.next(), it.next())
-        else {
-            return Err(Error::msg(format!(
-                "malformed perf line {line:?}: want name, ns/op and allocations"
-            )));
-        };
-        let ns = ns
-            .parse::<u64>()
-            .map_err(|_| Error::msg(format!("malformed perf number: {ns:?}")))?;
-        let allocs = allocs
-            .parse::<u64>()
-            .map_err(|_| Error::msg(format!("malformed alloc number: {allocs:?}")))?;
-        out.insert(name.to_string(), Base { ns, allocs });
+        let mut fields = line.split_whitespace();
+        let name = fields.next().unwrap_or_default();
+        let mut row = [0; N];
+        let mut slots = row.iter_mut();
+        for field in fields {
+            let Some(slot) = slots.next() else {
+                return Err(malformed_row(what, line, N));
+            };
+            *slot = field
+                .parse::<u64>()
+                .map_err(|_| Error::msg(format!("malformed {what} number: {field:?}")))?;
+        }
+        if slots.next().is_some() {
+            return Err(malformed_row(what, line, N));
+        }
+        out.insert(name.to_string(), row);
     }
     Ok(out)
+}
+
+/// The error for a line that is not a name followed by exactly `numbers` numbers.
+fn malformed_row(what: &str, line: &str, numbers: usize) -> Error {
+    Error::msg(format!(
+        "malformed {what} line {line:?}: want a name and {numbers} numbers"
+    ))
 }
 
 fn ensure_parent(path: &str) -> Result<()> {
@@ -1242,27 +1235,15 @@ fn write_footprints(path: &str, footprints: &[Footprint]) -> Result<()> {
 
 /// Load a footprint baseline into a name -> bytes map, or `None` if it does not exist.
 fn load_footprints(path: &str) -> Result<Option<HashMap<String, u64>>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Error::msg(format!("read {path}: {e}"))),
+    let Some(text) = read_if_present(path)? else {
+        return Ok(None);
     };
-    let mut out = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut it = line.split_whitespace();
-        let (Some(name), Some(bytes)) = (it.next(), it.next()) else {
-            return Err(Error::msg(format!("malformed footprint line: {line:?}")));
-        };
-        let bytes = bytes
-            .parse::<u64>()
-            .map_err(|_| Error::msg(format!("malformed footprint number: {bytes:?}")))?;
-        out.insert(name.to_string(), bytes);
-    }
-    Ok(Some(out))
+    Ok(Some(
+        parse_rows::<1>(&text, "footprint")?
+            .into_iter()
+            .map(|(name, [bytes])| (name, bytes))
+            .collect(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1368,6 +1349,78 @@ fn distinct_glyphs(start: u32, count: usize) -> Vec<u8> {
     out
 }
 
+/// The window's per-frame render state, reused across frames exactly as the live loop
+/// reuses it: the double-buffered list and its string pool, the glyph cache, the frame
+/// data, and the damage-diff scratch.
+struct RenderRig<'a> {
+    fonts: &'a Fonts,
+    theme: Theme,
+    metrics: CellMetrics,
+    surface: (i32, i32),
+    lists: DisplayListPool,
+    cache: GlyphCache,
+    frame: FrameData,
+    damage: Vec<Rect>,
+}
+
+impl<'a> RenderRig<'a> {
+    /// A rig for the bench grid at `metrics`, with nothing built yet.
+    fn new(fonts: &'a Fonts, metrics: CellMetrics) -> Self {
+        RenderRig {
+            fonts,
+            theme: Theme::default(),
+            metrics,
+            surface: (metrics.w * BENCH_COLS as i32, metrics.h * BENCH_ROWS as i32),
+            lists: DisplayListPool::default(),
+            cache: GlyphCache::default(),
+            frame: FrameData::default(),
+            damage: Vec::new(),
+        }
+    }
+
+    /// Build `screen`'s display list and diff it against the frame on screen, returning
+    /// how long each took in nanoseconds. An idle frame stops here, as the live loop does
+    /// on empty damage.
+    fn list_and_diff(&mut self, screen: &Screen) -> [u64; 2] {
+        let t0 = Instant::now();
+        {
+            let (out, strings) = self.lists.begin();
+            let inputs = plain_frame(screen, &self.theme, self.metrics, self.surface);
+            build_display_list_into(out, strings, &inputs);
+        }
+        let t1 = Instant::now();
+        let (w, h) = self.surface;
+        damage_into(
+            self.lists.front(),
+            self.lists.back(),
+            w,
+            h,
+            &mut self.damage,
+        );
+        let t2 = Instant::now();
+        [duration_ns(t1 - t0), duration_ns(t2 - t1)]
+    }
+
+    /// One painted frame: the list and the diff, then the vertices, then the list becomes
+    /// the frame on screen. Returns each stage's time in nanoseconds: list, diff, vertices.
+    fn paint(&mut self, screen: &Screen) -> [u64; 3] {
+        let [list, diff] = self.list_and_diff(screen);
+        let t0 = Instant::now();
+        let gamma = TextGamma::default();
+        build_frame_into(
+            self.fonts,
+            self.lists.back(),
+            &mut self.cache,
+            gamma,
+            &mut self.frame,
+        );
+        let vertices = duration_ns(t0.elapsed());
+        black_box((&self.damage, &self.frame));
+        self.lists.commit();
+        [list, diff, vertices]
+    }
+}
+
 /// Time the CPU render pipeline in isolation: `grid -> build_display_list -> damage
 /// diff -> gpu::build_frame` (vertices), per frame, with no GPU and no window. This
 /// gives the render side its own number so a fast parser can never hide a slow
@@ -1377,12 +1430,6 @@ fn distinct_glyphs(start: u32, count: usize) -> Vec<u8> {
 /// with the display list, its run strings, the vertex buffer, and the damage-diff
 /// scratch all pooled across frames, a warmed changed frame allocates nothing.
 pub fn render_bench(args: &[String]) -> Result<()> {
-    use crate::color::Theme;
-    use crate::platform::freetype::Fonts;
-    use crate::render::display::{damage_into, DisplayListPool};
-    use crate::render::gpu::{build_frame_into, FrameData, GlyphCache};
-    use crate::term_render::{build_display_list_into, CursorRender, FrameInputs};
-
     // `--frames N` overrides the default (the smoke test uses a tiny count).
     let frames = args
         .iter()
@@ -1394,21 +1441,9 @@ pub fn render_bench(args: &[String]) -> Result<()> {
 
     let fonts = Fonts::new(&[RENDER_FONT_PX])
         .map_err(|e| Error::msg(format!("render-bench needs a monospace font: {e}")))?;
-    let metrics = CellMetrics::from_fonts(&fonts, RENDER_FONT_PX);
-    let theme = Theme::default();
-    let surface = (metrics.w * BENCH_COLS as i32, metrics.h * BENCH_ROWS as i32);
-    let origin = (0, 0);
-    let cursor = CursorRender::default();
-
+    let mut rig = RenderRig::new(&fonts, CellMetrics::from_fonts(&fonts, RENDER_FONT_PX));
     let mut screen = Screen::new(BENCH_COLS, BENCH_ROWS);
     let mut parser = Parser::new();
-    let mut cache = GlyphCache::default();
-    // The window's per-frame render state, reused across frames exactly as the live
-    // loop reuses it: the double-buffered list + string pool, the frame data, and the
-    // damage-diff scratch.
-    let mut lists = DisplayListPool::default();
-    let mut frame = FrameData::default();
-    let mut damage_scratch: Vec<crate::platform::geom::Rect> = Vec::new();
     // A little over a screenful of real prose per frame, enough to turn the whole
     // grid over — the worst case a fast cat hits, so the diff sees a fully changed
     // screen and every cell is rebuilt.
@@ -1420,40 +1455,7 @@ pub fn render_bench(args: &[String]) -> Result<()> {
     // `front`/`back` genuinely differ (a real full-screen diff, like a cat).
     for _ in 0..3 {
         parser.advance_bytes(&mut screen, &feed);
-        let (out, strings) = lists.begin();
-        build_display_list_into(
-            out,
-            strings,
-            &FrameInputs {
-                screen: &screen,
-                bell: false,
-                theme: &theme,
-                metrics,
-                surface,
-                origin,
-                cursor,
-                selection: None,
-                hover: None,
-                preview: None,
-                scale: Scale::ONE,
-                scrollbar: &HIDDEN_SCROLLBAR,
-            },
-        );
-        damage_into(
-            lists.front(),
-            lists.back(),
-            surface.0,
-            surface.1,
-            &mut damage_scratch,
-        );
-        build_frame_into(
-            &fonts,
-            lists.back(),
-            &mut cache,
-            crate::render::gpu::TextGamma::default(),
-            &mut frame,
-        );
-        lists.commit();
+        rig.paint(&screen);
     }
 
     // One steady frame's allocation cost. With the list, its run strings, the frame
@@ -1461,99 +1463,20 @@ pub fn render_bench(args: &[String]) -> Result<()> {
     // allocates nothing.
     parser.advance_bytes(&mut screen, &feed);
     alloc::reset();
-    {
-        let (out, strings) = lists.begin();
-        build_display_list_into(
-            out,
-            strings,
-            &FrameInputs {
-                screen: &screen,
-                bell: false,
-                theme: &theme,
-                metrics,
-                surface,
-                origin,
-                cursor,
-                selection: None,
-                hover: None,
-                preview: None,
-                scale: Scale::ONE,
-                scrollbar: &HIDDEN_SCROLLBAR,
-            },
-        );
-        damage_into(
-            lists.front(),
-            lists.back(),
-            surface.0,
-            surface.1,
-            &mut damage_scratch,
-        );
-        build_frame_into(
-            &fonts,
-            lists.back(),
-            &mut cache,
-            crate::render::gpu::TextGamma::default(),
-            &mut frame,
-        );
-        black_box((&damage_scratch, &frame));
-        lists.commit();
-    }
+    rig.paint(&screen);
     let allocs = alloc::snapshot().allocs;
 
     let (mut build_ns, mut diff_ns, mut frame_ns, mut total_ns) =
         (u64::MAX, u64::MAX, u64::MAX, u64::MAX);
-    let mut verts = 0usize;
     for _ in 0..frames {
         parser.advance_bytes(&mut screen, &feed); // scroll the grid (untimed)
-
-        let t0 = Instant::now();
-        {
-            let (out, strings) = lists.begin();
-            build_display_list_into(
-                out,
-                strings,
-                &FrameInputs {
-                    screen: &screen,
-                    bell: false,
-                    theme: &theme,
-                    metrics,
-                    surface,
-                    origin,
-                    cursor,
-                    selection: None,
-                    hover: None,
-                    preview: None,
-                    scale: Scale::ONE,
-                    scrollbar: &HIDDEN_SCROLLBAR,
-                },
-            );
-        }
-        let t1 = Instant::now();
-        damage_into(
-            lists.front(),
-            lists.back(),
-            surface.0,
-            surface.1,
-            &mut damage_scratch,
-        );
-        let t2 = Instant::now();
-        build_frame_into(
-            &fonts,
-            lists.back(),
-            &mut cache,
-            crate::render::gpu::TextGamma::default(),
-            &mut frame,
-        );
-        let t3 = Instant::now();
-        verts = frame.vertices.len();
-        black_box((&damage_scratch, &frame));
-
-        build_ns = build_ns.min((t1 - t0).as_nanos() as u64);
-        diff_ns = diff_ns.min((t2 - t1).as_nanos() as u64);
-        frame_ns = frame_ns.min((t3 - t2).as_nanos() as u64);
-        total_ns = total_ns.min((t3 - t0).as_nanos() as u64);
-        lists.commit();
+        let [list, diff, vertices] = rig.paint(&screen);
+        build_ns = build_ns.min(list);
+        diff_ns = diff_ns.min(diff);
+        frame_ns = frame_ns.min(vertices);
+        total_ns = total_ns.min(list + diff + vertices);
     }
+    let verts = rig.frame.vertices.len();
 
     // One-cell change: only the home cell differs from the last frame (a cursor
     // blink or a single keystroke), yet the list and every vertex are still rebuilt
@@ -1563,50 +1486,10 @@ pub fn render_bench(args: &[String]) -> Result<()> {
     for i in 0..frames {
         parser.advance_bytes(&mut screen, b"\x1b[1;1H");
         parser.advance_bytes(&mut screen, if i % 2 == 0 { b"X" } else { b"Y" });
-        let t0 = Instant::now();
-        {
-            let (out, strings) = lists.begin();
-            build_display_list_into(
-                out,
-                strings,
-                &FrameInputs {
-                    screen: &screen,
-                    bell: false,
-                    theme: &theme,
-                    metrics,
-                    surface,
-                    origin,
-                    cursor,
-                    selection: None,
-                    hover: None,
-                    preview: None,
-                    scale: Scale::ONE,
-                    scrollbar: &HIDDEN_SCROLLBAR,
-                },
-            );
-        }
-        let t1 = Instant::now();
-        damage_into(
-            lists.front(),
-            lists.back(),
-            surface.0,
-            surface.1,
-            &mut damage_scratch,
-        );
-        let t2 = Instant::now();
-        build_frame_into(
-            &fonts,
-            lists.back(),
-            &mut cache,
-            crate::render::gpu::TextGamma::default(),
-            &mut frame,
-        );
-        let t3 = Instant::now();
-        black_box((&damage_scratch, &frame));
-        edit_list = edit_list.min((t1 - t0).as_nanos() as u64);
-        edit_diff = edit_diff.min((t2 - t1).as_nanos() as u64);
-        edit_frame = edit_frame.min((t3 - t2).as_nanos() as u64);
-        lists.commit();
+        let [list, diff, vertices] = rig.paint(&screen);
+        edit_list = edit_list.min(list);
+        edit_diff = edit_diff.min(diff);
+        edit_frame = edit_frame.min(vertices);
     }
 
     // Idle: nothing changed since the on-screen frame (no output, no blink). The list
@@ -1617,41 +1500,11 @@ pub fn render_bench(args: &[String]) -> Result<()> {
     // `front` stays the on-screen frame and each pass refills `back` from the pool.
     let (mut idle_list, mut idle_diff, mut idle_rects) = (u64::MAX, u64::MAX, usize::MAX);
     for _ in 0..frames {
-        let t0 = Instant::now();
-        {
-            let (out, strings) = lists.begin();
-            build_display_list_into(
-                out,
-                strings,
-                &FrameInputs {
-                    screen: &screen,
-                    bell: false,
-                    theme: &theme,
-                    metrics,
-                    surface,
-                    origin,
-                    cursor,
-                    selection: None,
-                    hover: None,
-                    preview: None,
-                    scale: Scale::ONE,
-                    scrollbar: &HIDDEN_SCROLLBAR,
-                },
-            );
-        }
-        let t1 = Instant::now();
-        damage_into(
-            lists.front(),
-            lists.back(),
-            surface.0,
-            surface.1,
-            &mut damage_scratch,
-        );
-        let t2 = Instant::now();
-        idle_rects = damage_scratch.len();
-        black_box(&damage_scratch);
-        idle_list = idle_list.min((t1 - t0).as_nanos() as u64);
-        idle_diff = idle_diff.min((t2 - t1).as_nanos() as u64);
+        let [list, diff] = rig.list_and_diff(&screen);
+        idle_rects = rig.damage.len();
+        black_box(&rig.damage);
+        idle_list = idle_list.min(list);
+        idle_diff = idle_diff.min(diff);
     }
 
     let us = |ns: u64| ns as f64 / 1000.0;
@@ -1710,20 +1563,7 @@ pub fn render_bench(args: &[String]) -> Result<()> {
                 build_display_list_into(
                     out,
                     strings,
-                    &FrameInputs {
-                        screen: &screen,
-                        bell: false,
-                        theme: &theme,
-                        metrics,
-                        surface,
-                        origin,
-                        cursor,
-                        selection: None,
-                        hover: None,
-                        preview: None,
-                        scale: Scale::ONE,
-                        scrollbar: &HIDDEN_SCROLLBAR,
-                    },
+                    &plain_frame(&screen, &rig.theme, rig.metrics, rig.surface),
                 );
             }
             lists.commit();
