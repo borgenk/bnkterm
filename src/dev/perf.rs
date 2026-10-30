@@ -411,8 +411,9 @@ fn link_scenario(fixture: &LinkFixture) -> Result<Sample> {
 /// nothing: the line goes into a reused buffer and the frame's strings are recycled.
 fn link_preview_scenario() -> Result<Sample> {
     use crate::color::Theme;
+    use crate::render::display::DisplayListPool;
     use crate::term_render::{
-        build_display_list_into, CellSpan, CursorRender, DisplayListPool, FrameInputs, LinkHover,
+        build_display_list_into, CellSpan, CursorRender, FrameInputs, LinkHover,
     };
 
     const COLS: usize = 80;
@@ -655,8 +656,9 @@ fn repeated_lines(cell: &str, cells: usize, lines: usize) -> Vec<u8> {
 fn frame_tabbar_scenario() -> Result<Sample> {
     use crate::color::Theme;
     use crate::config::TabBarConfig;
+    use crate::render::display::DisplayListPool;
     use crate::tab_bar::{self, BarGeom, TabLabel};
-    use crate::term_render::{build_display_list_into, CursorRender, DisplayListPool, FrameInputs};
+    use crate::term_render::{build_display_list_into, CursorRender, FrameInputs};
 
     const COLS: usize = 80;
     const ROWS: usize = 24;
@@ -756,8 +758,9 @@ fn frame_tabbar_scenario() -> Result<Sample> {
 fn frame_text_unicode_scenario() -> Result<Sample> {
     use crate::color::Theme;
     use crate::platform::freetype::Fonts;
+    use crate::render::display::DisplayListPool;
     use crate::render::gpu::{build_frame_into, FrameData, GlyphCache, TextGamma};
-    use crate::term_render::{build_display_list_into, CursorRender, DisplayListPool, FrameInputs};
+    use crate::term_render::{build_display_list_into, CursorRender, FrameInputs};
 
     let fonts = Fonts::new(&[RENDER_FONT_PX])
         .map_err(|e| Error::msg(format!("frame_text_unicode needs the default fonts: {e}")))?;
@@ -1376,9 +1379,9 @@ fn distinct_glyphs(start: u32, count: usize) -> Vec<u8> {
 pub fn render_bench(args: &[String]) -> Result<()> {
     use crate::color::Theme;
     use crate::platform::freetype::Fonts;
-    use crate::render::display::damage_into;
+    use crate::render::display::{damage_into, DisplayListPool};
     use crate::render::gpu::{build_frame_into, FrameData, GlyphCache};
-    use crate::term_render::{build_display_list_into, CursorRender, DisplayListPool, FrameInputs};
+    use crate::term_render::{build_display_list_into, CursorRender, FrameInputs};
 
     // `--frames N` overrides the default (the smoke test uses a tiny count).
     let frames = args

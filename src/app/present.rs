@@ -34,7 +34,6 @@ use crate::platform::wire::{Arg, Reader};
 use crate::render::display;
 use crate::render::gpu;
 use crate::render::vulkan;
-use crate::term_render;
 
 /// How long [`State::resize_buffers`] waits for the compositor to release a buffer before
 /// giving up on freeing its image *now*. Normally the release has long since signalled and
@@ -319,7 +318,7 @@ pub(super) struct GpuPresentation {
     /// The recycled display-list double buffer: the on-screen frame the next one is
     /// diffed against, plus a pool of run strings, so a steady frame builds the list
     /// without allocating.
-    pub(super) lists: term_render::DisplayListPool,
+    pub(super) lists: display::DisplayListPool,
     /// The reused GPU frame data (vertices/batches), refilled in place each frame.
     pub(super) frame_scratch: gpu::FrameData,
     /// The reused damage-diff output, so computing the changed regions each frame

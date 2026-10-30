@@ -11,6 +11,9 @@
 //!   the GPU batcher ([`crate::render::gpu::build_frame_into`]), which consumes exactly these
 //!   commands. Nothing here is Vulkan-specific.
 //!
+//! [`DisplayListPool`] holds the on-screen frame and the one being built, and recycles the
+//! text buffers of retired commands, so a steady frame builds its list without allocating.
+//!
 //! Commands are in *screen* space (already shifted by the scroll), so scrolling,
 //! which moves every command, naturally diffs as "everything changed" and falls
 //! back to a full repaint, exactly as the notes predict.
@@ -138,6 +141,86 @@ impl DrawCmd {
                 Some(text)
             }
             _ => None,
+        }
+    }
+}
+
+/// Reusable storage for the per-frame display list, so a steady stream of frames
+/// rebuilds it without touching the allocator. Two buffers let the damage differ
+/// compare the on-screen frame against the freshly built one; a pool of string
+/// buffers salvaged from retired [`DrawCmd`]s feeds the next build.
+///
+/// ```text
+///   begin()  ─ salvage back's run strings ─▶ pool, clear back
+///   fill back (build_display_list_into, drawing text from the pool)
+///   damage(front, back) ─▶ regions to repaint
+///   commit() ─ swap front/back once the frame is presented
+/// ```
+#[derive(Default)]
+pub struct DisplayListPool {
+    /// The two lists; `front` indexes the on-screen one, `front ^ 1` the scratch.
+    buffers: [DisplayList; 2],
+    front: usize,
+    /// String buffers reclaimed from retired commands, cleared and ready to refill.
+    strings: Vec<String>,
+    /// Whether `front` is a frame that was presented, rather than one
+    /// [`Self::reset`] emptied. Only the pool knows which, and a diff against a frame
+    /// that was never on screen says nothing about what the buffers hold.
+    front_presented: bool,
+}
+
+impl DisplayListPool {
+    /// Recycle the back buffer's run strings into the pool and empty it (keeping its
+    /// capacity), then hand back that empty buffer and the pool to fill.
+    pub fn begin(&mut self) -> (&mut DisplayList, &mut Vec<String>) {
+        let buf = &mut self.buffers[self.front ^ 1];
+        salvage(buf, &mut self.strings);
+        (buf, &mut self.strings)
+    }
+
+    /// The on-screen list (the previous frame): the differ's `old` side.
+    pub fn front(&self) -> &DisplayList {
+        &self.buffers[self.front]
+    }
+
+    /// The freshly built list (this frame): the differ's `new` side.
+    pub fn back(&self) -> &DisplayList {
+        &self.buffers[self.front ^ 1]
+    }
+
+    /// Whether [`Self::front`] describes what is on screen, so a diff against it is
+    /// meaningful. False until the first frame is presented and again after every
+    /// [`Self::reset`]: a frame built against buffers holding no known image has to
+    /// repaint the whole surface, because "no damage" would otherwise read as "the
+    /// screen already shows this" and present nothing at all.
+    pub fn front_presented(&self) -> bool {
+        self.front_presented
+    }
+
+    /// Promote the built back buffer to the on-screen list, once it is presented.
+    pub fn commit(&mut self) {
+        self.front ^= 1;
+        self.front_presented = true;
+    }
+
+    /// Forget both frames (a resize wiped the buffers): recycle their strings and clear
+    /// them, and record that nothing is on screen, so the next frame repaints whole
+    /// instead of diffing against an image the buffers no longer hold.
+    pub fn reset(&mut self) {
+        for buf in &mut self.buffers {
+            salvage(buf, &mut self.strings);
+        }
+        self.front = 0;
+        self.front_presented = false;
+    }
+}
+
+/// Empty `buf` (keeping its capacity) and move the text buffers its commands held into
+/// `strings`, ready for the next frame to draw from.
+fn salvage(buf: &mut DisplayList, strings: &mut Vec<String>) {
+    for cmd in buf.drain(..) {
+        if let Some(s) = cmd.into_text_buf() {
+            strings.push(s);
         }
     }
 }
@@ -427,5 +510,37 @@ mod tests {
                 h: 15
             }]
         );
+    }
+
+    #[test]
+    fn a_pool_only_claims_a_front_frame_that_was_presented() {
+        // What stops an empty diff reading as "the screen already shows this" against
+        // buffers that hold no image at all.
+        let mut pool = DisplayListPool::default();
+        assert!(!pool.front_presented(), "nothing presented yet");
+
+        let (out, _strings) = pool.begin();
+        out.push(DrawCmd::Fill {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8,
+            },
+            color: 0,
+        });
+        pool.commit();
+        assert!(pool.front_presented(), "that frame is on screen");
+        assert_eq!(pool.front().len(), 1, "and it is the one just built");
+
+        // A reallocation throws the images away, so the frame they held goes with them,
+        // however much the lists still remembered of it.
+        pool.reset();
+        assert!(!pool.front_presented());
+        assert!(pool.front().is_empty() && pool.back().is_empty());
+
+        // The next presented frame restores it.
+        pool.commit();
+        assert!(pool.front_presented());
     }
 }
