@@ -41,31 +41,62 @@ const OSC_MAX: usize = 4096;
 /// bytes; anything approaching this is not one of them.
 const DCS_MAX: usize = 4096;
 
+/// How a UTF-8 lead byte opens a scalar.
+#[derive(Clone, Copy)]
+struct Utf8Lead {
+    /// The payload bits the lead carries.
+    bits: u8,
+    /// Continuation bytes still to come, 1 to 3.
+    remaining: u8,
+    /// The range the first continuation must fall in.
+    next: (u8, u8),
+}
+
+/// The scalar a lead byte opens, or `None` for a byte that cannot start one: ASCII, a
+/// continuation, `C0` and `C1` (which only spell overlongs), and `F5..FF` (past U+10FFFF).
+///
+/// Unicode Table 3-7, transcribed. The four narrowed ranges are the interesting rows: `E0`
+/// and `F0` exclude the overlong encodings, `ED` excludes the surrogates, and `F4` stops
+/// at U+10FFFF.
+const fn utf8_lead(byte: u8) -> Option<Utf8Lead> {
+    // `advance_bytes` asks this of every control byte in ground. One range test answers
+    // them before the table below, which compiles to several.
+    if byte < 0xc2 || byte > 0xf4 {
+        return None;
+    }
+    let (bits, remaining, next) = match byte {
+        0xc2..=0xdf => (byte & 0x1f, 1, (0x80, 0xbf)),
+        0xe0 => (byte & 0x0f, 2, (0xa0, 0xbf)),
+        0xe1..=0xec | 0xee | 0xef => (byte & 0x0f, 2, (0x80, 0xbf)),
+        0xed => (byte & 0x0f, 2, (0x80, 0x9f)),
+        0xf0 => (byte & 0x07, 3, (0x90, 0xbf)),
+        0xf1..=0xf3 => (byte & 0x07, 3, (0x80, 0xbf)),
+        0xf4 => (byte & 0x07, 3, (0x80, 0x8f)),
+        _ => return None,
+    };
+    Some(Utf8Lead {
+        bits,
+        remaining,
+        next,
+    })
+}
+
 /// Whether the first UTF-8 lead is still capable of completing validly with the
 /// bytes already present. A missing continuation is not invalid—the next PTY
 /// chunk may provide it—but a present out-of-range continuation keeps the
 /// malformed sequence on the scalar oracle instead of opening a batch.
 fn utf8_prefix_may_complete(bytes: &[u8]) -> bool {
-    let Some(&lead) = bytes.first() else {
+    let Some(lead) = bytes.first().and_then(|&byte| utf8_lead(byte)) else {
         return false;
-    };
-    let (length, lo, hi) = match lead {
-        0xc2..=0xdf => (2usize, 0x80, 0xbf),
-        0xe0 => (3, 0xa0, 0xbf),
-        0xe1..=0xec | 0xee | 0xef => (3, 0x80, 0xbf),
-        0xed => (3, 0x80, 0x9f),
-        0xf0 => (4, 0x90, 0xbf),
-        0xf1..=0xf3 => (4, 0x80, 0xbf),
-        0xf4 => (4, 0x80, 0x8f),
-        _ => return false,
     };
     let Some(&second) = bytes.get(1) else {
         return true;
     };
+    let (lo, hi) = lead.next;
     if !(lo..=hi).contains(&second) {
         return false;
     }
-    for index in 2..length {
+    for index in 2..=usize::from(lead.remaining) {
         let Some(&continuation) = bytes.get(index) else {
             return true;
         };
@@ -365,8 +396,7 @@ pub struct Parser {
     /// are allocated once and reused, and both are capped.
     dcs: Vec<u8>,
     dcs_final: u8,
-    /// UTF-8 decode: continuation bytes still expected, the value so far, and the
-    /// smallest legal value for this length (to reject overlong encodings).
+    /// UTF-8 decode: continuation bytes still expected, and the value so far.
     utf8_remaining: u8,
     utf8_char: u32,
     /// The byte range the *next* continuation may fall in.
@@ -376,7 +406,7 @@ pub struct Parser {
     /// `A0..BF` is what makes an overlong three-byte encoding unrepresentable rather
     /// than merely detectable afterwards, and `ED` restricted to `80..9F` is what makes
     /// a surrogate unrepresentable. Checking the range up front, instead of the value
-    /// after the fact, is also what makes the *count* of U+FFFDs right (see `ground`).
+    /// after the fact, is also what makes the *count* of U+FFFDs right (see `advance`).
     utf8_next: (u8, u8),
 }
 
@@ -482,13 +512,7 @@ impl Parser {
         // Mid-UTF-8 (only possible in Ground): consume a continuation byte, or,
         // if this is not one, emit the replacement char and reprocess `byte`.
         if self.utf8_remaining > 0 {
-            let (lo, hi) = self.utf8_next;
-            if (lo..=hi).contains(&byte) {
-                self.utf8_char = (self.utf8_char << 6) | u32::from(byte & 0x3f);
-                self.utf8_remaining -= 1;
-                // Only the second byte is ever restricted; the rest are plain
-                // continuations.
-                self.utf8_next = (0x80, 0xbf);
+            if self.utf8_continue(byte) {
                 if self.utf8_remaining == 0 {
                     p.print(self.finish_utf8());
                 }
@@ -497,9 +521,7 @@ impl Parser {
             // The sequence ends here, at its maximal well-formed subpart, and `byte`
             // was never part of it: it is reprocessed below rather than swallowed.
             // That is what puts the `(` back in `e1 28 a1` -> U+FFFD `(` U+FFFD.
-            self.utf8_remaining = 0;
             p.print('\u{FFFD}');
-            // fall through: handle `byte` fresh
         }
 
         // CAN/SUB abort any sequence to ground; ESC (re)starts one, ending an OSC
@@ -561,11 +583,7 @@ impl Parser {
         let mut consumed = 0usize;
         while let Some(&byte) = bytes.get(consumed) {
             if self.utf8_remaining > 0 {
-                let (lo, hi) = self.utf8_next;
-                if (lo..=hi).contains(&byte) {
-                    self.utf8_char = (self.utf8_char << 6) | u32::from(byte & 0x3f);
-                    self.utf8_remaining -= 1;
-                    self.utf8_next = (0x80, 0xbf);
+                if self.utf8_continue(byte) {
                     consumed += 1;
                     if self.utf8_remaining == 0 {
                         let decoded = self.finish_utf8();
@@ -573,7 +591,6 @@ impl Parser {
                     }
                     continue;
                 }
-                self.utf8_remaining = 0;
                 run.push(performer, '\u{fffd}');
                 // Stop before `byte`: it was not part of the malformed sequence,
                 // and the scalar oracle should own the ill-formed boundary.
@@ -600,15 +617,10 @@ impl Parser {
                 // Caught by the ASCII handoff above; retained for exhaustiveness.
                 0x20..=0x7e => run.push(performer, char::from(byte)),
                 0x7f => {} // DEL is ignored without breaking adjacent text.
-                0x80..=0xbf | 0xc0 | 0xc1 | 0xf5..=0xff => run.push(performer, '\u{fffd}'),
-                0xc2..=0xdf => self.utf8_begin(u32::from(byte & 0x1f), 1, (0x80, 0xbf)),
-                0xe0 => self.utf8_begin(u32::from(byte & 0x0f), 2, (0xa0, 0xbf)),
-                0xe1..=0xec => self.utf8_begin(u32::from(byte & 0x0f), 2, (0x80, 0xbf)),
-                0xed => self.utf8_begin(u32::from(byte & 0x0f), 2, (0x80, 0x9f)),
-                0xee | 0xef => self.utf8_begin(u32::from(byte & 0x0f), 2, (0x80, 0xbf)),
-                0xf0 => self.utf8_begin(u32::from(byte & 0x07), 3, (0x90, 0xbf)),
-                0xf1..=0xf3 => self.utf8_begin(u32::from(byte & 0x07), 3, (0x80, 0xbf)),
-                0xf4 => self.utf8_begin(u32::from(byte & 0x07), 3, (0x80, 0x8f)),
+                0x80..=0xff => match utf8_lead(byte) {
+                    Some(lead) => self.utf8_begin(lead),
+                    None => run.push(performer, '\u{fffd}'),
+                },
             }
             consumed += 1;
         }
@@ -623,35 +635,41 @@ impl Parser {
             0x18 | 0x1a | 0x1b => {}
             0x00..=0x17 | 0x19 | 0x1c..=0x1f => p.execute(byte),
             0x20..=0x7e => p.print(char::from(byte)),
-            0x7f => {}                          // DEL: ignored in ground
-            0x80..=0xbf => p.print('\u{FFFD}'), // stray continuation byte
-            // Unicode Table 3-7, transcribed. The four narrowed ranges are the
-            // interesting rows: `E0` and `F0` exclude the overlong encodings, `ED`
-            // excludes the surrogates, and `F4` stops at U+10FFFF.
-            0xc0 | 0xc1 => p.print('\u{FFFD}'), // no non-overlong two-byte form exists
-            0xc2..=0xdf => self.utf8_begin(u32::from(byte & 0x1f), 1, (0x80, 0xbf)),
-            0xe0 => self.utf8_begin(u32::from(byte & 0x0f), 2, (0xa0, 0xbf)),
-            0xe1..=0xec => self.utf8_begin(u32::from(byte & 0x0f), 2, (0x80, 0xbf)),
-            0xed => self.utf8_begin(u32::from(byte & 0x0f), 2, (0x80, 0x9f)),
-            0xee | 0xef => self.utf8_begin(u32::from(byte & 0x0f), 2, (0x80, 0xbf)),
-            0xf0 => self.utf8_begin(u32::from(byte & 0x07), 3, (0x90, 0xbf)),
-            0xf1..=0xf3 => self.utf8_begin(u32::from(byte & 0x07), 3, (0x80, 0xbf)),
-            0xf4 => self.utf8_begin(u32::from(byte & 0x07), 3, (0x80, 0x8f)),
-            0xf5..=0xff => p.print('\u{FFFD}'), // past U+10FFFF, or not a lead at all
+            0x7f => {} // DEL: ignored in ground
+            0x80..=0xff => match utf8_lead(byte) {
+                Some(lead) => self.utf8_begin(lead),
+                None => p.print('\u{FFFD}'),
+            },
         }
     }
 
-    fn utf8_begin(&mut self, init: u32, remaining: u8, next: (u8, u8)) {
-        self.utf8_char = init;
-        self.utf8_remaining = remaining;
-        self.utf8_next = next;
+    fn utf8_begin(&mut self, lead: Utf8Lead) {
+        self.utf8_char = u32::from(lead.bits);
+        self.utf8_remaining = lead.remaining;
+        self.utf8_next = lead.next;
+    }
+
+    /// Take `byte` as the next continuation of the sequence in progress, and return
+    /// whether it was one. If it was not, the sequence ends and the caller owes one
+    /// U+FFFD. Call only while `utf8_remaining > 0`.
+    fn utf8_continue(&mut self, byte: u8) -> bool {
+        let (lo, hi) = self.utf8_next;
+        if !(lo..=hi).contains(&byte) {
+            self.utf8_remaining = 0;
+            return false;
+        }
+        self.utf8_char = (self.utf8_char << 6) | u32::from(byte & 0x3f);
+        self.utf8_remaining -= 1;
+        // Only the first continuation is ever narrowed.
+        self.utf8_next = (0x80, 0xbf);
+        true
     }
 
     /// Turn a completed code point into a char.
     ///
     /// No overlong or surrogate check is needed here, and its absence is the point: the
-    /// per-lead ranges in `ground` mean an ill-formed value can never be accumulated in
-    /// the first place. The `unwrap_or` is unreachable and kept only because the
+    /// per-lead ranges in [`utf8_lead`] mean an ill-formed value can never be accumulated
+    /// in the first place. The `unwrap_or` is unreachable and kept only because the
     /// no-panic rule does not make exceptions for reasoning.
     fn finish_utf8(&self) -> char {
         char::from_u32(self.utf8_char).unwrap_or('\u{FFFD}')
