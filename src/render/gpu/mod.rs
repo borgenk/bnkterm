@@ -2,7 +2,7 @@
 //! data. This module is deliberately free of Vulkan: it packs glyph rasters
 //! into atlases and emits vertices and draw batches as plain values, so
 //! the geometry and packing logic is unit-testable without a device.
-//! `vulkan.rs` consumes the output ([`FrameData`]) verbatim.
+//! `render::vulkan` consumes the output ([`FrameData`]) verbatim.
 //!
 //! ```text
 //!   &[DrawCmd] ─┬─ Fill/RoundRect ──────────────▶ quads (solid / SDF corners)

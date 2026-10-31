@@ -45,11 +45,8 @@ impl TerminalCore {
     /// Adopt the window's fresh geometry and resize the grid to it.
     pub(in crate::app) fn resize(&mut self, geom: TerminalGeometry) {
         let (cols, rows) = (geom.cols, geom.rows);
-        // Adopt the window's fresh geometry, then resize the grid to it. In
-        // demo mode there is no child; rebuild the static grid. Otherwise
-        // push the size to the child (TIOCSWINSZ → SIGWINCH). The PTY resize
-        // is best-effort: a resize on a dead child just surfaces as EOF on
-        // the next read, which shuts down cleanly.
+        // In demo mode there is no child; rebuild the static grid. Otherwise resize the
+        // grid now and schedule the child's winsize (below).
         self.geom = geom;
         // An in-progress drag cannot survive: the button is held on a window that is
         // being resized. It ends here, and copies what it selected (below) the way its

@@ -13,15 +13,16 @@
 //!     │ execute       │  ▼ intermediate ▼            │
 //!     ▼              esc_dispatch      csi_intermediate / csi_ignore
 //!   (UTF-8 decode)     │  ]──▶ osc_string ──BEL/ST──▶ (title)
-//!                      P/X/^/_──▶ string swallow (DCS/SOS/PM/APC: no-op in v1)
+//!                      │  P──▶ dcs_entry … dcs_passthrough ──ST──▶ dcs_dispatch
+//!                      X/^/_──▶ string ignored to ST (SOS/PM/APC)
 //! ```
 //!
 //! Hostile-input posture (a shell can print anything): parameters and
 //! intermediates are bounded and saturating, the OSC buffer is capped, every
 //! byte in every state has a defined transition, and there is no recursion, no
 //! `unwrap`, and no indexing that can trap. Malformed UTF-8 yields U+FFFD, never
-//! a panic. DCS/SOS/PM/APC strings are recognized and safely swallowed; bnkterm
-//! implements no DCS in v1.
+//! a panic. A DCS payload is capped and dispatched whole or not at all; SOS, PM and
+//! APC strings are recognized and discarded.
 
 use crate::platform::bytes;
 
@@ -888,17 +889,11 @@ impl Parser {
     // ---- DCS ----------------------------------------------------------------
     //
     // A DCS is a CSI with a payload: `ESC P <params> <intermediates> <final> <data> ST`.
-    // The prologue is parsed exactly like a CSI's — same parameters, same intermediates —
-    // and the final byte names the sequence rather than performing it, because what
-    // follows is the argument. `DCS $ q m ST` is "what are the current SGR settings?".
-    //
-    // "Exactly like a CSI's" includes the C0 rule: a control byte arriving mid-prologue is
-    // executed and the sequence carries on. These states abort on one, which is both a
-    // divergence from xterm and an inconsistency with the CSI states three screens up —
-    // and it is invisible, because the only symptom is that a program which pads a
-    // DECRQSS waits out its own timeout for a reply that was never going to come. The
-    // payload state (`dcs_passthrough`) is different and already correct: there a C0 is
-    // data.
+    // The prologue is parsed exactly like a CSI's: the same parameters, the same
+    // intermediates, and the same rule that a C0 arriving mid-prologue is executed and the
+    // sequence carries on. The final byte names the sequence rather than performing it,
+    // because what follows is the argument. `DCS $ q m ST` is "what are the current SGR
+    // settings?". In the payload (`dcs_passthrough`) a C0 is data.
 
     fn dcs_entry<P: Perform>(&mut self, p: &mut P, byte: u8) {
         if is_c0(byte) {

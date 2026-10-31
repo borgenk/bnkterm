@@ -285,7 +285,6 @@ impl Screen {
         }
     }
 
-    /// ECH: erase `n` cells from the cursor, without shifting the rest.
     /// ECH: blank `n` cells from the cursor without shifting anything.
     ///
     /// Cancels a deferred wrap, as every operator that rewrites the cells around the
@@ -464,14 +463,9 @@ impl Screen {
                 1 => self.pen.attrs.insert(Attrs::BOLD),
                 2 => self.pen.attrs.insert(Attrs::DIM),
                 3 => self.pen.attrs.insert(Attrs::ITALIC),
-                // `4` is underline; `4:n` picks a style (1 single, 2 double, 3 curly,
-                // 4 dotted, 5 dashed) and `4:0` turns it off. We draw only a solid
-                // underline for now, so a style other than 0 is an underline of some
-                // kind and that is what the cell records. Storing *which* style needs a
-                // wider `Attrs` and a cell field; until then a curly underline shows up
-                // as a straight one, which is the right kind of wrong.
-                // `4` underlines; `4:n` says with what shape. `4:0` is the one
-                // sub-parameter of 4 that is not an underline at all.
+                // `4` underlines; `4:n` picks the shape (1 single, 2 double, 3 curly,
+                // 4 dotted, 5 dashed), and `4:0` is the one sub-parameter of 4 that is not
+                // an underline at all.
                 4 => match param.get(1).copied() {
                     Some(0) => {
                         self.pen.attrs.remove(Attrs::UNDERLINE);

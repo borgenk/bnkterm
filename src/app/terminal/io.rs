@@ -461,6 +461,8 @@ impl TerminalCore {
         if self.winsize_at.is_some_and(|at| at <= now) {
             self.winsize_at = None;
             let (cols, rows) = self.screen.dimensions();
+            // Best-effort: a resize on a dead child surfaces as EOF on the next read, which
+            // shuts down cleanly.
             if let Some(pty) = &self.pty {
                 let _ = pty.resize(cols, rows);
             }

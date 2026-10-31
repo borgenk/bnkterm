@@ -347,11 +347,9 @@ impl Pty {
     /// The master and the slave name the same line discipline, so a `tcsetattr` the
     /// *child* makes on its own tty is visible here without the child telling us
     /// anything: this is how a password prompt is noticed at all, since `sudo` prints
-    /// no escape sequence to announce itself. It is one `TCGETS`, and like
-    /// [`cwd`](Self::cwd) and [`foreground_program`](Self::foreground_program) it is
-    /// called only when a tab's output settles, never per read (the drain does ~950k
-    /// reads over a 150 MB cat; a syscall on that path is exactly the tax `PERF_LOG`
-    /// exists to prevent).
+    /// no escape sequence to announce itself. It is one `TCGETS`, made once per batch of
+    /// output rather than per read: the drain does ~950k reads over a 150 MB cat, and a
+    /// syscall on each would be a tax on every byte.
     pub fn tty_mode(&self) -> Option<TtyMode> {
         // SAFETY: `t` is a live, correctly-typed local; tcgetattr either fills it for
         // a valid fd or returns nonzero, and we read it only on success.

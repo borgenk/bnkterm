@@ -279,8 +279,8 @@ pub(super) struct Row {
     /// It lives on the row rather than on the row's last cell because it describes the
     /// *line*, and a cell is addressed by a column that a resize moves: widening would
     /// strand the flag mid-row and narrowing would truncate it away, and either one
-    /// silently breaks a wrapped line in half on the next copy. We do not re-wrap on
-    /// resize ([`Buffer::resize`]), so nothing would put it back.
+    /// silently breaks a wrapped line in half on the next copy. The alt screen only clamps
+    /// its rows on a resize ([`Buffer::resize`]), so nothing would put it back.
     ///
     /// The invariant: true only while the text that wrapped is still the text in the
     /// final column. Every write or erase reaching that column clears it.
@@ -422,8 +422,8 @@ impl Row {
     /// Truncation drops any combining marks past the new edge and blanks a wide
     /// glyph's leader whose spacer just fell off, so no half of a wide cell is
     /// ever left dangling. [`Row::wrapped`] is line state, not cell state, so it
-    /// survives untouched. This is the column half of a terminal resize; it does
-    /// not re-wrap soft-wrapped content (see [`Buffer::resize`]).
+    /// survives untouched. This is the column half of a resize that clamps rather than
+    /// reflows (see [`Buffer::resize`]).
     pub(super) fn resize_cols(&mut self, new_cols: usize) {
         let old = self.cells.len();
         if new_cols < old {
@@ -928,10 +928,10 @@ impl Buffer {
     /// scroll region resets to the full screen (as xterm does on resize) and the cursor is
     /// re-clamped.
     ///
-    /// Deliberately does NOT re-wrap soft-wrapped lines on a width change — that is
-    /// [`Buffer::reflow`]'s job, called instead of this when the width changes. This is the
-    /// same-width path (a height change or a scale-driven metrics change), where re-wrapping
-    /// would be wasted work.
+    /// Clamps rather than re-wraps: a width change truncates or pads each row. The primary
+    /// screen takes this path only when the width is unchanged and [`Buffer::reflow`]
+    /// otherwise; the alt screen always takes it, because the full-screen program that owns
+    /// it repaints on `SIGWINCH`.
     pub(super) fn resize(&mut self, new_cols: usize, new_rows: usize) {
         let new_cols = new_cols.max(1);
         let new_rows = new_rows.max(1);

@@ -18,7 +18,7 @@
 //! the compositor may resend the whole set at any time (a GPU hotplug, a
 //! scanout change), so `done` replaces the snapshot rather than extending it.
 //! This module is pure parsing and state: the fd mmap and the wire routing live
-//! with the caller (`app.rs`), so everything here is testable on plain bytes.
+//! with the caller (`app/present.rs`), so everything here is testable on plain bytes.
 
 use crate::platform::error::{Error, Result};
 

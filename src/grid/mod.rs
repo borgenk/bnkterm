@@ -124,8 +124,9 @@ impl AbsRow {
 ///   history: a scroll inside a `DECSTBM` region, a `DL`, or any scroll on the alt
 ///   screen (which keeps no history at all). Every row below the hole shifts up, so the
 ///   ids no longer name the same lines.
-/// - **The content is destroyed wholesale**: `RIS`, a resize (rows re-index and we do
-///   not re-wrap), an alt-screen switch, or an `ED` that erases the whole display.
+/// - **The content is destroyed or renumbered wholesale**: `RIS`, a width change (the
+///   primary reflows), any alt-screen resize, an alt-screen switch, or an `ED` that erases
+///   the whole display.
 ///
 /// Note what is *not* here: ordinary output. A row retiring into history keeps its id,
 /// and a row evicted off the front of a full ring only makes ids below `evicted`
@@ -1475,8 +1476,8 @@ impl Screen {
     ///
     /// A textbook mark-and-sweep, run only when [`StyleTable::intern`] reports the table
     /// full, so the walk over every cell is an *event* rather than a per-frame cost. The
-    /// roots are every cell in both buffers plus the pen and both saved cursors, because
-    /// a rendition can be set with nothing printed under it yet.
+    /// roots are every cell in both buffers plus the pen, because a rendition can be set
+    /// with nothing printed under it yet.
     ///
     /// Deliberately not reference counted: see [`StyleTable`].
     fn collect_styles(&mut self) {
