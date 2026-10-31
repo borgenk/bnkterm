@@ -48,11 +48,11 @@ mod print;
 mod reply;
 mod view;
 
-/// The grid's suite. One module rather than one per sibling above, because these tests are
-/// overwhelmingly *end to end* — feed bytes, assert the resulting screen — so a single test
-/// routinely exercises `perform`, `edit`, `print` and `view` at once and belongs to no one
-/// of them. Splitting them along the implementation's seams would file each test under
-/// whichever module it happens to touch first.
+/// The grid's suite, filed by the behaviour each test pins rather than by the sibling it
+/// touches. The tests are overwhelmingly *end to end* (feed bytes, assert the resulting
+/// screen), so a single test routinely exercises `perform`, `edit`, `print` and `view` at
+/// once and belongs to no one of them; filed along those seams, each would land under
+/// whichever module it happened to touch first.
 #[cfg(test)]
 mod tests;
 
