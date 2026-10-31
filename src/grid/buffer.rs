@@ -471,8 +471,8 @@ impl LogicalLine {
     /// non-default background or a combining mark is content, not padding, and stops the
     /// trim: a coloured prompt bar drawn with spaces, or a marked blank, must survive a
     /// reflow rather than be pulled up into the line above it. A wide glyph's spacer is
-    /// not `PackedCell::BLANK` (it carries `WIDE_SPACER`), so a trailing wide pair is never
-    /// half-trimmed.
+    /// not `PackedCell::BLANK` (its width is `CellWidth::Spacer`), so a trailing wide pair
+    /// is never half-trimmed.
     pub(super) fn trim_trailing_blanks(&mut self) {
         let mut end = self.cells.len();
         while end > 0
@@ -1201,7 +1201,7 @@ impl Buffer {
                     break;
                 };
                 // A wide glyph whose spacer cannot share its row (only at new_cols == 1) is
-                // stored clipped: the leader alone with its WIDE_LEADER attr stripped, and its
+                // stored clipped: the leader alone, narrowed to `CellWidth::Narrow`, and its
                 // spacer dropped, exactly as the printer records a wide glyph at a single
                 // column. Leaving the leader marked would strand it without the spacer the
                 // grid's invariant demands, and copying the spacer would orphan it onto the

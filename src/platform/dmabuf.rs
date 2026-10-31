@@ -22,8 +22,8 @@
 
 use crate::platform::error::{Error, Result};
 
-/// DRM fourcc for 32-bit xRGB, little-endian (`XR24`), the dmabuf twin of the
-/// `wl_shm` XRGB8888 the software path renders today.
+/// DRM fourcc for 32-bit xRGB, little-endian (`XR24`): the format of every buffer
+/// bnkterm presents.
 pub const DRM_FORMAT_XRGB8888: u32 = fourcc(b"XR24");
 
 /// A DRM fourcc: four ASCII bytes packed little-endian.

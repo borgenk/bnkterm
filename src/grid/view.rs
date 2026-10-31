@@ -498,8 +498,8 @@ impl Screen {
     }
 
     /// The inclusive cell range of the whole logical line at absolute `row`, for a
-    /// triple-click selection: it spans every row a soft wrap joined (the `WRAPPED` flag
-    /// on a row's last cell continues it into the next), edge to edge.
+    /// triple-click selection: it spans every row a soft wrap joined (a row's `wrapped`
+    /// flag continues it into the next), edge to edge.
     ///
     /// The walk runs over the stream, not the visible band, so triple-clicking the first
     /// row on screen still takes the part of the line that wrapped in from above it.

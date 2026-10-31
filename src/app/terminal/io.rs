@@ -168,7 +168,7 @@ impl TerminalCore {
         //
         // A *release* is excluded, and must be. Under kitty's
         // `REPORT_EVENT_TYPES` a release encodes to bytes of its own, and
-        // `App::on_key_release` forwards one for every key whose press a binding
+        // `State::on_key_release` forwards one for every key whose press a binding
         // consumed — so counting releases as typing would have letting go of
         // Ctrl+Shift+C undo the copy that pressing it just made.
         if event != input::KeyEvent::Release {

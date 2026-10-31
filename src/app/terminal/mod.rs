@@ -224,7 +224,7 @@ pub(super) struct TerminalCore {
     /// change, a fresh selection to own, or the child exiting).
     outbox: Vec<ToWindow>,
     /// The child's last-seen window title, so a `Title` is emitted only when it
-    /// changes (the sender dedupes, so Stage 2 never spams the channel).
+    /// changes.
     last_title: String,
     /// The child's working directory, re-read when the tab's output settles. It
     /// labels the tab when no title or foreground job is known; `None` before the

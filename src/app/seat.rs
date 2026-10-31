@@ -747,7 +747,7 @@ impl State {
     fn on_wheel(&mut self, value: f32) -> Result<()> {
         // Gather fractional deltas (touchpads send many small ones) into whole
         // notches, then hand them to the terminal (which reports them, scrolls the
-        // view, or sends arrow keys — see `apply_pointer`).
+        // view, or sends arrow keys; see `TerminalCore::pointer`).
         let notches = wheel_notches(&mut self.pointer.axis_accum, value);
         if notches == 0 {
             return Ok(());

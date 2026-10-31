@@ -68,7 +68,7 @@ impl Drop for Device {
 /// A live Vulkan device matched to the compositor's main DRM device, with a
 /// graphics queue, a command pool, and the format/memory facts the render
 /// targets need. Every failure on the way here is a clean `Err` the caller
-/// answers with the software path.
+/// reports.
 pub struct Gpu {
     fns: DeviceFns,
     queue: VkQueue,

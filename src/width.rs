@@ -10,7 +10,8 @@
 //!      conjoining jamo: they compose onto the previous cell and take no column.
 //!   1  the ordinary case: one glyph, one column.
 //!   2  East Asian Wide and Fullwidth: CJK and most emoji, drawn across two
-//!      columns (a WIDE_LEADER cell plus a WIDE_SPACER placeholder in the grid).
+//!      columns (a `CellWidth::Leader` cell plus a `CellWidth::Spacer` placeholder in
+//!      the grid).
 //! ```
 //!
 //! A generated two-level table maps each scalar to a width. Unicode is divided
@@ -25,8 +26,6 @@
 #[cfg(test)]
 use core::cmp::Ordering;
 
-/// Columns `c` occupies when printed: 0, 1, or 2. Zero-width wins over wide, so a
-/// combining mark that also carries an East Asian width still measures 0.
 /// Display columns occupied by one already-segmented grapheme cluster.
 ///
 /// This is the *other* width function, and the two must never disagree: [`width`] measures
@@ -69,6 +68,8 @@ pub fn text_cells(text: &str) -> usize {
         .sum()
 }
 
+/// Columns `c` occupies when printed: 0, 1, or 2. Zero-width wins over wide, so a
+/// combining mark that also carries an East Asian width still measures 0.
 pub fn width(c: char) -> u8 {
     let cp = u32::from(c);
     let page_number = usize::try_from(cp >> WIDTH_PAGE_SHIFT).unwrap_or_default();

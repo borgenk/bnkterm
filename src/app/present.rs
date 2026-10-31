@@ -760,8 +760,8 @@ impl State {
     /// buffer release retries: a `wl_buffer.release` on the implicit path, the
     /// release wake under explicit sync.
     ///
-    /// The display list is built and diffed against `present_list` (what is on
-    /// screen): an identical frame early-outs (the common idle case), otherwise
+    /// The display list is built and diffed against `DisplayListPool::front` (what is
+    /// on screen): an identical frame early-outs (the common idle case), otherwise
     /// the changed screen regions are reported to the compositor as damage. The
     /// GPU repaints the full frame every present; the *screen* damage is still
     /// just the diff.

@@ -1549,7 +1549,7 @@ mod tests {
 
     #[test]
     fn letting_go_of_a_key_does_not_end_the_selection() {
-        // The window swallows Ctrl+Shift+C as a copy chord, but `App::on_key_release`
+        // The window swallows Ctrl+Shift+C as a copy chord, but `State::on_key_release`
         // forwards its *release* like any other key's, and under kitty's
         // `REPORT_EVENT_TYPES` that release encodes to bytes of its own. Treating "the
         // encoder produced something" as typing would therefore have the copy chord wipe

@@ -411,9 +411,9 @@ struct State {
     /// Resolved font files reused when a scale change reopens the faces.
     font_selection: FontSelection,
     xkb: Xkb,
-    /// The tab manager behind the window seam. It owns the terminal core (and in
-    /// Phase 1, every core), routes input/timers, supplies the visible display list,
-    /// and drains terminal facts for the window to act on.
+    /// The tab manager behind the window seam. It owns every tab's terminal core,
+    /// routes input/timers, supplies the visible display list, and drains terminal
+    /// facts for the window to act on.
     tabs: Tabs,
     /// Reused `poll(2)` descriptor storage: Wayland first, followed by gatherer
     /// wake fds. Clearing it retains capacity, so idle waits do not allocate.
@@ -992,9 +992,9 @@ impl State {
     }
 
     /// Hand the geometry [`Self::resize_to`] worked out to the tabs: each one resizes its
-    /// grid (a width change rewraps it) and its PTY winsize (best-effort, so this cannot
-    /// fail from here — see `apply`), and the bar takes its strip. A no-op when nothing has
-    /// moved since the last paint.
+    /// grid (a width change rewraps it) and schedules its PTY winsize for when the drag
+    /// settles (see `TerminalCore::resize`), and the bar takes its strip. A no-op when
+    /// nothing has moved since the last paint.
     ///
     /// This is the expensive half of a resize, and it is paced with the frames rather than
     /// run per configure. A compositor delivers a configure per pointer motion during an
@@ -1094,8 +1094,7 @@ impl State {
     }
 
     /// Act on the tabs layer's routed outbound messages after a pump (or a copy):
-    /// each is a Wayland request the terminal cannot make itself. Window-side by
-    /// necessity; Stage 2 turns this outbox into the terminal→window channel.
+    /// each is a Wayland request the terminal cannot make itself.
     fn drain_outbox(&mut self) -> Result<()> {
         // Swap the queue out so the match arms can take `&mut self` freely, drain it
         // (which keeps the local buffer's capacity), then hand the emptied buffer back

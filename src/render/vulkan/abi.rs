@@ -96,7 +96,7 @@ pub(super) const VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT: u32 = 100
 pub(super) const VK_QUEUE_GRAPHICS_BIT: u32 = 0x1;
 
 /// `VK_FORMAT_B8G8R8A8_UNORM`: bytes B,G,R,A in memory, the Vulkan twin of
-/// little-endian DRM XRGB8888 (and of the software canvas's pixel layout).
+/// little-endian DRM XRGB8888.
 pub(super) const VK_FORMAT_B8G8R8A8_UNORM: u32 = 44;
 /// `VK_FORMAT_B8G8R8A8_SRGB`: the same bytes as the UNORM twin, but sampled and
 /// stored through the sRGB transfer function. The presentable image is created
@@ -203,8 +203,8 @@ pub(super) const VK_COMMAND_BUFFER_LEVEL_PRIMARY: u32 = 0;
 pub(super) const VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT: u32 = 0x1;
 
 /// Every fence wait in this backend bounds at one second: a GPU that takes
-/// longer to clear or paint a window is broken, and a clean error (falling
-/// back to software) beats a frozen editor.
+/// longer to clear or paint a window is broken, and a clean error beats a
+/// frozen window.
 pub(super) const FENCE_TIMEOUT_NS: u64 = 1_000_000_000;
 
 /// `DRM_FORMAT_MOD_INVALID`: "the layout is implicit"; never allocate with it.
