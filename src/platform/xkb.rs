@@ -227,17 +227,18 @@ impl Xkb {
         unsafe { xkb_compose_state_reset(compose.as_ptr()) };
     }
 
-    /// Whether Shift is currently active, so navigation keys extend a selection.
+    /// Whether Shift is currently active. This and the two below are the pointer's
+    /// modifiers: a mouse report's bits, and Ctrl+click on a link.
     pub fn shift_active(&self) -> bool {
         self.mod_active(XKB_MOD_NAME_SHIFT)
     }
 
-    /// Whether Control is currently active, gating the editor shortcuts.
+    /// Whether Control is currently active.
     pub fn ctrl_active(&self) -> bool {
         self.mod_active(XKB_MOD_NAME_CTRL)
     }
 
-    /// Whether (plain) Alt is currently active; the find bar's mode toggles.
+    /// Whether (plain) Alt is currently active.
     pub fn alt_active(&self) -> bool {
         self.mod_active(XKB_MOD_NAME_ALT)
     }

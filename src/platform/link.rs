@@ -1,8 +1,8 @@
 //! Finding a URL inside a line of text.
 //!
-//! A URL usually arrives with no markup around it: a note is typed with one straight
-//! in the prose, and a terminal's output prints one (`git push` prints a pull-request
-//! URL, a dev server prints `http://localhost:3000`). Nothing marks those as links, so
+//! A URL usually arrives with no markup around it: a terminal's output prints one
+//! (`git push` prints a pull-request URL, a dev server prints
+//! `http://localhost:3000`). Nothing marks those as links, so
 //! an app that wants them clickable has to *find* them in the text. That is this
 //! module, and nothing else: a pure `&str -> Range` scan holding no buffer and no
 //! parser state, so it is exhaustively testable without a window or a GPU.
@@ -41,8 +41,8 @@
 //!   gives its `)` back to the prose.
 //!
 //! We detect exactly the schemes [`browser::OPENABLE_SCHEMES`] lists, by scanning for
-//! that same constant. The text being scanned may be hostile (a note can be pasted, a
-//! program can print anything), so `javascript:` and `data:` in prose are never even
+//! that same constant. The text being scanned may be hostile (a program can print
+//! anything), so `javascript:` and `data:` in prose are never even
 //! candidates, and other `word:` text is not a link at all.
 //!
 //! [uts58]: https://www.unicode.org/reports/tr58/

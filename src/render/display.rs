@@ -1,13 +1,12 @@
 //! The frame as data: a flat list of drawing primitives the painter emits and a
-//! backend consumes. This is the seam the architecture notes call the "display
-//! list" (section 1a). Two things hang off it:
+//! backend consumes. Two things hang off it:
 //!
-//! - **Damage tracking** (section 1b): because a frame is now a value, two frames
-//!   can be compared. [`damage_into`] diffs the previous frame against the new one and
-//!   returns just the screen rectangles that changed, so an idle caret blink
-//!   presents a caret-sized damaged region instead of the whole surface, and a
-//!   keystroke reports the edited line rather than the screen.
-//! - **A backend-agnostic frame** (section 5): the list is turned into pixels by
+//! - **Damage tracking**: because a frame is a value, two frames can be compared.
+//!   [`damage_into`] diffs the previous frame against the new one and returns just the
+//!   screen rectangles that changed, so an idle cursor blink presents a cursor-sized
+//!   damaged region instead of the whole surface, and a keystroke reports the edited
+//!   line rather than the screen.
+//! - **A backend-agnostic frame**: the list is turned into pixels by
 //!   the GPU batcher ([`crate::render::gpu::build_frame_into`]), which consumes exactly these
 //!   commands. Nothing here is Vulkan-specific.
 //!
@@ -16,7 +15,7 @@
 //!
 //! Commands are in *screen* space (already shifted by the scroll), so scrolling,
 //! which moves every command, naturally diffs as "everything changed" and falls
-//! back to a full repaint, exactly as the notes predict.
+//! back to a full repaint.
 //!
 //! ```text
 //!   layout + params ──build_display_list──▶ DisplayList ──┬─ gpu::build_frame ─▶ vertices
@@ -26,8 +25,8 @@
 use crate::platform::freetype::FaceKey;
 use crate::platform::geom::Rect;
 
-/// A frame, as the ordered primitives that draw it. Stacking is the list order:
-/// background first, then panels, selection, glyphs, and the caret last.
+/// A frame, as the ordered primitives that draw it. Stacking is the list order: a
+/// later command draws over an earlier one.
 pub type DisplayList = Vec<DrawCmd>;
 
 /// Beyond this many distinct changed regions, repainting the whole surface is
@@ -63,14 +62,14 @@ pub struct Fade {
 }
 
 /// One drawing primitive in screen (post-scroll) pixels. The set is deliberately
-/// small and low level so a future GPU backend can execute the same list; the
-/// painter decomposes higher-level chrome (an image's selection border, a button)
-/// into these. Every variant is `Eq + Hash` so [`damage_into`] can diff two frames by
-/// value, which is why text runs carry an owned [`String`] and a borrow-free
-/// [`FaceKey`] rather than a `&str`/`&Face` tied to the rope and fonts.
+/// small and low level so the GPU batcher can execute it directly; the painter
+/// decomposes higher-level chrome (a tab, the scrollbar, a link preview) into these.
+/// Every variant is `Eq + Hash` so [`damage_into`] can diff two frames by value, which
+/// is why text runs carry an owned [`String`] and a borrow-free [`FaceKey`] rather than
+/// a `&str`/`&Face` tied to the grid and fonts.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum DrawCmd {
-    /// A solid, opaque rectangle (background, selection, caret, quote bar, rule).
+    /// A solid, opaque rectangle (background, selection, cursor, an underline rule).
     Fill { rect: Rect, color: u32 },
     /// A solid rectangle with anti-aliased rounded corners (the scrollbar thumb, an
     /// overlay panel).
@@ -230,8 +229,8 @@ fn salvage(buf: &mut DisplayList, strings: &mut Vec<String>) {
 /// per-frame call allocates nothing. Clamped to the `width` x `height` surface and free
 /// of overlaps.
 ///
-/// After the common prefix and suffix are stripped (lists are built in document
-/// order, so a blink or a small edit differs in only a handful of commands, and
+/// After the common prefix and suffix are stripped (lists are built in the same order
+/// every frame, so a blink or a small edit differs in only a handful of commands, and
 /// equality bails on the first differing field), the survivors are diffed
 /// positionally: the i-th command of each frame is compared, and a differing pair
 /// damages both its old and new bounds. Inserting or removing a command misaligns

@@ -16,12 +16,11 @@ use crate::platform::error::{Error, Result};
 /// web and mail schemes text links to, plus `file:` for local references.
 ///
 /// **This is a scheme allowlist, not a guarantee that nothing executable is reachable.**
-/// The URL never reaches a shell — `javascript:` and `data:` are refused outright, and a
-/// leading dash cannot become an `xdg-open` option — but `xdg-open` dispatches by
+/// The URL never reaches a shell: `javascript:` and `data:` are refused outright, and a
+/// leading dash cannot become an `xdg-open` option. But `xdg-open` dispatches by
 /// *handler*, so `file:///path/to/x.desktop` is launched by `gio open` rather than
-/// displayed. Genuinely low: an attacker must already have written that file, and the
-/// click is a deliberate Ctrl+click on a link whose target the user can read. Low is not
-/// the same as impossible, and the comment here used to claim impossible.
+/// displayed. The risk is low, not nil: an attacker must already have written that file,
+/// and the click is a deliberate Ctrl+click on a link whose target the user can read.
 pub const OPENABLE_SCHEMES: [&str; 4] = ["https://", "http://", "file://", "mailto:"];
 
 /// Which `xdg-open` a link goes to: the one beside the shell that printed it, so a

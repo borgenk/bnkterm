@@ -662,7 +662,7 @@ impl Gpu {
         Ok(())
     }
 
-    /// Render `img` and present it under the milestone-3 implicit-sync bridge:
+    /// Render `img` and present it under the implicit-sync bridge:
     /// acquire from the dmabuf's read fences, release the render fence back into
     /// the dmabuf (CPU wait if the bridge is unavailable). The fallback path for
     /// compositors that do not offer explicit sync. Returns with the frame in
@@ -1002,8 +1002,8 @@ impl Gpu {
                 let offset = 0u64;
                 (f.cmd_bind_vertex_buffers)(img.cmd, 0, 1, &img.vertices.buf, &offset);
                 // The viewport, the only push constant: the vertex stage maps pixel
-                // coordinates to clip space with it. The coverage exponent that used
-                // to ride along here is now per run, in the vertex data (gpu.rs).
+                // coordinates to clip space with it. The coverage exponent is per run, in
+                // the vertex data (`render::gpu`).
                 let push: [f32; 2] = [img.target.width as f32, img.target.height as f32];
                 (f.cmd_push_constants)(
                     img.cmd,
@@ -1013,7 +1013,7 @@ impl Gpu {
                     8,
                     push.as_ptr().cast(),
                 );
-                // The atlas set (set 0) is the only descriptor set now; bind it
+                // The atlas set (set 0) is the only descriptor set; bind it
                 // once, then draw every batch (a frame is a single batch, but the
                 // loop is kept so a future clipped-repaint path stays a drop-in).
                 (f.cmd_bind_descriptor_sets)(

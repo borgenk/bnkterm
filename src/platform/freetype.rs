@@ -877,8 +877,9 @@ impl SizedFaces {
     }
 }
 
-/// A set of [`Face`]s at different pixel sizes and styles, so a document can mix
-/// body text, larger headings, and inline emphasis. Each distinct size opens the
+/// A set of [`Face`]s at different pixel sizes and styles, so the grid and the tab
+/// labels each draw at their own size, in regular, bold and italic. Each distinct size
+/// opens the
 /// family's regular face plus whatever variant files exist (the same files,
 /// re-read per size); the first size opened is the fallback for any size that was
 /// not requested, and a missing variant falls back to the regular face, so a
@@ -1850,9 +1851,8 @@ mod tests {
         // icon a git prompt prints. It lives in the private-use area, so a plain
         // text or monospace family never carries it: the config's fallback chain
         // (a symbols font) must supply it or the cell renders as a blank / tofu
-        // box. This holds for either app: with an empty fallback list (a text
-        // editor) the resolver simply returns the primary and the ink assertion
-        // is skipped; with a symbols font configured (a terminal) it inks.
+        // box. With an empty fallback list the resolver returns the primary and the
+        // ink assertion is skipped; with a symbols font configured it inks.
         const BRANCH: char = '\u{F418}';
         let fonts = Fonts::new(&[16]).expect("a default font");
         let key = FaceKey::Prose {

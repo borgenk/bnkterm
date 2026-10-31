@@ -333,13 +333,8 @@ fn fill_renderer(r: &mut Renderer, fns: &DeviceFns, device: VkDevice) -> Result<
     // Pipeline layout: the atlas set plus the push constant. **Eight bytes, one
     // member**: the viewport `vec2` at offset 0, which is what both shaders declare
     // (`layout(push_constant) uniform Push { vec2 viewport; }`) and what `target.rs`
-    // pushes. The description here used to name a second member — a gamma float at
-    // offset 8, 12 bytes total — left over from before the coverage exponent moved to a
-    // per-run value. The code was right end to end and only the comment was stale, which
-    // in a codebase where comments are the spec is the dangerous half: someone adding a
-    // fragment constant at offset 8 would have trusted it and got a shader/layout
-    // mismatch. `size` below is the single source of truth; the shaders are pinned
-    // against it by `struct_sizes_match_the_c_abi`'s neighbours in `abi.rs`.
+    // pushes. No test checks the shaders against `size` below, so a new member means
+    // changing both shaders, this range and the push together.
     let set_layouts = [r.set_layout_atlas];
     let push_range = VkPushConstantRange {
         stage_flags: VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
