@@ -1444,6 +1444,26 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_dcs_prologue_discards_its_payload_up_to_the_terminator() {
+        // A DCS whose prologue cannot be parsed is dropped, but its payload still runs to
+        // ST. A dropped CSI ends at its first final byte instead, which here would print
+        // `payload`.
+        for seq in [
+            b"\x1bP1<qpayload\x1b\\Z".as_slice(), // private marker after a parameter
+            b"\x1bP$1qpayload\x1b\\Z",            // parameter after an intermediate
+            b"\x1bP!!!qpayload\x1b\\Z",           // a third intermediate
+            b"\x1bP\x80qpayload\x1b\\Z",          // a high byte as the first
+        ] {
+            assert_eq!(
+                run(seq),
+                vec![Action::Print('Z')],
+                "{:?}",
+                String::from_utf8_lossy(seq)
+            );
+        }
+    }
+
+    #[test]
     fn a_dcs_payload_is_capped_like_every_other_buffer() {
         // The child writes this. A megabyte of payload must cost nothing but the time to
         // skip it, and an over-long one is dropped whole rather than acted on truncated.
