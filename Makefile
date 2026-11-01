@@ -156,13 +156,14 @@ perf-stages:
 
 # Headless render-pipeline timing: grid -> display list -> damage diff -> vertices,
 # per frame, no GPU or window, so a fast parser cannot hide a slow renderer. Clean
-# timing by default; for per-frame allocation counts swap dev for perf-alloc, and read
-# the two separately because the counting allocator taxes the timing.
+# timing by default; for per-frame allocation counts add `--features perf-alloc`, and
+# read the two separately because the counting allocator taxes the timing.
 render-bench:
 	cargo run --release --bin bnkterm-dev -- --render-bench
 
-# Regenerate src/width_tables.rs and src/platform/grapheme_tables.rs from the vendored
-# Unicode data. The only way to do it on a Unicode bump.
+# Regenerate src/width_tables.rs, src/platform/grapheme_tables.rs and
+# src/platform/link_tables.rs from the vendored Unicode data. The only way to do it on a
+# Unicode bump.
 tables:
 	cargo run --release --bin bnkterm-dev -- --gen-tables
 

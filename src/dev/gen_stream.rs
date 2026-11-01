@@ -21,7 +21,7 @@ const DEFAULT_SIZE: usize = 150_000_000;
 /// marker, and the later ones are stream content.
 const START_MARKER: &[u8] = b"*** START OF ";
 
-/// `bnkterm --gen-stream --input <source> --output <stream> [--size N]`.
+/// `bnkterm-dev --gen-stream --input <source> --output <stream> [--size N]`.
 pub fn run(args: &[String]) -> Result<()> {
     let input =
         flag(args, "--input").ok_or_else(|| Error::msg("--gen-stream needs --input FILE"))?;

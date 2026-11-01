@@ -26,7 +26,7 @@ use std::path::Path;
 /// Where fixtures live, relative to the repo root (the CWD `make`/`cargo` run in).
 const FIXTURES: &str = "tests/fixtures";
 
-/// `bnkterm --capture <name> <cols> <rows> -- <command> [args...]`.
+/// `bnkterm-dev --capture <name> <cols> <rows> -- <command> [args...]`.
 pub fn run(args: &[String]) -> Result<()> {
     let i = args
         .iter()
