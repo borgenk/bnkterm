@@ -157,7 +157,7 @@ impl Perform for ParseCounter {
         self.actions = self.actions.saturating_add(1);
     }
 
-    fn osc_dispatch(&mut self, _data: &[u8], _bel_terminated: bool) {
+    fn osc_dispatch(&mut self, _data: &[u8], _bel_terminated: bool, _wire_len: usize) {
         self.actions = self.actions.saturating_add(1);
     }
 }
@@ -233,7 +233,7 @@ impl Perform for GridActions {
         self.observe_sequence();
     }
 
-    fn osc_dispatch(&mut self, _data: &[u8], _bel_terminated: bool) {
+    fn osc_dispatch(&mut self, _data: &[u8], _bel_terminated: bool, _wire_len: usize) {
         self.observe_sequence();
     }
 }

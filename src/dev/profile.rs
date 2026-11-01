@@ -349,7 +349,7 @@ impl Perform for Observer {
         self.observe_sequence();
     }
 
-    fn osc_dispatch(&mut self, _data: &[u8], _bel_terminated: bool) {
+    fn osc_dispatch(&mut self, _data: &[u8], _bel_terminated: bool, _wire_len: usize) {
         self.observe_sequence();
     }
 }

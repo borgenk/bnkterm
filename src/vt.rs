@@ -35,7 +35,8 @@ const MAX_PARAMS: usize = 32;
 /// ignored, matching the reference parser.
 const MAX_INTERMEDIATES: usize = 2;
 
-/// Cap on the OSC string buffer (e.g. a window title); bytes past it are dropped.
+/// Cap on an OSC string as sent, C0 controls included. A string that reaches it is
+/// dropped whole.
 const OSC_MAX: usize = 4096;
 
 /// Cap on a DCS payload. The sequences we answer (DECRQSS, XTGETTCAP) carry a handful of
@@ -148,13 +149,14 @@ pub trait Perform {
     /// recorder, a headless consumer) is not made to care.
     fn dcs_dispatch(&mut self, _params: &Params, _intermediates: &[u8], _action: u8, _data: &[u8]) {
     }
-    /// A complete OSC string (the bytes between `ESC ]` and its terminator), and which
-    /// terminator ended it: `true` for BEL (xterm's convention), `false` for ST.
+    /// A complete OSC string (the bytes between `ESC ]` and its terminator), which
+    /// terminator ended it (`true` for BEL, xterm's convention, `false` for ST), and its
+    /// length as sent, counting the C0 controls stripped from `data`.
     ///
     /// The terminator matters because an OSC *query* is answered with an OSC, and a
     /// client that sent BEL may only be looking for BEL. Mirroring what we were sent is
     /// the one answer that is right for both kinds of client.
-    fn osc_dispatch(&mut self, data: &[u8], bel_terminated: bool);
+    fn osc_dispatch(&mut self, data: &[u8], bel_terminated: bool, wire_len: usize);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -860,7 +862,7 @@ impl Parser {
                 self.finish_osc(p, true);
                 self.state = State::Ground;
             }
-            0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f => {} // ignore other controls
+            // Other C0 controls are kept to count toward the cap, and stripped at the end.
             _ => {
                 if self.osc.len() < OSC_MAX {
                     self.osc.push(byte);
@@ -882,7 +884,9 @@ impl Parser {
     /// or URL that long is already past what we would honour.
     fn finish_osc<P: Perform>(&mut self, p: &mut P, bel_terminated: bool) {
         if self.osc.len() < OSC_MAX {
-            p.osc_dispatch(&self.osc, bel_terminated);
+            let wire_len = self.osc.len();
+            self.osc.retain(|&b| !is_c0(b));
+            p.osc_dispatch(&self.osc, bel_terminated, wire_len);
         }
     }
 
@@ -1127,7 +1131,7 @@ mod tests {
                 byte,
             });
         }
-        fn osc_dispatch(&mut self, data: &[u8], bel_terminated: bool) {
+        fn osc_dispatch(&mut self, data: &[u8], bel_terminated: bool, _wire_len: usize) {
             self.actions
                 .push(Action::Osc(data.to_vec(), bel_terminated));
         }
@@ -1599,6 +1603,25 @@ mod tests {
         ok.resize(OSC_MAX, b'a');
         ok.extend_from_slice(b"\x07");
         assert!(run(&ok).iter().any(|a| matches!(a, Action::Osc(..))));
+    }
+
+    #[test]
+    fn controls_inside_an_osc_are_stripped_from_it_but_count_toward_its_cap() {
+        // A control is not part of the text: an OSC 8 target never holds one.
+        assert_eq!(
+            run(b"\x1b]0;a\x00b\rc\x7f\x07"),
+            vec![Action::Osc(b"0;abc\x7f".to_vec(), true)]
+        );
+
+        // It is part of the sequence, though, and padding a sequence with NULs must not
+        // carry it past the cap that bounds it.
+        let mut padded = b"\x1b]0;".to_vec();
+        padded.resize(OSC_MAX + 2, 0);
+        padded.extend_from_slice(b"title\x07");
+        assert!(
+            !run(&padded).iter().any(|a| matches!(a, Action::Osc(..))),
+            "a NUL-padded OSC past the cap was dispatched"
+        );
     }
 
     #[test]

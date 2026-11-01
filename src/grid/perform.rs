@@ -238,7 +238,7 @@ impl Perform for Screen {
         }
     }
 
-    fn osc_dispatch(&mut self, data: &[u8], bel_terminated: bool) {
+    fn osc_dispatch(&mut self, data: &[u8], bel_terminated: bool, _wire_len: usize) {
         // OSC Ps ; Pt
         let mut parts = data.splitn(2, |&b| b == b';');
         let ps = parts.next().unwrap_or(&[]);
