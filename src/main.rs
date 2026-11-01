@@ -2,9 +2,8 @@ use bnkterm::app;
 use bnkterm::cli::{Invocation, Mode, USAGE};
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let stats_env = std::env::var_os("BNKTERM_STATS").is_some();
-    let invocation = match Invocation::parse(&args, stats_env) {
+    let invocation = match Invocation::parse(std::env::args().skip(1), stats_env) {
         Ok(invocation) => invocation,
         Err(arg) => {
             eprintln!("bnkterm: unknown argument {arg:?}; {USAGE}");

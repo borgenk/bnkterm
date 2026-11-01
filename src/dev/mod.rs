@@ -1,5 +1,6 @@
 pub mod alloc;
 pub mod capture;
+mod flags;
 #[cfg(test)]
 pub mod fuzz;
 pub mod gen_stream;

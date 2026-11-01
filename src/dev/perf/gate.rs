@@ -4,12 +4,12 @@
 //! footprint gate beside it.
 
 use crate::color::Theme;
-use crate::dev::alloc;
 use crate::dev::perf::footprint::{gate_footprints, measure_footprints, FOOTPRINT_PATH};
 use crate::dev::perf::{
     corpus, ensure_parent, parse_rows, plain_frame, ratio_pct, read_if_present, BENCH_COLS,
     BENCH_ROWS, METRICS, RENDER_FONT_PX,
 };
+use crate::dev::{alloc, flags};
 use crate::error::{Error, Result};
 use crate::grid::{LinkId, LinkProbe, Screen};
 use crate::platform::freetype::Fonts;
@@ -61,8 +61,14 @@ struct Base {
 /// Run the gate: measure speed and footprint, write `latest`, then compare each to
 /// (or establish) its baseline. Returns an error when anything regressed and
 /// `--save` was not given, so the exit code signals it to a script or CI.
-pub fn run(args: &[String]) -> Result<()> {
-    let save = args.iter().any(|a| a == "--save");
+pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
+    let mut save = false;
+    for arg in args {
+        match arg.as_ref() {
+            "--save" => save = true,
+            other => return Err(flags::unknown(other)),
+        }
+    }
     eprintln!("bnkterm perf: measuring (build --release for meaningful numbers)...");
     if !alloc::ENABLED {
         eprintln!("  allocations unmeasured; build --features perf-alloc (or `make perf`)");

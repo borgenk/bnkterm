@@ -4,7 +4,7 @@
 //! gating it.
 
 use crate::dev::perf::{duration_ns, ensure_parent, BENCH_COLS, BENCH_ROWS};
-use crate::dev::{alloc, profile, stream, sys};
+use crate::dev::{alloc, flags, profile, stream, sys};
 use crate::error::{Error, Result};
 use crate::gather::BUF_CAP;
 use crate::grid::Screen;
@@ -28,12 +28,15 @@ const CAT_REPS: usize = 10;
 /// decode -> parse -> grid (fed in [`BUF_CAP`] slices, as a live PTY delivers),
 /// reporting min and median wall time and MB/s with rendering excluded. The file is
 /// read once, outside the timed loop, so the number is parse and grid, not disk IO.
-pub fn cat_bench(args: &[String]) -> Result<()> {
+pub fn cat_bench(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
+    let mut args = args.into_iter();
     let path = args
-        .iter()
-        .position(|a| a == "--cat-bench")
-        .and_then(|i| args.get(i + 1))
+        .next()
         .ok_or_else(|| Error::msg("--cat-bench needs a FILE argument"))?;
+    let path = path.as_ref();
+    if let Some(arg) = args.next() {
+        return Err(flags::unknown(arg.as_ref()));
+    }
     let bytes = std::fs::read(path).map_err(|e| Error::msg(format!("read {path}: {e}")))?;
     if bytes.is_empty() {
         return Err(Error::msg(format!("{path} is empty")));
@@ -88,20 +91,16 @@ fn feed_in_chunks(parser: &mut Parser, screen: &mut Screen, bytes: &[u8]) {
 /// grid column is reported only when a stream contains print and execute actions:
 /// replaying an invented subset of CSI/OSC semantics would be a mock rather than
 /// a measurement.
-pub fn run_stages(args: &[String]) -> Result<()> {
-    let size_mib = parse_size(args)
-        .unwrap_or(LAB_DEFAULT_MIB)
-        .clamp(1, LAB_MAX_MIB);
-    let target = size_mib * 1024 * 1024;
-    let selected = select_streams(args);
-    let requested_delivery = parse_delivery(args)?;
+pub fn run_stages(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
+    let lab = LabArgs::parse(args)?;
+    let target = lab.size_mib * 1024 * 1024;
 
     println!(
         "\n{:<18} {:<14} {:>12} {:>12} {:>12}",
         "stream", "delivery", "parser MB/s", "grid MB/s", "full MB/s"
     );
-    for name in selected {
-        let input = load_lab_input(name, target, requested_delivery)?;
+    for name in lab.selected() {
+        let input = load_lab_input(name, target, lab.delivery)?;
         let parser_ns = measure_parser_stage(&input);
         let (grid_ns, non_text_actions) = measure_grid_stage(&input);
         let full_ns = measure_full_stage(&input);
@@ -328,17 +327,13 @@ fn mib(bytes: u64) -> f64 {
 
 /// Run the lab: generate each selected stream, drive the whole pipeline over it,
 /// print a table, and append the numbers to `data/history.jsonl` keyed by commit.
-pub fn run_lab(args: &[String]) -> Result<()> {
-    let size_mib = parse_size(args)
-        .unwrap_or(LAB_DEFAULT_MIB)
-        .clamp(1, LAB_MAX_MIB);
-    let target = size_mib * 1024 * 1024;
-    let selected = select_streams(args);
-    let show_profiles = args.iter().any(|a| a == "--profile");
-    let requested_delivery = parse_delivery(args)?;
+pub fn run_lab(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
+    let lab = LabArgs::parse(args)?;
+    let target = lab.size_mib * 1024 * 1024;
     eprintln!(
-        "bnkterm perf-lab: {size_mib} MiB/stream, {} streams{}",
-        selected.len(),
+        "bnkterm perf-lab: {} MiB/stream, {} streams{}",
+        lab.size_mib,
+        lab.selected().count(),
         if alloc::ENABLED {
             ""
         } else {
@@ -354,9 +349,9 @@ pub fn run_lab(args: &[String]) -> Result<()> {
         "stream", "delivery", "min ms", "MB/s", "allocs/pass", "held MiB", "rss MiB", "swap MiB"
     );
 
-    for &name in &selected {
-        let input = load_lab_input(name, target, requested_delivery)?;
-        if show_profiles {
+    for name in lab.selected() {
+        let input = load_lab_input(name, target, lab.delivery)?;
+        if lab.profile {
             let profile = profile::StreamProfile::analyze(&input.bytes, &input.chunks);
             println!("\nprofile {name}:\n{profile}");
         }
@@ -417,7 +412,7 @@ pub fn run_lab(args: &[String]) -> Result<()> {
     append(HISTORY_PATH, &history)?;
     eprintln!(
         "appended {} lab result(s) to {HISTORY_PATH}",
-        selected.len()
+        lab.selected().count()
     );
     Ok(())
 }
@@ -456,16 +451,68 @@ fn load_lab_input(
     })
 }
 
-fn parse_delivery(args: &[String]) -> Result<profile::Delivery> {
-    let Some(index) = args.iter().position(|arg| arg == "--delivery") else {
-        return Ok(profile::Delivery::Recorded);
-    };
-    match args.get(index + 1).map(String::as_str) {
-        Some("recorded") => Ok(profile::Delivery::Recorded),
-        Some("normalized") | Some("64k") => Ok(profile::Delivery::Normalized),
-        _ => Err(Error::msg(
-            "--delivery needs `recorded`, `normalized`, or `64k`",
-        )),
+/// The lab's arguments: `--size MIB`, `--delivery KIND`, `--profile`, and stream names.
+struct LabArgs {
+    size_mib: usize,
+    /// Bit `i` names the `i`th of [`lab_streams`].
+    streams: u64,
+    delivery: profile::Delivery,
+    profile: bool,
+}
+
+/// Every stream the lab runs, in its usual order.
+fn lab_streams() -> impl Iterator<Item = &'static str> {
+    stream::NAMES
+        .iter()
+        .copied()
+        .chain(profile::recording_names())
+}
+
+impl LabArgs {
+    fn parse(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<Self> {
+        let mut lab = LabArgs {
+            size_mib: LAB_DEFAULT_MIB,
+            streams: 0,
+            delivery: profile::Delivery::Recorded,
+            profile: false,
+        };
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            match arg.as_ref() {
+                "--size" => {
+                    lab.size_mib =
+                        flags::parsed::<usize>("--size", &mut args)?.clamp(1, LAB_MAX_MIB)
+                }
+                "--delivery" => {
+                    lab.delivery = match flags::value("--delivery", &mut args)?.as_ref() {
+                        "recorded" => profile::Delivery::Recorded,
+                        "normalized" | "64k" => profile::Delivery::Normalized,
+                        _ => {
+                            return Err(Error::msg(
+                                "--delivery needs `recorded`, `normalized`, or `64k`",
+                            ))
+                        }
+                    }
+                }
+                "--profile" => lab.profile = true,
+                name => {
+                    let bit = lab_streams()
+                        .position(|n| n == name)
+                        .and_then(|i| 1u64.checked_shl(u32::try_from(i).ok()?));
+                    lab.streams |= bit.ok_or_else(|| flags::unknown(name))?;
+                }
+            }
+        }
+        Ok(lab)
+    }
+
+    /// The named streams, or all of them when none is named.
+    fn selected(&self) -> impl Iterator<Item = &'static str> {
+        let mask = self.streams;
+        lab_streams()
+            .enumerate()
+            .filter(move |&(i, _)| mask == 0 || (i < 64 && (mask >> i) & 1 == 1))
+            .map(|(_, name)| name)
     }
 }
 
@@ -474,31 +521,6 @@ fn feed_lab_input<P: Perform>(parser: &mut Parser, performer: &mut P, input: &La
     profile::for_each_chunk(&input.bytes, &input.chunks, |chunk| {
         parser.advance_bytes(performer, chunk);
     });
-}
-
-/// The `--size N` argument (MiB), if present and parseable.
-fn parse_size(args: &[String]) -> Option<usize> {
-    let i = args.iter().position(|a| a == "--size")?;
-    args.get(i + 1)?.parse().ok()
-}
-
-/// The stream names to run: any explicitly named on the command line, else all.
-fn select_streams(args: &[String]) -> Vec<&'static str> {
-    let all: Vec<&'static str> = stream::NAMES
-        .iter()
-        .copied()
-        .chain(profile::recording_names())
-        .collect();
-    let named: Vec<&'static str> = all
-        .iter()
-        .copied()
-        .filter(|n| args.iter().any(|a| a == n))
-        .collect();
-    if named.is_empty() {
-        all
-    } else {
-        named
-    }
 }
 
 /// The short commit hash, or "unknown" (read-only; the lab only records it).
@@ -570,18 +592,39 @@ mod tests {
             bytes.extend_from_slice("héllo \x1b[31mworld\x1b[0m 日本語\n".as_bytes());
         }
         let f = TempFile::write("multi", &bytes);
-        assert!(cat_bench(&["--cat-bench".into(), f.arg()]).is_ok());
+        assert!(cat_bench([f.arg()]).is_ok());
+    }
+
+    #[test]
+    fn lab_arguments_name_streams_in_their_usual_order_and_refuse_the_rest() {
+        let parse = |list: &[&str]| LabArgs::parse(list);
+        let (first, second) = (stream::NAMES[0], stream::NAMES[1]);
+        let lab = parse(&[second, "--size", "2", first, "--delivery", "64k"]).unwrap();
+        assert!(lab.selected().eq([first, second]));
+        assert_eq!(lab.size_mib, 2);
+        assert!(matches!(lab.delivery, profile::Delivery::Normalized));
+
+        assert!(parse(&[]).unwrap().selected().eq(lab_streams()));
+
+        for bad in [
+            &["ascci"][..],
+            &["--delivery", "fast"],
+            &["--size"],
+            &["--size", "big"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
     fn cat_bench_rejects_missing_arg_empty_and_absent() {
         // No path after the flag.
-        assert!(cat_bench(&["--cat-bench".into()]).is_err());
+        assert!(cat_bench(Vec::<&str>::new()).is_err());
         // A path that does not exist.
-        assert!(cat_bench(&["--cat-bench".into(), "/no/such/bnkterm/stream".into()]).is_err());
+        assert!(cat_bench(["/no/such/bnkterm/stream"]).is_err());
         // An empty file has nothing to stream.
         let empty = TempFile::write("empty", b"");
-        assert!(cat_bench(&["--cat-bench".into(), empty.arg()]).is_err());
+        assert!(cat_bench([empty.arg()]).is_err());
     }
 
     #[test]

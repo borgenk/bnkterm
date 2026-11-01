@@ -27,29 +27,29 @@ use std::path::Path;
 const FIXTURES: &str = "tests/fixtures";
 
 /// `bnkterm-dev --capture <name> <cols> <rows> -- <command> [args...]`.
-pub fn run(args: &[String]) -> Result<()> {
-    let i = args
-        .iter()
-        .position(|a| a == "--capture")
-        .ok_or_else(|| Error::msg("no --capture flag"))?;
-    let name = args.get(i + 1).ok_or_else(usage)?;
+pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
+    let mut args = args.into_iter();
+    let name = args.next().ok_or_else(usage)?;
+    let name = name.as_ref();
     let cols: usize = args
-        .get(i + 2)
-        .and_then(|s| s.parse().ok())
+        .next()
+        .and_then(|s| s.as_ref().parse().ok())
         .ok_or_else(usage)?;
     let rows: usize = args
-        .get(i + 3)
-        .and_then(|s| s.parse().ok())
+        .next()
+        .and_then(|s| s.as_ref().parse().ok())
         .ok_or_else(usage)?;
-    if args.get(i + 4).map(String::as_str) != Some("--") {
+    if !args.next().is_some_and(|a| a.as_ref() == "--") {
         return Err(usage());
     }
-    let command: Vec<&str> = args[i + 5..].iter().map(String::as_str).collect();
+    // The child's argv, which the spawn takes as a slice.
+    let command: Vec<_> = args.collect();
     if command.is_empty() {
         return Err(Error::msg("--capture: no command given after --"));
     }
+    let argv: Vec<&str> = command.iter().map(|a| a.as_ref()).collect();
 
-    let capture = capture(cols, rows, &command)?;
+    let capture = capture(cols, rows, &argv)?;
 
     let fixtures = Path::new(FIXTURES);
     std::fs::create_dir_all(fixtures).map_err(|e| Error::msg(format!("create {FIXTURES}: {e}")))?;

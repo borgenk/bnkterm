@@ -10,6 +10,7 @@
 //!   body       ── duplicate to exactly `size` bytes (last copy truncated) ──▶ stream
 //! ```
 
+use crate::dev::flags;
 use crate::error::{Error, Result};
 
 /// The default stream size, in decimal bytes (see the Makefile's note on why the
@@ -22,17 +23,20 @@ const DEFAULT_SIZE: usize = 150_000_000;
 const START_MARKER: &[u8] = b"*** START OF ";
 
 /// `bnkterm-dev --gen-stream --input <source> --output <stream> [--size N]`.
-pub fn run(args: &[String]) -> Result<()> {
-    let input =
-        flag(args, "--input").ok_or_else(|| Error::msg("--gen-stream needs --input FILE"))?;
-    let output =
-        flag(args, "--output").ok_or_else(|| Error::msg("--gen-stream needs --output FILE"))?;
-    let size = match flag(args, "--size") {
-        Some(s) => s
-            .parse::<usize>()
-            .map_err(|_| Error::msg(format!("--size: not a byte count: {s}")))?,
-        None => DEFAULT_SIZE,
-    };
+pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
+    let (mut input, mut output, mut size) = (None, None, DEFAULT_SIZE);
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_ref() {
+            "--input" => input = Some(flags::value("--input", &mut args)?),
+            "--output" => output = Some(flags::value("--output", &mut args)?),
+            "--size" => size = flags::parsed("--size", &mut args)?,
+            other => return Err(flags::unknown(other)),
+        }
+    }
+    let input = input.ok_or_else(|| Error::msg("--gen-stream needs --input FILE"))?;
+    let output = output.ok_or_else(|| Error::msg("--gen-stream needs --output FILE"))?;
+    let (input, output) = (input.as_ref(), output.as_ref());
     if size == 0 {
         return Err(Error::msg("--size must be positive"));
     }
@@ -48,12 +52,6 @@ pub fn run(args: &[String]) -> Result<()> {
         body.len()
     );
     Ok(())
-}
-
-/// The value following `name` in `args`, if present.
-fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    let i = args.iter().position(|a| a == name)?;
-    args.get(i + 1).map(String::as_str)
 }
 
 /// `data` with the leading licence header removed: everything up to and including

@@ -32,17 +32,20 @@ impl Invocation {
     /// `BNKTERM_STATS` is set, the same knob as `--stats` for a launcher that cannot pass
     /// arguments; it is passed in so the parse stays pure. The error is the first
     /// argument that is not one of bnkterm's flags.
-    pub fn parse(args: &[String], stats_env: bool) -> Result<Self, String> {
+    pub fn parse(
+        args: impl IntoIterator<Item = impl AsRef<str>>,
+        stats_env: bool,
+    ) -> Result<Self, String> {
         let mut mode = Mode::Run;
         let (mut verbose, mut stats) = (false, stats_env);
         for arg in args {
-            match arg.as_str() {
+            match arg.as_ref() {
                 "--verbose" | "-v" => verbose = true,
                 "--stats" => stats = true,
                 "--demo" if mode == Mode::Run => mode = Mode::Demo,
                 "--demo" => {}
                 "--gpu-probe" => mode = Mode::GpuProbe,
-                _ => return Err(arg.clone()),
+                other => return Err(other.to_owned()),
             }
         }
         // `--stats` implies verbose: the frame lines are useless without knowing which
@@ -63,8 +66,7 @@ mod tests {
     use crate::cli::*;
 
     fn parse(list: &[&str]) -> Result<Invocation, String> {
-        let args: Vec<String> = list.iter().map(|a| a.to_string()).collect();
-        Invocation::parse(&args, false)
+        Invocation::parse(list, false)
     }
 
     fn mode(list: &[&str]) -> Mode {
@@ -108,7 +110,7 @@ mod tests {
             "the louder of the two wins"
         );
         // The environment variable is the same knob as `--stats`.
-        let env = Invocation::parse(&["--verbose".to_string()], true);
+        let env = Invocation::parse(["--verbose"], true);
         assert_eq!(env.map(|i| i.verbosity), Ok(Verbosity::Stats));
     }
 

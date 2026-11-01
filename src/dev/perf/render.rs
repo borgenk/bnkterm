@@ -3,8 +3,8 @@
 //! stage, and a warmed frame's allocations are counted.
 
 use crate::color::Theme;
-use crate::dev::alloc;
 use crate::dev::perf::{corpus, duration_ns, plain_frame, BENCH_COLS, BENCH_ROWS, RENDER_FONT_PX};
+use crate::dev::{alloc, flags};
 use crate::error::{Error, Result};
 use crate::grid::Screen;
 use crate::platform::freetype::Fonts;
@@ -128,15 +128,19 @@ impl<'a> RenderRig<'a> {
 /// device. Built `--features perf-alloc` it also reports allocations per frame —
 /// with the display list, its run strings, the vertex buffer, and the damage-diff
 /// scratch all pooled across frames, a warmed changed frame allocates nothing.
-pub fn render_bench(args: &[String]) -> Result<()> {
-    // `--frames N` overrides the default (the smoke test uses a tiny count).
-    let frames = args
-        .iter()
-        .position(|a| a == "--frames")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(RENDER_FRAMES);
+pub fn render_bench(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
+    let mut frames = RENDER_FRAMES;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_ref() {
+            // The smoke test uses a tiny count.
+            "--frames" => frames = flags::parsed("--frames", &mut args)?,
+            other => return Err(flags::unknown(other)),
+        }
+    }
+    if frames == 0 {
+        return Err(Error::msg("--frames must be positive"));
+    }
 
     let fonts = Fonts::new(&[RENDER_FONT_PX])
         .map_err(|e| Error::msg(format!("render-bench needs a monospace font: {e}")))?;
@@ -313,6 +317,6 @@ mod tests {
             eprintln!("no monospace font; skipping render_bench smoke test");
             return;
         }
-        assert!(render_bench(&["--frames".into(), "2".into()]).is_ok());
+        assert!(render_bench(["--frames", "2"]).is_ok());
     }
 }

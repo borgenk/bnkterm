@@ -19,6 +19,7 @@
 //! To bump the Unicode version, replace the files in `ucd/` with the new release's and
 //! run `make tables`.
 
+use crate::dev::flags;
 use crate::error::{Error, Result};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -35,7 +36,10 @@ const SOFT_HYPHEN: u32 = 0x00AD;
 const SCALAR_LIMIT: usize = 0x11_0000;
 const WIDTH_PAGE_LEN: usize = 256;
 
-pub fn run(_args: &[String]) -> Result<()> {
+pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
+    if let Some(arg) = args.into_iter().next() {
+        return Err(flags::unknown(arg.as_ref()));
+    }
     let (version, tables) = generate()?;
     for (path, source) in tables {
         std::fs::write(path, source).map_err(|e| Error::msg(format!("write {path}: {e}")))?;
