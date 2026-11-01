@@ -43,7 +43,6 @@ modules:
           - data
           - dist
           - docs
-          - docs-internal
           - flatpak-repo
           - rust-toolchain.toml
           - stats
