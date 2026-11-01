@@ -238,7 +238,7 @@ impl Perform for Screen {
         }
     }
 
-    fn osc_dispatch(&mut self, data: &[u8], bel_terminated: bool, _wire_len: usize) {
+    fn osc_dispatch(&mut self, data: &[u8], bel_terminated: bool, wire_len: usize) {
         // OSC Ps ; Pt
         let mut parts = data.splitn(2, |&b| b == b';');
         let ps = parts.next().unwrap_or(&[]);
@@ -254,6 +254,7 @@ impl Perform for Screen {
             b"52" => self.osc_clipboard(pt),
             b"104" => self.osc_reset_palette(pt),
             b"133" => self.osc_shell_mark(pt),
+            b"7501" => self.osc_program_status(pt, bel_terminated, wire_len),
             b"110" => self.reset_named_color(NamedColor::Foreground),
             b"111" => self.reset_named_color(NamedColor::Background),
             b"112" => self.reset_named_color(NamedColor::Cursor),

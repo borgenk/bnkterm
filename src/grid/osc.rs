@@ -6,6 +6,7 @@
 //!   OSC 4     a palette entry            OSC 7    the shell's working directory
 //!   OSC 10/11/12  fg / bg / cursor       OSC 133  where a prompt and its output begin
 //!   OSC 104   reset the palette          OSC 52   put this on the clipboard
+//!                                        OSC 7501 what a program says it is doing
 //! ```
 //!
 //! Two of these are more than decoration. `OSC 133` is what turns an undifferentiated
@@ -15,15 +16,16 @@
 //! the clipboard, and its *read* half is refused on purpose: see
 //! [`Screen::osc_clipboard`].
 //!
-//! Everything here parses attacker-controlled bytes, so the payload decoders at the
-//! bottom (percent, base64) refuse malformed input rather than improvising on it.
+//! Everything here parses attacker-controlled bytes, so the payload decoders (percent
+//! here, base64 in `platform::bytes`) refuse malformed input rather than improvising on it.
 
 // The grid's shared vocabulary: the types in `grid/mod.rs` and the imports it makes.
 // `Screen`'s operations are split across these sibling modules, so each one works on
 // the same definitions rather than re-importing them piecemeal.
 use crate::grid::reply::push_osc_end;
 use crate::grid::*;
-use crate::platform::bytes::push_decimal;
+use crate::platform::bytes::{base64_decode, push_decimal};
+use crate::program_status::{State, SEQUENCE_MAX};
 
 impl Screen {
     /// OSC 0/2: set the window title.
@@ -280,22 +282,31 @@ impl Screen {
         let kind = fields.next().unwrap_or(&[]);
         match kind {
             b"A" => {
+                // A redraw too: the shell only draws its prompt once it has the terminal back.
+                self.program_status.prompt_started();
                 let row = self.cursor_abs_row();
-                // A shell that redraws its prompt in place (zsh does, on every keystroke
-                // with syntax highlighting) re-marks the same row. It is the same prompt.
-                if self.prompts.last().map(|p| p.row) == Some(row) {
-                    return;
-                }
-                if self.prompts.len() >= PROMPT_LIMIT {
-                    // A quarter at once: dropping one mark per new one would shift the
-                    // whole list on every prompt of a flood.
-                    self.prompts.drain(..PROMPT_LIMIT / 4);
-                }
-                self.prompts.push(Prompt {
+                let prompt = Prompt {
                     row,
                     output: None,
                     exit: None,
-                });
+                    ended: false,
+                };
+                match self.prompts.last_mut() {
+                    // A shell that redraws its prompt in place (zsh does, on every
+                    // keystroke with syntax highlighting) re-marks the same row with no
+                    // command in between. It is the same prompt.
+                    Some(last) if last.row == row && last.output.is_none() && !last.ended => {}
+                    // The same row after a command: the next prompt, where the last one was.
+                    Some(last) if last.row == row => *last = prompt,
+                    _ => {
+                        if self.prompts.len() >= PROMPT_LIMIT {
+                            // A quarter at once: dropping one mark per new one would shift
+                            // the whole list on every prompt of a flood.
+                            self.prompts.drain(..PROMPT_LIMIT / 4);
+                        }
+                        self.prompts.push(prompt);
+                    }
+                }
             }
             b"C" => {
                 let row = self.cursor_abs_row();
@@ -312,6 +323,7 @@ impl Screen {
                     .and_then(|f| f.trim().parse::<i32>().ok());
                 if let Some(p) = self.prompts.last_mut() {
                     p.exit = exit.or(p.exit);
+                    p.ended = true;
                 }
             }
             // `B` (the prompt ends, input begins) we parse and do not need: nothing we
@@ -357,6 +369,34 @@ impl Screen {
         let offset = b.scrollback.len().saturating_sub(index);
         self.view_offset = offset.min(self.scrollback_len());
         true
+    }
+
+    /// `OSC 7501`: a status report, or `?` asking whether the terminal takes them. A bare
+    /// `?` answer accepts every state and kind of the protocol's first revision. The cap
+    /// counts `wire_len`, because the protocol caps the sequence as sent.
+    pub(super) fn osc_program_status(&mut self, pt: &[u8], bel: bool, wire_len: usize) {
+        let terminator = if bel { 1 } else { 2 };
+        if b"\x1b]".len() + wire_len + terminator > SEQUENCE_MAX {
+            return;
+        }
+        if pt == b"?" {
+            if let Some(out) = self.reply() {
+                out.extend_from_slice(b"\x1b]7501;?");
+                push_osc_end(out, bel);
+            }
+            return;
+        }
+        self.program_status.apply(pt);
+    }
+
+    /// The most demanding program status, `None` when there is nothing to show.
+    pub fn program_status(&self) -> Option<State> {
+        self.program_status.summary()
+    }
+
+    /// The user has seen this terminal: drop its `done` and `error` records.
+    pub fn acknowledge_program_status(&mut self) {
+        self.program_status.acknowledge();
     }
 
     /// The working directory the shell last reported (`OSC 7`).
@@ -470,88 +510,6 @@ pub(super) fn percent_decode(input: &[u8]) -> String {
         }
     }
     String::from_utf8_lossy(&bytes).into_owned()
-}
-
-/// Decode base64, the encoding `OSC 52` wraps clipboard text in. `None` for anything
-/// malformed, which the caller drops.
-///
-/// Hand-rolled, and easily: base64 is a fixed 4-to-3 byte fold with no lengths, no
-/// offsets and no allocation decisions taken from the input, which is exactly the shape
-/// of thing the dependency policy says to write rather than depend on. (Image decoding
-/// is the counter-example, and the reason the policy exists at all.)
-///
-/// Strict about what it accepts: the child writes this. Whitespace is skipped (mail-era
-/// encoders wrap lines), padding is optional, and anything else is a refusal rather than
-/// a guess — a decoder that improvises on bad input is how you smuggle bytes past it.
-pub(super) fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() / 4 * 3 + 3);
-    let mut quad = [0u8; 4];
-    let mut n = 0;
-    let mut padding = 0;
-    for &byte in input {
-        if byte.is_ascii_whitespace() {
-            continue;
-        }
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => {
-                padding += 1;
-                if padding > 2 {
-                    return None;
-                }
-                0
-            }
-            _ => return None,
-        };
-        // Padding may only ever be trailing: `A=AA` is malformed, not a clever encoding.
-        if padding > 0 && byte != b'=' {
-            return None;
-        }
-        quad[n] = value;
-        n += 1;
-        if n == 4 {
-            let triple = (u32::from(quad[0]) << 18)
-                | (u32::from(quad[1]) << 12)
-                | (u32::from(quad[2]) << 6)
-                | u32::from(quad[3]);
-            out.push((triple >> 16) as u8);
-            if padding < 2 {
-                out.push((triple >> 8) as u8);
-            }
-            if padding < 1 {
-                out.push(triple as u8);
-            }
-            n = 0;
-        }
-    }
-    match n {
-        // A clean end, padded or exactly aligned.
-        0 => Some(out),
-        // Unpadded input, which the spec allows: finish the partial group.
-        //
-        // Only when it really is unpadded. `=` exists to *complete* a four-character
-        // group, so a group that ended early cannot have carried any — and the loop above
-        // counts a `=` into `n` like any other character, which is what made `AA=` land
-        // here and decode to two bytes where the same input without the `=` gives one.
-        // A length that cannot occur must be refused, not rounded to the nearest one that
-        // can: this decoder's whole contract is that it never improvises on bad input.
-        2 | 3 if padding == 0 => {
-            let triple =
-                (u32::from(quad[0]) << 18) | (u32::from(quad[1]) << 12) | (u32::from(quad[2]) << 6);
-            out.push((triple >> 16) as u8);
-            if n == 3 {
-                out.push((triple >> 8) as u8);
-            }
-            Some(out)
-        }
-        // One leftover character encodes six bits of nothing, and a padded partial group
-        // is a length base64 cannot produce.
-        _ => None,
-    }
 }
 
 #[cfg(test)]

@@ -144,9 +144,138 @@ fn hex_value(digit: u8) -> Option<u8> {
     }
 }
 
+/// Decode base64, the encoding `OSC 52` and `OSC 7501` wrap text in. `None` for anything
+/// malformed, which the caller drops.
+///
+/// Strict about what it accepts: the child writes this. Whitespace is skipped (mail-era
+/// encoders wrap lines), padding is optional, and anything else is a refusal rather than
+/// a guess: a decoder that improvises on bad input is how you smuggle bytes past it.
+pub fn base64_decode(input: &[u8]) -> Option<Vec<u8>> {
+    let mut out = vec![0; input.len() / 4 * 3 + 3];
+    let len = base64_decode_into(input, &mut out)?;
+    out.truncate(len);
+    Some(out)
+}
+
+/// [`base64_decode`] into `out`, answering how many bytes it wrote. `None` also when the
+/// text decodes to more than `out` holds.
+pub fn base64_decode_into(input: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut len = 0;
+    let mut put = |byte: u8| -> Option<()> {
+        *out.get_mut(len)? = byte;
+        len += 1;
+        Some(())
+    };
+    let mut quad = [0u8; 4];
+    let mut n = 0;
+    let mut padding = 0;
+    for &byte in input {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                padding += 1;
+                if padding > 2 {
+                    return None;
+                }
+                0
+            }
+            _ => return None,
+        };
+        // Padding may only ever be trailing: `A=AA` is malformed, not a clever encoding.
+        if padding > 0 && byte != b'=' {
+            return None;
+        }
+        quad[n] = value;
+        n += 1;
+        if n == 4 {
+            let triple = (u32::from(quad[0]) << 18)
+                | (u32::from(quad[1]) << 12)
+                | (u32::from(quad[2]) << 6)
+                | u32::from(quad[3]);
+            put((triple >> 16) as u8)?;
+            if padding < 2 {
+                put((triple >> 8) as u8)?;
+            }
+            if padding < 1 {
+                put(triple as u8)?;
+            }
+            n = 0;
+        }
+    }
+    match n {
+        // A clean end, padded or exactly aligned.
+        0 => Some(len),
+        // Unpadded input, which the spec allows: finish the partial group. `=` only
+        // completes a full group, and the loop counts it into `n`, so a short group that
+        // carried one is refused here.
+        2 | 3 if padding == 0 => {
+            let triple =
+                (u32::from(quad[0]) << 18) | (u32::from(quad[1]) << 12) | (u32::from(quad[2]) << 6);
+            put((triple >> 16) as u8)?;
+            if n == 3 {
+                put((triple >> 8) as u8)?;
+            }
+            Some(len)
+        }
+        // One leftover character encodes six bits of nothing, and a padded partial group
+        // is a length base64 cannot produce.
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::platform::bytes::*;
+
+    #[test]
+    fn base64_decodes_what_a_terminal_actually_receives() {
+        assert_eq!(base64_decode(b"aGVsbG8="), Some(b"hello".to_vec()));
+        assert_eq!(base64_decode(b"aGVsbG8h"), Some(b"hello!".to_vec()));
+        assert_eq!(base64_decode(b"eA=="), Some(b"x".to_vec()));
+        assert_eq!(base64_decode(b""), Some(Vec::new()));
+        // Padding is optional, and line breaks (mail-era encoders wrap) are skipped.
+        assert_eq!(base64_decode(b"aGVsbG8"), Some(b"hello".to_vec()));
+        assert_eq!(base64_decode(b"aGVs\nbG8="), Some(b"hello".to_vec()));
+        // Every byte of the alphabet, including the two that are not alphanumeric.
+        assert_eq!(base64_decode(b"+/8="), Some(vec![0xfb, 0xff]));
+        // And the refusals.
+        assert_eq!(base64_decode(b"a"), None);
+        assert_eq!(base64_decode(b"a==="), None);
+        assert_eq!(base64_decode(b"aa=a"), None);
+        assert_eq!(base64_decode(b"////_"), None);
+
+        // Padding only completes a four-character group, so a short group cannot carry it.
+        assert_eq!(base64_decode(b"AA="), None, "a padded two-character group");
+        assert_eq!(base64_decode(b"A="), None, "a padded one-character group");
+        assert_eq!(
+            base64_decode(b"AAA=="),
+            None,
+            "padding past the group boundary"
+        );
+        // The well-formed neighbours of each, so the refusals above cannot be over-broad.
+        assert_eq!(base64_decode(b"AA"), Some(vec![0x00]));
+        assert_eq!(base64_decode(b"AAA"), Some(vec![0x00, 0x00]));
+        assert_eq!(base64_decode(b"AAA="), Some(vec![0x00, 0x00]));
+        assert_eq!(base64_decode(b"AA=="), Some(vec![0x00]));
+    }
+
+    #[test]
+    fn base64_decodes_into_a_fixed_buffer_and_refuses_what_overflows_it() {
+        let mut out = [0; 6];
+        assert_eq!(base64_decode_into(b"aGVsbG8h", &mut out), Some(6));
+        assert_eq!(&out, b"hello!");
+        // One byte short, in a whole group and in an unpadded tail.
+        assert_eq!(base64_decode_into(b"aGVsbG8h", &mut out[..5]), None);
+        assert_eq!(base64_decode_into(b"aGVsbG8", &mut out[..4]), None);
+        assert_eq!(base64_decode_into(b"aGVsbG8", &mut out[..5]), Some(5));
+    }
 
     #[test]
     fn percent_decoding_is_strict() {

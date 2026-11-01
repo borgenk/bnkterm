@@ -35,7 +35,7 @@ use crate::platform::host::Hostname;
 use crate::platform::verdict::Refusal;
 use crate::pty::{Launch, ZombieChild};
 use crate::render::display::DisplayList;
-use crate::tab_bar::{self, BarGeom, Lift, Slot, TabLabel};
+use crate::tab_bar::{self, BarGeom, Lift, Marker, Slot, TabLabel};
 
 /// One global gather budget per event-loop turn. Foreground output is parsed
 /// first; background tabs rotate through whatever remains.
@@ -199,6 +199,7 @@ impl Tabs {
         if !self.is_empty() {
             self.active_mut().focus(false)?;
             self.active_mut().drop_hover();
+            self.active_mut().acknowledge_program_status();
         }
         let id = self.allocate_id();
         self.entries.push(TabEntry { id, core });
@@ -259,6 +260,7 @@ impl Tabs {
             // the new last entry.
             self.active = index.min(self.entries.len() - 1);
             let _ = self.active_mut().focus(window_focused);
+            self.active_mut().acknowledge_program_status();
             self.active_mut().dirty = true;
             self.queue_active_title();
         }
@@ -278,10 +280,13 @@ impl Tabs {
         let _ = self.active_mut().focus(false);
         // The pointer stays with the window, so a background tab has nothing under it.
         self.active_mut().drop_hover();
+        // Whatever finished while this tab was on screen has been seen.
+        self.active_mut().acknowledge_program_status();
         // A drag holds the active tab, which this one replaces.
         self.drag = None;
         self.active = index;
         let _ = self.active_mut().focus(window_focused);
+        self.active_mut().acknowledge_program_status();
         self.active_mut().dirty = true;
         self.bar_dirty = true;
         self.rebuild_bar();
@@ -806,6 +811,7 @@ impl Tabs {
             .map(|(index, title)| TabLabel {
                 title,
                 active: index == self.active,
+                marker: self.marker(index),
             })
             .collect();
         self.bar_slots = tab_bar::layout(cols, &labels, &self.cfg);
@@ -842,6 +848,30 @@ impl Tabs {
             self.notice = Some(Notice::link_refused(refusal, &self.shell_startup));
             self.mark_dirty();
         }
+        self.refresh_markers();
+    }
+
+    /// The status marker tab `index` shows, none on the active tab.
+    fn marker(&self, index: usize) -> Option<Marker> {
+        if index == self.active {
+            return None;
+        }
+        let state = self.entries.get(index)?.core.program_status()?;
+        Marker::for_state(state, &self.theme)
+    }
+
+    /// Rebuild the bar when a tab's marker no longer matches the laid-out one.
+    fn refresh_markers(&mut self) {
+        if !self.shows_bar() {
+            return;
+        }
+        let stale = (0..self.entries.len()).any(|index| {
+            self.bar_slots.get(index).map(|slot| slot.marker) != Some(self.marker(index))
+        });
+        if stale {
+            self.bar_dirty = true;
+            self.rebuild_bar();
+        }
     }
 
     /// Retry every child retained after a close, dropping handles that are reaped.
@@ -857,6 +887,7 @@ mod tests {
     use crate::input::{Key, Mods};
     use crate::platform::geom::Scale;
     use crate::platform::verdict::{Refusal, Verdict};
+    use crate::program_status::State;
     use crate::pty::{Launch, PollSet, Target};
     use crate::render::display::DrawCmd;
     use crate::testutil::METRICS;
@@ -1413,6 +1444,96 @@ mod tests {
             .take_outbox()
             .into_iter()
             .any(|message| matches!(message, ToWindow::Title(title) if title == "background job")));
+    }
+
+    /// The marker each tab's slot carries, in bar order.
+    fn markers(tabs: &Tabs) -> Vec<Option<Marker>> {
+        tabs.bar_slots.iter().map(|slot| slot.marker).collect()
+    }
+
+    #[test]
+    fn a_background_report_marks_its_tab_once_routed_and_the_active_tab_never() {
+        let mut tabs = demo_tabs(2);
+        let theme = Theme::default();
+        let pill = Marker::for_state(State::Blocked, &theme);
+        tabs.entries[0]
+            .core
+            .feed_test_bytes(b"\x1b]7501;state=blocked\x07");
+        tabs.entries[1]
+            .core
+            .feed_test_bytes(b"\x1b]7501;state=working\x07\x1b]7501;state=blocked:id=sub\x07");
+        tabs.bar_dirty = false;
+        tabs.take_outbox();
+        assert!(tabs.bar_dirty, "a marker change repaints the bar");
+        assert_eq!(
+            markers(&tabs),
+            [None, pill],
+            "the child's blocked outranks working"
+        );
+
+        // A report that changes no marker leaves the bar alone.
+        tabs.bar_dirty = false;
+        tabs.entries[1]
+            .core
+            .feed_test_bytes(b"\x1b]7501;state=idle\x07");
+        tabs.take_outbox();
+        assert!(!tabs.bar_dirty);
+        assert_eq!(markers(&tabs), [None, pill]);
+    }
+
+    #[test]
+    fn a_tab_acknowledges_its_results_on_screen_and_keeps_what_still_waits() {
+        let mut tabs = demo_tabs(3);
+        let theme = Theme::default();
+        let [first, second, third] = [0, 1, 2].map(|index| tabs.entries[index].id);
+        tabs.entries[1]
+            .core
+            .feed_test_bytes(b"\x1b]7501;state=done\x07");
+        tabs.entries[2]
+            .core
+            .feed_test_bytes(b"\x1b]7501;state=blocked\x07");
+        tabs.take_outbox();
+        let dot = Marker::for_state(State::Done, &theme);
+        let pill = Marker::for_state(State::Blocked, &theme);
+        assert_eq!(markers(&tabs), [None, dot, pill]);
+
+        // Visiting each tab clears the result and leaves the question standing.
+        assert!(tabs.select(second, false));
+        assert!(tabs.select(third, false));
+        assert!(tabs.select(first, false));
+        assert_eq!(markers(&tabs), [None, None, pill]);
+
+        // A result that lands on the tab being looked at is seen there.
+        tabs.entries[0]
+            .core
+            .feed_test_bytes(b"\x1b]7501;state=error\x07");
+        tabs.take_outbox();
+        assert!(tabs.select(second, false));
+        assert_eq!(markers(&tabs), [None, None, pill]);
+    }
+
+    #[test]
+    fn opening_a_tab_acknowledges_the_one_it_replaces() {
+        let mut tabs = demo_tabs(2);
+        tabs.launch = Launch::new(vec!["/bin/cat".to_string()], Target::Local);
+        tabs.entries[0]
+            .core
+            .feed_test_bytes(b"\x1b]7501;state=done\x07");
+        tabs.entries[1]
+            .core
+            .feed_test_bytes(b"\x1b]7501;state=done\x07");
+        tabs.take_outbox();
+        let dot = Marker::for_state(State::Done, &Theme::default());
+        assert_eq!(markers(&tabs), [None, dot]);
+        if tabs.open(geom(80, 24), false).is_err() {
+            eprintln!("fork/exec unavailable; skipping");
+            return;
+        }
+        assert_eq!(
+            markers(&tabs),
+            [None, dot, None],
+            "the tab on screen saw its result; the background one did not"
+        );
     }
 
     /// One tab hides the bar, so its title changes leave the bar alone. The tab that

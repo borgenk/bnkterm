@@ -569,18 +569,22 @@ fn frame_tabbar_scenario() -> Result<Sample> {
             TabLabel {
                 title: "edit",
                 active: true,
+                marker: None,
             },
             TabLabel {
                 title: "make",
                 active: false,
+                marker: None,
             },
             TabLabel {
                 title: "logs",
                 active: false,
+                marker: None,
             },
             TabLabel {
                 title: "term",
                 active: false,
+                marker: None,
             },
         ],
         &cfg,
@@ -1009,5 +1013,45 @@ mod tests {
                 s.allocs
             );
         }
+    }
+
+    #[cfg(feature = "perf-alloc")]
+    #[test]
+    fn program_status_never_allocates() {
+        use crate::program_status::Records;
+
+        // New ids past the limit, updates with decoded text, then a table filled again
+        // after each way records leave.
+        let fill: Vec<Vec<u8>> = (0..100)
+            .map(|n| format!("state=done:id=job/{n}").into_bytes())
+            .collect();
+        let updates = [
+            &b"state=blocked:id=job/99:msg=QXBwcm92ZSB0aGUgZGVwbG95Pw:title=RVUgV2VzdA"[..],
+            b"state=working:id=job/98",
+        ];
+        let leave = [
+            &b"state=clear:id=job/97"[..],
+            b"state=clear:id=job",
+            b"state=clear",
+        ];
+
+        alloc::reset();
+        let mut records = Records::default();
+        let refill = |records: &mut Records| {
+            for report in &fill {
+                records.apply(report);
+            }
+            for report in updates {
+                records.apply(report);
+            }
+        };
+        refill(&mut records);
+        records.prompt_started();
+        records.acknowledge();
+        for report in leave {
+            refill(&mut records);
+            records.apply(report);
+        }
+        assert_eq!(alloc::snapshot().allocs, 0);
     }
 }

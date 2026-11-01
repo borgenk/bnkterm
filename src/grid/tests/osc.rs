@@ -1,9 +1,9 @@
 //! What the child sets out of band: the title, the working directory, prompt marks, the
-//! palette and the clipboard.
+//! palette, the clipboard and program status.
 
 use crate::color::{Ground, Rgb};
-use crate::grid::osc::base64_decode;
 use crate::grid::*;
+use crate::program_status::State;
 use crate::testutil::feed;
 
 #[test]
@@ -296,43 +296,6 @@ fn a_malformed_osc_52_is_dropped_rather_than_half_decoded() {
 }
 
 #[test]
-fn base64_decodes_what_a_terminal_actually_receives() {
-    assert_eq!(base64_decode(b"aGVsbG8="), Some(b"hello".to_vec()));
-    assert_eq!(base64_decode(b"aGVsbG8h"), Some(b"hello!".to_vec()));
-    assert_eq!(base64_decode(b"eA=="), Some(b"x".to_vec()));
-    assert_eq!(base64_decode(b""), Some(Vec::new()));
-    // Padding is optional, and line breaks (mail-era encoders wrap) are skipped.
-    assert_eq!(base64_decode(b"aGVsbG8"), Some(b"hello".to_vec()));
-    assert_eq!(base64_decode(b"aGVs\nbG8="), Some(b"hello".to_vec()));
-    // Every byte of the alphabet, including the two that are not alphanumeric.
-    assert_eq!(base64_decode(b"+/8="), Some(vec![0xfb, 0xff]));
-    // And the refusals.
-    assert_eq!(base64_decode(b"a"), None);
-    assert_eq!(base64_decode(b"a==="), None);
-    assert_eq!(base64_decode(b"aa=a"), None);
-    assert_eq!(base64_decode(b"////_"), None);
-
-    // Padding only ever *completes* a four-character group, so a group that ended early
-    // cannot have been padded. These are refusals rather than short decodes, and the
-    // distinction is not academic: the padding used to be counted as a data character, so
-    // `AA=` decoded to *two* bytes where the same input without the `=` gives one — the
-    // decoder inventing a byte out of a malformed length, which is exactly what the strict
-    // contract above exists to prevent.
-    assert_eq!(base64_decode(b"AA="), None, "a padded two-character group");
-    assert_eq!(base64_decode(b"A="), None, "a padded one-character group");
-    assert_eq!(
-        base64_decode(b"AAA=="),
-        None,
-        "padding past the group boundary"
-    );
-    // The well-formed neighbours of each, so the refusals above cannot be over-broad.
-    assert_eq!(base64_decode(b"AA"), Some(vec![0x00]));
-    assert_eq!(base64_decode(b"AAA"), Some(vec![0x00, 0x00]));
-    assert_eq!(base64_decode(b"AAA="), Some(vec![0x00, 0x00]));
-    assert_eq!(base64_decode(b"AA=="), Some(vec![0x00]));
-}
-
-#[test]
 fn a_program_reset_returns_to_the_configured_colours() {
     let mut s = Screen::new(10, 2);
     let mut configured = Theme::default();
@@ -469,4 +432,108 @@ fn a_malformed_colour_is_ignored_not_guessed_at() {
     }
     assert_eq!(*s.theme(), before, "nothing moved");
     assert!(s.take_responses().is_empty(), "and nothing was answered");
+}
+
+#[test]
+fn osc_7501_answers_the_query_in_kind_and_never_echoes_a_report() {
+    let mut s = Screen::new(20, 4);
+    feed(&mut s, b"\x1b]7501;?\x07");
+    assert_eq!(s.take_responses(), b"\x1b]7501;?\x07");
+    feed(&mut s, b"\x1b]7501;?\x1b\\");
+    assert_eq!(s.take_responses(), b"\x1b]7501;?\x1b\\");
+
+    // A report is never answered, and the answer to a later query carries nothing of it.
+    feed(&mut s, b"\x1b]7501;state=blocked:id=x:msg=SGk\x07");
+    assert!(s.take_responses().is_empty());
+    assert_eq!(s.program_status(), Some(State::Blocked));
+    feed(&mut s, b"\x1b]7501;?\x07");
+    assert_eq!(s.take_responses(), b"\x1b]7501;?\x07");
+}
+
+#[test]
+fn program_status_belongs_to_the_terminal_and_ends_at_a_new_prompt() {
+    let mut s = Screen::new(20, 6);
+    feed(&mut s, b"\x1b]133;A\x07$ deploy\r\n");
+    feed(
+        &mut s,
+        b"\x1b]7501;state=working\x07\x1b]7501;state=done:id=eu\x07",
+    );
+    assert_eq!(s.program_status(), Some(State::Done));
+
+    // Neither the alt screen nor a soft reset touches the records.
+    feed(&mut s, b"\x1b[?1049h\x1b[!p\x1b[?1049l");
+    feed(&mut s, b"\x1b]7501;state=clear:id=eu\x07");
+    assert_eq!(s.program_status(), Some(State::Working));
+
+    // The next prompt ends what was running and keeps what finished.
+    feed(
+        &mut s,
+        b"\x1b]7501;state=done:id=eu\x07\x1b]7501;state=blocked\x07",
+    );
+    feed(&mut s, b"\r\n\x1b]133;A\x07$ ");
+    assert_eq!(s.program_status(), Some(State::Done));
+
+    // So does a prompt redrawn in place.
+    feed(&mut s, b"\x1b]7501;state=blocked\x07\r\x1b]133;A\x07$ ");
+    assert_eq!(s.program_status(), Some(State::Done));
+
+    feed(&mut s, b"\x1b]7501;state=clear\x07");
+    assert_eq!(s.program_status(), None);
+
+    feed(&mut s, b"\x1b]7501;state=error\x07\x1bc");
+    assert_eq!(s.program_status(), None, "RIS removes every record");
+}
+
+#[test]
+fn a_prompt_on_the_same_row_after_a_command_is_a_new_prompt() {
+    // A command whose program sent the cursor home, then the shell's next prompt on the
+    // row of the last one. The mark belongs to the new prompt, with nothing recorded yet.
+    // Either half of a command is enough: `D` without `C` (bash before 4.4 has no `PS0`
+    // to send it), with or without its optional code, and `C` alone.
+    for command in [
+        &b"\x1b]133;C\x07\x1b]133;D;130\x07"[..],
+        b"\x1b]133;D;0\x07",
+        b"\x1b]133;D\x07",
+        b"\x1b]133;C\x07",
+    ] {
+        let mut s = Screen::new(20, 6);
+        feed(&mut s, b"\x1b]133;A\x07$ agent\r\n");
+        feed(&mut s, command);
+        feed(&mut s, b"\x1b[H\x1b]133;A\x07$ ");
+        let fresh = Prompt {
+            row: s.abs_row(0),
+            output: None,
+            exit: None,
+            ended: false,
+        };
+        assert_eq!(s.prompts(), [fresh], "{command:?}");
+    }
+}
+
+#[test]
+fn osc_7501_caps_the_sequence_as_sent_counting_what_the_parser_strips() {
+    // `len` bytes as sent, padded with an unknown key. The last `nuls` before the
+    // terminator are NULs, which the parser strips.
+    let report = |len: usize, nuls: usize, bel: bool| {
+        let end: &[u8] = if bel { b"\x07" } else { b"\x1b\\" };
+        let mut seq = b"\x1b]7501;state=done:pad=".to_vec();
+        seq.resize(len - end.len() - nuls, b'x');
+        seq.resize(len - end.len(), 0);
+        seq.extend_from_slice(end);
+        seq
+    };
+    let applied = |seq: Vec<u8>| {
+        let mut s = Screen::new(20, 4);
+        feed(&mut s, &seq);
+        s.program_status() == Some(State::Done)
+    };
+    assert!(applied(report(64, 8, false)), "NULs alone discard nothing");
+    for bel in [false, true] {
+        assert!(applied(report(4096, 0, bel)), "at the cap, bel={bel}");
+        assert!(!applied(report(4097, 0, bel)), "past it, bel={bel}");
+        assert!(
+            !applied(report(4097, 1000, bel)),
+            "past it in NULs, bel={bel}"
+        );
+    }
 }

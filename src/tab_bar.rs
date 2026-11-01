@@ -29,13 +29,25 @@
 //! roughly twice the anti-aliased ink of the solid ones and came out fat as well as
 //! muddy. Ramping ink leaves both the colour and the stroke weight alone and lands
 //! on exactly the tab background, whatever colour that is.
+//!
+//! An inactive tab whose program reports a status (`OSC 7501`) carries a [`Marker`] just
+//! before its label, one shape per state so none relies on colour alone. Every marker
+//! reserves the widest one's slot, right-aligned against the label, so the label stays
+//! put as the state changes.
+//!
+//! ```text
+//!   │ ○  claude │ ●  build │ ■  deploy │ ▬  claude │
+//!     working     done       error       blocked
+//! ```
 
 use std::ops::Range;
 
+use crate::color::{Rgb, Theme};
 use crate::config::{TabBarConfig, TabColors};
 use crate::platform::freetype::{FaceKey, FontStyle, Fonts};
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
+use crate::program_status::State;
 use crate::render::display::{DisplayList, DrawCmd, Fade};
 use crate::term_render::{self, CellMetrics};
 use crate::width;
@@ -111,6 +123,29 @@ impl BarGeom {
 pub(crate) struct TabLabel<'a> {
     pub title: &'a str,
     pub active: bool,
+    pub marker: Option<Marker>,
+}
+
+/// A tab's status marker, from its program's most demanding report.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Marker {
+    Ring(Rgb),
+    Dot(Rgb),
+    Square(Rgb),
+    Pill(Rgb),
+}
+
+impl Marker {
+    /// The marker for `state`, coloured from `palette`, or `None` for idle.
+    pub fn for_state(state: State, palette: &Theme) -> Option<Self> {
+        match state {
+            State::Idle => None,
+            State::Working => Some(Marker::Ring(palette.indexed(4))),
+            State::Done => Some(Marker::Dot(palette.indexed(2))),
+            State::Error => Some(Marker::Square(palette.indexed(1))),
+            State::Blocked => Some(Marker::Pill(palette.indexed(3))),
+        }
+    }
 }
 
 /// One tab's block geometry and its sanitized (but not yet fitted) label. The label
@@ -126,6 +161,7 @@ pub(crate) struct Slot {
     /// with the empty title mapped to `shell`. Fitted to the block at paint time.
     pub title: String,
     pub active: bool,
+    pub marker: Option<Marker>,
 }
 
 /// Give every tab one equal width, clamped into the config bounds, and lay them
@@ -184,6 +220,7 @@ pub(crate) fn layout(cols: usize, labels: &[TabLabel<'_>], cfg: &TabBarConfig) -
                 cells,
                 title,
                 active: label.active,
+                marker: label.marker,
             }
         })
         .collect()
@@ -264,18 +301,22 @@ pub(crate) fn fill_bar(
             });
         }
         let (content_left, content_px) = bar.content_span(slot);
-        paint_label(
+        let (marker, lead) = marker_room(slot.marker, content_px, lm);
+        let label_x = paint_label(
             out,
             strings,
             fonts,
             &slot.title,
-            content_left,
-            content_px,
+            content_left + lead,
+            content_px - lead,
             baseline,
             face,
             colors,
             lm,
         );
+        if let Some(marker) = marker {
+            paint_marker(out, marker, label_x, bar, colors);
+        }
     }
 
     // A divider between two adjacent inactive tabs; never beside the active block,
@@ -316,18 +357,22 @@ pub(crate) fn fill_bar(
             });
             let dx = lift.left - bar.block_left(slot);
             let (content_left, content_px) = bar.content_span(slot);
-            paint_label(
+            let (marker, lead) = marker_room(slot.marker, content_px, lm);
+            let label_x = paint_label(
                 out,
                 strings,
                 fonts,
                 &slot.title,
-                content_left + dx,
-                content_px,
+                content_left + dx + lead,
+                content_px - lead,
                 baseline,
                 face,
                 cfg.active,
                 lm,
             );
+            if let Some(marker) = marker {
+                paint_marker(out, marker, label_x, bar, cfg.active);
+            }
         }
     }
 }
@@ -373,6 +418,8 @@ pub(crate) fn drop_index(slots: &[Slot], bar: &BarGeom, left: i32) -> Option<usi
 /// still reads the label's true contrast, so the tail's strokes weigh the same as
 /// the head's. Fitting measures glyph advances but allocates nothing beyond the one
 /// pooled run string, so a steady repaint stays allocation-free.
+///
+/// Returns the label's left edge, which a status marker is placed against.
 #[allow(clippy::too_many_arguments)]
 fn paint_label(
     out: &mut DisplayList,
@@ -385,9 +432,9 @@ fn paint_label(
     face: FaceKey,
     colors: TabColors,
     lm: CellMetrics,
-) {
+) -> i32 {
     if content_px <= 0 || title.is_empty() {
-        return;
+        return content_left;
     }
     let budget = content_px as f32;
     // How much of the title fits, and its measured width. The first cluster always
@@ -437,6 +484,79 @@ fn paint_label(
         fade,
         lm,
     );
+    start_x
+}
+
+/// The marker to paint in a content span `span` pixels wide, and the pixels to keep
+/// before the label for it. No marker in a span too narrow for the slot and one cell.
+fn marker_room(marker: Option<Marker>, span: i32, lm: CellMetrics) -> (Option<Marker>, i32) {
+    let d = marker_diameter(lm);
+    let lead = 2 * d + marker_gap(d);
+    match marker {
+        Some(marker) if span >= lead + lm.w => (Some(marker), lead),
+        _ => (None, 0),
+    }
+}
+
+/// Paint `marker` ending one gap before `label_x`, centred on the strip.
+fn paint_marker(
+    out: &mut DisplayList,
+    marker: Marker,
+    label_x: i32,
+    bar: &BarGeom,
+    colors: TabColors,
+) {
+    let d = marker_diameter(bar.label);
+    let right = label_x - marker_gap(d);
+    let dot = Rect {
+        x: right - d,
+        y: bar.y + (bar.h - d) / 2,
+        w: d,
+        h: d,
+    };
+    let round = |rect: Rect, color: Rgb| DrawCmd::RoundRect {
+        rect,
+        color: color.to_u32(),
+        radius: rect.h / 2,
+    };
+    match marker {
+        Marker::Ring(color) => {
+            let stroke = (d / 5).max(1);
+            out.push(round(dot, color));
+            out.push(round(
+                Rect {
+                    x: dot.x + stroke,
+                    y: dot.y + stroke,
+                    w: d - 2 * stroke,
+                    h: d - 2 * stroke,
+                },
+                colors.bg,
+            ));
+        }
+        Marker::Dot(color) => out.push(round(dot, color)),
+        Marker::Square(color) => out.push(DrawCmd::Fill {
+            rect: dot,
+            color: color.to_u32(),
+        }),
+        Marker::Pill(color) => out.push(round(
+            Rect {
+                x: right - 2 * d,
+                w: 2 * d,
+                ..dot
+            },
+            color,
+        )),
+    }
+}
+
+/// A marker dot's diameter: a little over the x-height, so a ring or a dot never reads
+/// as a letter.
+fn marker_diameter(lm: CellMetrics) -> i32 {
+    ((lm.ascent * 3 + 2) / 5).max(4)
+}
+
+fn marker_gap(d: i32) -> i32 {
+    (d * 3 / 4).max(2)
 }
 
 /// The width of a truncated label's dissolving tail, in device pixels: [`FADE_SPAN`]
@@ -476,7 +596,11 @@ mod tests {
     use crate::testutil::METRICS;
 
     fn label(title: &str, active: bool) -> TabLabel<'_> {
-        TabLabel { title, active }
+        TabLabel {
+            title,
+            active,
+            marker: None,
+        }
     }
 
     /// Blocks are font-free, so laying out needs no fonts; only painting (which fits
@@ -1075,6 +1199,129 @@ mod tests {
         assert_eq!(
             dividers, 0,
             "no hairline borders the lifted active tab's gap"
+        );
+    }
+
+    /// Paint one inactive tab carrying `marker`, returning the label run's x and every
+    /// command other than the strip background and the label.
+    fn paint_marked(
+        fonts: &Fonts,
+        cfg: &TabBarConfig,
+        marker: Option<Marker>,
+    ) -> (i32, Vec<DrawCmd>) {
+        let marked = TabLabel {
+            title: "claude",
+            active: false,
+            marker,
+        };
+        let slots = lay(80, &[marked], cfg);
+        let out = paint(fonts, &slots, cfg, 80, 0);
+        let x = out
+            .iter()
+            .find_map(|c| match c {
+                DrawCmd::Text { x, .. } => Some(*x),
+                _ => None,
+            })
+            .expect("a label run");
+        let marks = out
+            .into_iter()
+            .skip(1)
+            .filter(|c| !matches!(c, DrawCmd::Text { .. }))
+            .collect();
+        (x, marks)
+    }
+
+    #[test]
+    fn each_marker_has_its_own_shape_and_the_label_stays_put_beside_it() {
+        let cfg = TabBarConfig::default();
+        let fonts = fonts();
+        let green = Rgb::new(0, 200, 0);
+        let (bare_x, nothing) = paint_marked(&fonts, &cfg, None);
+        assert!(nothing.is_empty());
+
+        let mut label_xs = Vec::new();
+        let mut right_edges = Vec::new();
+        for marker in [
+            Marker::Ring(green),
+            Marker::Dot(green),
+            Marker::Square(green),
+            Marker::Pill(green),
+        ] {
+            let (x, marks) = paint_marked(&fonts, &cfg, Some(marker));
+            label_xs.push(x);
+            let shape = |c: &DrawCmd| match *c {
+                DrawCmd::RoundRect { rect, color, .. } => (rect, color, true),
+                DrawCmd::Fill { rect, color } => (rect, color, false),
+                _ => panic!("{marker:?} painted {c:?}"),
+            };
+            let shapes: Vec<_> = marks.iter().map(shape).collect();
+            let (outer, color, rounded) = shapes[0];
+            assert_eq!(color, green.to_u32(), "{marker:?}");
+            match marker {
+                Marker::Ring(_) => {
+                    assert_eq!(shapes.len(), 2, "a ring is a disc with a hole");
+                    let (inner, hole, _) = shapes[1];
+                    assert_eq!(hole, cfg.inactive.bg.to_u32());
+                    assert!(inner.w < outer.w && inner.x > outer.x);
+                }
+                Marker::Dot(_) => assert!(rounded && outer.w == outer.h),
+                Marker::Square(_) => assert!(!rounded && outer.w == outer.h),
+                Marker::Pill(_) => assert!(rounded && outer.w == 2 * outer.h),
+            }
+            if !matches!(marker, Marker::Ring(_)) {
+                assert_eq!(shapes.len(), 1, "{marker:?}");
+            }
+            let right = outer.x + outer.w;
+            assert!(right < x, "{marker:?} sits clear of the label");
+            assert!(x - right < outer.h, "{marker:?} sits beside the label");
+            right_edges.push(right);
+        }
+        assert!(
+            label_xs.iter().all(|&x| x == label_xs[0]),
+            "the label does not move between states: {label_xs:?}"
+        );
+        assert!(
+            right_edges.iter().all(|&r| r == right_edges[0]),
+            "every marker keeps the same gap: {right_edges:?}"
+        );
+        assert!(label_xs[0] > bare_x, "the marker and label centre together");
+    }
+
+    #[test]
+    fn a_tab_too_narrow_for_the_marker_shows_the_label_alone() {
+        let cfg = TabBarConfig {
+            min_width: 2,
+            max_width: 2,
+            ..TabBarConfig::default()
+        };
+        let fonts = fonts();
+        let (_, marks) = paint_marked(&fonts, &cfg, Some(Marker::Pill(Rgb::new(9, 9, 9))));
+        assert!(marks.is_empty(), "{marks:?}");
+    }
+
+    #[test]
+    fn markers_take_the_configured_palette_and_idle_has_none() {
+        let mut palette = Theme::default();
+        palette.set_indexed(1, Rgb::new(1, 0, 0));
+        palette.set_indexed(2, Rgb::new(0, 2, 0));
+        palette.set_indexed(3, Rgb::new(3, 3, 0));
+        assert_eq!(Marker::for_state(State::Idle, &palette), None);
+        palette.set_indexed(4, Rgb::new(0, 0, 4));
+        assert_eq!(
+            Marker::for_state(State::Working, &palette),
+            Some(Marker::Ring(Rgb::new(0, 0, 4)))
+        );
+        assert_eq!(
+            Marker::for_state(State::Done, &palette),
+            Some(Marker::Dot(Rgb::new(0, 2, 0)))
+        );
+        assert_eq!(
+            Marker::for_state(State::Error, &palette),
+            Some(Marker::Square(Rgb::new(1, 0, 0)))
+        );
+        assert_eq!(
+            Marker::for_state(State::Blocked, &palette),
+            Some(Marker::Pill(Rgb::new(3, 3, 0)))
         );
     }
 }

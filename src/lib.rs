@@ -16,6 +16,7 @@ pub mod mouse;
 mod notice;
 mod panel;
 mod platform;
+pub mod program_status;
 pub mod pty;
 mod render;
 pub mod shell_integration;

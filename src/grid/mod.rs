@@ -15,7 +15,8 @@
 //!       ▼                          what a sequence turns into:
 //!   perform.rs ──────────────┬───▶ print.rs    characters into cells
 //!   (syntax -> meaning)      ├───▶ edit.rs     motion, erase, scroll, modes, SGR, resize
-//!                            ├───▶ osc.rs      title, palette, links, cwd, prompt marks
+//!                            ├───▶ osc.rs      title, palette, links, cwd, prompt marks,
+//!                            │                 program status
 //!                            └───▶ reply.rs    what we answer (DA, DSR, DECRQM, DECRQSS)
 //!
 //!   the app's side ─────────────▶ view.rs      reading the grid back out: display vs
@@ -66,6 +67,7 @@ use crate::mouse::{MouseMode, MouseProtocol};
 use crate::platform::grapheme;
 use crate::platform::host::Hostname;
 use crate::platform::verdict::{self, Refusal, Verdict};
+use crate::program_status::Records;
 use crate::vt::{Params, Perform};
 use crate::width::width;
 use std::cmp::Ordering;
@@ -1216,6 +1218,8 @@ pub struct Screen {
     /// compositor connection, so it queues the request here the same way it queues query
     /// replies, and the app drains it and does the Wayland half.
     clipboard_writes: Vec<(ClipboardTarget, Vec<u8>)>,
+    /// `OSC 7501` records, one table for both screens: a record belongs to the terminal.
+    program_status: Records,
     /// The child rang the bell (BEL, `0x07`) since the app last looked. What a bell
     /// *means* is the app's business (a flash, a mark on the tab); all the grid knows is
     /// that it was rung.
@@ -1265,6 +1269,8 @@ pub struct Prompt {
     /// The command's exit status (`OSC 133;D;<code>`), once it has one. `Some(0)` is a
     /// success; anything else is the shell telling us it went wrong.
     pub exit: Option<i32>,
+    /// Whether the shell said the command ended (`OSC 133;D`), with or without a code.
+    pub ended: bool,
 }
 
 /// The most prompts to remember; past it the oldest quarter is forgotten. The shell writes
@@ -1340,6 +1346,7 @@ impl Screen {
             last_printed: None,
             synchronized: false,
             clipboard_writes: Vec::new(),
+            program_status: Records::default(),
             bell: false,
             focus_events: false,
             in_band_resize: false,

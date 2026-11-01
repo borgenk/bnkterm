@@ -47,6 +47,7 @@ use crate::grid::{LinkProbe, Screen};
 use crate::mouse::MouseButton;
 use crate::platform::host::Hostname;
 use crate::platform::scroll::Scrollbar;
+use crate::program_status::State;
 use crate::pty::{Pty, Target, TtyMode};
 use crate::term_render::{LinkHover, Selection};
 use crate::vt::Parser;
@@ -349,6 +350,16 @@ impl TerminalCore {
             Some(path) => abbreviate_home(path),
             None => "shell".to_string(),
         }
+    }
+
+    /// The state this tab's status marker shows (`OSC 7501`).
+    pub(in crate::app) fn program_status(&self) -> Option<State> {
+        self.screen.program_status()
+    }
+
+    /// The user has seen this tab: drop the results it was holding (`OSC 7501`).
+    pub(in crate::app) fn acknowledge_program_status(&mut self) {
+        self.screen.acknowledge_program_status();
     }
 
     /// The cwd's final component when the foreground program opts into the path
