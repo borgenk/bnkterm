@@ -215,6 +215,8 @@ impl State {
             self.conn.request(pointer, wl_pointer::RELEASE, &[]);
         }
         self.pointer.enter_serial = 0;
+        // A pointer the seat took away sends no release, and maybe no leave first.
+        self.end_pointer_gesture();
         self.pointer_left_grid()
     }
 
@@ -891,7 +893,7 @@ fn pointer_button(code: u32) -> Option<MouseButton> {
 #[cfg(test)]
 mod tests {
     use crate::app::seat::*;
-    use crate::app::tests::window;
+    use crate::app::tests::{event, window};
     use crate::platform::verdict::Refusal;
 
     /// The pointer resting on plain, unclaimed grid text.
@@ -1173,64 +1175,97 @@ mod tests {
         pointer_event(state, wl_pointer::EV_LEAVE, &[3, 0]);
     }
 
-    /// A compositor grab that takes the pointer mid-drag (an interactive move, a popup)
-    /// sends `leave` and keeps the release for itself. The tab drag has to end with the
-    /// leave, or it keeps reordering under a pointer with no button held, and the next
-    /// left release is swallowed as its end.
-    #[test]
-    fn leaving_the_window_ends_a_tab_drag() {
-        let (mut state, _compositor) = window(&["one", "two", "three"]);
-        let grid = state.layout.terminal;
-        let bar_y = (state.layout.bar_y + state.layout.bar_h / 2) as f32;
-        let first_x = (grid.pad + grid.metrics.w) as f32;
-        enter(&mut state, first_x, bar_y);
-        press_left(&mut state);
-        assert!(state.tabs.dragging(), "the press on a tab armed a drag");
-        let first = state.tabs.tab_at_bar_col(1);
-
-        leave(&mut state);
-        enter(&mut state, first_x, bar_y);
-        motion(&mut state, (grid.width - 1) as f32, bar_y);
-        assert_eq!(
-            state.tabs.tab_at_bar_col(1),
-            first,
-            "motion with no button held does not move a tab"
-        );
-        assert!(!state.tabs.dragging(), "the leave ended the drag");
-        assert_eq!(
-            state.pointer.bar_button, None,
-            "no release is owed to the strip"
+    /// The seat loses its pointer and gets one back, as when the only mouse is unplugged
+    /// and plugged in again. No leave comes first.
+    fn replug_pointer(state: &mut State) {
+        const SEAT: u32 = 90;
+        state.objects.seat = Some(SEAT);
+        if state.objects.pointer == 0 {
+            event(
+                state,
+                SEAT,
+                wl_seat::EV_CAPABILITIES,
+                &[wl_seat::CAP_POINTER],
+            );
+        }
+        event(state, SEAT, wl_seat::EV_CAPABILITIES, &[0]);
+        assert_eq!(state.objects.pointer, 0, "the old pointer was released");
+        event(
+            state,
+            SEAT,
+            wl_seat::EV_CAPABILITIES,
+            &[wl_seat::CAP_POINTER],
         );
     }
 
-    /// The same cut-off for a scrollbar thumb drag: once the pointer has left, moving it
-    /// back over the window must not scroll the view.
+    type LosePointer = fn(&mut State);
+
+    /// The ways a pointer goes away mid-gesture without sending the release: a compositor
+    /// grab (an interactive move, a popup) sends `leave` and keeps the release for
+    /// itself, and a pointer the seat loses sends nothing more at all.
+    const POINTER_LOSSES: [(LosePointer, &str); 2] =
+        [(leave, "a leave"), (replug_pointer, "losing the pointer")];
+
+    /// The tab drag has to end with the pointer, or it keeps reordering under a pointer
+    /// with no button held, and the next left release is swallowed as its end.
     #[test]
-    fn leaving_the_window_ends_a_scrollbar_drag() {
-        let (mut state, _compositor) = window(&["one"]);
-        let history: String = (0..300).map(|i| format!("line {i}\r\n")).collect();
-        state.tabs.active_mut().feed_test_bytes(history.as_bytes());
-        let grid = state.layout.terminal;
-        let y = (grid.height / 2) as f32;
-        let lane_x = (0..grid.width)
-            .rev()
-            .map(|x| x as f32)
-            .find(|&x| state.tabs.active().on_scrollbar(x, y))
-            .expect("a scrollbar lane");
-        enter(&mut state, lane_x, y);
-        press_left(&mut state);
-        assert!(state.pointer.drag_scroll, "the press took the thumb");
+    fn losing_the_pointer_ends_a_tab_drag() {
+        for (lose, how) in POINTER_LOSSES {
+            let (mut state, _compositor) = window(&["one", "two", "three"]);
+            let grid = state.layout.terminal;
+            let bar_y = (state.layout.bar_y + state.layout.bar_h / 2) as f32;
+            let first_x = (grid.pad + grid.metrics.w) as f32;
+            enter(&mut state, first_x, bar_y);
+            press_left(&mut state);
+            assert!(state.tabs.dragging(), "the press on a tab armed a drag");
+            let first = state.tabs.tab_at_bar_col(1);
 
-        let resting = state.tabs.active().scroll_position();
+            lose(&mut state);
+            enter(&mut state, first_x, bar_y);
+            motion(&mut state, (grid.width - 1) as f32, bar_y);
+            assert_eq!(
+                state.tabs.tab_at_bar_col(1),
+                first,
+                "after {how}, motion with no button held does not move a tab"
+            );
+            assert!(!state.tabs.dragging(), "{how} ended the drag");
+            assert_eq!(
+                state.pointer.bar_button, None,
+                "after {how}, no release is owed to the strip"
+            );
+        }
+    }
 
-        leave(&mut state);
-        enter(&mut state, lane_x, y);
-        motion(&mut state, lane_x, 1.0);
-        assert_eq!(
-            state.tabs.active().scroll_position(),
-            resting,
-            "motion with no button held does not scroll"
-        );
-        assert!(!state.pointer.drag_scroll, "the leave let go of the thumb");
+    /// The same cut-off for a scrollbar thumb drag: once the pointer has gone, moving one
+    /// over the window again must not scroll the view.
+    #[test]
+    fn losing_the_pointer_ends_a_scrollbar_drag() {
+        for (lose, how) in POINTER_LOSSES {
+            let (mut state, _compositor) = window(&["one"]);
+            let history: String = (0..300).map(|i| format!("line {i}\r\n")).collect();
+            state.tabs.active_mut().feed_test_bytes(history.as_bytes());
+            let grid = state.layout.terminal;
+            let y = (grid.height / 2) as f32;
+            let lane_x = (0..grid.width)
+                .rev()
+                .map(|x| x as f32)
+                .find(|&x| state.tabs.active().on_scrollbar(x, y))
+                .expect("a scrollbar lane");
+            enter(&mut state, lane_x, y);
+            press_left(&mut state);
+            assert!(state.pointer.drag_scroll, "the press took the thumb");
+
+            let resting = state.tabs.active().scroll_position();
+
+            lose(&mut state);
+            enter(&mut state, lane_x, y);
+            motion(&mut state, lane_x, 1.0);
+            assert_eq!(
+                state.tabs.active().scroll_position(),
+                resting,
+                "after {how}, motion with no button held does not scroll"
+            );
+            assert!(!state.pointer.drag_scroll, "{how} let go of the thumb");
+        }
     }
 }
