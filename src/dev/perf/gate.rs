@@ -5,6 +5,7 @@
 
 use crate::color::Theme;
 use crate::dev::perf::footprint::{gate_footprints, measure_footprints, FOOTPRINT_PATH};
+use crate::dev::perf::instructions::Counter;
 use crate::dev::perf::{
     corpus, ensure_parent, parse_rows, plain_frame, ratio_pct, read_if_present, BENCH_COLS,
     BENCH_ROWS, METRICS, RENDER_FONT_PX,
@@ -50,6 +51,8 @@ struct Sample {
     name: &'static str,
     ns: u64,
     allocs: u64,
+    /// User-space instructions per op, where the kernel lets a process count them.
+    instructions: Option<u64>,
 }
 
 /// A baseline entry: the recorded time per op and allocation count.
@@ -72,6 +75,9 @@ pub fn run(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<()> {
     eprintln!("bnkterm perf: measuring (build --release for meaningful numbers)...");
     if !alloc::ENABLED {
         eprintln!("  allocations unmeasured; build --features perf-alloc (or `make perf`)");
+    }
+    if Counter::open().is_none() {
+        eprintln!("  instructions unmeasured; the kernel refuses performance counters here");
     }
     let samples = measure()?;
     write_samples(LATEST_PATH, &samples)?;
@@ -321,13 +327,14 @@ fn link_scenario(fixture: &LinkFixture) -> Result<Sample> {
             probe.verdict(),
         )));
     }
-    let (ns, allocs) = best_of(GATE_ROUNDS, fixture.iters, || {
+    let (ns, allocs, instructions) = best_of(GATE_ROUNDS, fixture.iters, || {
         screen.link_at(row, col, &mut probe)
     });
     Ok(Sample {
         name: fixture.name,
         ns,
         allocs,
+        instructions,
     })
 }
 
@@ -386,11 +393,12 @@ fn link_preview_scenario() -> Result<Sample> {
     for _ in 0..4 {
         black_box(build());
     }
-    let (ns, allocs) = best_of(GATE_ROUNDS, 512, &mut build);
+    let (ns, allocs, instructions) = best_of(GATE_ROUNDS, 512, &mut build);
     Ok(Sample {
         name: "link_preview",
         ns,
         allocs,
+        instructions,
     })
 }
 
@@ -415,7 +423,7 @@ fn grid_reflow_scenario() -> Result<Sample> {
     // Alternate between two adjacent widths so every timed op is a real reflow (a resize
     // to the width already in force returns without doing anything).
     let mut wide = false;
-    let (ns, allocs) = best_of(GATE_ROUNDS, 64, || {
+    let (ns, allocs, instructions) = best_of(GATE_ROUNDS, 64, || {
         wide = !wide;
         screen.resize(BENCH_COLS - usize::from(wide), BENCH_ROWS);
         screen.cursor() // an observable result, so the work is not elided
@@ -424,6 +432,7 @@ fn grid_reflow_scenario() -> Result<Sample> {
         name: "grid_reflow",
         ns,
         allocs,
+        instructions,
     })
 }
 
@@ -470,11 +479,12 @@ fn frame_damage_scenario() -> Sample {
     // a round timed a 0.1 ms window, too short to be reproducible; this puts it on the
     // same ~1.5 ms footing as the rest. The time is per op and the allocation count
     // does not depend on the inner count, so the baseline stays comparable either way.
-    let (ns, allocs) = best_of(GATE_ROUNDS, 8192, &mut diff);
+    let (ns, allocs, instructions) = best_of(GATE_ROUNDS, 8192, &mut diff);
     Sample {
         name: "frame_damage",
         ns,
         allocs,
+        instructions,
     }
 }
 
@@ -524,11 +534,12 @@ fn frame_damage_scroll_scenario() -> Sample {
     for _ in 0..4 {
         black_box(diff());
     }
-    let (ns, allocs) = best_of(GATE_ROUNDS, 32, &mut diff);
+    let (ns, allocs, instructions) = best_of(GATE_ROUNDS, 32, &mut diff);
     Sample {
         name: "frame_damage_scroll",
         ns,
         allocs,
+        instructions,
     }
 }
 
@@ -632,11 +643,12 @@ fn frame_tabbar_scenario() -> Result<Sample> {
     for _ in 0..4 {
         black_box(build());
     }
-    let (ns, allocs) = best_of(GATE_ROUNDS, 512, &mut build);
+    let (ns, allocs, instructions) = best_of(GATE_ROUNDS, 512, &mut build);
     Ok(Sample {
         name: "frame_tabbar",
         ns,
         allocs,
+        instructions,
     })
 }
 
@@ -673,7 +685,7 @@ fn frame_text_unicode_scenario() -> Result<Sample> {
     let list = lists.back();
     let mut cache = GlyphCache::default();
     let mut frame = FrameData::default();
-    let (ns, allocs) = best_of(GATE_ROUNDS, 16, || {
+    let (ns, allocs, instructions) = best_of(GATE_ROUNDS, 16, || {
         build_frame_into(&fonts, list, &mut cache, TextGamma::default(), &mut frame);
         frame.vertices.len()
     });
@@ -681,6 +693,7 @@ fn frame_text_unicode_scenario() -> Result<Sample> {
         name: "frame_text_unicode",
         ns,
         allocs,
+        instructions,
     })
 }
 
@@ -691,11 +704,16 @@ fn stream_scenario(name: &'static str, chunk: &[u8], iters: u64) -> Sample {
     let mut screen = Screen::new(BENCH_COLS, BENCH_ROWS);
     let mut parser = Parser::new();
     warm(&mut parser, &mut screen, chunk);
-    let (ns, allocs) = best_of(GATE_ROUNDS, iters, || {
+    let (ns, allocs, instructions) = best_of(GATE_ROUNDS, iters, || {
         parser.advance_bytes(&mut screen, chunk);
         screen.cursor() // an observable result, so the work is not elided
     });
-    Sample { name, ns, allocs }
+    Sample {
+        name,
+        ns,
+        allocs,
+        instructions,
+    }
 }
 
 /// Drive the grid to steady state before timing: enough newlines to fill the
@@ -735,20 +753,27 @@ fn warm(parser: &mut Parser, screen: &mut Screen, chunk: &[u8]) {
 const COUNTED_OPS: u64 = 64;
 
 /// The best (minimum) ns per op over `rounds`, each timing `inner` ops, plus the
-/// allocations [`COUNTED_OPS`] ops make in total. The minimum is the least-noisy
+/// allocations [`COUNTED_OPS`] ops make in total and the instructions each takes on
+/// average. The minimum is the least-noisy
 /// estimator for a microbenchmark. The count is a total because a per-op average would
 /// round an occasional allocation down to zero. It comes from an untimed pass after one
 /// warm op, and the counter is per thread (see [`alloc`]), so a parallel sibling never
 /// bleeds into it. Under `perf-alloc` the timed rounds still pay the counter on every
 /// allocation they make, so an allocating scenario times a little slower there than in a
 /// plain build. `black_box` stops the optimizer eliding the work.
-fn best_of<T>(rounds: u32, inner: u64, mut f: impl FnMut() -> T) -> (u64, u64) {
+fn best_of<T>(rounds: u32, inner: u64, mut f: impl FnMut() -> T) -> (u64, u64, Option<u64>) {
     black_box(f());
+    let mut counter = Counter::open();
     alloc::reset();
+    let start = counter.as_mut().and_then(Counter::read);
     for _ in 0..COUNTED_OPS {
         black_box(f());
     }
+    let end = counter.as_mut().and_then(Counter::read);
     let allocs = alloc::snapshot().allocs;
+    let instructions = start
+        .zip(end)
+        .map(|(start, end)| end.saturating_sub(start) / COUNTED_OPS);
 
     let mut best = u64::MAX;
     for _ in 0..rounds.max(1) {
@@ -758,7 +783,7 @@ fn best_of<T>(rounds: u32, inner: u64, mut f: impl FnMut() -> T) -> (u64, u64) {
         }
         best = best.min((start.elapsed().as_nanos() as u64) / inner.max(1));
     }
-    (best, allocs)
+    (best, allocs, instructions)
 }
 
 /// How a measured number compares to its baseline; the one classification behind
@@ -816,8 +841,8 @@ fn print_table(
     sorted.sort_by_key(|s| s.name);
     let allocs = format!("allocs/{COUNTED_OPS}");
     println!(
-        "\n{:<16} {:>11} {:>11} {:>16}   {:>9} {:>8} {:>16}",
-        "metric", "ns/op", "base", "Δ", allocs, "base", "Δ"
+        "\n{:<16} {:>11} {:>11} {:>16}   {:>9} {:>8} {:>16}   {:>12}",
+        "metric", "ns/op", "base", "Δ", allocs, "base", "Δ", "instr/op"
     );
     let mut regressed = Vec::new();
     for s in sorted {
@@ -851,9 +876,10 @@ fn print_table(
             regressed.push(s.name);
         }
 
+        let instructions = s.instructions.map_or("-".to_string(), |n| n.to_string());
         println!(
-            "{:<16} {:>11} {:>11} {:>16}   {:>9} {:>8} {:>16}",
-            s.name, s.ns, base_ns_col, ns_flag, alloc_cur, alloc_base, alloc_col
+            "{:<16} {:>11} {:>11} {:>16}   {:>9} {:>8} {:>16}   {:>12}",
+            s.name, s.ns, base_ns_col, ns_flag, alloc_cur, alloc_base, alloc_col, instructions
         );
     }
     regressed
@@ -924,7 +950,12 @@ mod tests {
             ("noisy", 109, 0),
             ("slow", 111, 0),
         ]
-        .map(|(name, ns, allocs)| Sample { name, ns, allocs });
+        .map(|(name, ns, allocs)| Sample {
+            name,
+            ns,
+            allocs,
+            instructions: None,
+        });
         assert_eq!(
             print_table(&samples, &baseline, true),
             ["first_alloc", "one_more", "slow"]
@@ -970,11 +1001,32 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn instructions_per_op_follow_the_work_each_op_does() {
+        let work = |n: u64| {
+            move || {
+                let mut sum = 0u64;
+                for i in 0..n {
+                    sum = black_box(sum.wrapping_add(i));
+                }
+                sum
+            }
+        };
+        let (_, _, light) = best_of(1, 1, work(100));
+        let (_, _, heavy) = best_of(1, 1, work(10_000));
+        // Where the kernel refuses performance events there is nothing to count.
+        let (Some(light), Some(heavy)) = (light, heavy) else {
+            return;
+        };
+        assert!(heavy > 10_000, "at least one per iteration: {heavy}");
+        assert!(heavy > light * 20, "{light} for 100, {heavy} for 10000");
+    }
+
     #[cfg(feature = "perf-alloc")]
     #[test]
     fn an_allocation_every_few_ops_is_counted() {
         let mut calls = 0u64;
-        let (_, allocs) = best_of(1, 1, || {
+        let (_, allocs, _) = best_of(1, 1, || {
             calls += 1;
             if calls.is_multiple_of(8) {
                 black_box(Vec::<u8>::with_capacity(16));

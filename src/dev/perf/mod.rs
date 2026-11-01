@@ -59,6 +59,7 @@
 
 mod footprint;
 pub mod gate;
+mod instructions;
 pub mod lab;
 pub mod render;
 

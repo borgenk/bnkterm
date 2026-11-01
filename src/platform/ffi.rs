@@ -561,6 +561,72 @@ pub(crate) unsafe fn close_from(first: c_uint) -> c_long {
     }
 }
 
+/// The original, version-0 layout of `struct perf_event_attr` (linux/perf_event.h). The
+/// kernel accepts this shorter struct and treats the later fields as zero.
+#[repr(C)]
+struct PerfEventAttr {
+    kind: u32,
+    size: u32,
+    config: u64,
+    sample_period: u64,
+    sample_type: u64,
+    read_format: u64,
+    /// The bitfield word: `exclude_kernel` is bit 5, `exclude_hv` bit 6.
+    flags: u64,
+    wakeup_events: u32,
+    bp_type: u32,
+    config1: u64,
+}
+
+const PERF_ATTR_SIZE_VER0: u32 = 64;
+const PERF_TYPE_HARDWARE: u32 = 0;
+const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
+const PERF_ATTR_EXCLUDE_KERNEL: u64 = 1 << 5;
+const PERF_ATTR_EXCLUDE_HV: u64 = 1 << 6;
+const PERF_FLAG_FD_CLOEXEC: c_long = 8;
+#[cfg(target_arch = "x86_64")]
+const SYS_PERF_EVENT_OPEN: c_long = 298;
+#[cfg(target_arch = "aarch64")]
+const SYS_PERF_EVENT_OPEN: c_long = 241;
+
+/// A counter of the user-space instructions the calling thread retires, read from the
+/// fd as a native-endian `u64`. `pmu` names a core type's PMU on a hybrid CPU (its
+/// `/sys/bus/event_source/devices/*/type`), which counts only on that type's cores;
+/// `None` is the generic counter. Fails where the kernel refuses performance events.
+pub(crate) fn instruction_counter(pmu: Option<u32>) -> Result<OwnedFd> {
+    let attr = PerfEventAttr {
+        kind: PERF_TYPE_HARDWARE,
+        size: PERF_ATTR_SIZE_VER0,
+        config: pmu.map_or(0, |kind| u64::from(kind) << 32) | PERF_COUNT_HW_INSTRUCTIONS,
+        sample_period: 0,
+        sample_type: 0,
+        read_format: 0,
+        flags: PERF_ATTR_EXCLUDE_KERNEL | PERF_ATTR_EXCLUDE_HV,
+        wakeup_events: 0,
+        bp_type: 0,
+        config1: 0,
+    };
+    let (pid, cpu, group): (c_long, c_long, c_long) = (0, -1, -1);
+    // SAFETY: attr is a complete version-0 perf_event_attr that outlives the call. Pid 0
+    // with cpu -1 counts the calling thread on any CPU, and group -1 opens it alone.
+    let rc = unsafe {
+        syscall(
+            SYS_PERF_EVENT_OPEN,
+            &attr as *const PerfEventAttr,
+            pid,
+            cpu,
+            group,
+            PERF_FLAG_FD_CLOEXEC,
+        )
+    };
+    let fd = c_int::try_from(rc).unwrap_or(-1);
+    if fd < 0 {
+        return Err(errno_error("perf_event_open"));
+    }
+    // SAFETY: fd is a fresh, owned descriptor returned by perf_event_open.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// Add 1 to the eventfd's counter to wake a poller. The return is unchecked because
 /// this write cannot meaningfully fail: an 8-byte write to a counter eventfd blocks
 /// (or returns `EAGAIN`) only at `u64::MAX - 1`, which is unreachable when the
@@ -1429,6 +1495,22 @@ mod tests {
         assert_eq!(DRM_IOCTL_SYNCOBJ_EVENTFD, 0xC018_64CF);
         // `struct pollfd` (poll.h): int + short + short.
         assert_eq!(mem::size_of::<PollFd>(), 8);
+    }
+
+    #[test]
+    fn perf_event_attr_matches_the_abi() {
+        assert_eq!(
+            mem::size_of::<PerfEventAttr>(),
+            usize::try_from(PERF_ATTR_SIZE_VER0).unwrap()
+        );
+        assert_eq!(mem::offset_of!(PerfEventAttr, config), 8);
+        assert_eq!(mem::offset_of!(PerfEventAttr, read_format), 32);
+        assert_eq!(mem::offset_of!(PerfEventAttr, flags), 40);
+        assert_eq!(mem::offset_of!(PerfEventAttr, wakeup_events), 48);
+        assert_eq!(mem::offset_of!(PerfEventAttr, config1), 56);
+        assert_eq!(PERF_ATTR_EXCLUDE_KERNEL | PERF_ATTR_EXCLUDE_HV, 0x60);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(SYS_PERF_EVENT_OPEN, 298);
     }
 
     // A real round-trip against the kernel's DRM syncobj interface: push a
