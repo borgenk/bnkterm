@@ -15,6 +15,8 @@ MIT license covers the rest of the tree.
 | `GraphemeBreakProperty.txt` | `src/platform/grapheme_tables.rs` | Grapheme_Cluster_Break |
 | `emoji-data.txt` | `src/platform/grapheme_tables.rs` | Extended_Pictographic (rule GB11) |
 | `DerivedCoreProperties.txt` | `src/platform/grapheme_tables.rs` | Indic_Conjunct_Break (rule GB9c) |
+| `DerivedGeneralCategory.txt` | `src/platform/link_tables.rs` | General Category (Ps, Pe, Pi, Pf, Po → URL punctuation; Cf → draws nothing) |
+| `DerivedCoreProperties.txt` | `src/platform/link_tables.rs` | Default_Ignorable_Code_Point (draws nothing) |
 | `GraphemeBreakTest.txt` | `grapheme.rs` test | the official UAX #29 conformance suite |
 
 ## Refreshing on a Unicode bump
@@ -22,7 +24,7 @@ MIT license covers the rest of the tree.
 These came from the Arch `unicode-character-database` package (`/usr/share/unicode/`),
 which tracks the latest Unicode. To move to a new version:
 
-1. `make deps` (installs `unicode-character-database`), or fetch the files from
+1. Update the package (`pacman -S unicode-character-database`), or fetch the files from
    `https://www.unicode.org/Public/<version>/ucd/`.
 2. Copy the six files above into this directory (from `/usr/share/unicode/`, note the
    `extracted/`, `auxiliary/`, and `emoji/` subpaths).
