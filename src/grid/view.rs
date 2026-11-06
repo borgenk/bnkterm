@@ -379,8 +379,10 @@ impl Screen {
     /// The text of a linear selection, `a`..`b` inclusive in absolute `(row, col)`
     /// cells (either order), **appended** to `out`. Rows join with `\n`, except a
     /// soft-wrapped row joins with nothing (the two rows are one logical line, so a
-    /// selection across a wrap copies as unbroken text). Trailing blanks on a row are
-    /// dropped, wide spacers skipped, combining marks kept.
+    /// selection across a wrap copies as unbroken text). Trailing blanks are dropped
+    /// where a line or the selection ends. A row that joins the next keeps them, since
+    /// a space in its last column is text, and drops only its wrap padding. Wide
+    /// spacers are skipped, combining marks kept.
     ///
     /// Absolute rows, so it copies the lines the user picked no matter where the
     /// viewport has drifted to since — including lines that have scrolled out of sight
@@ -406,24 +408,27 @@ impl Screen {
         while row <= end_row {
             let first = if row == start.0 { start.1 } else { 0 };
             let last = if row == end.0 { end.1 } else { last_col };
+            // A soft wrap continues the same logical line: no newline.
+            let joins = row != end_row && self.wraps(row);
+            let padding = joins && self.ends_in_wrap_padding(row);
             // Append this row straight onto the shared buffer rather than into a fresh
-            // per-row `String`, then drop its trailing spaces in place — no further back
-            // than where the row began, so an earlier row's content is untouched.
+            // per-row `String`, then, where the line ends, drop its trailing spaces in
+            // place — no further back than where the row began, so an earlier row's
+            // content is untouched.
             let row_start = out.len();
             for col in first..=last.min(last_col) {
                 let cell = self.abs_cell(row, col);
-                if cell.is_wide_spacer() {
+                if cell.is_wide_spacer() || (padding && col == last_col) {
                     continue;
                 }
                 out.push(cell.rune);
                 out.extend(self.abs_marks(row, col));
             }
-            while out.len() > row_start && out.ends_with(' ') {
-                out.pop();
-            }
-            if row != end_row {
-                // A soft wrap continues the same logical line: no newline.
-                if !self.wraps(row) {
+            if !joins {
+                while out.len() > row_start && out.ends_with(' ') {
+                    out.pop();
+                }
+                if row != end_row {
                     out.push('\n');
                 }
             }
@@ -463,6 +468,14 @@ impl Screen {
     /// logical line. False for a row that has aged out of history.
     pub(super) fn wraps(&self, row: AbsRow) -> bool {
         self.active().abs_row(row).is_some_and(|r| r.wrapped)
+    }
+
+    /// Whether absolute `row` ends in wrap padding (see [`Row::ends_in_wrap_padding`]).
+    fn ends_in_wrap_padding(&self, row: AbsRow) -> bool {
+        let buf = self.active();
+        let next = row.next().and_then(|n| buf.abs_row(n));
+        buf.abs_row(row)
+            .is_some_and(|r| r.ends_in_wrap_padding(next))
     }
 
     /// Whether the line on the live screen at display `row` soft-wrapped into the next.

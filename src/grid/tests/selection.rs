@@ -31,6 +31,26 @@ fn selection_joins_a_soft_wrapped_line() {
 }
 
 #[test]
+fn a_space_at_the_wrap_point_survives_a_copy() {
+    // The space lands in the last column and the next word wraps: "ab " | "cd". That
+    // space is text, so the copy must not glue the two words together.
+    let mut s = Screen::new(3, 3);
+    feed(&mut s, b"ab cd");
+    assert!(s.row_wraps(0));
+    assert_eq!(selection_text(&s, at(&s, 0, 0), at(&s, 1, 1)), "ab cd");
+}
+
+#[test]
+fn wide_glyph_wrap_padding_is_not_copied() {
+    // "aかb" at two columns: か cannot fit beside 'a', so it wraps and leaves the last
+    // column blank. That blank is padding, not a space in the text.
+    let mut s = Screen::new(2, 4);
+    feed(&mut s, "aかb".as_bytes());
+    assert!(s.row_wraps(0));
+    assert_eq!(selection_text(&s, at(&s, 0, 0), at(&s, 2, 0)), "aかb");
+}
+
+#[test]
 fn a_resized_wrapped_line_copies_unbroken() {
     // Drag over an old wrapped line after a resize and the clipboard must not break
     // mid-sentence. A widen rejoins it onto one row; a narrow re-wraps it; both still

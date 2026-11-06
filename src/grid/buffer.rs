@@ -325,6 +325,19 @@ impl Row {
             && !self.combining.iter().any(|m| m.col >= col)
     }
 
+    /// Whether this row ends in wrap padding: a blank last column the printer left because
+    /// the wide glyph that continues the line on `next` could not fit there. Every other
+    /// cell of a wrapped row is text, a space in the last column included. The padding is
+    /// not: [`Buffer::reflow`] drops it when it joins the two rows, so a widen pulls the
+    /// glyph flush against the text before it, and a copy across the wrap leaves it out.
+    pub(super) fn ends_in_wrap_padding(&self, next: Option<&Row>) -> bool {
+        self.wrapped
+            && self.cells.last() == Some(&PackedCell::BLANK)
+            && next
+                .and_then(|n| n.cells.first())
+                .is_some_and(|c| c.is_wide_leader())
+    }
+
     /// Reset every cell to `blank` and drop combining marks, reusing the existing
     /// allocation so a recycled scroll row never allocates. The wrap link goes with
     /// the content: a recycled row must not inherit one and glue two unrelated lines
@@ -486,22 +499,12 @@ impl LogicalLine {
     }
 }
 
-/// Whether row `idx` of `rows` ends in wrap padding: a blank last column the printer left
-/// because the wide glyph that continues the line on the next row could not fit there.
-/// [`Buffer::reflow`] drops that cell when it joins the two, so a widen pulls the glyph
-/// flush against the text before it instead of keeping a phantom space.
-///
+/// Whether row `idx` of `rows` ends in wrap padding (see [`Row::ends_in_wrap_padding`]).
 /// An index past the end (or a row the reflow has already moved out, which is empty) is not
 /// padding, so a caller may ask about any row of the stream.
 pub(super) fn wrap_padding_at(rows: &[Row], idx: usize) -> bool {
-    rows.get(idx).is_some_and(|row| {
-        row.wrapped
-            && row.cells.last() == Some(&PackedCell::BLANK)
-            && rows
-                .get(idx + 1)
-                .and_then(|next| next.cells.first())
-                .is_some_and(|c| c.is_wide_leader())
-    })
+    rows.get(idx)
+        .is_some_and(|row| row.ends_in_wrap_padding(rows.get(idx + 1)))
 }
 
 /// Take a row from the recycle `pool` (or allocate one when it is empty) and fill it from
