@@ -205,11 +205,7 @@ impl BufPool {
     /// enforcing "all data batches → end marker → close".
     fn end_if_drained(&self) -> Option<GatherEnd> {
         let g = self.lock();
-        if g.ready.is_empty() {
-            g.end
-        } else {
-            None
-        }
+        if g.ready.is_empty() { g.end } else { None }
     }
 
     /// Main side: whether any ready batch is still undrained.

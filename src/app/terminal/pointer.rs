@@ -74,7 +74,7 @@ impl DragMode {
     fn last_row(self) -> AbsRow {
         match self {
             DragMode::Char(edge) => edge.row,
-            DragMode::Unit { range, .. } => range.1 .0,
+            DragMode::Unit { range, .. } => range.1.0,
         }
     }
 }
@@ -628,7 +628,7 @@ impl TerminalCore {
         }
         let stale = self
             .selection
-            .is_some_and(|sel| sel.epoch != epoch || !self.screen.row_exists(sel.ordered().1 .0));
+            .is_some_and(|sel| sel.epoch != epoch || !self.screen.row_exists(sel.ordered().1.0));
         if stale {
             self.set_selection(None);
             self.drag = None;
@@ -1054,9 +1054,10 @@ mod tests {
 
         click_mods(&mut core, true, 2, 0, input::Mods::CTRL);
         let out = core.take_outbox();
-        assert!(out
-            .iter()
-            .any(|m| matches!(m, ToWindow::LinkRefused(Refusal::Unreachable))));
+        assert!(
+            out.iter()
+                .any(|m| matches!(m, ToWindow::LinkRefused(Refusal::Unreachable)))
+        );
         hover_at(&mut core, 2, 0, input::Mods::NONE);
         assert_eq!(
             core.hovered_link(),
@@ -1098,9 +1099,10 @@ mod tests {
             "neither opened unchecked nor judged against the sandbox"
         );
         let url = format!("file://{}", script.display());
-        assert!(out
-            .iter()
-            .any(|m| matches!(m, ToWindow::OpenHostFile(handed) if *handed == url)));
+        assert!(
+            out.iter()
+                .any(|m| matches!(m, ToWindow::OpenHostFile(handed) if *handed == url))
+        );
 
         click_mods(&mut core, true, 7, 0, input::Mods::CTRL);
         assert_eq!(
@@ -1136,9 +1138,10 @@ mod tests {
         assert!(core.drag.is_none(), "the click was consumed");
         let out = core.take_outbox();
         assert!(!out.iter().any(|m| matches!(m, ToWindow::OpenUrl(_))));
-        assert!(out
-            .iter()
-            .any(|m| matches!(m, ToWindow::LinkRefused(Refusal::Executable))));
+        assert!(
+            out.iter()
+                .any(|m| matches!(m, ToWindow::LinkRefused(Refusal::Executable)))
+        );
         assert_eq!(
             core.hovered_link(),
             Some(Verdict::Refused(Refusal::Executable)),

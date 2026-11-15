@@ -271,11 +271,7 @@ pub fn write_x11_color(color: Rgb, out: &mut Vec<u8>) {
 /// One channel of the 6x6x6 color cube. `level` is `0..6`; the six steps are the
 /// xterm values 0, 95, 135, 175, 215, 255.
 fn cube_level(level: u8) -> u8 {
-    if level == 0 {
-        0
-    } else {
-        55 + level * 40
-    }
+    if level == 0 { 0 } else { 55 + level * 40 }
 }
 
 /// The 16 named slots: Tomorrow Night, a common built-in default.

@@ -343,36 +343,36 @@ pub(crate) fn fill_bar(
     // (no new theme entry): the tab you are holding looks like the tab you selected.
     // The block floats at its full nominal pitch (slot zero's width) even if its own
     // home slot was clipped, and its label rides along by the same shift.
-    if let Some(lift) = lift {
-        if let Some(slot) = slots.get(lift.slot).filter(|slot| !slot.cells.is_empty()) {
-            let pitch = bar.pitch(slots);
-            out.push(DrawCmd::Fill {
-                rect: Rect {
-                    x: lift.left,
-                    y: bar.y,
-                    w: pitch,
-                    h: bar.h,
-                },
-                color: cfg.active.bg.to_u32(),
-            });
-            let dx = lift.left - bar.block_left(slot);
-            let (content_left, content_px) = bar.content_span(slot);
-            let (marker, lead) = marker_room(slot.marker, content_px, lm);
-            let label_x = paint_label(
-                out,
-                strings,
-                fonts,
-                &slot.title,
-                content_left + dx + lead,
-                content_px - lead,
-                baseline,
-                face,
-                cfg.active,
-                lm,
-            );
-            if let Some(marker) = marker {
-                paint_marker(out, marker, label_x, bar, cfg.active);
-            }
+    if let Some(lift) = lift
+        && let Some(slot) = slots.get(lift.slot).filter(|slot| !slot.cells.is_empty())
+    {
+        let pitch = bar.pitch(slots);
+        out.push(DrawCmd::Fill {
+            rect: Rect {
+                x: lift.left,
+                y: bar.y,
+                w: pitch,
+                h: bar.h,
+            },
+            color: cfg.active.bg.to_u32(),
+        });
+        let dx = lift.left - bar.block_left(slot);
+        let (content_left, content_px) = bar.content_span(slot);
+        let (marker, lead) = marker_room(slot.marker, content_px, lm);
+        let label_x = paint_label(
+            out,
+            strings,
+            fonts,
+            &slot.title,
+            content_left + dx + lead,
+            content_px - lead,
+            baseline,
+            face,
+            cfg.active,
+            lm,
+        );
+        if let Some(marker) = marker {
+            paint_marker(out, marker, label_x, bar, cfg.active);
         }
     }
 }
@@ -697,7 +697,7 @@ mod tests {
     #[test]
     fn width_is_capped_at_max_and_floored_at_min() {
         let cfg = TabBarConfig::default(); // min 10, max 24
-                                           // Two tabs in a wide bar cap at max_width, not half the window each.
+        // Two tabs in a wide bar cap at max_width, not half the window each.
         let two = lay(200, &[label("a", true), label("b", false)], &cfg);
         assert_eq!(two[0].cells.len(), 24);
         assert_eq!(two[1].cells.len(), 24);
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn too_many_tabs_fall_back_to_an_equal_fill_below_min() {
         let cfg = TabBarConfig::default(); // min 10
-                                           // Twenty tabs cannot each be 10 wide in 80 cols; they fill equally at 4.
+        // Twenty tabs cannot each be 10 wide in 80 cols; they fill equally at 4.
         let many: Vec<_> = (0..20).map(|_| label("t", false)).collect();
         let slots = lay(80, &many, &cfg);
         assert!(slots.iter().all(|s| s.cells.len() == 4));
@@ -1104,7 +1104,7 @@ mod tests {
         let fonts = fonts();
         let cfg = equal_cfg();
         let mut slots = equal_blocks(&cfg, 3); // 0..10, 10..20, 20..30
-                                               // A narrow window cut the final block to half its width.
+        // A narrow window cut the final block to half its width.
         slots[2].cells = 20..25;
         let bar = geom(&fonts, 30, 0);
         let pitch = slots[0].cells.len() as i32 * METRICS.w; // 80, from the full slot 0

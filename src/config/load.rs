@@ -16,8 +16,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::color::{parse_x11_color, Rgb};
-use crate::config::{Config, TabBarPosition, FONT_SIZE_RANGE, TAB_BAR_HEIGHT_RANGE};
+use crate::color::{Rgb, parse_x11_color};
+use crate::config::{Config, FONT_SIZE_RANGE, TAB_BAR_HEIGHT_RANGE, TabBarPosition};
 
 /// A config line the loader could not use.
 #[derive(Clone, Debug, PartialEq, Eq)]

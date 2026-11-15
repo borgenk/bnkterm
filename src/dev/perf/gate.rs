@@ -4,11 +4,11 @@
 //! footprint gate beside it.
 
 use crate::color::Theme;
-use crate::dev::perf::footprint::{gate_footprints, measure_footprints, FOOTPRINT_PATH};
+use crate::dev::perf::footprint::{FOOTPRINT_PATH, gate_footprints, measure_footprints};
 use crate::dev::perf::instructions::Counter;
 use crate::dev::perf::{
-    corpus, ensure_parent, parse_rows, plain_frame, ratio_pct, read_if_present, BENCH_COLS,
-    BENCH_ROWS, METRICS, RENDER_FONT_PX,
+    BENCH_COLS, BENCH_ROWS, METRICS, RENDER_FONT_PX, corpus, ensure_parent, parse_rows,
+    plain_frame, ratio_pct, read_if_present,
 };
 use crate::dev::{alloc, flags};
 use crate::error::{Error, Result};
@@ -16,9 +16,9 @@ use crate::grid::{LinkId, LinkProbe, Screen};
 use crate::platform::freetype::Fonts;
 use crate::platform::geom::Rect;
 use crate::platform::verdict::{Refusal, Verdict};
-use crate::render::display::{damage_into, DisplayListPool};
-use crate::render::gpu::{build_frame_into, FrameData, GlyphCache, TextGamma};
-use crate::term_render::{build_display_list_into, CellMetrics, FrameInputs};
+use crate::render::display::{DisplayListPool, damage_into};
+use crate::render::gpu::{FrameData, GlyphCache, TextGamma, build_frame_into};
+use crate::term_render::{CellMetrics, FrameInputs, build_display_list_into};
 use crate::vt::Parser;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -903,8 +903,9 @@ fn write_samples(path: &str, samples: &[Sample]) -> Result<()> {
     ensure_parent(path)?;
     let mut sorted: Vec<&Sample> = samples.iter().collect();
     sorted.sort_by_key(|s| s.name);
-    let mut text =
-        format!("# bnkterm perf results: name, ns/op, allocations over {COUNTED_OPS} ops (lower is better)\n");
+    let mut text = format!(
+        "# bnkterm perf results: name, ns/op, allocations over {COUNTED_OPS} ops (lower is better)\n"
+    );
     for s in sorted {
         if alloc::ENABLED {
             let _ = writeln!(text, "{}\t{}\t{}", s.name, s.ns, s.allocs);
@@ -983,22 +984,28 @@ mod tests {
             link_scenario(&LinkFixture { iters: 1, ..f }).unwrap();
         }
         let [bare, anchor, wrapped, refused] = link_fixtures();
-        assert!(link_scenario(&LinkFixture {
-            anchored: true,
-            ..bare
-        })
-        .is_err());
-        assert!(link_scenario(&LinkFixture {
-            url: "https://example.com/",
-            ..anchor
-        })
-        .is_err());
+        assert!(
+            link_scenario(&LinkFixture {
+                anchored: true,
+                ..bare
+            })
+            .is_err()
+        );
+        assert!(
+            link_scenario(&LinkFixture {
+                url: "https://example.com/",
+                ..anchor
+            })
+            .is_err()
+        );
         assert!(link_scenario(&LinkFixture { rows: 2, ..wrapped }).is_err());
-        assert!(link_scenario(&LinkFixture {
-            verdict: Verdict::Open,
-            ..refused
-        })
-        .is_err());
+        assert!(
+            link_scenario(&LinkFixture {
+                verdict: Verdict::Open,
+                ..refused
+            })
+            .is_err()
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use crate::platform::fontconfig::FontFile;
 use crate::platform::freetype::{
-    FT_Load_Glyph, Face, FtBitmap, FT_LOAD_COLOR, FT_LOAD_RENDER, FT_PIXEL_MODE_BGRA,
+    FT_LOAD_COLOR, FT_LOAD_RENDER, FT_Load_Glyph, FT_PIXEL_MODE_BGRA, Face, FtBitmap,
 };
 use crate::platform::grapheme;
 use crate::platform::pixel::{premultiplied_over, resample_argb, straight_from_premultiplied};

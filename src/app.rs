@@ -43,13 +43,13 @@ use std::time::{Duration, Instant};
 use self::activation::{Activation, ClickedLink};
 use self::clipboard::{PendingSend, SelectionTransport, Transport};
 use self::host_check::HostChecks;
-use self::layout::{TerminalGeometry, WindowLayout, WINDOW_PADDING};
+use self::layout::{TerminalGeometry, WINDOW_PADDING, WindowLayout};
 use self::message::ToWindow;
 use self::present::GpuPresentation;
 use self::seat::PointerState;
 use self::tabs::Tabs;
 use self::terminal::TerminalCore;
-use crate::config::{self, Config, TabBarConfig, FONT_SIZE_RANGE};
+use crate::config::{self, Config, FONT_SIZE_RANGE, TabBarConfig};
 // The app orchestrates the platform/render layers (which carry their own error
 // type) and the terminal core (which uses the crate-level one). It speaks the
 // crate-level `Error`/`Result` throughout; a `?` on a platform call converts
@@ -128,10 +128,15 @@ impl Verbosity {
 
 /// Open the window, spawn the user's shell, and run the terminal until the shell exits or
 /// the window is closed.
-pub fn run(verbosity: Verbosity) -> crate::error::Result<()> {
-    // First, while this is the only thread: every child spawned from here on, a local
-    // shell, `flatpak-spawn` or a link's `xdg-open`, starts without the token.
-    let launch_token = activation::take_launch_token();
+///
+/// # Safety
+///
+/// No other thread may exist yet: this removes the launch token from the environment.
+pub unsafe fn run(verbosity: Verbosity) -> crate::error::Result<()> {
+    // First, so every child spawned from here on, a local shell, `flatpak-spawn` or a
+    // link's `xdg-open`, starts without the token.
+    // SAFETY: the caller guarantees this is the only thread.
+    let launch_token = unsafe { activation::take_launch_token() };
     let host = flatpak_host();
     let shell = match &host {
         Some(host) => host.var("SHELL"),
@@ -217,8 +222,13 @@ fn terminal_env() -> Vec<EnvVar> {
 /// `--demo`: open the window on the static styled grid, without a PTY. It is the same grid
 /// the screenshot asset is captured from (`make screenshot`), which is why the flag stays,
 /// and it isolates a render question from a live shell.
-pub fn run_demo(verbosity: Verbosity) -> crate::error::Result<()> {
-    let launch_token = activation::take_launch_token();
+///
+/// # Safety
+///
+/// As for [`run`].
+pub unsafe fn run_demo(verbosity: Verbosity) -> crate::error::Result<()> {
+    // SAFETY: the caller guarantees this is the only thread.
+    let launch_token = unsafe { activation::take_launch_token() };
     let mut state = State::new(
         true,
         verbosity,
@@ -1326,7 +1336,7 @@ mod tests {
         assert_eq!(points_to_px(10.0, 180), 20); // 1.5x  -> 20.0  -> 20
         assert_eq!(points_to_px(10.0, 240), 27); // 2.0x  -> 26.67 -> 27
         assert_eq!(points_to_px(9.0, 120), 12); // 9pt at 1.0x -> 12
-                                                // Same physical size two ways: 10pt at 2x equals 20pt at 1x.
+        // Same physical size two ways: 10pt at 2x equals 20pt at 1x.
         assert_eq!(points_to_px(10.0, 240), points_to_px(20.0, 120));
     }
 

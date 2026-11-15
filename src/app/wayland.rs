@@ -3,7 +3,7 @@
 //! the code that handles it.
 
 use crate::app::clipboard::Transport;
-use crate::app::{State, MAX_DIMENSION};
+use crate::app::{MAX_DIMENSION, State};
 use crate::error::{Error, Result};
 use crate::platform::protocol::{
     self, wl_buffer, wl_callback, wl_display, wl_keyboard, wl_output, wl_registry, wl_seat,

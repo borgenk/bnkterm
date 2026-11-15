@@ -10,10 +10,11 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // SAFETY: nothing above starts a thread.
     let result = match invocation.mode {
         Mode::GpuProbe => app::gpu_probe(),
-        Mode::Demo => app::run_demo(invocation.verbosity),
-        Mode::Run => app::run(invocation.verbosity),
+        Mode::Demo => unsafe { app::run_demo(invocation.verbosity) },
+        Mode::Run => unsafe { app::run(invocation.verbosity) },
     };
     if let Err(e) = result {
         eprintln!("bnkterm: {e}");

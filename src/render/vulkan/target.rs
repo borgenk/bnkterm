@@ -5,9 +5,9 @@ use crate::platform::error::{Error, Result};
 use crate::render::gpu::{AtlasInfo, AtlasUpload, FrameData};
 use crate::render::vulkan::abi::*;
 use crate::render::vulkan::renderer::{
-    color_range, destroy_texture, write_image_set, AtlasSlot, HostBuffer, Texture,
+    AtlasSlot, HostBuffer, Texture, color_range, destroy_texture, write_image_set,
 };
-use crate::render::vulkan::{pick_memory_type, Gpu};
+use crate::render::vulkan::{Gpu, pick_memory_type};
 
 /// How long a frame waits on the CPU for the compositor to finish reading its buffer,
 /// when that wait cannot ride the GPU. Past it the frame renders anyway: a frame that may

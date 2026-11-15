@@ -35,7 +35,7 @@ use crate::platform::geom::Rect;
 use crate::platform::grapheme;
 use crate::render::boxdraw;
 use crate::render::display::DrawCmd;
-use crate::render::gpu::atlas::{pack_argb, Atlas};
+use crate::render::gpu::atlas::{Atlas, pack_argb};
 use crate::render::gpu::cache::{AsciiRow, ClusterSlots, EmojiFit, PackedGlyph};
 use crate::render::gpu::gamma::Paint;
 

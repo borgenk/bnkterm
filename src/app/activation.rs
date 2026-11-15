@@ -67,13 +67,19 @@ impl Activation {
 }
 
 /// The token this process was launched with, removed from the environment with its X11
-/// counterpart so no child inherits either. Sound only before any other thread exists.
-pub(super) fn take_launch_token() -> Option<String> {
+/// counterpart so no child inherits either.
+///
+/// # Safety
+///
+/// No other thread may exist: removing an environment variable races any concurrent
+/// read of the environment.
+pub(super) unsafe fn take_launch_token() -> Option<String> {
     let token = LAUNCH_TOKEN_VARS
         .iter()
         .find_map(|name| std::env::var(name).ok().filter(|token| !token.is_empty()));
     for name in LAUNCH_TOKEN_VARS {
-        std::env::remove_var(name);
+        // SAFETY: the caller guarantees this is the only thread.
+        unsafe { std::env::remove_var(name) };
     }
     token
 }
@@ -165,7 +171,7 @@ impl State {
 mod tests {
     use std::process::Command;
 
-    use crate::app::activation::{take_launch_token, Activation};
+    use crate::app::activation::{Activation, take_launch_token};
     use crate::platform::browser::Opener;
     use crate::pty::Target;
 
@@ -183,7 +189,8 @@ mod tests {
     #[test]
     #[ignore = "helper: run in a child process by the_launch_token_is_taken_and_never_inherited"]
     fn take_the_launch_token_then_report_what_a_child_inherits() {
-        let token = take_launch_token();
+        // SAFETY: the only test in its process, run with `--test-threads=1`.
+        let token = unsafe { take_launch_token() };
         let inherited = Command::new("env").output().unwrap();
         println!("token={token:?}");
         print!("{}", String::from_utf8_lossy(&inherited.stdout));

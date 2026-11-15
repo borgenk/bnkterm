@@ -594,8 +594,10 @@ mod tests {
         for cmd in &out {
             if let DrawCmd::Cells { color, text, .. } = cmd {
                 assert_eq!(*color, theme.fg.to_u32(), "overlay text is plain fg");
-                assert!(grapheme::graphemes(text)
-                    .all(|(_, cluster)| width::cluster_width(cluster) == 1));
+                assert!(
+                    grapheme::graphemes(text)
+                        .all(|(_, cluster)| width::cluster_width(cluster) == 1)
+                );
             }
         }
     }

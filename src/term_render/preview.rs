@@ -4,7 +4,7 @@
 use crate::panel::Panel;
 use crate::platform::geom::Rect;
 use crate::platform::grapheme;
-use crate::term_render::{preview_room, Painter};
+use crate::term_render::{Painter, preview_room};
 use crate::width;
 
 impl Painter<'_> {

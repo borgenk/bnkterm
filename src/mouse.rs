@@ -202,15 +202,17 @@ mod tests {
 
     #[test]
     fn off_reports_nothing() {
-        assert!(encoded(
-            MouseMode::default(),
-            MouseButton::Left,
-            MouseKind::Press,
-            0,
-            0,
-            Mods::NONE
-        )
-        .is_none());
+        assert!(
+            encoded(
+                MouseMode::default(),
+                MouseButton::Left,
+                MouseKind::Press,
+                0,
+                0,
+                Mods::NONE
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -283,15 +285,17 @@ mod tests {
             b"\x1b[<32;1;1M"
         );
         // Press-only reporting drops motion entirely.
-        assert!(encoded(
-            PRESS,
-            MouseButton::Left,
-            MouseKind::Motion,
-            0,
-            0,
-            Mods::NONE
-        )
-        .is_none());
+        assert!(
+            encoded(
+                PRESS,
+                MouseButton::Left,
+                MouseKind::Motion,
+                0,
+                0,
+                Mods::NONE
+            )
+            .is_none()
+        );
         // Button-event reporting drops a *bare* hover (no button held).
         assert!(encoded(SGR, MouseButton::None, MouseKind::Motion, 0, 0, Mods::NONE).is_none());
         // Any-event reporting keeps the bare hover: code 3 + 32 = 35.

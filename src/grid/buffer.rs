@@ -222,10 +222,10 @@ impl Marks {
     }
 
     pub(super) fn push(&mut self, mark: CombiningMark) {
-        if let Some((col, n)) = &mut self.counted {
-            if usize::from(*col) == mark.col {
-                *n = n.saturating_add(1);
-            }
+        if let Some((col, n)) = &mut self.counted
+            && usize::from(*col) == mark.col
+        {
+            *n = n.saturating_add(1);
         }
         self.list.push(mark);
     }
@@ -442,10 +442,10 @@ impl Row {
         if new_cols < old {
             self.cells.truncate(new_cols);
             self.combining.retain(|m| m.col < new_cols);
-            if let Some(last) = self.cells.last_mut() {
-                if last.is_wide_leader() {
-                    *last = PackedCell::BLANK;
-                }
+            if let Some(last) = self.cells.last_mut()
+                && last.is_wide_leader()
+            {
+                *last = PackedCell::BLANK;
             }
         } else if new_cols > old {
             self.cells.resize(new_cols, PackedCell::BLANK);
@@ -749,10 +749,8 @@ impl Buffer {
                 };
                 *slot = PackedCell::new(c, width, pen.style, pen.link);
             }
-            if wide {
-                if let Some(slot) = r.cells.get_mut(col.saturating_add(1)) {
-                    *slot = PackedCell::new(' ', CellWidth::Spacer, pen.style, pen.link);
-                }
+            if wide && let Some(slot) = r.cells.get_mut(col.saturating_add(1)) {
+                *slot = PackedCell::new(' ', CellWidth::Spacer, pen.style, pen.link);
             }
             col = col.saturating_add(usize::from(cell_width));
         }
@@ -1137,16 +1135,17 @@ impl Buffer {
             // at both widths: keep the row and adjust only its width. Trimming and re-laying
             // it out would pad the same text back into the same single row, so the cells
             // never need to move, and this is the shape of nearly every scrollback row.
-            if let Some([row]) = old_rows.get_mut(start..idx) {
-                if !row.wrapped && row.is_blank_from(new_cols) {
-                    let empty = row.is_blank_from(0);
-                    let mut row = std::mem::replace(row, Row::empty());
-                    row.resize_cols(new_cols);
-                    new_start.push(0);
-                    new_stream.push(row);
-                    empty_tail = if empty { empty_tail + 1 } else { 0 };
-                    continue;
-                }
+            if let Some([row]) = old_rows.get_mut(start..idx)
+                && !row.wrapped
+                && row.is_blank_from(new_cols)
+            {
+                let empty = row.is_blank_from(0);
+                let mut row = std::mem::replace(row, Row::empty());
+                row.resize_cols(new_cols);
+                new_start.push(0);
+                new_stream.push(row);
+                empty_tail = if empty { empty_tail + 1 } else { 0 };
+                continue;
             }
 
             // Unwrap the run into the reused buffer: one flat cell sequence with the marks

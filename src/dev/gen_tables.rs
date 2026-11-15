@@ -436,7 +436,7 @@ fn incb_ranges() -> Result<Vec<(u32, u32, &'static str)>> {
             other => {
                 return Err(Error::msg(format!(
                     "unknown Indic_Conjunct_Break value {other:?}"
-                )))
+                )));
             }
         };
         ranges.push((lo, hi, variant));

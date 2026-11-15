@@ -434,13 +434,17 @@ mod tests {
         // report, as does any key past sixteen bytes.
         assert_eq!(apply_all(&["state=done:app=a,b"]).records().len(), 1);
         let long_app = "a".repeat(33);
-        assert!(apply_all(&[format!("state=done:app={long_app}")])
-            .records()
-            .is_empty());
+        assert!(
+            apply_all(&[format!("state=done:app={long_app}")])
+                .records()
+                .is_empty()
+        );
         let long_key = "k".repeat(17);
-        assert!(apply_all(&[format!("state=done:{long_key}=1")])
-            .records()
-            .is_empty());
+        assert!(
+            apply_all(&[format!("state=done:{long_key}=1")])
+                .records()
+                .is_empty()
+        );
         // The key limit binds keys, not a malformed token that never had one.
         let token = "t".repeat(17);
         assert_eq!(

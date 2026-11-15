@@ -15,8 +15,8 @@
 //! place every other link does, and the thread only judges.
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::app::State;
 use crate::platform::ffi;
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn a_check_reports_back_what_to_open_or_refuse_and_wakes_the_loop() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
         let fixture = FixtureDir::new();
         let dir = fixture.0.as_path();
         let script = dir.join("build.sh");

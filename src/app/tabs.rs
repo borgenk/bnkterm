@@ -414,10 +414,10 @@ impl Tabs {
         self.drag = Some(drag);
         // The dragged tab is always the active one, so its current slot is `active`;
         // move only when its centre has crossed into a different block.
-        if let Some(want) = want {
-            if want != self.active {
-                self.move_active_to(want);
-            }
+        if let Some(want) = want
+            && want != self.active
+        {
+            self.move_active_to(want);
         }
     }
 
@@ -718,23 +718,23 @@ impl Tabs {
         link_preview: bool,
     ) {
         self.active().fill_frame_list(out, strings, link_preview);
-        if self.shows_bar() {
-            if let Some(bar) = &self.bar_geom {
-                // A lifted drag resolves to the slot its id now sits in (a background
-                // close may have shifted it) plus the block's floating left edge.
-                let lift = self
-                    .drag
-                    .as_ref()
-                    .filter(|drag| drag.lifted)
-                    .and_then(|drag| {
-                        let slot = self.entries.iter().position(|entry| entry.id == drag.id)?;
-                        Some(Lift {
-                            slot,
-                            left: drag.left,
-                        })
-                    });
-                tab_bar::fill_bar(out, strings, &self.bar_slots, bar, &self.cfg, fonts, lift);
-            }
+        if self.shows_bar()
+            && let Some(bar) = &self.bar_geom
+        {
+            // A lifted drag resolves to the slot its id now sits in (a background
+            // close may have shifted it) plus the block's floating left edge.
+            let lift = self
+                .drag
+                .as_ref()
+                .filter(|drag| drag.lifted)
+                .and_then(|drag| {
+                    let slot = self.entries.iter().position(|entry| entry.id == drag.id)?;
+                    Some(Lift {
+                        slot,
+                        left: drag.left,
+                    })
+                });
+            tab_bar::fill_bar(out, strings, &self.bar_slots, bar, &self.cfg, fonts, lift);
         }
     }
 
@@ -1040,10 +1040,11 @@ mod tests {
         );
         assert!(tabs.close(ids[2], true));
         assert!(tabs.is_empty());
-        assert!(tabs
-            .take_outbox()
-            .into_iter()
-            .any(|message| matches!(message, ToWindow::Closed)));
+        assert!(
+            tabs.take_outbox()
+                .into_iter()
+                .any(|message| matches!(message, ToWindow::Closed))
+        );
     }
 
     /// Drive `tabs` for up to `within` or until its notice is raised, answering whether
@@ -1434,16 +1435,19 @@ mod tests {
             .feed_test_bytes(b"\x1b]2;background job\x07");
 
         let routed = tabs.take_outbox();
-        assert!(!routed
-            .iter()
-            .any(|message| matches!(message, ToWindow::Title(_))));
+        assert!(
+            !routed
+                .iter()
+                .any(|message| matches!(message, ToWindow::Title(_)))
+        );
         assert!(tabs.bar_dirty);
 
         assert!(tabs.select(background, false));
-        assert!(tabs
-            .take_outbox()
-            .into_iter()
-            .any(|message| matches!(message, ToWindow::Title(title) if title == "background job")));
+        assert!(
+            tabs.take_outbox().into_iter().any(
+                |message| matches!(message, ToWindow::Title(title) if title == "background job")
+            )
+        );
     }
 
     /// The marker each tab's slot carries, in bar order.
@@ -1567,10 +1571,11 @@ mod tests {
     fn resize_updates_every_core() {
         let mut tabs = demo_tabs(3);
         tabs.resize_all(layout(100, 30, 800, 480));
-        assert!(tabs
-            .entries
-            .iter()
-            .all(|entry| entry.core.dimensions() == (100, 30)));
+        assert!(
+            tabs.entries
+                .iter()
+                .all(|entry| entry.core.dimensions() == (100, 30))
+        );
         assert!(tabs.entries.iter().all(|entry| entry.core.origin_y() == 16));
     }
 

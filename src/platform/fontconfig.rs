@@ -72,7 +72,7 @@ const FC_RESULT_MATCH: c_int = 0;
 const FC_TRUE: c_int = 1;
 
 #[link(name = "fontconfig")]
-extern "C" {
+unsafe extern "C" {
     fn FcInit() -> c_int;
     fn FcPatternCreate() -> *mut FcPattern;
     fn FcPatternDestroy(pattern: *mut FcPattern);
@@ -294,10 +294,11 @@ fn alias_targets<'a>(
             .iter()
             .zip(&baseline)
             .all(|(left, right)| left.eq_ignore_ascii_case(right));
-    if targets.is_empty() && !same_order {
-        if let Some(first) = configured.first() {
-            targets.push(*first);
-        }
+    if targets.is_empty()
+        && !same_order
+        && let Some(first) = configured.first()
+    {
+        targets.push(*first);
     }
     targets
 }

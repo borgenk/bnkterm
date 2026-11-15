@@ -3,7 +3,7 @@
 //! and decode, parse and grid over a real file (`--cat-bench`). For finding work, not
 //! gating it.
 
-use crate::dev::perf::{duration_ns, ensure_parent, BENCH_COLS, BENCH_ROWS};
+use crate::dev::perf::{BENCH_COLS, BENCH_ROWS, duration_ns, ensure_parent};
 use crate::dev::{alloc, flags, profile, stream, sys};
 use crate::error::{Error, Result};
 use crate::gather::BUF_CAP;
@@ -490,7 +490,7 @@ impl LabArgs {
                         _ => {
                             return Err(Error::msg(
                                 "--delivery needs `recorded`, `normalized`, or `64k`",
-                            ))
+                            ));
                         }
                     }
                 }

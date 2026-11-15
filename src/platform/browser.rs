@@ -105,7 +105,7 @@ pub fn can_open(url: &str) -> bool {
 mod tests {
     use std::ffi::OsStr;
 
-    use crate::platform::browser::{can_open, open_url, xdg_open, Opener};
+    use crate::platform::browser::{Opener, can_open, open_url, xdg_open};
 
     #[test]
     fn allowed_schemes_pass() {

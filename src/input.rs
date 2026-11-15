@@ -708,15 +708,14 @@ fn push_utf8(c: char, out: &mut Vec<u8>) {
 /// C0 control byte when one exists; Alt prefixes an `ESC` before whatever the
 /// non-Alt encoding would be (`metaSendsEscape`).
 fn encode_char(c: char, mods: Mods, out: &mut Vec<u8>) {
-    if mods.contains(Mods::CTRL) {
-        if let Some(b) = ctrl_byte(c) {
-            alt_prefix(mods, out);
-            out.push(b);
-            return;
-        }
-        // Ctrl with no control mapping (e.g. Ctrl+1): fall through to the plain
-        // character, still honouring an Alt prefix.
+    if mods.contains(Mods::CTRL)
+        && let Some(b) = ctrl_byte(c)
+    {
+        alt_prefix(mods, out);
+        out.push(b);
+        return;
     }
+    // Ctrl with no control mapping (e.g. Ctrl+1) sends the plain character too.
     alt_prefix(mods, out);
     push_utf8(c, out);
 }

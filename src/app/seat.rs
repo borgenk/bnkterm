@@ -14,9 +14,9 @@
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
+use crate::app::State;
 use crate::app::clipboard::Transport;
 use crate::app::message::{PointerEvent, Side};
-use crate::app::State;
 use crate::error::{Error, Result};
 use crate::input;
 use crate::keymode::{self, Disposition, KeyMode, WindowAction};
@@ -288,21 +288,20 @@ impl State {
         // child (the alt screen has no history, so there it is a normal key). The
         // already-resolved key rather than the keycode, so the keypad's Page/Home/End
         // reach this too — with NumLock off they *are* those keys.
-        if let Some(named) = resolved {
-            if self.tabs.active_mut().handle_scroll_key(named, mods) {
-                return Ok(());
-            }
+        if let Some(named) = resolved
+            && self.tabs.active_mut().handle_scroll_key(named, mods)
+        {
+            return Ok(());
         }
         // Send the key, and if it produced bytes and the keymap marks it
         // repeatable, arm auto-repeat on it.
-        if let Some(key) = resolved {
-            if self
+        if let Some(key) = resolved
+            && self
                 .tabs
                 .active_mut()
                 .key(key, mods, input::KeyEvent::Press)?
-            {
-                self.arm_repeat(keycode);
-            }
+        {
+            self.arm_repeat(keycode);
         }
         Ok(())
     }

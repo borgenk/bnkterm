@@ -9,8 +9,8 @@ use crate::platform::geom::Rect;
 use crate::platform::verdict::Verdict;
 use crate::render::display::DrawCmd;
 use crate::term_render::{
-    bell_background, cells_safe, dim, push_owned_cells, style_of, take_string,
-    take_string_with_capacity, CellSpan, Painter,
+    CellSpan, Painter, bell_background, cells_safe, dim, push_owned_cells, style_of, take_string,
+    take_string_with_capacity,
 };
 
 /// The selection highlight background: a muted steel blue that stays legible

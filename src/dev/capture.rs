@@ -11,7 +11,7 @@
 //! chunked. Never as a golden; the hand-authored fixtures in `tests/golden.rs` are the
 //! golden path.
 //!
-//! Capturing runs through [`Pty::spawn_command`], the same fork/exec/drain the live
+//! Capturing runs through [`Pty::spawn`], the same fork/exec/drain the live
 //! terminal uses, so the `unsafe` stays in `pty.rs` and a fixture sees the PTY setup a
 //! real session does. The captured `.in` and its checksum are committed.
 //!
@@ -20,7 +20,7 @@
 
 use crate::dev::sha256;
 use crate::error::{Error, Result};
-use crate::pty::{PollSet, Pty, ReadOutcome};
+use crate::pty::{EnvVar, Launch, PollSet, Pty, ReadOutcome, Target};
 use std::path::Path;
 
 /// Where fixtures live, relative to the repo root (the CWD `make`/`cargo` run in).
@@ -92,15 +92,23 @@ struct Capture {
 /// will hang, so drive it non-interactively.
 fn capture(cols: usize, rows: usize, command: &[&str]) -> Result<Capture> {
     // A program lays out for the grid it is told about: the size is on the PTS via
-    // the winsize ioctl (set by `spawn_command`), and `COLUMNS`/`LINES` are the env
-    // fallback some programs read instead. Set them (and a known `TERM`) before the
-    // fork so the child inherits them. Safe to mutate the environment here: the
-    // capture process is single-threaded, unlike the live terminal with its gatherers.
-    std::env::set_var("TERM", "xterm-256color");
-    std::env::set_var("COLUMNS", cols.to_string());
-    std::env::set_var("LINES", rows.to_string());
+    // the winsize ioctl, and `COLUMNS`/`LINES` are the env fallback some programs read
+    // instead.
+    let set = |name: &'static str, value: &str| EnvVar {
+        name,
+        value: Some(value.to_string()),
+    };
+    let launch = Launch::new(
+        command.iter().map(|arg| arg.to_string()).collect(),
+        Target::Local,
+    )
+    .with_env(vec![
+        set("TERM", "xterm-256color"),
+        set("COLUMNS", &cols.to_string()),
+        set("LINES", &rows.to_string()),
+    ]);
 
-    let pty = Pty::spawn_command(cols, rows, command)?;
+    let pty = Pty::spawn(cols, rows, &launch)?;
     let mut poll = PollSet::new();
     let mut out = Vec::new();
     let mut chunks = Vec::new();

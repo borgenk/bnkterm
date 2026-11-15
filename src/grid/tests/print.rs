@@ -90,7 +90,7 @@ fn combining_mark_attaches_to_base() {
     let mut s = Screen::new(10, 3);
     s.print('e');
     s.print('\u{0301}'); // combining acute accent
-                         // The base cell is unchanged; the mark is in the side table.
+    // The base cell is unchanged; the mark is in the side table.
     assert_eq!(s.cell(0, 0).rune, 'e');
     assert_eq!(s.cursor(), (0, 1)); // zero-width, cursor did not advance
     assert_eq!(s.marks_at(0, 0).collect::<Vec<_>>(), ['\u{0301}']);
@@ -128,7 +128,7 @@ fn combining_mark_after_wide_char_hits_the_leader() {
     let mut s = Screen::new(10, 3);
     s.print('か'); // wide: leader at 0, spacer at 1, cursor at 2
     s.print('\u{3099}'); // combining voiced sound mark -> が
-                         // The mark composes onto the leader (col 0), not the spacer (col 1).
+    // The mark composes onto the leader (col 0), not the spacer (col 1).
     assert_eq!(s.marks_at(0, 0).collect::<Vec<_>>(), ['\u{3099}']);
     assert!(s.marks_at(0, 1).next().is_none());
 }

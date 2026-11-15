@@ -25,7 +25,7 @@
 use crate::grid::reply::push_osc_end;
 use crate::grid::*;
 use crate::platform::bytes::{base64_decode, push_decimal};
-use crate::program_status::{State, SEQUENCE_MAX};
+use crate::program_status::{SEQUENCE_MAX, State};
 
 impl Screen {
     /// OSC 0/2: set the window title.

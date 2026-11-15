@@ -580,7 +580,7 @@ struct Termios {
     c_ospeed: u32,
 }
 
-extern "C" {
+unsafe extern "C" {
     fn posix_openpt(flags: c_int) -> c_int;
     fn grantpt(fd: c_int) -> c_int;
     fn unlockpt(fd: c_int) -> c_int;
@@ -593,7 +593,7 @@ extern "C" {
     /// is not async-signal-safe and has no business in a post-fork child.
     /// [`resolve_program`] does the search in the parent instead.
     fn execve(path: *const c_char, argv: *const *const c_char, envp: *const *const c_char)
-        -> c_int;
+    -> c_int;
     fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
     fn close(fd: c_int) -> c_int;
     /// Variadic because POSIX says so: a third `mode_t` argument is read only when
@@ -709,66 +709,70 @@ unsafe fn fork_child_in_pty(
     envp: &[*const c_char],
     claim_tty: bool,
 ) -> c_int {
-    let pid = fork();
-    if pid != 0 {
-        return pid; // parent (or -1); nothing else to do here
-    }
-    // --- child: async-signal-safe only, _exit on any failure ---
-    //
-    // Signals first, because `exec` will not undo either of these for us. It resets
-    // *caught* dispositions to the default but deliberately preserves *ignored* ones,
-    // and it does not touch the signal mask at all, so whatever we leave here is what
-    // the shell and everything the shell ever runs inherits.
-    //
-    // So every disposition goes back to the default, not only the ones we set. The Rust
-    // runtime ignores `SIGPIPE`, which the parent needs (serving a clipboard selection
-    // wants `EPIPE` when the paster goes away, not death) and the child must not have:
-    // `yes | head -1` would never get the signal that is supposed to stop it. And the
-    // parent can inherit ignores of its own: `nohup` ignores `SIGHUP`, and a shell
-    // starting us with `&` ignores `SIGINT` and `SIGQUIT`, after which `Ctrl+C` stops
-    // nothing in any tab. `SIGKILL`, `SIGSTOP` and glibc's internal signals refuse the
-    // change, which is harmless.
-    for sig in 1..=SIGRTMAX {
-        signal(sig, SIG_DFL);
-    }
-    let empty = SigSet { words: [0; 16] };
-    sigprocmask(SIG_SETMASK, &empty as *const SigSet, core::ptr::null_mut());
-    setsid();
-    // Without O_NOCTTY a session leader opening a tty takes it as its controlling terminal,
-    // which has to be left to the host side when that side is to claim it.
-    let flags = if claim_tty { O_RDWR } else { O_RDWR | O_NOCTTY };
-    let slave = open(slave_path, flags);
-    if slave < 0 {
-        _exit(127);
-    }
-    // Every one of these is checked, and the point is what an *unchecked* failure would
-    // look like: a `TIOCSCTTY` that quietly fails hands the shell a session with no
-    // controlling terminal, so job control does not work, `Ctrl+C` reaches nothing, and
-    // no error is ever printed. Failing to `_exit(127)` here is the difference between a
-    // tab that visibly refuses to open and one that opens subtly broken.
-    if claim_tty && ffi::ioctl(slave, TIOCSCTTY, 0 as c_ulong) < 0 {
-        _exit(127);
-    }
-    for fd in [0, 1, 2] {
-        if dup2(slave, fd) < 0 {
+    // SAFETY: the caller upholds the contract above, and every call below is an
+    // async-signal-safe syscall on the arguments that contract covers.
+    unsafe {
+        let pid = fork();
+        if pid != 0 {
+            return pid; // parent (or -1); nothing else to do here
+        }
+        // --- child: async-signal-safe only, _exit on any failure ---
+        //
+        // Signals first, because `exec` will not undo either of these for us. It resets
+        // *caught* dispositions to the default but deliberately preserves *ignored* ones,
+        // and it does not touch the signal mask at all, so whatever we leave here is what
+        // the shell and everything the shell ever runs inherits.
+        //
+        // So every disposition goes back to the default, not only the ones we set. The Rust
+        // runtime ignores `SIGPIPE`, which the parent needs (serving a clipboard selection
+        // wants `EPIPE` when the paster goes away, not death) and the child must not have:
+        // `yes | head -1` would never get the signal that is supposed to stop it. And the
+        // parent can inherit ignores of its own: `nohup` ignores `SIGHUP`, and a shell
+        // starting us with `&` ignores `SIGINT` and `SIGQUIT`, after which `Ctrl+C` stops
+        // nothing in any tab. `SIGKILL`, `SIGSTOP` and glibc's internal signals refuse the
+        // change, which is harmless.
+        for sig in 1..=SIGRTMAX {
+            signal(sig, SIG_DFL);
+        }
+        let empty = SigSet { words: [0; 16] };
+        sigprocmask(SIG_SETMASK, &empty as *const SigSet, core::ptr::null_mut());
+        setsid();
+        // Without O_NOCTTY a session leader opening a tty takes it as its controlling terminal,
+        // which has to be left to the host side when that side is to claim it.
+        let flags = if claim_tty { O_RDWR } else { O_RDWR | O_NOCTTY };
+        let slave = open(slave_path, flags);
+        if slave < 0 {
             _exit(127);
         }
+        // Every one of these is checked, and the point is what an *unchecked* failure would
+        // look like: a `TIOCSCTTY` that quietly fails hands the shell a session with no
+        // controlling terminal, so job control does not work, `Ctrl+C` reaches nothing, and
+        // no error is ever printed. Failing to `_exit(127)` here is the difference between a
+        // tab that visibly refuses to open and one that opens subtly broken.
+        if claim_tty && ffi::ioctl(slave, TIOCSCTTY, 0 as c_ulong) < 0 {
+            _exit(127);
+        }
+        for fd in [0, 1, 2] {
+            if dup2(slave, fd) < 0 {
+                _exit(127);
+            }
+        }
+        // The shell gets the terminal on 0-2 and nothing else. Every fd from 3 up closes: the
+        // slave's own, and any opened without close-on-exec, such as the dmabufs and sync files
+        // a GPU driver exports. Without `close_range` (before Linux 5.9) only the slave closes.
+        if ffi::close_from(3) != 0 && slave > 2 {
+            close(slave);
+        }
+        // `execve`, not `execvp`. POSIX's list of async-signal-safe functions has `execve` on
+        // it and not `execvp`, and this is a post-`fork` child in a threaded process: `execvp`
+        // walks `$PATH` and may allocate inside glibc, either of which can deadlock against a
+        // lock another thread held at the moment of the fork. `resolve_program` does the
+        // `$PATH` search up front, in the parent, where searching is allowed, and the
+        // environment was built there too.
+        execve(argv[0], argv.as_ptr(), envp.as_ptr());
+        // Only reached if exec failed.
+        _exit(127);
     }
-    // The shell gets the terminal on 0-2 and nothing else. Every fd from 3 up closes: the
-    // slave's own, and any opened without close-on-exec, such as the dmabufs and sync files
-    // a GPU driver exports. Without `close_range` (before Linux 5.9) only the slave closes.
-    if ffi::close_from(3) != 0 && slave > 2 {
-        close(slave);
-    }
-    // `execve`, not `execvp`. POSIX's list of async-signal-safe functions has `execve` on
-    // it and not `execvp`, and this is a post-`fork` child in a threaded process: `execvp`
-    // walks `$PATH` and may allocate inside glibc, either of which can deadlock against a
-    // lock another thread held at the moment of the fork. `resolve_program` does the
-    // `$PATH` search up front, in the parent, where searching is allowed, and the
-    // environment was built there too.
-    execve(argv[0], argv.as_ptr(), envp.as_ptr());
-    // Only reached if exec failed.
-    _exit(127);
 }
 
 #[cfg(test)]

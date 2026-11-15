@@ -21,7 +21,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::rc::Rc;
 
-use crate::platform::emoji::{wants_emoji, ColorGlyph, EmojiFont};
+use crate::platform::emoji::{ColorGlyph, EmojiFont, wants_emoji};
 use crate::platform::error::{Error, Result};
 use crate::platform::fontconfig::{self, FontFile, Fontconfig};
 
@@ -248,7 +248,7 @@ pub(crate) const FT_PIXEL_MODE_BGRA: u8 = 7;
 
 #[link(name = "freetype")]
 #[allow(non_snake_case)]
-extern "C" {
+unsafe extern "C" {
     fn FT_Init_FreeType(alibrary: *mut FtLibrary) -> FtError;
     fn FT_Done_FreeType(library: FtLibrary) -> FtError;
     fn FT_New_Face(
@@ -1497,7 +1497,7 @@ mod tests {
         ]
         .concat();
         let loca = u16s(&[0, 0, 18]); // glyph 0 is empty, glyph 1 is 36 bytes
-                                      // Ascender 13, descender -3, widest 11, caret upright, max before 13, min after -3.
+        // Ascender 13, descender -3, widest 11, caret upright, max before 13, min after -3.
         let line_metrics = [13, 0xFD, 11, 1, 0, 0, 0, 0, 13, 0xFD, 0, 0];
         let eblc = [
             &u32s(&[0x0002_0000, 1])[..], // version, one strike

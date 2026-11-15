@@ -7,7 +7,7 @@ use crate::platform::freetype::{FaceKey, FontStyle};
 use crate::platform::geom::Rect;
 use crate::render::display::DrawCmd;
 use crate::term_render::{
-    push_owned_cells, style_of, take_string, CursorRender, CursorShape, Painter, LOCK_GLYPH,
+    CursorRender, CursorShape, LOCK_GLYPH, Painter, push_owned_cells, style_of, take_string,
 };
 
 /// The width of a bar (`DECSCUSR 5/6`) cursor, in pixels.

@@ -17,7 +17,7 @@
 //! Struct layouts (`msghdr`, `iovec`, `cmsghdr`) mirror the Linux x86_64/arm64
 //! ABI; this targets Linux/Wayland and nothing else.
 
-use core::ffi::{c_char, c_int, c_long, c_short, c_uint, c_ulong, c_void, CStr};
+use core::ffi::{CStr, c_char, c_int, c_long, c_short, c_uint, c_ulong, c_void};
 use std::mem;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
@@ -158,7 +158,7 @@ pub(crate) enum Read {
     Err(c_int),
 }
 
-extern "C" {
+unsafe extern "C" {
     fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn mmap(
@@ -1281,10 +1281,10 @@ pub(crate) fn open_any_render_node() -> Option<OwnedFd> {
             .to_str()
             .and_then(|n| n.strip_prefix("renderD"))
             .and_then(|n| n.parse::<u32>().ok());
-        if let Some(minor) = minor {
-            if let Ok(fd) = open_drm_render_node(minor) {
-                return Some(fd);
-            }
+        if let Some(minor) = minor
+            && let Ok(fd) = open_drm_render_node(minor)
+        {
+            return Some(fd);
         }
     }
     None
@@ -1371,7 +1371,7 @@ mod tests {
     fn a_signal_storm_neither_cuts_a_bounded_wait_short_nor_stretches_it() {
         use std::os::unix::thread::{JoinHandleExt, RawPthread};
         extern "C" fn interrupt(_: c_int) {}
-        extern "C" {
+        unsafe extern "C" {
             fn signal(signum: c_int, handler: usize) -> usize;
             fn pthread_kill(thread: RawPthread, sig: c_int) -> c_int;
         }

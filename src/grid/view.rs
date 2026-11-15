@@ -90,11 +90,7 @@ impl Screen {
     /// How many lines the view is scrolled up into scrollback (0 = live bottom).
     /// Always 0 on the alt screen, which keeps no history.
     pub fn view_offset(&self) -> usize {
-        if self.on_alt {
-            0
-        } else {
-            self.view_offset
-        }
+        if self.on_alt { 0 } else { self.view_offset }
     }
 
     /// Whether the view is currently showing history rather than the live bottom.
@@ -985,10 +981,10 @@ pub(super) fn split_replies(responses: &[u8]) -> Vec<&[u8]> {
             start = i;
         }
     }
-    if let Some(reply) = responses.get(start..) {
-        if !reply.is_empty() {
-            out.push(reply);
-        }
+    if let Some(reply) = responses.get(start..)
+        && !reply.is_empty()
+    {
+        out.push(reply);
     }
     out
 }

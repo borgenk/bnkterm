@@ -486,7 +486,7 @@ fn hts_sets_a_tab_stop_and_cbt_walks_back_to_it() {
     feed(&mut s, b"\x1b[3g"); // TBC 3: clear every stop, default or otherwise
     feed(&mut s, b"\x1b[1;5H\x1bH"); // column 5 (1-based): set a stop here
     feed(&mut s, b"\x1b[1;20H\x1bH"); // and another at column 20
-                                      // A tab from home now lands on the first stop we set, not on column 8.
+    // A tab from home now lands on the first stop we set, not on column 8.
     feed(&mut s, b"\x1b[1;1H\t");
     assert_eq!(s.cursor(), (0, 4));
     feed(&mut s, b"\t");

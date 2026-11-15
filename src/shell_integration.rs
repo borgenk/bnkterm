@@ -707,8 +707,11 @@ mod tests {
         // Spliced around whatever is already there, in both forms PROMPT_COMMAND takes:
         // the report first (so a config that sets its own title still wins) and the marks
         // last (so the A mark sits closest to the prompt).
-        assert!(BASHRC
-            .contains(r#"PROMPT_COMMAND=(_bnkterm_report "${PROMPT_COMMAND[@]}" _bnkterm_marks)"#));
+        assert!(
+            BASHRC.contains(
+                r#"PROMPT_COMMAND=(_bnkterm_report "${PROMPT_COMMAND[@]}" _bnkterm_marks)"#
+            )
+        );
         assert!(BASHRC.contains(
             "PROMPT_COMMAND=$'_bnkterm_report\\n'\"${PROMPT_COMMAND}\"$'\\n_bnkterm_marks'"
         ));

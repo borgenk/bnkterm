@@ -3,15 +3,15 @@
 //! stage, and a warmed frame's allocations are counted.
 
 use crate::color::Theme;
-use crate::dev::perf::{corpus, duration_ns, plain_frame, BENCH_COLS, BENCH_ROWS, RENDER_FONT_PX};
+use crate::dev::perf::{BENCH_COLS, BENCH_ROWS, RENDER_FONT_PX, corpus, duration_ns, plain_frame};
 use crate::dev::{alloc, flags};
 use crate::error::{Error, Result};
 use crate::grid::Screen;
 use crate::platform::freetype::Fonts;
 use crate::platform::geom::Rect;
-use crate::render::display::{damage_into, DisplayListPool};
-use crate::render::gpu::{build_frame_into, FrameData, GlyphCache, TextGamma};
-use crate::term_render::{build_display_list_into, CellMetrics};
+use crate::render::display::{DisplayListPool, damage_into};
+use crate::render::gpu::{FrameData, GlyphCache, TextGamma, build_frame_into};
+use crate::term_render::{CellMetrics, build_display_list_into};
 use crate::vt::Parser;
 use std::hint::black_box;
 use std::time::Instant;
@@ -32,15 +32,16 @@ fn distinct_glyphs(start: u32, count: usize) -> Vec<u8> {
     let mut buf = [0u8; 4];
     let (mut cp, mut made, mut col) = (start, 0, 0);
     while made < count {
-        if let Some(c) = char::from_u32(cp) {
-            if !c.is_control() && !c.is_whitespace() {
-                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-                made += 1;
-                col += 1;
-                if col >= 30 {
-                    out.push(b'\n');
-                    col = 0;
-                }
+        if let Some(c) = char::from_u32(cp)
+            && !c.is_control()
+            && !c.is_whitespace()
+        {
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            made += 1;
+            col += 1;
+            if col >= 30 {
+                out.push(b'\n');
+                col = 0;
             }
         }
         cp = cp.wrapping_add(1);
@@ -228,7 +229,9 @@ pub fn render_bench(args: impl IntoIterator<Item = impl AsRef<str>>) -> Result<(
     );
     println!("  total        {:>8.1} us/frame", us(total_ns));
     if alloc::ENABLED {
-        println!("  allocs       {allocs:>8} per frame (list, strings, vertices, and damage scratch all reused)");
+        println!(
+            "  allocs       {allocs:>8} per frame (list, strings, vertices, and damage scratch all reused)"
+        );
     }
     println!(
         "  1-cell edit  {:>8.1} us list + {:.1} us diff + {:.1} us vertices = {:.1} us \

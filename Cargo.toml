@@ -3,7 +3,7 @@ cargo-features = ["panic-immediate-abort"]
 [package]
 name = "bnkterm"
 version = "0.3.3"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 
 [features]

@@ -311,7 +311,7 @@ mod tests {
         assert_eq!(printable_run_len(b"ab\x7fcd"), 2); // DEL stops it
         assert_eq!(printable_run_len(b"ab\x1fcd"), 2); // a C0 control stops it
         assert_eq!(printable_run_len(b"ab\x80"), 2); // a UTF-8 high byte stops it
-                                                     // The inclusive boundaries space (0x20) and tilde (0x7e) are printable.
+        // The inclusive boundaries space (0x20) and tilde (0x7e) are printable.
         assert_eq!(printable_run_len(&[0x20, 0x7e]), 2);
         // Exactly one SWAR word, all printable.
         assert_eq!(printable_run_len(b"abcdefgh"), 8);

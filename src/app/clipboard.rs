@@ -384,10 +384,10 @@ impl State {
                 .take_fd()
                 .ok_or_else(|| Error::msg("selection source.send arrived without its fd"))?;
             self.begin_selection_send(t, fd);
-        } else if opcode == ops.ev_cancelled {
-            if let Some(source) = self.sel_mut(t).state.retire_source() {
-                self.conn.request(source, ops.source_destroy, &[]);
-            }
+        } else if opcode == ops.ev_cancelled
+            && let Some(source) = self.sel_mut(t).state.retire_source()
+        {
+            self.conn.request(source, ops.source_destroy, &[]);
         }
         Ok(())
     }
@@ -571,7 +571,7 @@ fn mime_rank(mime: &str) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use crate::app::clipboard::{Route, SelectionState, SelectionTransport, CLIPBOARD_OPS};
+    use crate::app::clipboard::{CLIPBOARD_OPS, Route, SelectionState, SelectionTransport};
 
     #[test]
     fn a_send_to_a_replaced_source_still_has_its_fd_taken() {

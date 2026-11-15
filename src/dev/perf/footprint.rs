@@ -3,7 +3,7 @@
 //! on every machine, so it gates against `stats/footprint.txt` at equality.
 
 use crate::dev::perf::{
-    corpus, ensure_parent, parse_rows, ratio_pct, read_if_present, BENCH_COLS, BENCH_ROWS,
+    BENCH_COLS, BENCH_ROWS, corpus, ensure_parent, parse_rows, ratio_pct, read_if_present,
 };
 use crate::error::{Error, Result};
 use crate::grid::Screen;

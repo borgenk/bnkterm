@@ -429,7 +429,7 @@ pub(crate) fn as_byte_literal(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::dev::fuzz::{as_byte_literal, shrink, Rng, Stream, INTERRUPTERS};
+    use crate::dev::fuzz::{INTERRUPTERS, Rng, Stream, as_byte_literal, shrink};
 
     /// The stream has to replay exactly, or a seed in a failure report is worthless.
     #[test]
@@ -537,10 +537,10 @@ mod tests {
                 while j < bytes.len() && matches!(bytes[j], 0x20..=0x3f) {
                     j += 1;
                 }
-                if let Some(&f) = bytes.get(j) {
-                    if (0x40..=0x7e).contains(&f) {
-                        finals.insert(f);
-                    }
+                if let Some(&f) = bytes.get(j)
+                    && (0x40..=0x7e).contains(&f)
+                {
+                    finals.insert(f);
                 }
                 i = j + 1;
             } else {

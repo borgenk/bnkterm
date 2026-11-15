@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use crate::app::layout::TerminalGeometry;
-use crate::app::terminal::{demo_screen, TerminalCore};
+use crate::app::terminal::{TerminalCore, demo_screen};
 use crate::grid::CursorStyle;
 use crate::input;
 use crate::platform::scroll;

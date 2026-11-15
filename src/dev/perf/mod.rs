@@ -185,11 +185,11 @@ fn malformed_row(what: &str, line: &str, numbers: usize) -> Error {
 }
 
 fn ensure_parent(path: &str) -> Result<()> {
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::msg(format!("create {}: {e}", parent.display())))?;
-        }
+    if let Some(parent) = std::path::Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::msg(format!("create {}: {e}", parent.display())))?;
     }
     Ok(())
 }

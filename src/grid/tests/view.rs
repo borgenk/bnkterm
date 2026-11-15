@@ -65,8 +65,8 @@ fn the_alt_screen_reports_nothing_to_scroll() {
     feed(&mut s, b"a\r\nb\r\nc\r\nd");
     assert!(s.scrollback_len() > 0, "the primary screen has history");
     feed(&mut s, b"\x1b[?1049h"); // enter the alt screen
-                                  // The history is still behind it, but the alt screen does not show it, so it
-                                  // reports content == viewport: unscrollable, which is what hides the bar.
+    // The history is still behind it, but the alt screen does not show it, so it
+    // reports content == viewport: unscrollable, which is what hides the bar.
     assert_eq!(s.scroll_extent(), (2, 2));
     assert_eq!(s.scroll_position(), 0);
     // And a thumb cannot drag a view that does not scroll.

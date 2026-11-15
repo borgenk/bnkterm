@@ -56,7 +56,7 @@ struct HbGlyphPosition {
 }
 
 #[link(name = "harfbuzz")]
-extern "C" {
+unsafe extern "C" {
     fn hb_ft_font_create_referenced(ft_face: *mut c_void) -> *mut c_void;
     fn hb_font_destroy(font: *mut c_void);
     fn hb_buffer_create() -> *mut c_void;

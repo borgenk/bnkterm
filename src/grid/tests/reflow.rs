@@ -561,7 +561,7 @@ fn reflow_carries_prompt_marks() {
     feed(&mut s, b"\x1b]133;C\x07cdefgh"); // output "cdefgh" wraps to "cdef" | "gh"
     assert_eq!(s.prompts()[0].row, s.abs_row(0));
     s.resize(8, 4); // widen: "ab" stays row 0, "cdefgh" rejoins below it
-                    // The prompt still names the row holding "ab", and its output the rejoined line.
+    // The prompt still names the row holding "ab", and its output the rejoined line.
     let p = s.prompts()[0];
     let prompt_row = s.display_row(p.row).expect("prompt row on screen");
     assert_eq!(s.row_string(prompt_row).trim_end(), "ab");

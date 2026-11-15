@@ -108,7 +108,7 @@ pub fn host_argv(command: &[String], env: &[EnvVar]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::flatpak::{host_argv, parse_env0, Host};
+    use crate::flatpak::{Host, host_argv, parse_env0};
     use crate::pty::EnvVar;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStrExt;
