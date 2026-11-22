@@ -18,8 +18,8 @@
 //! into 256-scalar pages and identical pages share one body, keeping lookup to
 //! two indexed loads without carrying a 1.1 MiB flat table. The generator also
 //! retains the source ranges in test builds as an exhaustive correctness oracle.
-//! Control characters never reach `width`: the parser
-//! dispatches C0/C1 as actions, so only printable scalar values are measured.
+//! Control characters never reach `width`: the parser executes C0 and drops C1,
+//! so only printable scalar values are measured.
 //! xterm is the reference for the two wcwidth tweaks the generator bakes in
 //! (SOFT HYPHEN is width 1, not 0; the Hangul jamo are width 0 though not marks).
 

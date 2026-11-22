@@ -135,7 +135,7 @@ pub trait Perform {
             self.print(char::from(b));
         }
     }
-    /// A C0/C1 control byte to act on (BS, HT, LF, CR, ...).
+    /// A C0 control byte to act on (BS, HT, LF, CR, ...).
     fn execute(&mut self, byte: u8);
     /// A complete CSI sequence: its numeric parameters, intermediate bytes, the
     /// private-marker byte if any (`?`/`<`/`=`/`>`, else 0), and the final byte.
@@ -516,8 +516,10 @@ impl Parser {
         // if this is not one, emit the replacement char and reprocess `byte`.
         if self.utf8_remaining > 0 {
             if self.utf8_continue(byte) {
-                if self.utf8_remaining == 0 {
-                    p.print(self.finish_utf8());
+                if self.utf8_remaining == 0
+                    && let Some(decoded) = self.finish_utf8()
+                {
+                    p.print(decoded);
                 }
                 return;
             }
@@ -588,8 +590,9 @@ impl Parser {
             if self.utf8_remaining > 0 {
                 if self.utf8_continue(byte) {
                     consumed += 1;
-                    if self.utf8_remaining == 0 {
-                        let decoded = self.finish_utf8();
+                    if self.utf8_remaining == 0
+                        && let Some(decoded) = self.finish_utf8()
+                    {
                         run.push(performer, decoded);
                     }
                     continue;
@@ -668,14 +671,19 @@ impl Parser {
         true
     }
 
-    /// Turn a completed code point into a char.
+    /// Turn a completed code point into the char to print, or `None` for a C1 control
+    /// (U+0080 to U+009F), which is dropped rather than printed or executed, as in xterm.
     ///
     /// No overlong or surrogate check is needed here, and its absence is the point: the
     /// per-lead ranges in [`utf8_lead`] mean an ill-formed value can never be accumulated
     /// in the first place. The `unwrap_or` is unreachable and kept only because the
     /// no-panic rule does not make exceptions for reasoning.
-    fn finish_utf8(&self) -> char {
-        char::from_u32(self.utf8_char).unwrap_or('\u{FFFD}')
+    fn finish_utf8(&self) -> Option<char> {
+        // Table 3-7 starts at `C2`, so no completed sequence is below U+0080.
+        if self.utf8_char < 0xa0 {
+            return None;
+        }
+        Some(char::from_u32(self.utf8_char).unwrap_or('\u{FFFD}'))
     }
 
     // ---- escape -------------------------------------------------------------
@@ -1723,9 +1731,9 @@ mod tests {
 
         // And the edges of Table 3-7 itself, which is what makes the above fall out.
         assert_eq!(
-            printed(&[0xc2, 0x80]),
-            "\u{80}",
-            "the smallest two-byte form"
+            printed(&[0xc2, 0x80, b'A']),
+            "A",
+            "the smallest two-byte form is well-formed: a C1 control, dropped, not U+FFFD"
         );
         assert_eq!(
             printed(&[0xe0, 0xa0, 0x80]),
@@ -1791,6 +1799,39 @@ mod tests {
         p.advance_bytes(&mut r, b"hi\x1b["); // trailing CSI introducer, no final byte
         assert!(!p.finish(&mut r));
         assert_eq!(r.actions, vec![Action::Print('h'), Action::Print('i')]);
+    }
+
+    /// All 32, through both decode paths and split across a read; U+00A0 still prints.
+    #[test]
+    fn utf8_encoded_c1_controls_are_dropped() {
+        for cp in 0x80..=0x9f_u32 {
+            let c1 = char::from_u32(cp).unwrap();
+            for (src, want) in [
+                (format!("A{c1}B"), ['A', 'B']),
+                (format!("é{c1}é"), ['é', 'é']),
+            ] {
+                let want = Vec::from(want.map(Action::Print));
+                assert_eq!(
+                    run(src.as_bytes()),
+                    want,
+                    "U+{cp:04X} through advance_bytes"
+                );
+                assert_eq!(
+                    run_per_byte(src.as_bytes()),
+                    want,
+                    "U+{cp:04X} through advance"
+                );
+            }
+        }
+
+        let mut p = Parser::new();
+        let mut r = Recorder::default();
+        p.advance_bytes(&mut r, &[0xc2]);
+        p.advance_bytes(&mut r, &[0x85, b'x']);
+        assert_eq!(r.actions, vec![Action::Print('x')], "split across a read");
+
+        assert_eq!(run(&[0xc2, 0xa0]), vec![Action::Print('\u{a0}')]);
+        assert_eq!(run_per_byte(&[0xc2, 0xa0]), vec![Action::Print('\u{a0}')]);
     }
 
     #[test]
