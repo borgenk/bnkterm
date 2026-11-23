@@ -83,6 +83,70 @@ const fn utf8_lead(byte: u8) -> Option<Utf8Lead> {
     })
 }
 
+/// The char a completed code point prints as, or `None` for a C1 control (U+0080 to
+/// U+009F), which is dropped rather than printed or executed, as in xterm.
+///
+/// No overlong or surrogate check is needed here, and its absence is the point: the
+/// per-lead ranges in [`utf8_lead`] mean an ill-formed value can never be accumulated
+/// in the first place. The `unwrap_or` is unreachable and kept only because the
+/// no-panic rule does not make exceptions for reasoning.
+fn printable_scalar(value: u32) -> Option<char> {
+    // Table 3-7 starts at `C2`, so no completed sequence is below U+0080.
+    if value < 0xa0 {
+        return None;
+    }
+    Some(char::from_u32(value).unwrap_or('\u{FFFD}'))
+}
+
+/// Decode the well-formed multibyte sequences at the start of `bytes` into `run`, and
+/// return how many bytes they took. Stops at ASCII, a partial sequence, or a malformed
+/// one, all of which the byte-at-a-time decoder owns.
+///
+/// The ranges are Unicode Table 3-7 again, matched on the bytes directly: going through
+/// [`utf8_lead`] costs a struct and an `Option` per scalar.
+/// `every_lead_and_continuation_decodes_the_same_on_both_paths` holds the two
+/// transcriptions to the same answer.
+fn decode_well_formed<P: Perform>(bytes: &[u8], performer: &mut P, run: &mut TextRun) -> usize {
+    let low6 = |byte: u8| u32::from(byte & 0x3f);
+    let continuation = |byte: u8| byte & 0xc0 == 0x80;
+    let mut rest = bytes;
+    loop {
+        let value = match *rest {
+            [b0 @ 0xc2..=0xdf, b1, ref tail @ ..] if continuation(b1) => {
+                rest = tail;
+                (u32::from(b0 & 0x1f) << 6) | low6(b1)
+            }
+            [b0 @ 0xe0..=0xef, b1, b2, ref tail @ ..]
+                if continuation(b2)
+                    && match b0 {
+                        0xe0 => (0xa0..=0xbf).contains(&b1),
+                        0xed => (0x80..=0x9f).contains(&b1),
+                        _ => continuation(b1),
+                    } =>
+            {
+                rest = tail;
+                (u32::from(b0 & 0x0f) << 12) | (low6(b1) << 6) | low6(b2)
+            }
+            [b0 @ 0xf0..=0xf4, b1, b2, b3, ref tail @ ..]
+                if continuation(b2)
+                    && continuation(b3)
+                    && match b0 {
+                        0xf0 => (0x90..=0xbf).contains(&b1),
+                        0xf4 => (0x80..=0x8f).contains(&b1),
+                        _ => continuation(b1),
+                    } =>
+            {
+                rest = tail;
+                (u32::from(b0 & 0x07) << 18) | (low6(b1) << 12) | (low6(b2) << 6) | low6(b3)
+            }
+            _ => return bytes.len() - rest.len(),
+        };
+        if let Some(c) = printable_scalar(value) {
+            run.push(performer, c);
+        }
+    }
+}
+
 /// Whether the first UTF-8 lead is still capable of completing validly with the
 /// bytes already present. A missing continuation is not invalid—the next PTY
 /// chunk may provide it—but a present out-of-range continuation keeps the
@@ -604,6 +668,13 @@ impl Parser {
             }
 
             if byte.wrapping_sub(0x20) <= 0x5e {
+                // A lone printable byte between multibyte scalars (a space between words,
+                // a base letter before its mark) skips the run scan.
+                if bytes.get(consumed + 1).is_some_and(|&next| next >= 0x80) {
+                    run.push(performer, char::from(byte));
+                    consumed += 1;
+                    continue;
+                }
                 let tail = bytes.get(consumed..).unwrap_or_default();
                 let ascii = bytes::printable_run_len(tail);
                 if ascii >= ASCII_HANDOFF {
@@ -623,10 +694,18 @@ impl Parser {
                 // Caught by the ASCII handoff above; retained for exhaustiveness.
                 0x20..=0x7e => run.push(performer, char::from(byte)),
                 0x7f => {} // DEL is ignored without breaking adjacent text.
-                0x80..=0xff => match utf8_lead(byte) {
-                    Some(lead) => self.utf8_begin(lead),
-                    None => run.push(performer, '\u{fffd}'),
-                },
+                0x80..=0xff => {
+                    let tail = bytes.get(consumed..).unwrap_or_default();
+                    let decoded = decode_well_formed(tail, performer, run);
+                    if decoded > 0 {
+                        consumed += decoded;
+                        continue;
+                    }
+                    match utf8_lead(byte) {
+                        Some(lead) => self.utf8_begin(lead),
+                        None => run.push(performer, '\u{fffd}'),
+                    }
+                }
             }
             consumed += 1;
         }
@@ -671,19 +750,8 @@ impl Parser {
         true
     }
 
-    /// Turn a completed code point into the char to print, or `None` for a C1 control
-    /// (U+0080 to U+009F), which is dropped rather than printed or executed, as in xterm.
-    ///
-    /// No overlong or surrogate check is needed here, and its absence is the point: the
-    /// per-lead ranges in [`utf8_lead`] mean an ill-formed value can never be accumulated
-    /// in the first place. The `unwrap_or` is unreachable and kept only because the
-    /// no-panic rule does not make exceptions for reasoning.
     fn finish_utf8(&self) -> Option<char> {
-        // Table 3-7 starts at `C2`, so no completed sequence is below U+0080.
-        if self.utf8_char < 0xa0 {
-            return None;
-        }
-        Some(char::from_u32(self.utf8_char).unwrap_or('\u{FFFD}'))
+        printable_scalar(self.utf8_char)
     }
 
     // ---- escape -------------------------------------------------------------
@@ -1799,6 +1867,39 @@ mod tests {
         p.advance_bytes(&mut r, b"hi\x1b["); // trailing CSI introducer, no final byte
         assert!(!p.finish(&mut r));
         assert_eq!(r.actions, vec![Action::Print('h'), Action::Print('i')]);
+    }
+
+    /// Inside a run, because a sequence that opens a chunk never reaches the run lane's own
+    /// copy of Table 3-7.
+    #[test]
+    fn every_lead_and_continuation_decodes_the_same_on_both_paths() {
+        for lead in 0x80..=0xff_u8 {
+            let len = match lead {
+                0xe0..=0xef => 3,
+                0xf0..=0xff => 4,
+                _ => 2,
+            };
+            let first = match lead {
+                0xe0 => 0xa0,
+                0xf0 => 0x90,
+                _ => 0x80,
+            };
+            for position in 1..len {
+                for value in 0..=0xff_u8 {
+                    let mut src = "é".as_bytes().to_vec();
+                    src.push(lead);
+                    for at in 1..len {
+                        src.push(match at {
+                            _ if at == position => value,
+                            1 => first,
+                            _ => 0x80,
+                        });
+                    }
+                    src.extend_from_slice("é".as_bytes());
+                    assert_eq!(run(&src), run_per_byte(&src), "{src:02x?}");
+                }
+            }
+        }
     }
 
     /// All 32, through both decode paths and split across a read; U+00A0 still prints.
