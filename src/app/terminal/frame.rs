@@ -86,10 +86,14 @@ impl TerminalCore {
     /// Scroll the scrollback view for a navigation chord on the primary screen, returning
     /// whether the key was consumed: Shift + PageUp/PageDown/Home/End moves by pages and
     /// ends, and Ctrl+Shift + Up/Down jumps between the prompts the shell marked. A page is
-    /// a screenful less one line, so a line of context carries across. The window resolves
-    /// the keycode to a named key; the grid does the scrolling.
+    /// a screenful less one line, so a line of context carries across. With Super held the
+    /// key goes to the child. The window resolves the keycode to a named key; the grid does
+    /// the scrolling.
     pub(in crate::app) fn handle_scroll_key(&mut self, key: input::Key, mods: input::Mods) -> bool {
-        if !mods.contains(input::Mods::SHIFT) || self.screen.is_alt() {
+        if !mods.contains(input::Mods::SHIFT)
+            || mods.contains(input::Mods::SUPER)
+            || self.screen.is_alt()
+        {
             return false;
         }
         let (_, rows) = self.screen.dimensions();
@@ -951,6 +955,15 @@ mod tests {
         let mut core = scrollable_core(100);
         assert!(core.handle_scroll_key(input::Key::PageUp, input::Mods::SHIFT));
         assert!(core.scrollbar_retry_at().is_some());
+    }
+
+    #[test]
+    fn a_super_chord_leaves_the_scrollback_to_the_child() {
+        let mut core = scrollable_core(100);
+        let super_shift = input::Mods::SUPER | input::Mods::SHIFT;
+        assert!(!core.handle_scroll_key(input::Key::PageUp, super_shift));
+        assert!(!core.handle_scroll_key(input::Key::Home, super_shift));
+        assert!(!core.screen.is_scrolled());
     }
 
     #[test]

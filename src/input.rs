@@ -17,7 +17,8 @@
 //! - **Text keys** (`Char`, Enter, Tab, Backspace, Escape): Ctrl folds the
 //!   character into its C0 control byte (`Ctrl+A` → `0x01`), and Alt (the
 //!   `metaSendsEscape` convention) prefixes an `ESC`. So `Alt+Ctrl+A` is
-//!   `ESC 0x01`.
+//!   `ESC 0x01`. Super has no legacy form, so a text key held with it sends
+//!   nothing rather than the bare key.
 //! - **Named keys** (arrows, Home/End, Insert/Delete/Page, F-keys): a CSI or SS3
 //!   sequence, with any modifiers folded into xterm's numeric *modifier
 //!   parameter* `1 + shift + alt·2 + ctrl·4 + super·8`. Unmodified keys use the
@@ -456,9 +457,13 @@ fn reports_release(key: Key, mods: Mods) -> bool {
 /// The legacy xterm encoding: what every application gets until it asks for better.
 fn encode_legacy(key: Key, mods: Mods, modes: Modes, out: &mut Vec<u8>) {
     match key {
+        // A deliberate departure from xterm, which sends the bare key: no legacy form
+        // carries Super.
+        Key::Char { .. } | Key::Enter | Key::Tab | Key::Backspace | Key::Escape
+            if mods.contains(Mods::SUPER) => {}
         Key::Char { typed, .. } => encode_char(typed, mods, out),
         Key::Enter => {
-            // The one deliberate departure from xterm, which sends CR here and leaves
+            // A deliberate departure from xterm, which sends CR here and leaves
             // the application blind. See the module header: LF is distinguishable to
             // anything that looks and identical to anything that does not.
             if mods.contains(Mods::SHIFT) {
@@ -517,6 +522,8 @@ fn encode_named_event(key: Key, mods: Mods, event: KeyEvent, modes: Modes, out: 
         Key::PageUp => tilde_key(5, mods, event, out),
         Key::PageDown => tilde_key(6, mods, event, out),
         Key::Function(n) => function_key(n, mods, event, out),
+        // Neither keypad form can carry Super, so it sends nothing rather than the bare key.
+        Key::KeypadEnter | Key::Keypad(_) if mods.contains(Mods::SUPER) => {}
         Key::KeypadEnter => {
             if modes.app_keypad {
                 out.extend_from_slice(b"\x1bOM");
@@ -603,11 +610,11 @@ fn encode_kitty(key: Key, mods: Mods, event: KeyEvent, modes: Modes, out: &mut V
 ///
 /// The two levels differ only in how much legacy they are willing to break. Level 1
 /// keeps every well-known encoding (`Ctrl+C` is still `0x03`, `Shift+Enter` is still a
-/// newline) and only rescues keys that legacy cannot express at all, such as `Ctrl+1`.
-/// Level 2 gives up the exceptions, so `Ctrl+C` becomes `CSI 27;5;99~` and
-/// `Shift+Enter` becomes `CSI 27;2;13~`. An application that asks for level 2 has said
-/// it would rather parse keys than receive control bytes; tmux's `extended-keys on`
-/// and Claude Code both ask for exactly that.
+/// newline) and only rescues keys that legacy cannot express at all, such as `Ctrl+1`
+/// or any text key held with Super. Level 2 gives up the exceptions, so `Ctrl+C`
+/// becomes `CSI 27;5;99~` and `Shift+Enter` becomes `CSI 27;2;13~`. An application that
+/// asks for level 2 has said it would rather parse keys than receive control bytes;
+/// tmux's `extended-keys on` and Claude Code both ask for exactly that.
 fn encode_modify_other_keys(key: Key, mods: Mods, modes: Modes, out: &mut Vec<u8>) {
     let level = modes.modify_other_keys;
     match key {
@@ -617,8 +624,9 @@ fn encode_modify_other_keys(key: Key, mods: Mods, modes: Modes, out: &mut Vec<u8
                 push_utf8(typed, out);
                 return;
             }
-            let well_known = mods.contains(Mods::CTRL) && ctrl_byte(typed).is_some()
-                || mods.contains(Mods::ALT) && !mods.contains(Mods::SUPER);
+            let well_known = !mods.contains(Mods::SUPER)
+                && (mods.contains(Mods::CTRL) && ctrl_byte(typed).is_some()
+                    || mods.contains(Mods::ALT));
             if level == ModifyOtherKeys::Level1 && well_known {
                 encode_char(typed, mods, out);
             } else {
@@ -626,8 +634,8 @@ fn encode_modify_other_keys(key: Key, mods: Mods, modes: Modes, out: &mut Vec<u8
             }
         }
         Key::Enter | Key::Tab | Key::Backspace | Key::Escape => {
-            // Level 1 leaves these alone entirely: they are xterm's named exceptions.
-            if mods.0 == 0 || level == ModifyOtherKeys::Level1 {
+            // Level 1 leaves these alone: they are xterm's named exceptions.
+            if mods.0 == 0 || level == ModifyOtherKeys::Level1 && !mods.contains(Mods::SUPER) {
                 encode_legacy(key, mods, modes, out);
             } else {
                 csi_27(text_key_code(key), mods, out);
@@ -1168,6 +1176,86 @@ mod tests {
         assert_eq!(encoded(Key::plain('a'), Mods::ALT, m), vec![0x1b, b'a']);
         assert_eq!(encoded(Key::Tab, Mods::CTRL, m), vec![b'\t']);
         assert_eq!(encoded(Key::Enter, Mods::SHIFT, m), vec![b'\n']);
+    }
+
+    #[test]
+    fn super_with_a_text_key_sends_nothing_in_the_legacy_encoding() {
+        let shift_a = Key::Char {
+            typed: 'A',
+            base: 'a',
+        };
+        for (key, mods) in [
+            (Key::plain('a'), Mods::SUPER),
+            (shift_a, Mods::SUPER | Mods::SHIFT),
+            (Key::plain('c'), Mods::SUPER | Mods::CTRL),
+            (Key::plain('a'), Mods::SUPER | Mods::ALT),
+            (Key::Enter, Mods::SUPER),
+            (Key::Enter, Mods::SUPER | Mods::SHIFT),
+            (Key::Tab, Mods::SUPER),
+            (Key::Tab, Mods::SUPER | Mods::SHIFT),
+            (Key::Backspace, Mods::SUPER),
+            (Key::Escape, Mods::SUPER),
+        ] {
+            assert!(enc(key, mods).is_empty(), "{key:?} with {mods:?}");
+        }
+        // A key with a modifier parameter carries Super in it.
+        assert_eq!(enc(Key::Up, Mods::SUPER), b"\x1b[1;9A");
+        assert_eq!(enc(Key::Delete, Mods::SUPER), b"\x1b[3;9~");
+        assert_eq!(enc(Key::Function(5), Mods::SUPER), b"\x1b[15;9~");
+    }
+
+    #[test]
+    fn super_with_a_keypad_key_sends_nothing_in_any_encoding() {
+        let app = Modes {
+            app_keypad: true,
+            ..Modes::default()
+        };
+        for modes in [Modes::default(), app, kitty(), mok(ModifyOtherKeys::Level2)] {
+            for key in [
+                Key::Keypad(KeypadKey::Digit(7)),
+                Key::Keypad(KeypadKey::Begin),
+                Key::KeypadEnter,
+            ] {
+                assert!(
+                    encoded(key, Mods::SUPER, modes).is_empty(),
+                    "{key:?} under {modes:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn both_protocols_report_super_on_text_keys() {
+        let shift_a = Key::Char {
+            typed: 'A',
+            base: 'a',
+        };
+        assert_eq!(
+            encoded(Key::plain('a'), Mods::SUPER, kitty()),
+            b"\x1b[97;9u"
+        );
+        assert_eq!(
+            encoded(shift_a, Mods::SUPER | Mods::SHIFT, kitty()),
+            b"\x1b[97;10u"
+        );
+        assert_eq!(encoded(Key::Enter, Mods::SUPER, kitty()), b"\x1b[13;9u");
+        assert_eq!(encoded(Key::Escape, Mods::SUPER, kitty()), b"\x1b[27;9u");
+
+        // Level 1 keeps only the well-known encodings, and nothing held with Super has one.
+        let level1 = mok(ModifyOtherKeys::Level1);
+        for (key, mods, bytes) in [
+            (Key::plain('a'), Mods::SUPER, b"\x1b[27;9;97~".as_slice()),
+            (Key::plain('c'), Mods::SUPER | Mods::CTRL, b"\x1b[27;13;99~"),
+            (Key::plain('a'), Mods::SUPER | Mods::ALT, b"\x1b[27;11;97~"),
+            (Key::Enter, Mods::SUPER, b"\x1b[27;9;13~"),
+            (Key::Tab, Mods::SUPER, b"\x1b[27;9;9~"),
+        ] {
+            assert_eq!(encoded(key, mods, level1), bytes, "{key:?} with {mods:?}");
+        }
+        assert_eq!(
+            encoded(Key::plain('a'), Mods::SUPER, mok(ModifyOtherKeys::Level2)),
+            b"\x1b[27;9;97~"
+        );
     }
 
     /// Modes with both kitty flags: disambiguate, and report event types. This is what

@@ -45,6 +45,8 @@ const XKB_MOD_NAME_CTRL: &[u8] = b"Control\0";
 /// The plain Alt key. AltGr is a different modifier (Level3), so this stays
 /// false while typing AltGr characters.
 const XKB_MOD_NAME_ALT: &[u8] = b"Mod1\0";
+/// The real modifier the standard keymaps put Super on.
+const XKB_MOD_NAME_LOGO: &[u8] = b"Mod4\0";
 
 /// Compose-sequence status after feeding a keysym. The fourth state, "nothing"
 /// (`0`, the keysym is part of no sequence), is the catch-all in the match below.
@@ -149,6 +151,12 @@ impl Xkb {
         NonNull::new(state)
     }
 
+    /// Install [`MINIMAL_KEYMAP`], for tests that need key and modifier state.
+    #[cfg(test)]
+    pub(crate) fn load_minimal_keymap(&mut self) -> Result<()> {
+        self.load_keymap(MINIMAL_KEYMAP.as_bytes(), XKB_KEYMAP_FORMAT_TEXT_V1)
+    }
+
     /// Install the keymap the compositor sent (its raw, NUL-terminated bytes).
     pub fn load_keymap(&mut self, bytes: &[u8], format: u32) -> Result<()> {
         if format != XKB_KEYMAP_FORMAT_TEXT_V1 {
@@ -241,6 +249,11 @@ impl Xkb {
     /// Whether (plain) Alt is currently active.
     pub fn alt_active(&self) -> bool {
         self.mod_active(XKB_MOD_NAME_ALT)
+    }
+
+    /// Whether Super is currently active.
+    pub fn super_active(&self) -> bool {
+        self.mod_active(XKB_MOD_NAME_LOGO)
     }
 
     /// The base character a text key produces, from its keysym: Shift and the
@@ -462,6 +475,32 @@ fn compose_locale(var: impl Fn(&str) -> Option<String>) -> String {
         .unwrap_or_else(|| "C".to_string())
 }
 
+/// The smallest keymap that can answer "is Ctrl held": one key bound to
+/// `Control_L` and mapped into the real `Control` modifier, plus the two keys the
+/// compose tests type on. Written out here rather than read from the system's xkb
+/// data so the test depends on nothing outside the process.
+///
+/// The keycodes carry the `+8` evdev offset, so `<AC01> = 38` is evdev 30 (the `a`
+/// key) and `<AD03> = 26` is evdev 18.
+#[cfg(test)]
+pub(crate) const MINIMAL_KEYMAP: &str = r#"
+xkb_keymap {
+  xkb_keycodes "min" { minimum = 8; maximum = 255; <LCTL> = 37; <AC01> = 38; <AD03> = 26; };
+  xkb_types "min" {
+    type "ONE_LEVEL" { modifiers = none; map[none] = Level1; level_name[Level1] = "Any"; };
+  };
+  xkb_compatibility "min" {
+    interpret Control_L { action = SetMods(modifiers = Control); };
+  };
+  xkb_symbols "min" {
+    key <LCTL> { type = "ONE_LEVEL", [ Control_L ] };
+    key <AC01> { type = "ONE_LEVEL", [ a ] };
+    key <AD03> { type = "ONE_LEVEL", [ dead_acute ] };
+    modifier_map Control { <LCTL> };
+  };
+};
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::platform::xkb::*;
@@ -524,32 +563,8 @@ mod tests {
         assert!(!xkb.shift_active());
         assert!(!xkb.ctrl_active());
         assert!(!xkb.alt_active());
+        assert!(!xkb.super_active());
     }
-
-    /// The smallest keymap that can answer "is Ctrl held": one key bound to
-    /// `Control_L` and mapped into the real `Control` modifier, plus the two keys the
-    /// compose tests type on. Written out here rather than read from the system's xkb
-    /// data so the test depends on nothing outside the process.
-    ///
-    /// The keycodes carry the `+8` evdev offset, so `<AC01> = 38` is evdev 30 (the `a`
-    /// key) and `<AD03> = 26` is evdev 18.
-    const MINIMAL_KEYMAP: &str = r#"
-xkb_keymap {
-  xkb_keycodes "min" { minimum = 8; maximum = 255; <LCTL> = 37; <AC01> = 38; <AD03> = 26; };
-  xkb_types "min" {
-    type "ONE_LEVEL" { modifiers = none; map[none] = Level1; level_name[Level1] = "Any"; };
-  };
-  xkb_compatibility "min" {
-    interpret Control_L { action = SetMods(modifiers = Control); };
-  };
-  xkb_symbols "min" {
-    key <LCTL> { type = "ONE_LEVEL", [ Control_L ] };
-    key <AC01> { type = "ONE_LEVEL", [ a ] };
-    key <AD03> { type = "ONE_LEVEL", [ dead_acute ] };
-    modifier_map Control { <LCTL> };
-  };
-};
-"#;
 
     /// Evdev codes for the two keys `MINIMAL_KEYMAP` binds to text.
     const KEY_A: u32 = 30;
@@ -581,7 +596,7 @@ xkb_keymap {
     /// a fixture table instead of the system's.
     fn composing_xkb() -> Xkb {
         let mut xkb = Xkb::new().expect("xkb context");
-        xkb.load_keymap(MINIMAL_KEYMAP.as_bytes(), XKB_KEYMAP_FORMAT_TEXT_V1)
+        xkb.load_minimal_keymap()
             .expect("the minimal keymap compiles");
 
         let locale = std::ffi::CString::new("C").expect("no NUL");
@@ -672,6 +687,28 @@ xkb_keymap {
     }
 
     #[test]
+    fn each_modifier_reads_from_its_own_real_modifier() {
+        // Real modifier indices are fixed in every keymap: Shift 0, Control 2, Mod1 3,
+        // Mod4 6. A compositor sends these bits in `wl_keyboard.modifiers`.
+        let mut xkb = Xkb::new().expect("xkb context");
+        xkb.load_minimal_keymap()
+            .expect("the minimal keymap compiles");
+        type Query = fn(&Xkb) -> bool;
+        let queries: [(&str, Query); 4] = [
+            ("shift", Xkb::shift_active),
+            ("ctrl", Xkb::ctrl_active),
+            ("alt", Xkb::alt_active),
+            ("super", Xkb::super_active),
+        ];
+        for (held, bit) in [("shift", 0), ("ctrl", 2), ("alt", 3), ("super", 6)] {
+            xkb.update_modifiers(1 << bit, 0, 0, 0);
+            for (name, query) in queries {
+                assert_eq!(query(&xkb), name == held, "{name} with {held} held");
+            }
+        }
+    }
+
+    #[test]
     fn a_lookup_leaves_a_sequence_in_flight_alone() {
         // `key_char` is the question to ask when the answer is only being looked at (a
         // shortcut table, a release). Advancing the machine there would consume a dead
@@ -695,7 +732,7 @@ xkb_keymap {
         // window — and the next plain left-click would be read as a Ctrl+click and
         // follow a hyperlink the user never asked for.
         let mut xkb = Xkb::new().expect("xkb context");
-        xkb.load_keymap(MINIMAL_KEYMAP.as_bytes(), XKB_KEYMAP_FORMAT_TEXT_V1)
+        xkb.load_minimal_keymap()
             .expect("the minimal keymap compiles");
 
         // `Control` is real modifier index 2 in every keymap, so its mask is 1 << 2 —
@@ -726,7 +763,7 @@ xkb_keymap {
         // that locks Shift) have the same shape. Effective state is the union of the
         // three, and it is what xterm reads out of an X event's state mask.
         let mut xkb = Xkb::new().expect("xkb context");
-        xkb.load_keymap(MINIMAL_KEYMAP.as_bytes(), XKB_KEYMAP_FORMAT_TEXT_V1)
+        xkb.load_minimal_keymap()
             .expect("the minimal keymap compiles");
 
         xkb.update_modifiers(0, 1 << 2, 0, 0);

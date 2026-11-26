@@ -438,7 +438,7 @@ impl State {
             self.xkb.shift_active(),
             self.xkb.alt_active(),
             self.xkb.ctrl_active(),
-            false,
+            self.xkb.super_active(),
         )
     }
 
@@ -1195,6 +1195,47 @@ mod tests {
             wl_seat::EV_CAPABILITIES,
             &[wl_seat::CAP_POINTER],
         );
+    }
+
+    /// Hand the window one `wl_keyboard` event, a `u32` per argument.
+    fn keyboard_event(state: &mut State, opcode: u16, args: &[u32]) {
+        let body: Vec<u8> = args.iter().flat_map(|a| a.to_ne_bytes()).collect();
+        state
+            .on_keyboard(opcode, &mut Reader::new(&body))
+            .expect("the keyboard event");
+    }
+
+    #[test]
+    fn super_from_the_compositor_keeps_a_chord_from_firing() {
+        const CTRL: u32 = 1 << 2;
+        const MOD4: u32 = 1 << 6;
+        const KEY_TAB: u32 = 15;
+        let press_tab = |state: &mut State| {
+            let pressed = wl_keyboard::KEY_STATE_PRESSED;
+            keyboard_event(state, wl_keyboard::EV_KEY, &[1, 0, KEY_TAB, pressed]);
+        };
+        let (mut state, _compositor) = window(&["one", "two"]);
+        state
+            .xkb
+            .load_minimal_keymap()
+            .expect("the minimal keymap compiles");
+        let first = state.tabs.active_id();
+
+        keyboard_event(
+            &mut state,
+            wl_keyboard::EV_MODIFIERS,
+            &[0, CTRL | MOD4, 0, 0, 0],
+        );
+        press_tab(&mut state);
+        assert_eq!(
+            state.tabs.active_id(),
+            first,
+            "Super+Ctrl+Tab is not Ctrl+Tab"
+        );
+
+        keyboard_event(&mut state, wl_keyboard::EV_MODIFIERS, &[0, CTRL, 0, 0, 0]);
+        press_tab(&mut state);
+        assert_ne!(state.tabs.active_id(), first, "Ctrl+Tab switches");
     }
 
     type LosePointer = fn(&mut State);

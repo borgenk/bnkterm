@@ -23,7 +23,9 @@
 //! a silent cancel.
 //!
 //! Normal mode also binds chords that need no leader: Ctrl+Tab and Ctrl+PgUp/PgDn switch
-//! tabs, Ctrl+Shift+T/W open and close one, and Ctrl+Shift+C/V copy and paste.
+//! tabs, Ctrl+Shift+T/W open and close one, and Ctrl+Shift+C/V copy and paste. None of
+//! them match with Super held: a Super chord passes through to the child, or cancels an
+//! armed mode.
 //!
 //! The whole thing is two pure functions with no window or PTY: [`advance`] is the
 //! `(mode, key, mods) -> (mode, disposition)` transition, unit-tested as a table;
@@ -155,6 +157,13 @@ fn window_chord(key: Key, mods: Mods) -> Option<WindowAction> {
 /// return the next mode and what the app should do with the key. Pure: no I/O, no
 /// manager, so the entire table is pinned by unit tests.
 pub(crate) fn advance(mode: KeyMode, key: Key, mods: Mods) -> (KeyMode, Disposition) {
+    if mods.contains(Mods::SUPER) {
+        let disposition = match mode {
+            KeyMode::Normal => Disposition::Passthrough,
+            KeyMode::Leader | KeyMode::Tabs => Disposition::Consumed(None),
+        };
+        return (KeyMode::Normal, disposition);
+    }
     match mode {
         KeyMode::Normal => {
             if is_leader(key, mods) {
@@ -374,6 +383,38 @@ mod tests {
                 advance(KeyMode::Normal, key, mods),
                 (KeyMode::Normal, Disposition::Passthrough),
                 "{key:?} with {mods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_super_chord_is_never_a_window_binding() {
+        let ctrl_shift = Mods::CTRL | Mods::SHIFT;
+        for (key, mods) in [
+            (Key::plain('a'), Mods::CTRL),
+            (Key::Tab, Mods::CTRL),
+            (Key::PageUp, Mods::CTRL),
+            (shifted('t'), ctrl_shift),
+            (shifted('c'), ctrl_shift),
+            (shifted('v'), ctrl_shift),
+        ] {
+            assert_eq!(
+                advance(KeyMode::Normal, key, mods | Mods::SUPER),
+                (KeyMode::Normal, Disposition::Passthrough),
+                "{key:?} with {mods:?} and Super"
+            );
+        }
+        // An armed table is left, and the key swallowed, as for any unbound key.
+        for (mode, key, mods) in [
+            (KeyMode::Leader, Key::plain('c'), Mods::NONE),
+            (KeyMode::Leader, Key::plain('c'), Mods::CTRL),
+            (KeyMode::Tabs, Key::Up, Mods::NONE),
+            (KeyMode::Tabs, Key::Up, Mods::SHIFT),
+        ] {
+            assert_eq!(
+                advance(mode, key, mods | Mods::SUPER),
+                (KeyMode::Normal, Disposition::Consumed(None)),
+                "{key:?} with {mods:?} and Super in {mode:?}"
             );
         }
     }
