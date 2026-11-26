@@ -42,7 +42,6 @@ modules:
           - build-dir
           - data
           - dist
-          - docs
           - flatpak-repo
           - rust-toolchain.toml
           - stats
